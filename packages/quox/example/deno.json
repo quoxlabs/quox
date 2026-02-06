@@ -1,0 +1,10 @@
+{
+  "tasks": {
+    "dev": "CACHE_DIR=./build/cache deno run --watch -A main.ts",
+    "compile": "export CACHE_DIR=./build/cache && deno -A main.ts && deno compile -A --include ./build/cache --output ./build/quox-meow main.ts"
+  },
+  "lock": false,
+  "imports": {
+    "@quoxlabs/quox": "jsr:@quoxlabs/quox@^0.0.1-alpha.1"
+  }
+}
