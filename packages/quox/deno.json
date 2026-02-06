@@ -18,16 +18,5 @@
     "exclude": [
       "!./target/x86_64-unknown-linux-gnu/release/libquox.so"
     ]
-  },
-  "fmt": {
-    "lineWidth": 120,
-    "proseWrap": "never"
-  },
-  "lint": {
-    "rules": {
-      "tags": [
-        "recommended"
-      ]
-    }
   }
 }

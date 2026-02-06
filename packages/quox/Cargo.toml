@@ -16,7 +16,7 @@ lto=true
 opt-level="z"
 
 [dependencies]
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros"] }
+tokio = { version = "1.49.0", features = ["full"] }
 blitz-html = "0.2.0"
 blitz-dom = "0.2.4"
 blitz-shell = "0.2.3"

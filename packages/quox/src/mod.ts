@@ -1,9 +1,3 @@
-/**
- * Quox lets you write TSX, and render it to a native application window on any OS. Without a build step.
- *
- * @module
- */
-
 import * as path from "@std/path";
 import { Buffer } from "node:buffer";
 import os from "node:os";
@@ -90,7 +84,8 @@ async function load(): Promise<RenderRawHTML> {
       with: { type: "json" },
     }),
   );
-  const source = `https://jsr.io/${name}/${version}/target/${RUST_TARGET}/release/${RUST_LIB}`;
+  const source =
+    `https://jsr.io/${name}/${version}/target/${RUST_TARGET}/release/${RUST_LIB}`;
   const destDir = path.join(CACHE_DIR, name, version);
   const destFile = path.join(destDir, RUST_LIB);
 
