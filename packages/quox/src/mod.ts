@@ -41,10 +41,10 @@ async function loadLib(): Promise<QuoxLib> {
  * Downloads/caches the binary
  */
 async function cache(options?: LoadOptions) {
-  const { libUrl, cacheDir, cacheFile } = await locateCache(options);
+  const { url, cacheDir, cacheFile, local } = await locateCache(options);
 
-  // If file exists, return path immediately
-  if (await exists(cacheFile, { isFile: true })) {
+  // If file exists, return path immediately (unless local, which is not immutable)
+  if (!local && await exists(cacheFile, { isFile: true })) {
     return cacheFile;
   }
 
@@ -55,10 +55,10 @@ async function cache(options?: LoadOptions) {
   const tempDest = await Deno.makeTempFile({ dir: cacheDir });
   try {
     using file = await Deno.open(tempDest, { write: true });
-    const response = await fetch(libUrl);
+    const response = await fetch(url);
     if (!response.ok || response.body === null) {
       throw new Error(
-        `Could not fetch library from ${libUrl}: ${response.statusText}`,
+        `Could not fetch library from ${url}: ${response.statusText}`,
       );
     }
     await response.body.pipeTo(file.writable);
@@ -87,15 +87,18 @@ async function locateCache(options?: LoadOptions) {
       throw new Error(`unsupported architecture '${cpu}'`);
   }
   const libName = `libquox.so`;
-  const libUrl =
-    new URL(`../target/${target}/release/${libName}`, import.meta.url).href;
-  const libUrlBytes = new TextEncoder().encode(libUrl);
+  const libUrl = new URL(
+    `../target/${target}/release/${libName}`,
+    import.meta.url,
+  );
+  const url = libUrl.href;
+  const libUrlBytes = new TextEncoder().encode(url);
   const libUrlHash = await crypto.subtle.digest("SHA-1", libUrlBytes);
   const libUrlHex = new Uint8Array(libUrlHash).toHex();
   const cacheDir = options?.cacheDir ??
     join(homedir(), ".cache", "quox", libUrlHex);
   const cacheFile = join(cacheDir, libName);
-  return { libUrl, cacheDir, cacheFile };
+  return { url, cacheDir, cacheFile, local: libUrl.protocol === "file:" };
 }
 
 export class RustService implements Disposable {
