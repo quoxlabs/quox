@@ -1,25 +1,26 @@
 use anyrender_vello::VelloWindowRenderer;
 use blitz_dom::DocumentConfig;
 use blitz_html::HtmlDocument;
-use blitz_shell::{BlitzShellEvent, ControlFlow, EventLoop};
+use blitz_shell::{BlitzShellEvent, EventLoop, create_default_event_loop};
 use std::error::Error;
 use std::ffi::{CStr, CString, c_void};
 use std::os::raw::c_char;
 use std::time::Duration;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
-use winit::platform::x11::EventLoopBuilderExtX11;
 
 type StatusCallback = extern "C" fn(event: *const c_char);
 
 pub struct QuoxApp {
     rt: Runtime,
+    ev: EventLoop<BlitzShellEvent>,
     sender: Option<mpsc::Sender<String>>,
 }
 impl QuoxApp {
     fn new() -> Self {
         QuoxApp {
             rt: Runtime::new().unwrap(),
+            ev: create_default_event_loop(),
             sender: None,
         }
     }
@@ -52,7 +53,7 @@ pub extern "C" fn app_start_work(ptr: *mut c_void, cb: StatusCallback) {
                             let s = CString::new("Counter reset").unwrap();
                             cb(s.as_ptr());
                         } else if cmd.trim_start().starts_with("<!DOCTYPE html>") {
-                            run_html(&cmd).expect("cannot render");
+                            run_html(state.ev, &cmd).expect("cannot render");
                         }
                     } else {
                         break;
@@ -91,19 +92,8 @@ pub extern "C" fn app_free(ptr: *mut c_void) {
     }
 }
 
-pub fn create_default_event_loop() -> EventLoop<BlitzShellEvent> {
-    let mut ev_builder = EventLoop::with_user_event();
-    ev_builder.with_any_thread(true);
-
-    let event_loop = ev_builder.build().unwrap();
-    event_loop.set_control_flow(ControlFlow::Wait);
-
-    event_loop
-}
-
 /// Open a native window (via `winit`) and render the given HTML using `blitz` + `anyrender_vello`.
-pub fn run_html(html: &str) -> Result<(), Box<dyn Error>> {
-    let event_loop = create_default_event_loop();
+pub fn run_html(event_loop: EventLoop<BlitzShellEvent>, html: &str) -> Result<(), Box<dyn Error>> {
     let proxy = event_loop.create_proxy();
 
     // Parse HTML into a Blitz document.
