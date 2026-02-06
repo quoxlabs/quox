@@ -61,8 +61,9 @@ pub extern "C" fn app_start_work(ptr: *mut c_void, cb: StatusCallback) {
                 _ = tokio::time::sleep(Duration::from_millis(500)) => {
                     i += 10;
                     let msg = format!("Status update: {}", i);
-                    let c_str = CString::new(msg).unwrap();
-                    cb(c_str.as_ptr());
+                    if let Ok(c_str) = CString::new(msg) {
+                         cb(c_str.as_ptr());
+                    }
                 }
             }
         }
