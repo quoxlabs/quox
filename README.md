@@ -7,14 +7,14 @@ Simple. Speedy. Small. Secure.
 quox lets you write TSX, and render it to a native application window on any OS.
 Without a build step.
 
-Built on top of Deno, servo, WebGPU, FFI. Free and open-source.
+Built on top of Deno, blitz, FFI. Free and open-source.
 
-quox is not anywhere close to being ready, not even as a hello world example.
-Until then, imagine this:
+quox is not anywhere close to being ready It only really works as a hello world
+example. Until then, imagine this:
 
 ```ts
 // main.tsx
-import { renderToWindow } from "https://quox.dev/mod.ts";
+import { renderToWindow } from "jsr:@quoxlabs/quox";
 
 await renderToWindow(<h1>Hello, world!</h1>);
 ```
@@ -39,7 +39,7 @@ This will enable:
 It has a lot of nice benefits:
 
 - a single JS context for your entire app
-- access to the web stack (all of npm)
+- access to the web stack (all of npm and jsr)
 - fully cross-platform
 - built-in security
 - pure Deno tooling lets you iterate at ludicrous speeds

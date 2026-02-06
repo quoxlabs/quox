@@ -11,9 +11,9 @@ crate-type = ["cdylib"]
 name = "quox"
 
 [profile.release]
-strip=true
-lto=true
-opt-level="z"
+# strip=true
+# lto=true
+# opt-level="z"
 
 [dependencies]
 tokio = { version = "1.49.0", features = ["full"] }
@@ -25,3 +25,4 @@ blitz-net = "0.2.1"
 futures-task = "0.3.31"
 futures-util = "0.3.31"
 anyrender_vello = "0.6.2"
+winit = "0.30.12"
