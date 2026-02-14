@@ -32,9 +32,8 @@ export interface LoadOptions {
   arch?: "x64" | "arm64";
 }
 
-async function loadLib(): Promise<QuoxLib> {
-  const libPath = await cache();
-  return Deno.dlopen(libPath, SYMBOLS);
+function loadLibCached(path: string): QuoxLib {
+  return Deno.dlopen(path, SYMBOLS);
 }
 
 /**
@@ -135,7 +134,15 @@ export class RustService implements Disposable {
    * Initializes the service, ensuring the library is loaded/cached.
    */
   static async init(): Promise<RustService> {
-    const lib = await loadLib();
+    const path = await cache();
+    return RustService.initCached(path);
+  }
+
+  /**
+   * Initializes the service from a cached library path, ensuring it is loaded.
+   */
+  static initCached(path: string): RustService {
+    const lib = loadLibCached(path);
     return new RustService(lib);
   }
 
