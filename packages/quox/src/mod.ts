@@ -185,5 +185,5 @@ export async function renderRawHTML(html: string): Promise<RustService> {
 }
 
 if (import.meta.main) {
-  await cache();
+  console.log(await cache());
 }
