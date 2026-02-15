@@ -6,19 +6,19 @@ const SYMBOLS = {
   app_new: {
     parameters: [],
     result: "pointer",
-  },
+  } satisfies Deno.ForeignFunction,
   app_start_work: {
     parameters: ["pointer", "function"],
     result: "void",
-  },
+  } satisfies Deno.ForeignFunction,
   app_send_cmd: {
     parameters: ["pointer", "buffer"],
     result: "void",
-  },
+  } satisfies Deno.ForeignFunction,
   app_free: {
     parameters: ["pointer"],
     result: "void",
-  },
+  } satisfies Deno.ForeignFunction,
 } as const;
 
 type QuoxLib = Deno.DynamicLibrary<typeof SYMBOLS>;
