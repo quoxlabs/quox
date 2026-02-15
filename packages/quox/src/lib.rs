@@ -112,6 +112,20 @@ pub fn run_html(event_loop: EventLoop<BlitzShellEvent>, html: &str) -> Result<()
     let mut app = blitz_shell::BlitzApplication::new(proxy);
     app.add_window(window_config);
 
+    // FIXME: Houston, we have a problem:
+    // 1. The following (blocking!) line is needed in order to run the application.
+    // 2. It MUST be called from the main thread, as it requires exclusive access to the windows. Running an application from other threads is apparently a very bad idea.
+    // 3. The only way to call into Rust from the main thread is by calling it directly via FFI.
+    //   a) We can't delegate this to a tokio runtime (uses a non-main thread to execute the future).
+    //   b) We also can't delegate this to our own thread (also non-main thread).
+    // 4. This always blocks the JS side indefinitely.
+    //   a) If we perform the FFI call directly, we block the application until the following (blocking!) line returns, i.e. never.
+    //   b) If we perform the FFI call with `nonblocking: true`, Deno spawns a new dedicated thread which may be blocked---but it is not the main thread.
+    // 5. How can we solve this?
+    //   a) Implement an event loop that crosses the JS-Rust boundary in order to drive tokio from the main (JS) thread? Ugly, slow, challenging.
+    //   b) Lauch the UI in a new process (ew!) and communicate via IPC? Moves more and more away from being self-contained inside Deno, but resembles how most other projects seem do it.
+    //   c) Fork Deno and implement a feature that lets us perform a single blocking FFI call from the main thread into Rust, and that makes the rest of Deno run on other worker threads? Probably the cleanest option, but also the hardest.
+
     // Blocks until the window is closed.
     event_loop
         .run_app(&mut app)
