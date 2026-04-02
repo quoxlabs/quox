@@ -1,10 +1,18 @@
 {
   "version": "5",
   "specifiers": {
+    "jsr:@std/fs@^1.0.22": "1.0.22",
     "jsr:@std/internal@^1.0.12": "1.0.12",
     "jsr:@std/path@^1.1.4": "1.1.4"
   },
   "jsr": {
+    "@std/fs@1.0.22": {
+      "integrity": "de0f277a58a867147a8a01bc1b181d0dfa80bfddba8c9cf2bacd6747bcec9308",
+      "dependencies": [
+        "jsr:@std/internal",
+        "jsr:@std/path"
+      ]
+    },
     "@std/internal@1.0.12": {
       "integrity": "972a634fd5bc34b242024402972cd5143eac68d8dffaca5eaa4dba30ce17b027"
     },
@@ -16,8 +24,13 @@
     }
   },
   "workspace": {
-    "dependencies": [
-      "jsr:@std/path@^1.1.4"
-    ]
+    "members": {
+      "packages/quox": {
+        "dependencies": [
+          "jsr:@std/fs@^1.0.22",
+          "jsr:@std/path@^1.1.4"
+        ]
+      }
+    }
   }
 }

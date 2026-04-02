@@ -1,32 +1,33 @@
 use anyrender_vello::VelloWindowRenderer;
 use blitz_dom::DocumentConfig;
 use blitz_html::HtmlDocument;
-use std::error::Error;
-use std::slice;
+use blitz_shell::{BlitzApplication, BlitzShellEvent, EventLoop, create_default_event_loop};
+use std::ffi::{CStr, c_void};
+use std::os::raw::c_char;
+use std::time::Duration;
+use tokio::runtime::Runtime;
+use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
 
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn render_raw_html(buffer: *const u8, len: usize) {
-    if buffer.is_null() {
-        panic!("null pointer html");
-    }
-    let input_bytes = unsafe { slice::from_raw_parts(buffer, len) };
-    let Ok(html_string) = std::str::from_utf8(input_bytes) else {
-        panic!("bad string encoding2");
-    };
-
-    if let Err(err) = run_html(html_string) {
-        eprintln!("run_html failed: {err:?}");
-    }
+pub struct QuoxWindow {
+    _rt: Runtime,
+    event_loop: EventLoop<BlitzShellEvent>,
+    app: BlitzApplication<VelloWindowRenderer>,
 }
 
-/// Open a native window (via `winit`) and render the given HTML using `blitz` + `anyrender_vello`.
-pub fn run_html(html: &str) -> Result<(), Box<dyn Error>> {
-    let event_loop = blitz_shell::create_default_event_loop::<blitz_shell::BlitzShellEvent>();
-    let proxy = event_loop.create_proxy();
+/// Create a native window rendering the given HTML string.
+/// Returns a pointer to the `QuoxWindow` which must be freed with `window_free`.
+#[unsafe(no_mangle)]
+pub extern "C" fn window_new(html_ptr: *const c_char) -> *mut c_void {
+    let html = unsafe { CStr::from_ptr(html_ptr) }
+        .to_string_lossy()
+        .into_owned();
 
-    // Parse HTML into a Blitz document.
+    let rt = Runtime::new().unwrap();
+    let ev = create_default_event_loop::<BlitzShellEvent>();
+    let proxy = ev.create_proxy();
+
     let doc = HtmlDocument::from_html(
-        html,
+        &html,
         DocumentConfig {
             base_url: Some("https://example.com".to_string()),
             ..Default::default()
@@ -37,11 +38,37 @@ pub fn run_html(html: &str) -> Result<(), Box<dyn Error>> {
     let attrs = blitz_shell::Window::default_attributes().with_title("Blitz HTML");
     let window_config = blitz_shell::WindowConfig::with_attributes(Box::new(doc), renderer, attrs);
 
-    let mut app = blitz_shell::BlitzApplication::new(proxy);
+    let mut app = BlitzApplication::new(proxy);
     app.add_window(window_config);
 
-    // Blocks until the window is closed.
-    event_loop
-        .run_app(&mut app)
-        .map_err(|e| Box::new(e) as Box<dyn Error>)
+    let window = QuoxWindow {
+        _rt: rt,
+        event_loop: ev,
+        app,
+    };
+    Box::into_raw(Box::new(window)) as *mut c_void
+}
+
+/// Run a single spin of the event loop.
+/// Returns `true` if the application should keep running, `false` if it has exited.
+#[unsafe(no_mangle)]
+pub extern "C" fn window_tick(ptr: *mut c_void) -> bool {
+    assert!(!ptr.is_null());
+    let window = unsafe { &mut *(ptr as *mut QuoxWindow) };
+    let _guard = window._rt.enter();
+    let status = window
+        .event_loop
+        .pump_app_events(Some(Duration::ZERO), &mut window.app);
+    matches!(status, PumpStatus::Continue)
+}
+
+/// Free a `QuoxWindow` created by `window_new`.
+#[unsafe(no_mangle)]
+pub extern "C" fn window_free(ptr: *mut c_void) {
+    if ptr.is_null() {
+        return;
+    }
+    unsafe {
+        let _ = Box::from_raw(ptr as *mut QuoxWindow);
+    }
 }

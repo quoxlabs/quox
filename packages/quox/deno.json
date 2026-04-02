@@ -2,11 +2,11 @@
   "name": "@quoxlabs/quox",
   "version": "0.0.1-alpha.1",
   "tasks": {
-    "build": "cargo build -r --target x86_64-unknown-linux-gnu",
-    "ok": "deno fmt --check && deno lint && deno check"
+    "build": "cargo build -r --target x86_64-unknown-linux-gnu"
   },
   "exports": "./src/mod.ts",
   "imports": {
+    "@std/fs": "jsr:@std/fs@^1.0.22",
     "@std/path": "jsr:@std/path@^1.1.4"
   },
   "license": "MIT",
@@ -18,16 +18,5 @@
     "exclude": [
       "!./target/x86_64-unknown-linux-gnu/release/libquox.so"
     ]
-  },
-  "fmt": {
-    "lineWidth": 120,
-    "proseWrap": "never"
-  },
-  "lint": {
-    "rules": {
-      "tags": [
-        "recommended"
-      ]
-    }
   }
 }

@@ -1,0 +1,7 @@
+{
+  "tasks": {
+    "build": "cd packages/quox && deno task build",
+    "ok": "deno fmt --check && deno lint && deno check"
+  },
+  "workspace": ["./packages/quox"]
+}
