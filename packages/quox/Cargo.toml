@@ -10,10 +10,15 @@ pedantic = { level = "warn", priority = -1 }
 crate-type = ["cdylib"]
 name = "quox"
 
+[profile.dev]
+# local builds for debugging
+
 [profile.release]
-# strip=true
-# lto=true
-# opt-level="z"
+opt-level = "z"
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"
 
 [dependencies]
 anyrender_vello = "0.8"

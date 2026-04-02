@@ -12,15 +12,15 @@ quox is not anywhere close to being ready It only really works as a hello world 
 
 ```ts
 // main.tsx
-import { renderToWindow } from "jsr:@quoxlabs/quox";
+import { renderRawHTML } from "jsr:@quoxlabs/quox@0.0.1-alpha.3";
 
-await renderToWindow(<h1>Hello, world!</h1>);
+await renderRawHTML("<h1>Hello, world!</h1>");
 ```
 
 Running
 
 ```sh
-deno run --allow-ffi main.tsx
+deno run --allow-ffi --allow-env main.tsx
 ```
 
 will open a native window on your machine with "Hello, world!" rendered to it.
