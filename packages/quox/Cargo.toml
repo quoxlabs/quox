@@ -22,6 +22,7 @@ panic = "abort"
 
 [dependencies]
 anyrender_vello = "0.8"
+linebender_resource_handle = "0.1.1"
 blitz-dom = { git = "https://github.com/DioxusLabs/blitz", rev = "4c9fb2820dc74860d3b2d972493fa4e9fa83eb48", package = "blitz-dom" }
 blitz-html = { git = "https://github.com/DioxusLabs/blitz", rev = "4c9fb2820dc74860d3b2d972493fa4e9fa83eb48", package = "blitz-html" }
 blitz-paint = { git = "https://github.com/DioxusLabs/blitz", rev = "4c9fb2820dc74860d3b2d972493fa4e9fa83eb48", package = "blitz-paint" }

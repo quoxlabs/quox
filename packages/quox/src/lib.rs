@@ -1,9 +1,10 @@
 use anyrender_vello::VelloScenePainter;
-use blitz_dom::DocumentConfig;
+use blitz_dom::{DocumentConfig, FontContext};
 use blitz_html::HtmlDocument;
 use blitz_paint::paint_scene;
 use blitz_traits::net::DummyNetProvider;
 use blitz_traits::shell::{ColorScheme, DummyShellProvider, Viewport};
+use linebender_resource_handle::Blob;
 use std::sync::Arc;
 use vello::wgpu::{
     self, BufferDescriptor, BufferUsages, Extent3d, TexelCopyBufferInfo, TexelCopyBufferLayout,
@@ -12,6 +13,20 @@ use vello::wgpu::{
 use vello::{AaConfig, AaSupport, RenderParams, Renderer, RendererOptions, Scene};
 use wasm_bindgen::prelude::*;
 use wgpu_context::WGPUContext;
+
+const LIBERATION_SANS: &[u8] = include_bytes!("../assets/LiberationSans-Regular.ttf");
+
+/// Prepend a `<style>` that names our embedded font explicitly so that blitz's
+/// CSS resolver finds it (the generic-family map is empty on wasm32).
+fn inject_font_css(html: &str) -> String {
+    const STYLE: &str =
+        "<style>html,body,*{font-family:'Liberation Sans',sans-serif;}</style>";
+    if let Some(pos) = html.find("</head>") {
+        format!("{}{}{}", &html[..pos], STYLE, &html[pos..])
+    } else {
+        format!("{STYLE}{html}")
+    }
+}
 
 #[wasm_bindgen(start)]
 pub fn start() {
@@ -31,6 +46,7 @@ pub struct QuoxRenderer {
     context: WGPUContext,
     dev_id: usize,
     renderer: Renderer,
+    font_ctx: FontContext,
 }
 
 #[wasm_bindgen]
@@ -56,6 +72,11 @@ impl QuoxRenderer {
         )
         .map_err(|e| JsValue::from_str(&format!("Vello renderer: {e:?}")))?;
 
+        let mut font_ctx = FontContext::default();
+        font_ctx
+            .collection
+            .register_fonts(Blob::new(Arc::new(LIBERATION_SANS) as _), None);
+
         Ok(QuoxRenderer {
             html: html.to_owned(),
             width: width.max(1),
@@ -63,6 +84,7 @@ impl QuoxRenderer {
             context,
             dev_id,
             renderer,
+            font_ctx,
         })
     }
 
@@ -86,12 +108,18 @@ impl QuoxRenderer {
         // Re-create the document each frame so HtmlDocument (which uses Rc
         // internally and is therefore not Send/Sync) never needs to be stored
         // in the struct.
+        //
+        // On wasm32-unknown-unknown fontique's system-font backend is a no-op,
+        // so generic CSS families (sans-serif, etc.) have no mapping. Inject
+        // an explicit font-family rule that names the font we embedded.
+        let html_with_font = inject_font_css(&self.html);
         let mut doc = HtmlDocument::from_html(
-            &self.html,
+            &html_with_font,
             DocumentConfig {
                 base_url: Some("https://example.com".to_string()),
                 net_provider: Some(Arc::new(DummyNetProvider::default())),
                 shell_provider: Some(Arc::new(DummyShellProvider)),
+                font_ctx: Some(self.font_ctx.clone()),
                 ..Default::default()
             },
         );
