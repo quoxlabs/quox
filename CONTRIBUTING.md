@@ -7,8 +7,10 @@
 
 ## TL;DR
 
-- `deno task build` to compile the library.
-- `deno publish` to upload to JSR. For a local dev build, see below.
+Inside `packages/quox/` use
+
+- `deno task dev` to compile the library.
+- `deno task build && deno publish` to upload to JSR. For a local dev build, see below.
 
 ## Development
 
@@ -17,23 +19,26 @@
 To build the `libquox.so` binary for linux locally:
 
 ```sh
-deno task build
+deno task dev
 ```
 
 To build the `libquox.dylib` binary for mac apple silicon locally:
 
 ```sh
-deno task build:mac
+deno task dev:mac
 ```
 
-This will create the binary at `packages/quox/target/x86_64-unknown-linux-gnu/release/libquox.so` or `packages/quox/target/aarch64-apple-darwin/release/libquox.dylib`. Checkout the script for the build target, i.e. we support x86_64 linux and macos.
+This will create the binary at `packages/quox/target/x86_64-unknown-linux-gnu/debug/libquox.so` or `packages/quox/target/aarch64-apple-darwin/debug/libquox.dylib`. Checkout the script for the build target, we support linux and macos.
 
 ### 2. Set the environment variable
 
-To use your locally built library instead of the one from JSR, set the `LIBQUOX_PATH` environment variable to the absolute path of your `libquox.so`:
+To use your locally built library instead of the one from JSR, set the `LIBQUOX_PATH` environment variable to the absolute path of your `library:
 
 ```sh
-export LIBQUOX_PATH=$(pwd)/packages/quox/target/x86_64-unknown-linux-gnu/release/libquox.so
+# linux
+export LIBQUOX_PATH=$(pwd)/packages/quox/target/x86_64-unknown-linux-gnu/debug/libquox.so
+# macos
+export LIBQUOX_PATH=$(pwd)/packages/quox/target/aarch64-apple-darwin/debug/libquox.dylib
 ```
 
 ### 3. Run the local developer example
@@ -41,5 +46,5 @@ export LIBQUOX_PATH=$(pwd)/packages/quox/target/x86_64-unknown-linux-gnu/release
 Now you can run an example using your local binary:
 
 ```sh
-deno run -A examples/local/main.ts
+deno run --allow-ffi --allow-env examples/local.ts
 ```

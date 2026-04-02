@@ -1,6 +1,6 @@
 {
   "tasks": {
-    "build": "cd packages/quox && deno task build",
+    "dev": "cd packages/quox && deno task dev",
     "ok": "deno fmt --check && deno lint && deno check"
   },
   "fmt": {
