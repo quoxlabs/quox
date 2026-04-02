@@ -136,6 +136,12 @@ impl QuoxRenderer {
         doc.set_viewport(Viewport::new(w, h, 1.0, ColorScheme::Light));
         doc.resolve(0.0);
 
+        // Clamp scroll offsets to the laid-out content size so the viewport
+        // can never scroll past the end of the document.
+        let content = doc.root_element().final_layout.size;
+        self.scroll_x = self.scroll_x.min((content.width as u32).saturating_sub(w));
+        self.scroll_y = self.scroll_y.min((content.height as u32).saturating_sub(h));
+
         let device_handle = self.context.device_pool[self.dev_id].clone();
 
         let texture = device_handle.device.create_texture(&TextureDescriptor {
