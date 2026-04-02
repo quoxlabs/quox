@@ -25,6 +25,10 @@ const x11functions = {
   },
   XInternAtom: { parameters: ["pointer", "buffer", "i32"], result: "usize" },
   XSetWMProtocols: { parameters: ["pointer", "usize", "buffer", "i32"], result: "i32" },
+  XChangeWindowAttributes: {
+    parameters: ["pointer", "usize", "u64", "buffer"],
+    result: "i32",
+  },
 } as const;
 
 function cString(s: string): Uint8Array<ArrayBuffer> {
@@ -33,11 +37,13 @@ function cString(s: string): Uint8Array<ArrayBuffer> {
   return buf;
 }
 
-// All event masks except PointerMotionHint (bit 7 = 0x80).
-// PointerMotionHint throttles MotionNotify to one hint per entry and requires
-// XQueryPointer acknowledgement before the next one is sent, which makes cursor
-// tracking extremely choppy.
-const ALL_X_EV_MASKS = 0x1ffff7fn;
+// All event masks except:
+//   - PointerMotionHint (bit 7): throttles MotionNotify to one hint per entry
+//     and requires XQueryPointer acknowledgement, making cursor tracking choppy.
+//   - ResizeRedirect (bit 18): blocks the WM from resizing the window, causing
+//     the drawable to stay at its initial size while synthetic ConfigureNotify
+//     events report the intended (larger) dimensions.
+const ALL_X_EV_MASKS = 0x1fbff7fn;
 enum _XEvMask {
   NoEvent = 0,
   KeyPress = 1 << 0,
@@ -131,6 +137,12 @@ class X11Window implements Window {
       white_pixel,
     );
     if (BigInt(window) === 0n) throw new Error("Failed to create window");
+
+    // Set background_pixmap = None so the X server does not clear the window
+    // to a solid colour on every resize (which causes white flicker).
+    const CW_BACK_PIXMAP = 1n; // bit 0
+    const attrs = new BigUint64Array([0n]); // None pixmap
+    lib.X11.symbols.XChangeWindowAttributes(lib.display, window, CW_BACK_PIXMAP, attrs);
 
     lib.X11.symbols.XSelectInput(lib.display, window, ALL_X_EV_MASKS);
 
