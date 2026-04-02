@@ -1,4 +1,4 @@
-import { renderRawHTML } from "../mod.ts";
+import { renderRawHTML } from "../../packages/quox/src/mod.ts";
 
 const html = `
 <!DOCTYPE html>

@@ -28,7 +28,7 @@ export interface LoadOptions {
   arch?: "x64" | "arm64";
 }
 
-function loadLibCached(path: string): QuoxLib {
+function loadLocalLib(path: string): QuoxLib {
   return Deno.dlopen(path, SYMBOLS);
 }
 
@@ -118,15 +118,19 @@ export class QuoxWindow implements Disposable {
     html: string,
     options?: LoadOptions,
   ): Promise<QuoxWindow> {
-    const path = await cache(options);
-    return QuoxWindow.createCached(path, html);
+    const libOverride = Deno.env.get("LIBQUOX_PATH");
+    const path = libOverride ?? await (async () => {
+      const cachedPath = await cache(options);
+      return cachedPath;
+    })();
+    return QuoxWindow.createLib(path, html);
   }
 
   /**
    * Initializes the window from a cached library path.
    */
-  static createCached(path: string, html: string): QuoxWindow {
-    const lib = loadLibCached(path);
+  static createLib(path: string, html: string): QuoxWindow {
+    const lib = loadLocalLib(path);
     return new QuoxWindow(lib, html);
   }
 

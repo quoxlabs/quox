@@ -4,13 +4,11 @@ More than just Electron.
 
 Simple. Speedy. Small. Secure.
 
-quox lets you write TSX, and render it to a native application window on any OS.
-Without a build step.
+quox lets you write TSX, and render it to a native application window on any OS. Without a build step.
 
 Built on top of Deno, blitz, FFI. Free and open-source.
 
-quox is not anywhere close to being ready It only really works as a hello world
-example. Until then, imagine this:
+quox is not anywhere close to being ready It only really works as a hello world example. Until then, imagine this:
 
 ```ts
 // main.tsx
@@ -29,12 +27,10 @@ will open a native window on your machine with "Hello, world!" rendered to it.
 
 This will enable:
 
-- `deno run -A https://example.com/main.tsx` runs a native desktop app without
-  installation
+- `deno run -A https://example.com/main.tsx` runs a native desktop app without installation
 - `deno install -A https://example.com/main.tsx` installs a native desktop app
 - `deno compile` creates standalone binaries of your app for Linux/Windows/Mac
-- `deno run --unstable-hmr main.tsx` lets you develop your app with hot module
-  replacement
+- `deno run --unstable-hmr main.tsx` lets you develop your app with hot module replacement
 
 It has a lot of nice benefits:
 
