@@ -34,6 +34,15 @@ if (import.meta.main) {
           `Key ${event.type === "keydown" ? "pressed" : "released"}: ${event.key} (${event.code})`,
         );
         break;
+      case "resize":
+        console.log(`Window resized to ${event.width}x${event.height}`);
+        break;
+      case "close":
+        console.log("Window closed");
+        break;
+      default:
+        console.log("Other even thrown:", event);
+        break;
     }
   });
 }

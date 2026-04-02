@@ -1,9 +1,11 @@
 export type {
   ButtonEvent,
+  CloseEvent,
   KeyEvent,
   Library,
   LoadLibrary,
   MoveEvent,
+  ResizeEvent,
   UIEvent,
   UIEventType,
   WheelEvent,

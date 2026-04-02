@@ -10,7 +10,9 @@ export type QuoxInputEvent =
   | QuoxMouseMoveEvent
   | QuoxMouseButtonEvent
   | QuoxMouseWheelEvent
-  | QuoxKeyboardEvent;
+  | QuoxKeyboardEvent
+  | QuoxResizeEvent
+  | QuoxCloseEvent;
 
 export type QuoxMouseMoveEvent = { type: "mousemove"; x: number; y: number };
 export type QuoxMouseButtonEvent = { type: "mousedown" | "mouseup"; button: number };
@@ -22,6 +24,8 @@ export type QuoxKeyboardEvent = {
   /** X11 keycode as decimal string (same value). */
   code: string;
 };
+export type QuoxResizeEvent = { type: "resize"; width: number; height: number };
+export type QuoxCloseEvent = { type: "close" };
 
 export interface LoadOptions {
   /** Width of the window in pixels (default 800). */
@@ -50,6 +54,10 @@ function mapWindingEvent(ev: WindingUIEvent): QuoxInputEvent | null {
       return { type: "keydown", key: String(ev.keycode), code: String(ev.keycode) };
     case "keyup":
       return { type: "keyup", key: String(ev.keycode), code: String(ev.keycode) };
+    case "resize":
+      return { type: "resize", width: ev.width, height: ev.height };
+    case "close":
+      return { type: "close" };
   }
 }
 
@@ -60,8 +68,8 @@ function mapWindingEvent(ev: WindingUIEvent): QuoxInputEvent | null {
 export class QuoxWindow implements Disposable {
   readonly #lib: WindingLibrary;
   readonly #win: WindingWindow;
-  readonly #width: number;
-  readonly #height: number;
+  #width: number;
+  #height: number;
   readonly #renderer: WasmRenderer;
   #intervalId: number | null = null;
   #rendering = false;
@@ -112,9 +120,24 @@ export class QuoxWindow implements Disposable {
     let ev: WindingUIEvent | undefined;
     while ((ev = this.#lib.event()) !== undefined) {
       const mapped = mapWindingEvent(ev);
-      if (mapped !== null) {
+      if (mapped === null) continue;
+
+      if (mapped.type === "close") {
+        // Notify listeners before tearing down so they can react.
         for (const cb of this.#listeners) cb(mapped);
+        this[Symbol.dispose]();
+        return;
       }
+
+      if (mapped.type === "resize") {
+        this.#width = mapped.width;
+        this.#height = mapped.height;
+        // Propagate new dimensions to the WASM renderer so Blitz/Vello reflows
+        // the layout at the correct viewport size.
+        this.#renderer.resize(mapped.width, mapped.height);
+      }
+
+      for (const cb of this.#listeners) cb(mapped);
     }
 
     // Render HTML via WebGPU in WASM.

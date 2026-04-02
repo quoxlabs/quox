@@ -33,7 +33,11 @@ function cString(s: string): Uint8Array<ArrayBuffer> {
   return buf;
 }
 
-const ALL_X_EV_MASKS = 0x1ffffffn;
+// All event masks except PointerMotionHint (bit 7 = 0x80).
+// PointerMotionHint throttles MotionNotify to one hint per entry and requires
+// XQueryPointer acknowledgement before the next one is sent, which makes cursor
+// tracking extremely choppy.
+const ALL_X_EV_MASKS = 0x1ffff7fn;
 enum _XEvMask {
   NoEvent = 0,
   KeyPress = 1 << 0,
@@ -252,15 +256,23 @@ class X11Library implements Library {
   }
   #event = new ArrayBuffer(192);
   event(): UIEvent | undefined {
-    if (this.X11.symbols.XPending(this.display) === 0) return undefined;
-    this.X11.symbols.XNextEvent(
-      this.display,
-      Deno.UnsafePointer.of(this.#event),
-    );
     const view = new DataView(this.#event);
-    const event = importEvent(view, this.wmProtocols, this.wmDeleteWindow);
-    if (event === undefined) return undefined;
-    return { ...event, window: this.windows.get(view.getBigUint64(32, true)) };
+    // Keep consuming X11 events until we find one we handle or the queue is empty.
+    // Returning undefined for unhandled types and immediately surfacing it to the
+    // caller would stop the outer while-loop in #tick, causing subsequent handled
+    // events (e.g. ConfigureNotify after a ReparentNotify) to be delayed by a
+    // full tick.
+    while (this.X11.symbols.XPending(this.display) !== 0) {
+      this.X11.symbols.XNextEvent(
+        this.display,
+        Deno.UnsafePointer.of(this.#event),
+      );
+      const event = importEvent(view, this.wmProtocols, this.wmDeleteWindow);
+      if (event !== undefined) {
+        return { ...event, window: this.windows.get(view.getBigUint64(32, true)) };
+      }
+    }
+    return undefined;
   }
   [Symbol.dispose](): void {
     this.close();
