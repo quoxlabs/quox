@@ -197,10 +197,10 @@ export class QuoxWindow implements Disposable {
     const screenPtr = X11.symbols.XDefaultScreenOfDisplay(display);
     if (!screenPtr) throw new Error("XDefaultScreenOfDisplay failed");
 
-    const screenView = new Deno.UnsafePointerView(screenPtr as Deno.PointerObject);
-    const parent = screenView.getBigUint64(16, true);
-    const whitePx = screenView.getBigUint64(88, true);
-    const blackPx = screenView.getBigUint64(96, true);
+    const screenData = new DataView(Deno.UnsafePointerView.getArrayBuffer(screenPtr as Deno.PointerObject, 104));
+    const parent = screenData.getBigUint64(16, true);
+    const whitePx = screenData.getBigUint64(88, true);
+    const blackPx = screenData.getBigUint64(96, true);
 
     const win = X11.symbols.XCreateSimpleWindow(display, parent, 0, 0, width, height, 0, blackPx, whitePx) as bigint;
 
