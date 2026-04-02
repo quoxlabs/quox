@@ -20,11 +20,6 @@ strip = true
 codegen-units = 1
 panic = "abort"
 
-# Tell wasm-pack / wasm-opt to enable all WASM features that the Rust
-# compiler (≥1.93) emits: bulk-memory and nontrapping-float-to-int.
-[package.metadata.wasm-pack.profile.release]
-wasm-opt = ["-Oz", "--enable-bulk-memory", "--enable-nontrapping-float-to-int"]
-
 [dependencies]
 anyrender_vello = "0.8"
 blitz-dom = { git = "https://github.com/DioxusLabs/blitz", rev = "4c9fb2820dc74860d3b2d972493fa4e9fa83eb48", package = "blitz-dom" }
@@ -34,6 +29,6 @@ blitz-traits = { git = "https://github.com/DioxusLabs/blitz", rev = "4c9fb2820dc
 console_error_panic_hook = "0.1"
 futures-intrusive = "0.5"
 vello = "0.8"
-wasm-bindgen = "0.2"
-wasm-bindgen-futures = "0.4"
+wasm-bindgen = "=0.2.106"
+wasm-bindgen-futures = "=0.4.56"
 wgpu_context = "0.4"

@@ -1,4 +1,4 @@
-import __wbg_init, { QuoxRenderer as WasmRenderer } from "../pkg/quox.js";
+import { QuoxRenderer as WasmRenderer } from "../lib/quox.js";
 
 // ---------------------------------------------------------------------------
 // X11 FFI
@@ -98,15 +98,6 @@ export interface LoadOptions {
 // Helpers
 // ---------------------------------------------------------------------------
 
-let wasmReady = false;
-
-async function ensureWasm(): Promise<void> {
-  if (!wasmReady) {
-    await __wbg_init();
-    wasmReady = true;
-  }
-}
-
 function parseX11Event(ev: DataView): QuoxInputEvent | null {
   const type = ev.getInt32(EV_TYPE_OFFSET, true);
   switch (type) {
@@ -197,8 +188,6 @@ export class QuoxWindow implements Disposable {
 
   /** Open an X11 window and create a WASM renderer for the given HTML. */
   static async create(html: string, options: LoadOptions = {}): Promise<QuoxWindow> {
-    await ensureWasm();
-
     const width = options.width ?? 800;
     const height = options.height ?? 600;
 

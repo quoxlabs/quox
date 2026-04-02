@@ -2,8 +2,9 @@
   "name": "@quoxlabs/quox",
   "version": "0.0.1-alpha.3",
   "tasks": {
-    "build": "wasm-pack build --target web --out-dir pkg",
-    "build:debug": "deno task build --dev"
+    "wasmbuild": "deno run -A jsr:@deno/wasmbuild@0.21.1",
+    "build": "deno task wasmbuild --skip-opt",
+    "build:debug": "deno task wasmbuild --debug --skip-opt"
   },
   "exports": "./src/mod.ts",
   "imports": {
@@ -14,9 +15,7 @@
   "publish": {
     "include": [
       "./src/mod.ts",
-      "./pkg/quox.js",
-      "./pkg/quox.d.ts",
-      "./pkg/quox_bg.wasm"
+      "./lib/"
     ]
   }
 }
