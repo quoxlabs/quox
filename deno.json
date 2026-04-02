@@ -14,5 +14,6 @@
       ]
     }
   },
-  "workspace": ["./packages/quox"]
+  "workspace": ["./packages/quox"],
+  "exclude": ["packages/browserbrowserbrowser"]
 }
