@@ -14,13 +14,19 @@
 
 ### 1. Build the native library
 
-To build the `libquox.so` binary locally:
+To build the `libquox.so` binary for linux locally:
 
 ```sh
 deno task build
 ```
 
-This will create the binary at `packages/quox/target/x86_64-unknown-linux-gnu/release/libquox.so`. Checkout the script for the build target, i.e. we support x86_64 linux.
+To build the `libquox.dylib` binary for mac apple silicon locally:
+
+```sh
+deno task build:mac
+```
+
+This will create the binary at `packages/quox/target/x86_64-unknown-linux-gnu/release/libquox.so` or `packages/quox/target/aarch64-apple-darwin/release/libquox.dylib`. Checkout the script for the build target, i.e. we support x86_64 linux and macos.
 
 ### 2. Set the environment variable
 

@@ -100,20 +100,21 @@ async function cache(options?: LoadOptions) {
   return cacheFile;
 }
 async function locateCache(options?: LoadOptions) {
-  const os = options?.os ?? "linux-gnu";
+  const detectedOS = Deno.build.os;
+  const os = options?.os ?? (detectedOS === "darwin" ? "apple-darwin" : "linux-gnu");
   const cpu = options?.arch ?? arch();
   let target: string;
   switch (cpu) {
     case "x64":
-      target = `x86_64-unknown-${os}`;
+      target = os === "apple-darwin" ? `x86_64-apple-darwin` : `x86_64-unknown-${os}`;
       break;
     case "arm64":
-      target = `aarch64-unknown-${os}`;
+      target = os === "apple-darwin" ? `aarch64-apple-darwin` : `aarch64-unknown-${os}`;
       break;
     default:
       throw new Error(`unsupported architecture '${cpu}'`);
   }
-  const libName = `libquox.so`;
+  const libName = os === "apple-darwin" ? "libquox.dylib" : "libquox.so";
   const libUrl = new URL(
     `../target/${target}/release/${libName}`,
     import.meta.url,
