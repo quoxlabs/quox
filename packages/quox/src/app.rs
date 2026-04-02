@@ -45,12 +45,12 @@ impl ApplicationHandler<BlitzShellEvent> for QuoxApplication {
         window_id: WindowId,
         event: WindowEvent,
     ) {
-        if let Some(cb) = self.callback {
-            if let Some(json) = events::serialize(&event) {
-                // SAFETY: `json` outlives this call; `cb` is a valid function pointer
-                // provided by Deno and kept alive on the TypeScript side.
-                unsafe { cb(json.as_ptr()) };
-            }
+        if let Some(cb) = self.callback
+            && let Some(json) = events::serialize(&event)
+        {
+            // SAFETY: `json` outlives this call; `cb` is a valid function pointer
+            // provided by Deno and kept alive on the TypeScript side.
+            unsafe { cb(json.as_ptr()) };
         }
         self.inner.window_event(event_loop, window_id, event);
     }
@@ -62,7 +62,7 @@ impl ApplicationHandler<BlitzShellEvent> for QuoxApplication {
 
 /// Owns the tokio runtime, winit event loop, and blitz application.
 pub struct QuoxWindow {
-    pub _rt: Runtime,
+    pub rt: Runtime,
     pub event_loop: EventLoop<BlitzShellEvent>,
     pub app: QuoxApplication,
 }

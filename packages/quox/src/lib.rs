@@ -14,8 +14,16 @@ use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
 
 /// Create a native window rendering the given HTML string.
 /// Returns an opaque pointer that must be freed with `window_free`.
+///
+/// # Panics
+///
+/// Panics if the tokio runtime cannot be created.
+///
+/// # Safety
+///
+/// `html_ptr` must be a valid null-terminated C string.
 #[unsafe(no_mangle)]
-pub extern "C" fn window_new(html_ptr: *const c_char) -> *mut c_void {
+pub unsafe extern "C" fn window_new(html_ptr: *const c_char) -> *mut c_void {
     let html = unsafe { CStr::from_ptr(html_ptr) }
         .to_string_lossy()
         .into_owned();
@@ -41,20 +49,24 @@ pub extern "C" fn window_new(html_ptr: *const c_char) -> *mut c_void {
     app.add_window(window_config);
 
     let window = QuoxWindow {
-        _rt: rt,
+        rt,
         event_loop: ev,
         app,
     };
-    Box::into_raw(Box::new(window)) as *mut c_void
+    Box::into_raw(Box::new(window)).cast::<c_void>()
 }
 
 /// Run a single spin of the event loop.
 /// Returns `true` to keep running, `false` if the application has exited.
+///
+/// # Panics
+///
+/// Panics if `ptr` is null.
 #[unsafe(no_mangle)]
 pub extern "C" fn window_tick(ptr: *mut c_void) -> bool {
     assert!(!ptr.is_null());
-    let window = unsafe { &mut *(ptr as *mut QuoxWindow) };
-    let _guard = window._rt.enter();
+    let window = unsafe { &mut *ptr.cast::<QuoxWindow>() };
+    let _guard = window.rt.enter();
     let status = window
         .event_loop
         .pump_app_events(Some(Duration::ZERO), &mut window.app);
@@ -65,10 +77,14 @@ pub extern "C" fn window_tick(ptr: *mut c_void) -> bool {
 /// The callback is invoked synchronously during `window_tick` for each input event,
 /// with a pointer to a null-terminated JSON string that is valid only for the
 /// duration of the call.
+///
+/// # Panics
+///
+/// Panics if `ptr` is null.
 #[unsafe(no_mangle)]
 pub extern "C" fn window_set_event_listener(ptr: *mut c_void, callback: EventCallback) {
     assert!(!ptr.is_null());
-    let window = unsafe { &mut *(ptr as *mut QuoxWindow) };
+    let window = unsafe { &mut *ptr.cast::<QuoxWindow>() };
     window.app.callback = Some(callback);
 }
 
@@ -79,6 +95,6 @@ pub extern "C" fn window_free(ptr: *mut c_void) {
         return;
     }
     unsafe {
-        let _ = Box::from_raw(ptr as *mut QuoxWindow);
+        let _ = Box::from_raw(ptr.cast::<QuoxWindow>());
     }
 }

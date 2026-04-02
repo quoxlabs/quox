@@ -1,4 +1,5 @@
 use std::ffi::CString;
+use std::fmt::Write;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::keyboard::{Key, PhysicalKey};
 
@@ -20,15 +21,15 @@ pub fn serialize(event: &WindowEvent) -> Option<CString> {
                 } else {
                     "mouseup"
                 },
-                mouse_button_index(button)
+                mouse_button_index(*button)
             )
         }
         WindowEvent::MouseWheel { delta, .. } => {
             let (dx, dy) = match delta {
-                MouseScrollDelta::LineDelta(x, y) => (*x as f64 * 100.0, *y as f64 * 100.0),
+                MouseScrollDelta::LineDelta(x, y) => (f64::from(*x) * 100.0, f64::from(*y) * 100.0),
                 MouseScrollDelta::PixelDelta(pos) => (pos.x, pos.y),
             };
-            format!(r#"{{"type":"wheel","deltaX":{},"deltaY":{}}}"#, dx, dy)
+            format!(r#"{{"type":"wheel","deltaX":{dx},"deltaY":{dy}}}"#)
         }
         WindowEvent::KeyboardInput { event, .. } => {
             let kind = if event.state == ElementState::Pressed {
@@ -56,14 +57,14 @@ pub fn serialize(event: &WindowEvent) -> Option<CString> {
     CString::new(json).ok()
 }
 
-fn mouse_button_index(button: &MouseButton) -> u32 {
+fn mouse_button_index(button: MouseButton) -> u32 {
     match button {
         MouseButton::Left => 0,
         MouseButton::Middle => 1,
         MouseButton::Right => 2,
         MouseButton::Back => 3,
         MouseButton::Forward => 4,
-        MouseButton::Other(n) => u32::from(*n) + 5,
+        MouseButton::Other(n) => u32::from(n) + 5,
     }
 }
 
@@ -77,7 +78,7 @@ fn json_escape(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c if (c as u32) < 0x20 => write!(out, "\\u{:04x}", c as u32).unwrap(),
             c => out.push(c),
         }
     }
