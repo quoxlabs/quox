@@ -1,10 +1,12 @@
 {
   "name": "@quoxlabs/quox",
-  "version": "0.0.1-alpha.3",
+  "version": "0.0.1-alpha.4",
   "tasks": {
-    "build": "cargo build --release --target x86_64-unknown-linux-gnu",
-    "dev": "cargo build --profile dev --target x86_64-unknown-linux-gnu",
-    "dev:mac": "cargo build --profile dev --target aarch64-apple-darwin"
+    "dev": "cargo build --profile dev",
+    "build:lib-darwin-arm64": "cargo build --release --target aarch64-apple-darwin",
+    "build:lib-darwin-x64": "cargo build --release --target x86_64-apple-darwin",
+    "build:lib-linux-arm64-gnu": "cargo build --release --target aarch64-unknown-linux-gnu",
+    "build:lib-linux-x64-gnu": "cargo build --release --target x86_64-unknown-linux-gnu"
   },
   "exports": "./src/mod.ts",
   "imports": {
@@ -14,11 +16,7 @@
   "license": "MIT",
   "publish": {
     "include": [
-      "./src/mod.ts",
-      "./target/x86_64-unknown-linux-gnu/release/libquox.so"
-    ],
-    "exclude": [
-      "!./target/x86_64-unknown-linux-gnu/release/libquox.so"
+      "./src/mod.ts"
     ]
   }
 }

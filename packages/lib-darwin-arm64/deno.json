@@ -1,0 +1,15 @@
+{
+  "name": "@quoxlabs/lib-darwin-arm64",
+  "version": "0.0.1-alpha.4",
+  "tasks": {
+    "build": "cd ../quox && deno task build:lib-darwin-arm64 && cp ./target/aarch64-apple-darwin/release/libquox.dylib ../lib-darwin-arm64/libquox.dylib"
+  },
+  "exports": {
+    "./lib": "./libquox.dylib"
+  },
+  "license": "MIT",
+  "publish": {
+    "include": ["./libquox.dylib"],
+    "exclude": ["!./libquox.dylib"]
+  }
+}

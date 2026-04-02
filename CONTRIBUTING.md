@@ -48,3 +48,12 @@ Now you can run an example using your local binary:
 ```sh
 deno run --allow-ffi --allow-env examples/local.ts
 ```
+
+## Supported platforms
+
+| package name                  | build target              |
+| ----------------------------- | ------------------------- |
+| @quoxlabs/lib-darwin-arm64    | aarch64-apple-darwin      |
+| @quoxlabs/lib-darwin-x64      | x86_64-apple-darwin       |
+| @quoxlabs/lib-linux-arm64-gnu | aarch64-unknown-linux-gnu |
+| @quoxlabs/lib-linux-x64-gnu   | x86_64-unknown-linux-gnu  |

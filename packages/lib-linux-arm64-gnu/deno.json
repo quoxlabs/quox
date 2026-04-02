@@ -1,0 +1,15 @@
+{
+  "name": "@quoxlabs/lib-linux-arm64-gnu",
+  "version": "0.0.1-alpha.4",
+  "tasks": {
+    "build": "cd ../quox && deno task build:lib-linux-arm64-gnu && cp ./target/aarch64-unknown-linux-gnu/release/libquox.so ../lib-linux-arm64-gnu/libquox.so"
+  },
+  "exports": {
+    "./lib": "./libquox.so"
+  },
+  "license": "MIT",
+  "publish": {
+    "include": ["./libquox.so"],
+    "exclude": ["!./libquox.so"]
+  }
+}
