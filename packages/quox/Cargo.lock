@@ -3310,6 +3310,8 @@ dependencies = [
  "blitz-traits",
  "futures-task",
  "futures-util",
+ "serde",
+ "serde_json",
  "tokio",
  "winit",
 ]
