@@ -60,6 +60,19 @@ export type QuoxKeyboardEvent = {
   code: string;
 };
 
+/**
+ * Retrieve the value of an environment variable, skipping the permission prompt entirely.
+ *
+ * Returns undefined if the supplied environment variable is not defined or the permission --allow-env is not granted.
+ */
+async function getDevEnv(key: string): Promise<string | undefined> {
+  const status = await Deno.permissions.query({ name: "env" });
+  if (status.state === "granted") {
+    return Deno.env.get(key);
+  }
+  return undefined;
+}
+
 function loadLocalLib(path: string): QuoxLib {
   return Deno.dlopen(path, SYMBOLS);
 }
@@ -162,7 +175,7 @@ export class QuoxWindow implements Disposable {
     html: string,
     options?: LoadOptions,
   ): Promise<QuoxWindow> {
-    const libOverride = Deno.env.get("LIBQUOX_PATH");
+    const libOverride = await getDevEnv("LIBQUOX_PATH");
     const path = libOverride ?? await (async () => {
       const cachedPath = await cache(options);
       return cachedPath;
