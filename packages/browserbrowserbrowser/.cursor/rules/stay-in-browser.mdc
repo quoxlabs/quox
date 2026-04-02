@@ -1,0 +1,12 @@
+---
+description: In-browser WASM-only product goal; avoid iframe/WebView as the primary “fix” for rendering/CSS.
+alwaysApply: true
+---
+
+# In-browser only (no “just use an iframe”)
+
+This project is a **browser inside the browser** built with **Rust → WebAssembly** and web APIs. The design **must stay inside a normal web page** in a real browser.
+
+- **Do not** recommend dropping that approach in favor of **`<iframe>`** (or native WebView) as the main solution to HTML/CSS/layout problems. Treating the real page as the renderer is **not** what this project is for.
+- **Do** improve what stays in-browser: parsing, canvas (or WebGPU) painting, CSS subsets, WASM dependencies, `fetch`/CORS, perf, etc.
+- If you mention outer-browser options, keep it **brief** and **secondary**—default guidance should preserve **WASM in the page**.
