@@ -152,5 +152,5 @@ const html = `
 </html>`;
 
 if (import.meta.main) {
-  await renderRawHTML(html, { width: 640, height: 560 });
+  await renderRawHTML(html);
 }
