@@ -137,6 +137,16 @@ export class QuoxWindow implements Disposable {
         this.#renderer.resize(mapped.width, mapped.height);
       }
 
+      if (mapped.type === "wheel") {
+        // Scale raw wheel notches (±1) to pixels so the viewport scrolls a
+        // comfortable distance per tick.
+        const SCROLL_SPEED = 40;
+        this.#renderer.scroll(
+          Math.round(mapped.deltaX * SCROLL_SPEED),
+          Math.round(mapped.deltaY * SCROLL_SPEED),
+        );
+      }
+
       for (const cb of this.#listeners) cb(mapped);
     }
 

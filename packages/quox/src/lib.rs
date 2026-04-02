@@ -19,8 +19,7 @@ const LIBERATION_SANS: &[u8] = include_bytes!("../assets/LiberationSans-Regular.
 /// Prepend a `<style>` that names our embedded font explicitly so that blitz's
 /// CSS resolver finds it (the generic-family map is empty on wasm32).
 fn inject_font_css(html: &str) -> String {
-    const STYLE: &str =
-        "<style>html,body,*{font-family:'Liberation Sans',sans-serif;}</style>";
+    const STYLE: &str = "<style>html,body,*{font-family:'Liberation Sans',sans-serif;}</style>";
     if let Some(pos) = html.find("</head>") {
         format!("{}{}{}", &html[..pos], STYLE, &html[pos..])
     } else {
@@ -43,6 +42,8 @@ pub struct QuoxRenderer {
     html: String,
     width: u32,
     height: u32,
+    scroll_x: u32,
+    scroll_y: u32,
     context: WGPUContext,
     dev_id: usize,
     renderer: Renderer,
@@ -81,6 +82,8 @@ impl QuoxRenderer {
             html: html.to_owned(),
             width: width.max(1),
             height: height.max(1),
+            scroll_x: 0,
+            scroll_y: 0,
             context,
             dev_id,
             renderer,
@@ -97,6 +100,13 @@ impl QuoxRenderer {
     pub fn resize(&mut self, width: u32, height: u32) {
         self.width = width.max(1);
         self.height = height.max(1);
+    }
+
+    /// Scroll the viewport by the given pixel delta. Negative values scroll
+    /// towards the top/left; the position is clamped to 0 at the origin.
+    pub fn scroll(&mut self, delta_x: i32, delta_y: i32) {
+        self.scroll_x = self.scroll_x.saturating_add_signed(delta_x);
+        self.scroll_y = self.scroll_y.saturating_add_signed(delta_y);
     }
 
     /// Render the current HTML and return a flat `width × height × 4`
@@ -130,7 +140,11 @@ impl QuoxRenderer {
 
         let texture = device_handle.device.create_texture(&TextureDescriptor {
             label: Some("quox-target"),
-            size: Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            size: Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: TextureDimension::D2,
@@ -144,7 +158,7 @@ impl QuoxRenderer {
 
         let mut scene = Scene::new();
         let mut painter = VelloScenePainter::new(&mut scene);
-        paint_scene(&mut painter, &*doc, 1.0, w, h, 0, 0);
+        paint_scene(&mut painter, &*doc, 1.0, w, h, self.scroll_x, self.scroll_y);
 
         self.renderer
             .render_to_texture(
@@ -171,9 +185,12 @@ impl QuoxRenderer {
             mapped_at_creation: false,
         });
 
-        let mut encoder = device_handle
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("quox-copy") });
+        let mut encoder =
+            device_handle
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("quox-copy"),
+                });
         encoder.copy_texture_to_buffer(
             texture.as_image_copy(),
             TexelCopyBufferInfo {
