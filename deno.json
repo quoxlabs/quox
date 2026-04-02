@@ -3,5 +3,16 @@
     "build": "cd packages/quox && deno task build",
     "ok": "deno fmt --check && deno lint && deno check"
   },
+  "fmt": {
+    "lineWidth": 120,
+    "proseWrap": "never"
+  },
+  "lint": {
+    "rules": {
+      "tags": [
+        "recommended"
+      ]
+    }
+  },
   "workspace": ["./packages/quox"]
 }
