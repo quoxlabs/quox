@@ -16,13 +16,13 @@ name = "quox"
 # opt-level="z"
 
 [dependencies]
-tokio = { version = "1.49.0", features = ["full"] }
+tokio = { version = "1.50.0", features = ["full"] }
 blitz-html = "0.2.0"
 blitz-dom = "0.2.4"
 blitz-shell = "0.2.3"
 blitz-traits = "0.2.0"
 blitz-net = "0.2.1"
-futures-task = "0.3.31"
-futures-util = "0.3.31"
+futures-task = "0.3.32"
+futures-util = "0.3.32"
 anyrender_vello = "0.6.2"
-winit = "0.30.12"
+winit = "0.30.13"
