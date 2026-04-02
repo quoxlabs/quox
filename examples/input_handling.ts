@@ -22,9 +22,7 @@ if (import.meta.main) {
       case "mousedown":
       case "mouseup":
         console.log(
-          `Mouse button ${event.button} ${
-            event.type === "mousedown" ? "pressed" : "released"
-          }`,
+          `Mouse button ${event.button} ${event.type === "mousedown" ? "pressed" : "released"}`,
         );
         break;
       case "wheel":
@@ -33,9 +31,7 @@ if (import.meta.main) {
       case "keydown":
       case "keyup":
         console.log(
-          `Key ${
-            event.type === "keydown" ? "pressed" : "released"
-          }: ${event.key} (${event.code})`,
+          `Key ${event.type === "keydown" ? "pressed" : "released"}: ${event.key} (${event.code})`,
         );
         break;
     }
