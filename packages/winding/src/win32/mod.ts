@@ -71,6 +71,9 @@ class Win32Window implements Window {
     this.id = BigInt(Deno.UnsafePointer.value(window));
     lib.windows.set(this.id, this);
   }
+  blit(_rgba: Uint8Array, _width: number, _height: number): void {
+    // TODO: implement pixel blitting for Win32
+  }
   [Symbol.dispose]() {
     this.close();
   }
@@ -187,7 +190,7 @@ class Win32Library implements Library {
     if (wndClass == 0) throw new Error(this.getLastError());
   }
   readonly windows = new Map<bigint, Win32Window>();
-  openWindow(): Win32Window {
+  openWindow(_x = 0, _y = 0, _w = 800, _h = 600): Win32Window {
     return new Win32Window(this, this.#classNameBuffer);
   }
   #msg = new ArrayBuffer(48);

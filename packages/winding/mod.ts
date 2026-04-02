@@ -1,3 +1,15 @@
+export type {
+  ButtonEvent,
+  KeyEvent,
+  Library,
+  LoadLibrary,
+  MoveEvent,
+  UIEvent,
+  UIEventType,
+  WheelEvent,
+  Window,
+  WindowEvent,
+} from "./src/types.ts";
 import type { LoadLibrary } from "./src/types.ts";
 import { load as X11Load } from "./src/x11/mod.ts";
 import { load as Win32Load } from "./src/win32/mod.ts";

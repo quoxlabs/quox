@@ -1,4 +1,4 @@
-export type UIEvent = KeyEvent | ButtonEvent | MoveEvent;
+export type UIEvent = KeyEvent | ButtonEvent | MoveEvent | WheelEvent;
 export type UIEventType = UIEvent["type"];
 
 export interface WindowEvent {
@@ -18,10 +18,17 @@ export interface MoveEvent extends WindowEvent {
   x: number;
   y: number;
 }
+export interface WheelEvent extends WindowEvent {
+  type: "wheel";
+  deltaX: number;
+  deltaY: number;
+}
 
 export interface Window {
   [Symbol.dispose]: () => void;
   close(): void;
+  /** Blit an RGBA pixel buffer to the window. Width and height must match the window dimensions. */
+  blit(rgba: Uint8Array, width: number, height: number): void;
 }
 
 export interface Library {
