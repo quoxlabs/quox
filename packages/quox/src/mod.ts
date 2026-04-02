@@ -3,19 +3,15 @@ import { exists } from "@std/fs";
 import { arch, homedir } from "node:os";
 
 const SYMBOLS = {
-  app_new: {
-    parameters: [],
+  window_new: {
+    parameters: ["buffer"],
     result: "pointer",
   } satisfies Deno.ForeignFunction,
-  app_start_work: {
-    parameters: ["pointer", "function"],
-    result: "void",
+  window_tick: {
+    parameters: ["pointer"],
+    result: "bool",
   } satisfies Deno.ForeignFunction,
-  app_send_cmd: {
-    parameters: ["pointer", "buffer"],
-    result: "void",
-  } satisfies Deno.ForeignFunction,
-  app_free: {
+  window_free: {
     parameters: ["pointer"],
     result: "void",
   } satisfies Deno.ForeignFunction,
@@ -100,95 +96,80 @@ async function locateCache(options?: LoadOptions) {
   return { url, cacheDir, cacheFile, local: libUrl.protocol === "file:" };
 }
 
-export class RustService implements Disposable {
+export class QuoxWindow implements Disposable {
   private lib: QuoxLib;
-  private symbols: QuoxLib["symbols"];
   private ptr: Deno.PointerValue;
+  private intervalId: number | null = null;
 
-  private callbackRef: Deno.UnsafeCallback<
-    { parameters: ["i32"]; result: "void" }
-  >;
-
-  // Changed constructor to public/private pattern used in engine.ts,
-  // but updated to take the loaded library instance.
-  private constructor(lib: QuoxLib) {
+  private constructor(lib: QuoxLib, html: string) {
     this.lib = lib;
-    this.symbols = lib.symbols;
-
-    this.ptr = this.symbols.app_new();
+    const buffer = new TextEncoder().encode(html + "\0");
+    this.ptr = lib.symbols.window_new(buffer);
     if (!this.ptr) {
-      throw new Error("Failed to allocate Rust state");
+      lib.close();
+      throw new Error("Failed to create native window");
     }
-
-    this.callbackRef = new Deno.UnsafeCallback(
-      { parameters: ["i32"], result: "void" },
-      (val: number) => {
-        this.onEvent(val);
-      },
-    );
-
-    this.callbackRef.ref();
   }
 
   /**
-   * Initializes the service, ensuring the library is loaded/cached.
+   * Initializes the window, ensuring the library is loaded/cached.
    */
-  static async init(): Promise<RustService> {
-    const path = await cache();
-    return RustService.initCached(path);
+  static async create(
+    html: string,
+    options?: LoadOptions,
+  ): Promise<QuoxWindow> {
+    const path = await cache(options);
+    return QuoxWindow.createCached(path, html);
   }
 
   /**
-   * Initializes the service from a cached library path, ensuring it is loaded.
+   * Initializes the window from a cached library path.
    */
-  static initCached(path: string): RustService {
+  static createCached(path: string, html: string): QuoxWindow {
     const lib = loadLibCached(path);
-    return new RustService(lib);
+    return new QuoxWindow(lib, html);
   }
 
   /**
-   * Kicks off the background Tokio task.
+   * Starts the render loop, ticking into Rust every 16ms (~60fps).
    */
   start() {
-    this.assertAlive();
-    this.symbols.app_start_work(this.ptr, this.callbackRef.pointer);
+    if (this.intervalId !== null) return;
+    this.intervalId = setInterval(() => {
+      const ptr = this.ptr;
+      if (!ptr) return;
+      const running = this.lib.symbols.window_tick(ptr);
+      if (!running) this.stop();
+    }, 16);
   }
 
   /**
-   * Sends a string command to the Rust Tokio loop.
+   * Stops the render loop and frees native resources.
    */
-  send(command: string) {
-    this.assertAlive();
-    const buffer = new TextEncoder().encode(command + "\0");
-    this.symbols.app_send_cmd(this.ptr, buffer);
-  }
-
-  /**
-   * Internal handler for events coming FROM Rust.
-   */
-  private onEvent(val: number) {
-    console.log(`[Deno] Received event from Rust: ${val}`);
-  }
-
-  private assertAlive() {
-    if (!this.ptr) throw new Error("RustService has been disposed");
+  stop() {
+    if (this.intervalId !== null) {
+      clearInterval(this.intervalId);
+      this.intervalId = null;
+    }
+    if (this.ptr) {
+      this.lib.symbols.window_free(this.ptr);
+      this.ptr = null;
+    }
   }
 
   [Symbol.dispose]() {
-    if (this.ptr) {
-      this.symbols.app_free(this.ptr);
-      this.ptr = null;
-    }
-    this.callbackRef.close();
+    this.stop();
     this.lib.close();
   }
 }
 
-export async function renderRawHTML(html: string): Promise<RustService> {
-  const service = await RustService.init();
-  service.start();
-  service.send(html);
-  return service;
+export async function renderRawHTML(
+  html: string,
+  options?: LoadOptions,
+): Promise<QuoxWindow> {
+  const window = await QuoxWindow.create(html, options);
+  window.start();
+  return window;
 }
 
 if (import.meta.main) {
