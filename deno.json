@@ -9,10 +9,8 @@
   },
   "lint": {
     "rules": {
-      "tags": [
-        "recommended"
-      ]
+      "tags": ["recommended"]
     }
   },
-  "workspace": ["./packages/quox"]
+  "workspace": ["./packages/quox", "./packages/lib-*"]
 }

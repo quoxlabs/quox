@@ -2,14 +2,12 @@
   "name": "@quoxlabs/lib-linux-x64-gnu",
   "version": "0.0.1-alpha.4",
   "tasks": {
-    "build": "cd ../quox && deno task build:lib-linux-x64-gnu && cp ./target/x86_64-unknown-linux-gnu/release/libquox.so ../lib-linux-x64-gnu/libquox.so"
+    "build": "cd ../quox && deno task build:lib-linux-x64-gnu && mkdir -p ../lib-linux-x64-gnu/target && cp ./target/x86_64-unknown-linux-gnu/release/libquox.so ../lib-linux-x64-gnu/target/libquox.so"
   },
-  "exports": {
-    "./lib": "./libquox.so"
-  },
+  "exports": "./mod.ts",
   "license": "MIT",
   "publish": {
-    "include": ["./libquox.so"],
-    "exclude": ["!./libquox.so"]
+    "include": ["./mod.ts", "./target/libquox.so"],
+    "exclude": ["!./target/libquox.so"]
   }
 }
