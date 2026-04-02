@@ -11,6 +11,10 @@ const SYMBOLS = {
     parameters: ["pointer"],
     result: "bool",
   } satisfies Deno.ForeignFunction,
+  window_set_event_listener: {
+    parameters: ["pointer", "pointer"],
+    result: "void",
+  } satisfies Deno.ForeignFunction,
   window_free: {
     parameters: ["pointer"],
     result: "void",
@@ -27,6 +31,34 @@ export interface LoadOptions {
   /** target CPU architecture to use instead of detecting it */
   arch?: "x64" | "arm64";
 }
+
+export type QuoxInputEvent =
+  | QuoxMouseMoveEvent
+  | QuoxMouseButtonEvent
+  | QuoxMouseWheelEvent
+  | QuoxKeyboardEvent;
+export type QuoxMouseMoveEvent = {
+  type: "mousemove";
+  x: number;
+  y: number;
+};
+export type QuoxMouseButtonEvent = {
+  type: "mousedown" | "mouseup";
+  /** 0=left, 1=middle, 2=right */
+  button: number;
+};
+export type QuoxMouseWheelEvent = {
+  type: "wheel";
+  deltaX: number;
+  deltaY: number;
+};
+export type QuoxKeyboardEvent = {
+  type: "keydown" | "keyup";
+  /** Logical key name, e.g. "a", "Enter", "ArrowUp" */
+  key: string;
+  /** Physical key code, e.g. "KeyA", "Enter", "ArrowUp" */
+  code: string;
+};
 
 function loadLocalLib(path: string): QuoxLib {
   return Deno.dlopen(path, SYMBOLS);
@@ -96,10 +128,21 @@ async function locateCache(options?: LoadOptions) {
   return { url, cacheDir, cacheFile, local: libUrl.protocol === "file:" };
 }
 
+type EventListenerCallbackDef = {
+  readonly parameters: readonly ["pointer"];
+  readonly result: "void";
+};
+
 export class QuoxWindow implements Disposable {
-  private lib: QuoxLib;
+  private readonly lib: QuoxLib;
   private ptr: Deno.PointerValue;
   private intervalId: number | null = null;
+  private windowEventListenerRef:
+    | Deno.UnsafeCallback<EventListenerCallbackDef>
+    | null = null;
+  private readonly windowEventListeners: Array<
+    (event: QuoxInputEvent) => void
+  > = [];
 
   private constructor(lib: QuoxLib, html: string) {
     this.lib = lib;
@@ -135,7 +178,7 @@ export class QuoxWindow implements Disposable {
   }
 
   /**
-   * Starts the render loop, ticking into Rust every 16ms (~60fps).
+   * Starts the render loop and input handling loop.
    */
   start() {
     if (this.intervalId !== null) return;
@@ -148,12 +191,60 @@ export class QuoxWindow implements Disposable {
   }
 
   /**
+   * Register a callback that is invoked for every input event (mouse and
+   * keyboard) that occurs during a tick.
+   */
+  addEventListener(callback: (event: QuoxInputEvent) => void) {
+    this.windowEventListeners.push(callback);
+    if (this.windowEventListenerRef === null) {
+      const nativeCb = new Deno.UnsafeCallback<EventListenerCallbackDef>(
+        { parameters: ["pointer"], result: "void" } as const,
+        (ptr: Deno.PointerValue) => {
+          if (!ptr) return;
+          const view = new Deno.UnsafePointerView(ptr as Deno.PointerObject);
+          let ev: QuoxInputEvent;
+          try {
+            ev = JSON.parse(view.getCString()); // implicit type case
+          } catch {
+            // ignore malformed JSON (should never happen in practice)
+          }
+          this.windowEventListeners.forEach((cb) => cb(ev));
+        },
+      );
+      this.windowEventListenerRef = nativeCb;
+      if (this.ptr) {
+        this.lib.symbols.window_set_event_listener(this.ptr, nativeCb.pointer);
+      }
+    }
+  }
+
+  /**
+   * Removes a callback that was previously registered via
+   * {@link QuoxWindow.addEventListener}.
+   */
+  removeEventListener(callback: (event: QuoxInputEvent) => void) {
+    const index = this.windowEventListeners.indexOf(callback);
+    if (index >= 0) this.windowEventListeners.splice(index, 1);
+    if (
+      this.windowEventListeners.length === 0 &&
+      this.windowEventListenerRef !== null
+    ) {
+      this.windowEventListenerRef.close();
+      this.windowEventListenerRef = null;
+    }
+  }
+
+  /**
    * Stops the render loop and frees native resources.
    */
   stop() {
     if (this.intervalId !== null) {
       clearInterval(this.intervalId);
       this.intervalId = null;
+    }
+    if (this.windowEventListenerRef !== null) {
+      this.windowEventListenerRef.close();
+      this.windowEventListenerRef = null;
     }
     if (this.ptr) {
       this.lib.symbols.window_free(this.ptr);

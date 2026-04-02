@@ -1,21 +1,19 @@
+mod app;
+mod events;
+
 use anyrender_vello::VelloWindowRenderer;
+use app::{EventCallback, QuoxWindow};
 use blitz_dom::DocumentConfig;
 use blitz_html::HtmlDocument;
-use blitz_shell::{BlitzApplication, BlitzShellEvent, EventLoop, create_default_event_loop};
+use blitz_shell::{BlitzShellEvent, create_default_event_loop};
 use std::ffi::{CStr, c_void};
 use std::os::raw::c_char;
 use std::time::Duration;
 use tokio::runtime::Runtime;
 use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
 
-pub struct QuoxWindow {
-    _rt: Runtime,
-    event_loop: EventLoop<BlitzShellEvent>,
-    app: BlitzApplication<VelloWindowRenderer>,
-}
-
 /// Create a native window rendering the given HTML string.
-/// Returns a pointer to the `QuoxWindow` which must be freed with `window_free`.
+/// Returns an opaque pointer that must be freed with `window_free`.
 #[unsafe(no_mangle)]
 pub extern "C" fn window_new(html_ptr: *const c_char) -> *mut c_void {
     let html = unsafe { CStr::from_ptr(html_ptr) }
@@ -36,9 +34,10 @@ pub extern "C" fn window_new(html_ptr: *const c_char) -> *mut c_void {
 
     let renderer = VelloWindowRenderer::new();
     let attrs = blitz_shell::Window::default_attributes().with_title("Blitz HTML");
-    let window_config = blitz_shell::WindowConfig::with_attributes(Box::new(doc), renderer, attrs);
+    let window_config =
+        blitz_shell::WindowConfig::with_attributes(Box::new(doc), renderer, attrs);
 
-    let mut app = BlitzApplication::new(proxy);
+    let mut app = app::QuoxApplication::new(proxy);
     app.add_window(window_config);
 
     let window = QuoxWindow {
@@ -50,7 +49,7 @@ pub extern "C" fn window_new(html_ptr: *const c_char) -> *mut c_void {
 }
 
 /// Run a single spin of the event loop.
-/// Returns `true` if the application should keep running, `false` if it has exited.
+/// Returns `true` to keep running, `false` if the application has exited.
 #[unsafe(no_mangle)]
 pub extern "C" fn window_tick(ptr: *mut c_void) -> bool {
     assert!(!ptr.is_null());
@@ -60,6 +59,17 @@ pub extern "C" fn window_tick(ptr: *mut c_void) -> bool {
         .event_loop
         .pump_app_events(Some(Duration::ZERO), &mut window.app);
     matches!(status, PumpStatus::Continue)
+}
+
+/// Register a callback to receive input events.
+/// The callback is invoked synchronously during `window_tick` for each input event,
+/// with a pointer to a null-terminated JSON string that is valid only for the
+/// duration of the call.
+#[unsafe(no_mangle)]
+pub extern "C" fn window_set_event_listener(ptr: *mut c_void, callback: EventCallback) {
+    assert!(!ptr.is_null());
+    let window = unsafe { &mut *(ptr as *mut QuoxWindow) };
+    window.app.callback = Some(callback);
 }
 
 /// Free a `QuoxWindow` created by `window_new`.
