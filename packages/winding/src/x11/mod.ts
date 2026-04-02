@@ -23,7 +23,15 @@ const x11functions = {
     parameters: ["pointer", "usize", "usize", "pointer", "i32", "i32", "i32", "i32", "u32", "u32"],
     result: "i32",
   },
+  XInternAtom: { parameters: ["pointer", "buffer", "i32"], result: "usize" },
+  XSetWMProtocols: { parameters: ["pointer", "usize", "buffer", "i32"], result: "i32" },
 } as const;
+
+function cString(s: string): Uint8Array<ArrayBuffer> {
+  const buf = new Uint8Array(s.length + 1) as Uint8Array<ArrayBuffer>;
+  for (let i = 0; i < s.length; i++) buf[i] = s.charCodeAt(i);
+  return buf;
+}
 
 const ALL_X_EV_MASKS = 0x1ffffffn;
 enum _XEvMask {
@@ -94,10 +102,12 @@ enum XEvType {
 class X11Window implements Window {
   readonly id: bigint;
   readonly #gc: bigint;
-  readonly #image: Deno.PointerValue;
-  readonly #imageBuf: Uint8Array;
-  readonly #width: number;
-  readonly #height: number;
+  #image: Deno.PointerValue;
+  // imageBuf is kept as a field so XCreateImage's internal pointer remains
+  // valid for the entire lifetime of each image.
+  #imageBuf: Uint8Array;
+  #width: number;
+  #height: number;
 
   constructor(readonly lib: X11Library, x = 0, y = 0, w = 800, h = 600) {
     const view = new Deno.UnsafePointerView(lib.screen);
@@ -119,6 +129,14 @@ class X11Window implements Window {
     if (BigInt(window) === 0n) throw new Error("Failed to create window");
 
     lib.X11.symbols.XSelectInput(lib.display, window, ALL_X_EV_MASKS);
+
+    // Ask the window manager to send WM_DELETE_WINDOW via ClientMessage instead
+    // of forcibly killing the process when the user closes the window.
+    if (lib.wmProtocols && lib.wmDeleteWindow) {
+      const protocolsBuf = new BigUint64Array([lib.wmDeleteWindow]);
+      lib.X11.symbols.XSetWMProtocols(lib.display, window, protocolsBuf, 1);
+    }
+
     lib.X11.symbols.XMapWindow(lib.display, window);
     lib.X11.symbols.XFlush(lib.display);
     this.id = BigInt(window);
@@ -127,8 +145,6 @@ class X11Window implements Window {
 
     this.#gc = lib.X11.symbols.XCreateGC(lib.display, window, 0, 0n) as bigint;
     const visual = lib.X11.symbols.XDefaultVisual(lib.display, 0);
-    // imageBuf is kept as a field so XCreateImage's internal pointer remains valid
-    // for the entire lifetime of the window.
     this.#imageBuf = new Uint8Array(w * h * 4);
     const image = lib.X11.symbols.XCreateImage(
       lib.display,
@@ -152,8 +168,35 @@ class X11Window implements Window {
    * Copy an RGBA pixel buffer to the X11 window. The buffer must be
    * `width * height * 4` bytes. Internally converts to X11 TrueColor BGRX
    * (little-endian) before blitting.
+   *
+   * If the dimensions differ from the last blit, the XImage is recreated to
+   * match the new size.
    */
-  blit(rgba: Uint8Array, _width: number, _height: number): void {
+  blit(rgba: Uint8Array, width: number, height: number): void {
+    if (width !== this.#width || height !== this.#height) {
+      this.#width = width;
+      this.#height = height;
+      this.#imageBuf = new Uint8Array(width * height * 4);
+      const visual = this.lib.X11.symbols.XDefaultVisual(this.lib.display, 0);
+      // The old XImage is intentionally not destroyed: XDestroyImage would try
+      // to free the JS-managed imageBuf pointer. We simply let the reference
+      // go stale; the tiny XImage struct is an acceptable one-time leak per
+      // resize event.
+      const image = this.lib.X11.symbols.XCreateImage(
+        this.lib.display,
+        visual,
+        24,
+        2,
+        0,
+        this.#imageBuf as Uint8Array<ArrayBuffer>,
+        width,
+        height,
+        32,
+        0,
+      );
+      if (!image) throw new Error("XCreateImage failed on resize");
+      this.#image = image;
+    }
     const buf = this.#imageBuf;
     for (let i = 0; i < rgba.length; i += 4) {
       buf[i] = rgba[i + 2]; // B ← R
@@ -189,6 +232,8 @@ class X11Library implements Library {
   readonly display: Deno.PointerObject;
   readonly screen: Deno.PointerObject;
   readonly windows = new Map<bigint, X11Window>();
+  readonly wmProtocols: bigint;
+  readonly wmDeleteWindow: bigint;
   constructor() {
     this.X11 = Deno.dlopen("libX11.so", x11functions);
     const display = this.X11.symbols.XOpenDisplay(0n);
@@ -197,6 +242,10 @@ class X11Library implements Library {
     const screen = this.X11.symbols.XDefaultScreenOfDisplay(display);
     if (screen == null) throw new Error("Failed to get default screen");
     this.screen = screen;
+    this.wmProtocols = BigInt(this.X11.symbols.XInternAtom(display, cString("WM_PROTOCOLS"), 0));
+    this.wmDeleteWindow = BigInt(
+      this.X11.symbols.XInternAtom(display, cString("WM_DELETE_WINDOW"), 0),
+    );
   }
   openWindow(x = 0, y = 0, w = 800, h = 600): X11Window {
     return new X11Window(this, x, y, w, h);
@@ -209,7 +258,7 @@ class X11Library implements Library {
       Deno.UnsafePointer.of(this.#event),
     );
     const view = new DataView(this.#event);
-    const event = importEvent(view);
+    const event = importEvent(view, this.wmProtocols, this.wmDeleteWindow);
     if (event === undefined) return undefined;
     return { ...event, window: this.windows.get(view.getBigUint64(32, true)) };
   }
@@ -222,7 +271,11 @@ class X11Library implements Library {
 }
 
 const BUTTONS = [, "left", "middle", "right"] as const;
-function importEvent(view: DataView<ArrayBuffer>): UIEvent | undefined {
+function importEvent(
+  view: DataView<ArrayBuffer>,
+  wmProtocols?: bigint,
+  wmDeleteWindow?: bigint,
+): UIEvent | undefined {
   const type = view.getInt32(0, true);
   switch (type) {
     case XEvType.KeyPress:
@@ -250,6 +303,22 @@ function importEvent(view: DataView<ArrayBuffer>): UIEvent | undefined {
         x: view.getInt32(64, true),
         y: view.getInt32(68, true),
       };
+    case XEvType.ConfigureNotify: {
+      // XConfigureEvent: width at offset 56, height at offset 60.
+      const width = view.getInt32(56, true);
+      const height = view.getInt32(60, true);
+      return { type: "resize", width, height };
+    }
+    case XEvType.ClientMessage: {
+      // XClientMessageEvent: message_type (Atom) at offset 40, data.l[0] at offset 56.
+      // Check for WM_DELETE_WINDOW sent via WM_PROTOCOLS.
+      const msgType = view.getBigUint64(40, true);
+      const data0 = view.getBigUint64(56, true);
+      if (msgType === wmProtocols && data0 === wmDeleteWindow) {
+        return { type: "close" };
+      }
+      return undefined;
+    }
     default:
       return undefined;
   }

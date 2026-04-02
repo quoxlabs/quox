@@ -1,4 +1,4 @@
-export type UIEvent = KeyEvent | ButtonEvent | MoveEvent | WheelEvent;
+export type UIEvent = KeyEvent | ButtonEvent | MoveEvent | WheelEvent | ResizeEvent | CloseEvent;
 export type UIEventType = UIEvent["type"];
 
 export interface WindowEvent {
@@ -22,6 +22,14 @@ export interface WheelEvent extends WindowEvent {
   type: "wheel";
   deltaX: number;
   deltaY: number;
+}
+export interface ResizeEvent extends WindowEvent {
+  type: "resize";
+  width: number;
+  height: number;
+}
+export interface CloseEvent extends WindowEvent {
+  type: "close";
 }
 
 export interface Window {

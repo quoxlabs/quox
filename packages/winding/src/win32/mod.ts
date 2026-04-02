@@ -121,13 +121,27 @@ class Win32Library implements Library {
       parameters: ["pointer", "u32", "usize", "usize"],
       result: "usize",
     }, (hWnd, uMsg, wParam, lParam) => {
+      const win = this.windows.get(BigInt(Deno.UnsafePointer.value(hWnd)));
       switch (uMsg) {
-        case 0x200: {
+        case 0x0005: { // WM_SIZE
+          const w = Number(BigInt(lParam) & 0xFFFFn);
+          const h = Number((BigInt(lParam) >> 16n) & 0xFFFFn);
+          if (w > 0 && h > 0) {
+            this.#event = { type: "resize", width: w, height: h, window: win };
+          }
+          break;
+        }
+        case 0x0010: // WM_CLOSE
+          this.#event = { type: "close", window: win };
+          // Return without calling DefWindowProcW to prevent immediate window
+          // destruction; let the application decide when to tear down.
+          return 0n;
+        case 0x200: { // WM_MOUSEMOVE
           this.#event = {
             type: "mousemove",
             x: Number(BigInt(lParam) & 0xFFFFn),
-            y: Number((BigInt(lParam) & 0xFFFF0000n) >> 16n),
-            window: this.windows.get(BigInt(Deno.UnsafePointer.value(hWnd))),
+            y: Number((BigInt(lParam) >> 16n) & 0xFFFFn),
+            window: win,
           };
           break;
         }
