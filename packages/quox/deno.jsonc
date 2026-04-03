@@ -6,7 +6,7 @@
     // needed until https://github.com/denoland/deno/issues/33151
     "patch": "deno run -A scripts/patch-webgpu.ts",
     "clean": "rm -rf lib/",
-    "build": "deno task clean && deno task wasmbuild --skip-opt && deno task patch",
+    "build": "deno task clean && RUSTFLAGS=\"-C target-feature=-bulk-memory,-nontrapping-fptoint\" deno task wasmbuild && deno task patch",
     "build:debug": "deno task clean && deno task wasmbuild --debug --skip-opt && deno task patch"
   },
   "exports": "./src/mod.ts",
