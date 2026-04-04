@@ -20,6 +20,11 @@ import { load as WaylandLoad } from "./wayland.ts";
 export const load: LoadLibrary = () => {
   if (Deno.build.os === "windows") return Win32Load();
   // Prefer Wayland when WAYLAND_DISPLAY is set; fall back to X11 otherwise.
-  if (Deno.env.get("WAYLAND_DISPLAY")) return WaylandLoad();
+  if (
+    Deno.permissions.querySync({ name: "env", variable: "WAYLAND_DISPLAY" }).state === "granted" &&
+    Deno.env.get("WAYLAND_DISPLAY")
+  ) {
+    return WaylandLoad();
+  }
   return X11Load();
 };
