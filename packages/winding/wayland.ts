@@ -611,7 +611,11 @@ class WaylandLibrary implements Library {
       () => {},
     );
     this.#listeners.push(capCb, nameCb);
-    const seatVtable = makeVtable([capCb, nameCb], readEventCount(Deno.UnsafePointer.value(this.ifaces.seat)), this.noop);
+    const seatVtable = makeVtable(
+      [capCb, nameCb],
+      readEventCount(Deno.UnsafePointer.value(this.ifaces.seat)),
+      this.noop,
+    );
     this.#vtables.push(seatVtable);
     sym.wl_proxy_add_listener(this.#seat, Deno.UnsafePointer.of(seatVtable), null);
     sym.wl_display_roundtrip(this.display);
