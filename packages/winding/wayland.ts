@@ -1,5 +1,13 @@
 import type { Library, LoadLibrary, UIEvent, Window } from "./types.ts";
-import { buildXdgIfaces, waylandSymbols, WlOp, WlSeatCap, WlShmFormat } from "./wayland_ffi.ts";
+import {
+  buildXdgIfaces,
+  libdlSymbols,
+  waylandSymbols,
+  WlCursorShape,
+  WlOp,
+  WlSeatCap,
+  WlShmFormat,
+} from "./wayland_ffi.ts";
 
 // ---------------------------------------------------------------------------
 // libc helpers (memfd, mmap, poll) — needed for shared-memory pixel buffers
@@ -23,11 +31,24 @@ const MAP_SHARED = 0x01;
 const MAP_FAILED = 0xFFFFFFFFFFFFFFFFn;
 const MFD_CLOEXEC = 1;
 const POLLIN = 1;
+const RTLD_NOW = 0x2;
+const RTLD_NOLOAD = 0x4;
+const LIBWAYLAND_CLIENT_SO = "libwayland-client.so.0";
 
 function cStr(s: string): Uint8Array<ArrayBuffer> {
   const b = new Uint8Array(s.length + 1);
   for (let i = 0; i < s.length; i++) b[i] = s.charCodeAt(i);
   return b;
+}
+
+function dlsymRequired(
+  libdl: Deno.DynamicLibrary<typeof libdlSymbols>,
+  handle: Deno.PointerObject,
+  name: string,
+): Deno.PointerObject {
+  const pointer = libdl.symbols.dlsym(handle, cStr(name));
+  if (!pointer) throw new Error(`winding failed to resolve symbol ${name}`);
+  return pointer;
 }
 
 // Encode args for wl_proxy_marshal_array_flags. Each slot is one union wl_argument
@@ -95,13 +116,12 @@ class WaylandWindow implements Window {
 
   constructor(readonly lib: WaylandLibrary, w: number, h: number) {
     const sym = lib.wl.symbols;
-    const surfaceIfacePtr = Deno.UnsafePointer.create(lib.wl.symbols.wl_surface_interface);
 
     // Create wl_surface
     const surface = sym.wl_proxy_marshal_array_flags(
       lib.compositor!,
       WlOp.COMPOSITOR_CREATE_SURFACE,
-      surfaceIfacePtr,
+      lib.ifaces.surface,
       sym.wl_proxy_get_version(lib.compositor!),
       0,
       args(0n),
@@ -118,7 +138,7 @@ class WaylandWindow implements Window {
       0,
       args(0n, BigInt(Deno.UnsafePointer.value(surface))),
     );
-    if (!xdgSurface) throw new Error("Failed to create xdg_surface");
+    if (!xdgSurface) throw new Error("winding failed to create xdg_surface");
     this.#xdgSurface = xdgSurface;
 
     // Create xdg_toplevel
@@ -151,18 +171,7 @@ class WaylandWindow implements Window {
     sym.wl_display_roundtrip(lib.display);
 
     // Ack the configure we just received
-    if (this.#pendingSerial !== 0) {
-      sym.wl_proxy_marshal_array_flags(
-        this.#xdgSurface,
-        WlOp.XDG_SURFACE_ACK_CONFIGURE,
-        null,
-        sym.wl_proxy_get_version(this.#xdgSurface),
-        0,
-        args(BigInt(this.#pendingSerial)),
-      );
-      this.#pendingSerial = 0;
-      this.#configured = true;
-    }
+    this.#ackPendingConfigure();
 
     lib.windows.add(this);
   }
@@ -187,8 +196,6 @@ class WaylandWindow implements Window {
       { parameters: ["pointer", "pointer", "i32", "i32", "pointer"], result: "void" },
       (_data, _toplevel, width, height, _states) => {
         if (width > 0 && height > 0) {
-          this.#width = width;
-          this.#height = height;
           this.lib.pushEvent({ type: "resize", width, height });
         }
       },
@@ -202,6 +209,21 @@ class WaylandWindow implements Window {
     // xdg_toplevel has 4 events but we only handle the first 2; rest get noop.
     this.#toplevelVtable = makeVtable([this.#toplevelConfigure, this.#toplevelClose], 4, noop);
     sym.wl_proxy_add_listener(this.#xdgToplevel, Deno.UnsafePointer.of(this.#toplevelVtable), null);
+  }
+
+  #ackPendingConfigure(): void {
+    if (this.#pendingSerial === 0) return;
+    const sym = this.lib.wl.symbols;
+    sym.wl_proxy_marshal_array_flags(
+      this.#xdgSurface,
+      WlOp.XDG_SURFACE_ACK_CONFIGURE,
+      null,
+      sym.wl_proxy_get_version(this.#xdgSurface),
+      0,
+      args(BigInt(this.#pendingSerial)),
+    );
+    this.#pendingSerial = 0;
+    this.#configured = true;
   }
 
   #setTitle(title: string): void {
@@ -222,8 +244,10 @@ class WaylandWindow implements Window {
    * (the most widely supported wl_shm format) before blitting.
    */
   blit(rgba: Uint8Array, width: number, height: number): void {
-    if (!this.#configured) return; // wait for first configure roundtrip
     const sym = this.lib.wl.symbols;
+    // Ack each configure serial before committing the next frame.
+    this.#ackPendingConfigure();
+    if (!this.#configured) return; // wait for first configure roundtrip
     const size = width * height * 4;
 
     // Recreate SHM storage when dimensions change
@@ -250,7 +274,7 @@ class WaylandWindow implements Window {
       const pool = sym.wl_proxy_marshal_array_flags(
         this.lib.shm!,
         WlOp.SHM_CREATE_POOL,
-        Deno.UnsafePointer.create(sym.wl_shm_pool_interface),
+        this.lib.ifaces.shmPool,
         sym.wl_proxy_get_version(this.lib.shm!),
         0,
         args(0n, BigInt(this.#shmFd), BigInt(size)),
@@ -260,7 +284,7 @@ class WaylandWindow implements Window {
       this.#buffer = sym.wl_proxy_marshal_array_flags(
         pool,
         WlOp.SHM_POOL_CREATE_BUFFER,
-        Deno.UnsafePointer.create(sym.wl_buffer_interface),
+        this.lib.ifaces.buffer,
         sym.wl_proxy_get_version(pool),
         0,
         args(0n, 0n, BigInt(width), BigInt(height), BigInt(width * 4), BigInt(WlShmFormat.ARGB8888)),
@@ -352,6 +376,8 @@ class WaylandWindow implements Window {
 
 class WaylandLibrary implements Library {
   readonly libc: Deno.DynamicLibrary<typeof libcSymbols>;
+  readonly libdl: Deno.DynamicLibrary<typeof libdlSymbols>;
+  readonly #wlHandle: Deno.PointerObject;
   readonly wl: Deno.DynamicLibrary<typeof waylandSymbols>;
   readonly display: Deno.PointerObject;
   // XDG interface structs -- built lazily in the constructor, mem kept alive to
@@ -360,11 +386,26 @@ class WaylandLibrary implements Library {
   readonly xdgWmBaseIface: Deno.PointerObject;
   readonly xdgSurfaceIface: Deno.PointerObject;
   readonly xdgToplevelIface: Deno.PointerObject;
+  readonly wpCursorShapeManagerIface: Deno.PointerObject;
+  readonly wpCursorShapeDeviceIface: Deno.PointerObject;
+  readonly ifaces: {
+    registry: Deno.PointerObject;
+    compositor: Deno.PointerObject;
+    shm: Deno.PointerObject;
+    shmPool: Deno.PointerObject;
+    buffer: Deno.PointerObject;
+    surface: Deno.PointerObject;
+    seat: Deno.PointerObject;
+    pointer: Deno.PointerObject;
+    keyboard: Deno.PointerObject;
+  };
   readonly windows = new Set<WaylandWindow>();
   // Globals bound from registry -- set during init roundtrip
   compositor: Deno.PointerObject | null = null;
   shm: Deno.PointerObject | null = null;
   xdgWmBase: Deno.PointerObject | null = null;
+  #cursorShapeManager: Deno.PointerObject | null = null;
+  #cursorShapeDevice: Deno.PointerObject | null = null;
   #seat: Deno.PointerObject | null = null;
   #pointer: Deno.PointerObject | null = null;
   #keyboard: Deno.PointerObject | null = null;
@@ -380,16 +421,42 @@ class WaylandLibrary implements Library {
 
   constructor() {
     this.libc = Deno.dlopen("libc.so.6", libcSymbols); // needed to perform a few syscalls
-    this.wl = Deno.dlopen("libwayland-client.so.0", waylandSymbols);
-    const { mem, xdgWmBaseIface, xdgSurfaceIface, xdgToplevelIface } = buildXdgIfaces();
+    this.libdl = Deno.dlopen("libdl.so.2", libdlSymbols);
+    this.wl = Deno.dlopen(LIBWAYLAND_CLIENT_SO, waylandSymbols);
+    // Retrieve an existing loader handle for dlsym without loading a second time.
+    const wlHandle = this.libdl.symbols.dlopen(cStr(LIBWAYLAND_CLIENT_SO), RTLD_NOW | RTLD_NOLOAD);
+    if (!wlHandle) throw new Error(`winding failed to get existing ${LIBWAYLAND_CLIENT_SO} handle via libdl`);
+    this.#wlHandle = wlHandle;
+    const {
+      mem,
+      xdgWmBaseIface,
+      xdgSurfaceIface,
+      xdgToplevelIface,
+      wpCursorShapeManagerIface,
+      wpCursorShapeDeviceIface,
+    } = buildXdgIfaces();
     this.#xdgMem = mem;
     this.xdgWmBaseIface = xdgWmBaseIface;
     this.xdgSurfaceIface = xdgSurfaceIface;
     this.xdgToplevelIface = xdgToplevelIface;
+    this.wpCursorShapeManagerIface = wpCursorShapeManagerIface;
+    this.wpCursorShapeDeviceIface = wpCursorShapeDeviceIface;
+    this.ifaces = {
+      registry: dlsymRequired(this.libdl, wlHandle, "wl_registry_interface"),
+      compositor: dlsymRequired(this.libdl, wlHandle, "wl_compositor_interface"),
+      shm: dlsymRequired(this.libdl, wlHandle, "wl_shm_interface"),
+      shmPool: dlsymRequired(this.libdl, wlHandle, "wl_shm_pool_interface"),
+      buffer: dlsymRequired(this.libdl, wlHandle, "wl_buffer_interface"),
+      surface: dlsymRequired(this.libdl, wlHandle, "wl_surface_interface"),
+      seat: dlsymRequired(this.libdl, wlHandle, "wl_seat_interface"),
+      pointer: dlsymRequired(this.libdl, wlHandle, "wl_pointer_interface"),
+      keyboard: dlsymRequired(this.libdl, wlHandle, "wl_keyboard_interface"),
+    };
     const sym = this.wl.symbols;
 
-    const display = sym.wl_display_connect(cStr(""));
-    if (!display) throw new Error("Failed to connect to Wayland display");
+    // NULL asks libwayland to use the default display from the environment.
+    const display = sym.wl_display_connect(null);
+    if (!display) throw new Error("winding failed to connect to Wayland display");
     this.display = display;
 
     this.noop = new Deno.UnsafeCallback({ parameters: [], result: "void" }, () => {});
@@ -412,12 +479,12 @@ class WaylandLibrary implements Library {
     const registry = sym.wl_proxy_marshal_array_flags(
       this.display,
       WlOp.DISPLAY_GET_REGISTRY,
-      Deno.UnsafePointer.create(sym.wl_registry_interface),
+      this.ifaces.registry,
       sym.wl_proxy_get_version(this.display),
       0,
       args(0n),
     );
-    if (!registry) throw new Error("Failed to get Wayland registry");
+    if (!registry) throw new Error("winding failed to get Wayland registry");
 
     // Registry global callback: bind compositor, shm, seat, xdg_wm_base
     const globalCb = new Deno.UnsafeCallback(
@@ -448,17 +515,20 @@ class WaylandLibrary implements Library {
     let version = 1;
 
     if (iface === "wl_compositor") {
-      ifacePtr = Deno.UnsafePointer.create(sym.wl_compositor_interface);
+      ifacePtr = this.ifaces.compositor;
       version = Math.min(offered, 4);
     } else if (iface === "wl_shm") {
-      ifacePtr = Deno.UnsafePointer.create(sym.wl_shm_interface);
+      ifacePtr = this.ifaces.shm;
       version = Math.min(offered, 1);
     } else if (iface === "wl_seat") {
-      ifacePtr = Deno.UnsafePointer.create(sym.wl_seat_interface);
+      ifacePtr = this.ifaces.seat;
       version = Math.min(offered, 5);
     } else if (iface === "xdg_wm_base") {
       ifacePtr = this.xdgWmBaseIface;
       version = Math.min(offered, 7);
+    } else if (iface === "wp_cursor_shape_manager_v1") {
+      ifacePtr = this.wpCursorShapeManagerIface;
+      version = Math.min(offered, 1);
     } else {
       return;
     }
@@ -485,7 +555,22 @@ class WaylandLibrary implements Library {
     else if (iface === "xdg_wm_base") {
       this.xdgWmBase = proxy;
       this.#setupXdgWmBaseListener(proxy);
+    } else if (iface === "wp_cursor_shape_manager_v1") {
+      this.#cursorShapeManager = proxy;
     }
+  }
+
+  #setDefaultCursorShape(serial: number): void {
+    if (!this.#cursorShapeDevice) return;
+    const sym = this.wl.symbols;
+    sym.wl_proxy_marshal_array_flags(
+      this.#cursorShapeDevice,
+      WlOp.WP_CURSOR_SHAPE_DEVICE_SET_SHAPE,
+      null,
+      sym.wl_proxy_get_version(this.#cursorShapeDevice),
+      0,
+      args(BigInt(serial), BigInt(WlCursorShape.DEFAULT)),
+    );
   }
 
   #setupXdgWmBaseListener(wmBase: Deno.PointerObject): void {
@@ -526,7 +611,11 @@ class WaylandLibrary implements Library {
       () => {},
     );
     this.#listeners.push(capCb, nameCb);
-    const seatVtable = makeVtable([capCb, nameCb], readEventCount(sym.wl_seat_interface), this.noop);
+    const seatVtable = makeVtable(
+      [capCb, nameCb],
+      readEventCount(Deno.UnsafePointer.value(this.ifaces.seat)),
+      this.noop,
+    );
     this.#vtables.push(seatVtable);
     sym.wl_proxy_add_listener(this.#seat, Deno.UnsafePointer.of(seatVtable), null);
     sym.wl_display_roundtrip(this.display);
@@ -537,7 +626,7 @@ class WaylandLibrary implements Library {
     const pointer = sym.wl_proxy_marshal_array_flags(
       this.#seat!,
       WlOp.SEAT_GET_POINTER,
-      Deno.UnsafePointer.create(sym.wl_pointer_interface),
+      this.ifaces.pointer,
       sym.wl_proxy_get_version(this.#seat!),
       0,
       args(0n),
@@ -545,8 +634,26 @@ class WaylandLibrary implements Library {
     if (!pointer) return;
     this.#pointer = pointer;
 
+    if (this.#cursorShapeManager && !this.#cursorShapeDevice) {
+      this.#cursorShapeDevice = sym.wl_proxy_marshal_array_flags(
+        this.#cursorShapeManager,
+        WlOp.WP_CURSOR_SHAPE_MANAGER_GET_POINTER,
+        this.wpCursorShapeDeviceIface,
+        sym.wl_proxy_get_version(this.#cursorShapeManager),
+        0,
+        args(0n, Deno.UnsafePointer.value(pointer)),
+      );
+    }
+
     // wl_pointer events (indices):
     // 0=enter, 1=leave, 2=motion, 3=button, 4=axis, 5=frame, 6=axis_source, 7=axis_stop, 8=axis_discrete ...
+    const enterCb = new Deno.UnsafeCallback(
+      // (data, pointer, serial, surface, surface_x_fixed, surface_y_fixed)
+      { parameters: ["pointer", "pointer", "u32", "pointer", "i32", "i32"], result: "void" },
+      (_data, _ptr, serial) => {
+        this.#setDefaultCursorShape(serial);
+      },
+    );
     const motionCb = new Deno.UnsafeCallback(
       // (data, pointer, time, surface_x_fixed, surface_y_fixed)
       { parameters: ["pointer", "pointer", "u32", "i32", "i32"], result: "void" },
@@ -574,10 +681,10 @@ class WaylandLibrary implements Library {
         else if (axis === 1) this.#events.push({ type: "wheel", deltaX: delta, deltaY: 0 });
       },
     );
-    this.#listeners.push(motionCb, buttonCb, axisCb);
-    const ptrEventCount = readEventCount(sym.wl_pointer_interface);
+    this.#listeners.push(enterCb, motionCb, buttonCb, axisCb);
+    const ptrEventCount = readEventCount(Deno.UnsafePointer.value(this.ifaces.pointer));
     const ptrVtable = makeVtable(
-      [null, null, motionCb, buttonCb, axisCb],
+      [enterCb, null, motionCb, buttonCb, axisCb],
       ptrEventCount,
       this.noop,
     );
@@ -590,7 +697,7 @@ class WaylandLibrary implements Library {
     const keyboard = sym.wl_proxy_marshal_array_flags(
       this.#seat!,
       WlOp.SEAT_GET_KEYBOARD,
-      Deno.UnsafePointer.create(sym.wl_keyboard_interface),
+      this.ifaces.keyboard,
       sym.wl_proxy_get_version(this.#seat!),
       0,
       args(0n),
@@ -607,7 +714,7 @@ class WaylandLibrary implements Library {
       },
     );
     this.#listeners.push(keyCb);
-    const kbEventCount = readEventCount(sym.wl_keyboard_interface);
+    const kbEventCount = readEventCount(Deno.UnsafePointer.value(this.ifaces.keyboard));
     const kbVtable = makeVtable([null, null, null, keyCb], kbEventCount, this.noop);
     this.#vtables.push(kbVtable);
     sym.wl_proxy_add_listener(keyboard, Deno.UnsafePointer.of(kbVtable), null);
@@ -651,6 +758,26 @@ class WaylandLibrary implements Library {
 
   close(): void {
     for (const win of this.windows) win.close();
+    if (this.#cursorShapeDevice) {
+      this.wl.symbols.wl_proxy_marshal_array_flags(
+        this.#cursorShapeDevice,
+        WlOp.WP_CURSOR_SHAPE_DEVICE_DESTROY,
+        null,
+        1,
+        1,
+        args(),
+      );
+    }
+    if (this.#cursorShapeManager) {
+      this.wl.symbols.wl_proxy_marshal_array_flags(
+        this.#cursorShapeManager,
+        WlOp.WP_CURSOR_SHAPE_MANAGER_DESTROY,
+        null,
+        1,
+        1,
+        args(),
+      );
+    }
     if (this.#pointer) {
       this.wl.symbols.wl_proxy_marshal_array_flags(this.#pointer, WlOp.POINTER_RELEASE, null, 1, 1, args());
     }
@@ -664,6 +791,8 @@ class WaylandLibrary implements Library {
     this.noop.close();
     this.wl.symbols.wl_display_disconnect(this.display);
     this.wl.close();
+    this.libdl.symbols.dlclose(this.#wlHandle);
+    this.libdl.close();
     this.libc.close();
   }
 }

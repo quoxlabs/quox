@@ -27,6 +27,8 @@ export interface XdgIfaces {
   xdgWmBaseIface: Deno.PointerObject;
   xdgSurfaceIface: Deno.PointerObject;
   xdgToplevelIface: Deno.PointerObject;
+  wpCursorShapeManagerIface: Deno.PointerObject;
+  wpCursorShapeDeviceIface: Deno.PointerObject;
 }
 
 // All request/event signatures come from xdg-shell-client-protocol-code.h.
@@ -137,7 +139,28 @@ export function buildXdgIfaces(): XdgIfaces {
     ]),
   )!;
 
-  return { mem, xdgWmBaseIface, xdgSurfaceIface, xdgToplevelIface };
+  const wpCursorShapeManagerIface = Deno.UnsafePointer.create(
+    buildIface("wp_cursor_shape_manager_v1", 1, [
+      ["destroy", ""],
+      ["get_pointer", "no"],
+    ], []),
+  )!;
+
+  const wpCursorShapeDeviceIface = Deno.UnsafePointer.create(
+    buildIface("wp_cursor_shape_device_v1", 1, [
+      ["destroy", ""],
+      ["set_shape", "uu"],
+    ], []),
+  )!;
+
+  return {
+    mem,
+    xdgWmBaseIface,
+    xdgSurfaceIface,
+    xdgToplevelIface,
+    wpCursorShapeManagerIface,
+    wpCursorShapeDeviceIface,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -185,6 +208,12 @@ export const WlOp = {
   XDG_TOPLEVEL_DESTROY: 0,
   XDG_TOPLEVEL_SET_TITLE: 2,
   XDG_TOPLEVEL_SET_APP_ID: 3,
+  // wp_cursor_shape_manager_v1 requests
+  WP_CURSOR_SHAPE_MANAGER_DESTROY: 0,
+  WP_CURSOR_SHAPE_MANAGER_GET_POINTER: 1,
+  // wp_cursor_shape_device_v1 requests
+  WP_CURSOR_SHAPE_DEVICE_DESTROY: 0,
+  WP_CURSOR_SHAPE_DEVICE_SET_SHAPE: 1,
 } as const;
 
 export const WlShmFormat = {
@@ -199,6 +228,10 @@ export const WlSeatCap = {
   TOUCH: 1 << 2,
 } as const;
 
+export const WlCursorShape = {
+  DEFAULT: 1,
+} as const;
+
 // ---------------------------------------------------------------------------
 // libwayland-client FFI symbols
 // Functions are declared with parameters/result; interface data symbols use
@@ -207,7 +240,7 @@ export const WlSeatCap = {
 
 export const waylandSymbols = {
   // Display lifecycle
-  wl_display_connect: { parameters: ["buffer"], result: "pointer" },
+  wl_display_connect: { parameters: ["pointer"], result: "pointer" },
   wl_display_disconnect: { parameters: ["pointer"], result: "void" },
   wl_display_get_fd: { parameters: ["pointer"], result: "i32" },
   // Event dispatch
@@ -228,14 +261,16 @@ export const waylandSymbols = {
   wl_proxy_add_listener: { parameters: ["pointer", "pointer", "pointer"], result: "i32" },
   wl_proxy_destroy: { parameters: ["pointer"], result: "void" },
   wl_proxy_get_version: { parameters: ["pointer"], result: "u32" },
-  // Interface data symbols -- values are bigint addresses of the C globals
-  wl_registry_interface: { type: "usize" },
-  wl_compositor_interface: { type: "usize" },
-  wl_shm_interface: { type: "usize" },
-  wl_shm_pool_interface: { type: "usize" },
-  wl_buffer_interface: { type: "usize" },
-  wl_surface_interface: { type: "usize" },
-  wl_seat_interface: { type: "usize" },
-  wl_pointer_interface: { type: "usize" },
-  wl_keyboard_interface: { type: "usize" },
+} as const;
+
+// ---------------------------------------------------------------------------
+// libdl FFI symbols
+// Functions are declared with parameters/result.
+// dlsym is used to resolve exported wl_interface global addresses.
+// ---------------------------------------------------------------------------
+
+export const libdlSymbols = {
+  dlopen: { parameters: ["buffer", "i32"], result: "pointer" },
+  dlsym: { parameters: ["pointer", "buffer"], result: "pointer" },
+  dlclose: { parameters: ["pointer"], result: "i32" },
 } as const;
