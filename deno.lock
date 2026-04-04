@@ -4,8 +4,8 @@
     "jsr:@std/fs@^1.0.22": "1.0.23",
     "jsr:@std/internal@^1.0.12": "1.0.12",
     "jsr:@std/path@^1.1.4": "1.1.4",
-    "npm:preact-render-to-string@^6.6.7": "6.6.7_preact@10.29.0",
-    "npm:preact@^10.29.0": "10.29.0"
+    "npm:preact-render-to-string@6.6.7": "6.6.7_preact@10.29.1",
+    "npm:preact@10.29.1": "10.29.1"
   },
   "jsr": {
     "@std/fs@1.0.23": {
@@ -26,21 +26,17 @@
     }
   },
   "npm": {
-    "preact-render-to-string@6.6.7_preact@10.29.0": {
+    "preact-render-to-string@6.6.7_preact@10.29.1": {
       "integrity": "sha512-3XdbsX3+vn9dQW+jJI/FsI9rlkgl6dbeUpqLsChak6jp3j3auFqBCkno7VChbMFs5Q8ylBj6DrUkKRwtVN3nvw==",
       "dependencies": [
         "preact"
       ]
     },
-    "preact@10.29.0": {
-      "integrity": "sha512-wSAGyk2bYR1c7t3SZ3jHcM6xy0lcBcDel6lODcs9ME6Th++Dx2KU+6D3HD8wMMKGA8Wpw7OMd3/4RGzYRpzwRg=="
+    "preact@10.29.1": {
+      "integrity": "sha512-gQCLc/vWroE8lIpleXtdJhTFDogTdZG9AjMUpVkDf2iTCNwYNWA+u16dL41TqUDJO4gm2IgrcMv3uTpjd4Pwmg=="
     }
   },
   "workspace": {
-    "dependencies": [
-      "npm:preact-render-to-string@^6.6.7",
-      "npm:preact@^10.29.0"
-    ],
     "members": {
       "packages/quox": {
         "dependencies": [

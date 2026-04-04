@@ -15,13 +15,5 @@
       ]
     }
   },
-  "workspace": ["./packages/quox", "./packages/winding"],
-  "compilerOptions": {
-    "jsx": "react-jsx",
-    "jsxImportSource": "preact"
-  },
-  "imports": {
-    "preact": "npm:preact@^10.29.0",
-    "preact-render-to-string": "npm:preact-render-to-string@^6.6.7"
-  }
+  "workspace": ["./packages/quox", "./packages/winding"]
 }
