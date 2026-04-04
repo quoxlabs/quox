@@ -2,7 +2,9 @@
   "version": "5",
   "specifiers": {
     "npm:preact-render-to-string@6.6.7": "6.6.7_preact@10.29.1",
-    "npm:preact@10.29.1": "10.29.1"
+    "npm:preact-render-to-string@^6.6.7": "6.6.7_preact@10.29.1",
+    "npm:preact@10.29.1": "10.29.1",
+    "npm:preact@^10.29.1": "10.29.1"
   },
   "npm": {
     "preact-render-to-string@6.6.7_preact@10.29.1": {
@@ -13,6 +15,16 @@
     },
     "preact@10.29.1": {
       "integrity": "sha512-gQCLc/vWroE8lIpleXtdJhTFDogTdZG9AjMUpVkDf2iTCNwYNWA+u16dL41TqUDJO4gm2IgrcMv3uTpjd4Pwmg=="
+    }
+  },
+  "workspace": {
+    "members": {
+      "packages/quox": {
+        "dependencies": [
+          "npm:preact-render-to-string@^6.6.7",
+          "npm:preact@^10.29.1"
+        ]
+      }
     }
   }
 }
