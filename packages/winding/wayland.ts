@@ -637,7 +637,7 @@ class WaylandLibrary implements Library {
         this.wpCursorShapeDeviceIface,
         sym.wl_proxy_get_version(this.#cursorShapeManager),
         0,
-        args(0n, BigInt(Deno.UnsafePointer.value(pointer))),
+        args(0n, Deno.UnsafePointer.value(pointer)),
       );
     }
 
