@@ -33,17 +33,14 @@ export const user32functions = {
   PeekMessageW: {
     parameters: ["pointer", "pointer", "u32", "u32", "u32"],
     result: "bool",
-    callback: true,
   },
   TranslateMessage: { parameters: ["pointer"], result: "bool" },
   DispatchMessageW: {
     parameters: ["pointer"],
     result: "usize",
-    callback: true,
   },
   DefWindowProcW: {
     parameters: ["pointer", "u32", "usize", "usize"],
     result: "usize",
-    callback: true,
   },
 } as const satisfies Deno.ForeignLibraryInterface;
