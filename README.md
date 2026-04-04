@@ -1,6 +1,6 @@
 # quox (/quarks/)
 
-More than just Electron.
+Brings the web stack to the desktop.
 
 - **Simple.** A full desktop app in 2 lines of code.
 - **Speedy.** Hardware-accelerated layouting and rendering.
@@ -10,9 +10,9 @@ More than just Electron.
 quox (pronounced like _quarks_) lets you write TSX, and render it to a native application window on any OS. Without a
 build step.
 
-Built on top of Deno, blitz, FFI. Free and open-source.
+Built on top of Deno, blitz, Wasm, WebGPU, and FFI. Free and open-source.
 
-This project is very young. Try it if you like bleeding edges, don't make your business depend on it just yet.
+This project is very young. Try it if you like bleeding edges, but don't make your business depend on it just yet.
 
 quox already works as a hello world example. Paste the following code to `main.tsx`:
 
