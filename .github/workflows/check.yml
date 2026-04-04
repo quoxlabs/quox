@@ -21,9 +21,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             packages/quox/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('packages/quox/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-check-${{ hashFiles('packages/quox/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-check-
       - run: deno fmt --check
       - run: deno lint
       - run: deno task build

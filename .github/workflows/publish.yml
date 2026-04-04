@@ -23,8 +23,8 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             packages/quox/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('packages/quox/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-publish-${{ hashFiles('packages/quox/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-publish-
       - run: deno task build:prod
       - run: deno publish
