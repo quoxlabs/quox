@@ -14,7 +14,7 @@ import {
 // and non-blocking event polling.
 // ---------------------------------------------------------------------------
 
-const libc = Deno.dlopen("libc.so.6", {
+const libcSymbols = {
   memfd_create: { parameters: ["buffer", "u32"], result: "i32" },
   ftruncate: { parameters: ["i32", "i64"], result: "i32" },
   // mmap(addr, length, prot, flags, fd, offset)
@@ -23,7 +23,7 @@ const libc = Deno.dlopen("libc.so.6", {
   close: { parameters: ["i32"], result: "i32" },
   // poll(fds, nfds, timeout_ms)
   poll: { parameters: ["buffer", "u32", "i32"], result: "i32" },
-});
+} as const satisfies Deno.ForeignLibraryInterface;
 
 const PROT_READ = 0x1;
 const PROT_WRITE = 0x2;
@@ -239,10 +239,17 @@ class WaylandWindow implements Window {
       this.#destroyShmBuffer();
       this.#width = width;
       this.#height = height;
-      this.#shmFd = libc.symbols.memfd_create(cStr("winding-shm"), MFD_CLOEXEC);
+      this.#shmFd = this.lib.libc.symbols.memfd_create(cStr("winding-shm"), MFD_CLOEXEC);
       if (this.#shmFd < 0) throw new Error("memfd_create failed");
-      if (libc.symbols.ftruncate(this.#shmFd, BigInt(size)) !== 0) throw new Error("ftruncate failed");
-      const mapped = libc.symbols.mmap(null, BigInt(size), PROT_READ | PROT_WRITE, MAP_SHARED, this.#shmFd, 0n);
+      if (this.lib.libc.symbols.ftruncate(this.#shmFd, BigInt(size)) !== 0) throw new Error("ftruncate failed");
+      const mapped = this.lib.libc.symbols.mmap(
+        null,
+        BigInt(size),
+        PROT_READ | PROT_WRITE,
+        MAP_SHARED,
+        this.#shmFd,
+        0n,
+      );
       if (!mapped || BigInt(Deno.UnsafePointer.value(mapped)) === MAP_FAILED) throw new Error("mmap failed");
       this.#shmPtr = mapped;
       this.#shmSize = size;
@@ -319,12 +326,12 @@ class WaylandWindow implements Window {
       this.#buffer = null;
     }
     if (this.#shmPtr && this.#shmSize > 0) {
-      libc.symbols.munmap(this.#shmPtr, BigInt(this.#shmSize));
+      this.lib.libc.symbols.munmap(this.#shmPtr, BigInt(this.#shmSize));
       this.#shmPtr = null;
       this.#shmSize = 0;
     }
     if (this.#shmFd >= 0) {
-      libc.symbols.close(this.#shmFd);
+      this.lib.libc.symbols.close(this.#shmFd);
       this.#shmFd = -1;
     }
   }
@@ -352,6 +359,7 @@ class WaylandWindow implements Window {
 // ---------------------------------------------------------------------------
 
 class WaylandLibrary implements Library {
+  readonly libc: Deno.DynamicLibrary<typeof libcSymbols>;
   readonly wl: Deno.DynamicLibrary<typeof waylandSymbols>;
   readonly display: Deno.PointerObject;
   readonly windows = new Set<WaylandWindow>();
@@ -373,6 +381,7 @@ class WaylandLibrary implements Library {
   #pollFd = new Uint8Array(8) as Uint8Array<ArrayBuffer>; // struct pollfd {int fd; short events; short revents;}
 
   constructor() {
+    this.libc = Deno.dlopen("libc.so.6", libcSymbols);
     this.wl = Deno.dlopen("libwayland-client.so.0", waylandSymbols);
     const sym = this.wl.symbols;
 
@@ -622,7 +631,7 @@ class WaylandLibrary implements Library {
     // Non-blocking read: prepare_read → poll fd → read_events or cancel_read
     if (sym.wl_display_prepare_read(this.display) === 0) {
       new DataView(this.#pollFd.buffer).setInt16(6, 0, true); // clear revents
-      const ready = libc.symbols.poll(this.#pollFd, 1, 0);
+      const ready = this.libc.symbols.poll(this.#pollFd, 1, 0);
       const revents = new DataView(this.#pollFd.buffer).getInt16(6, true);
       if (ready > 0 && (revents & POLLIN)) {
         sym.wl_display_read_events(this.display);
@@ -654,7 +663,7 @@ class WaylandLibrary implements Library {
     this.noop.close();
     this.wl.symbols.wl_display_disconnect(this.display);
     this.wl.close();
-    libc.close();
+    this.libc.close();
   }
 }
 
