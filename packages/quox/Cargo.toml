@@ -10,26 +10,16 @@ pedantic = { level = "warn", priority = -1 }
 crate-type = ["cdylib"]
 name = "quox"
 
-[profile.dev]
-# local builds for debugging
-
-[profile.release]
-opt-level = "z"
-lto = true
-strip = true
-codegen-units = 1
-panic = "abort"
-
 [dependencies]
-tokio = { version = "1.50.0", features = ["full"] }
-blitz-html = "0.2.0"
-blitz-dom = "0.2.4"
-blitz-shell = "0.2.3"
-blitz-traits = "0.2.0"
-blitz-net = "0.2.1"
-futures-task = "0.3.32"
-futures-util = "0.3.32"
-anyrender_vello = "0.6.2"
-winit = "0.30.13"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+anyrender_vello = "0.8"
+linebender_resource_handle = "0.1.1"
+blitz-dom = { git = "https://github.com/DioxusLabs/blitz", rev = "4c9fb2820dc74860d3b2d972493fa4e9fa83eb48", package = "blitz-dom" }
+blitz-html = { git = "https://github.com/DioxusLabs/blitz", rev = "4c9fb2820dc74860d3b2d972493fa4e9fa83eb48", package = "blitz-html" }
+blitz-paint = { git = "https://github.com/DioxusLabs/blitz", rev = "4c9fb2820dc74860d3b2d972493fa4e9fa83eb48", package = "blitz-paint" }
+blitz-traits = { git = "https://github.com/DioxusLabs/blitz", rev = "4c9fb2820dc74860d3b2d972493fa4e9fa83eb48", package = "blitz-traits" }
+console_error_panic_hook = "0.1"
+futures-intrusive = "0.5"
+vello = "0.8"
+wasm-bindgen = "=0.2.106"
+wasm-bindgen-futures = "=0.4.56"
+wgpu_context = "0.4"

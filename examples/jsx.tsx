@@ -1,5 +1,6 @@
-import { renderRawHTML } from "../mod.ts";
-import { render } from "preact-render-to-string";
+/** @jsxImportSource npm:preact@10.29.1 */
+import { renderRawHTML } from "../packages/quox/mod.ts";
+import { render } from "npm:preact-render-to-string@6.6.7";
 
 const MyDescription = () => {
   return (

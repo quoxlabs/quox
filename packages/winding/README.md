@@ -33,4 +33,4 @@ Run the file with FFI bindings allowed.
 deno run --allow-ffi app.ts
 ```
 
-Also See [this example](./example.ts).
+Also See [this example](../../examples/winding.ts).

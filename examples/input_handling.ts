@@ -1,4 +1,4 @@
-import { renderRawHTML } from "../mod.ts";
+import { renderRawHTML } from "../packages/quox/mod.ts";
 
 const html = `
 <!DOCTYPE html>
@@ -33,6 +33,15 @@ if (import.meta.main) {
         console.log(
           `Key ${event.type === "keydown" ? "pressed" : "released"}: ${event.key} (${event.code})`,
         );
+        break;
+      case "resize":
+        console.log(`Window resized to ${event.width}x${event.height}`);
+        break;
+      case "close":
+        console.log("Window closed");
+        break;
+      default:
+        console.log("Other even thrown:", event);
         break;
     }
   });

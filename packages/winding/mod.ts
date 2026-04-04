@@ -11,10 +11,10 @@ export type {
   WheelEvent,
   Window,
   WindowEvent,
-} from "./src/types.ts";
-import type { LoadLibrary } from "./src/types.ts";
-import { load as X11Load } from "./src/x11/mod.ts";
-import { load as Win32Load } from "./src/win32/mod.ts";
+} from "./types.ts";
+import type { LoadLibrary } from "./types.ts";
+import { load as X11Load } from "./x11.ts";
+import { load as Win32Load } from "./win32.ts";
 
 export const load: LoadLibrary = () => {
   if (Deno.build.os === "windows") return Win32Load();

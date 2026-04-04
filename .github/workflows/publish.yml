@@ -1,0 +1,30 @@
+name: publish
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+          cache: true
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            packages/quox/target
+          key: ${{ runner.os }}-cargo-publish-${{ hashFiles('packages/quox/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-publish-
+      - run: deno task build:prod
+      - run: deno publish
