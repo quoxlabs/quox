@@ -1,4 +1,4 @@
-import type { Library, LoadLibrary, UIEvent, Window } from "../types.ts";
+import type { Library, LoadLibrary, UIEvent, Window } from "./src/../types.ts";
 
 const x11functions = {
   XOpenDisplay: { parameters: ["usize"], result: "pointer" },

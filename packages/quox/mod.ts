@@ -1,4 +1,4 @@
-import { QuoxRenderer as WasmRenderer } from "../lib/quox.js";
+import { QuoxRenderer as WasmRenderer } from "./lib/quox.js";
 import { load as windingLoad } from "@quoxlabs/winding";
 import type { Library as WindingLibrary, UIEvent as WindingUIEvent, Window as WindingWindow } from "@quoxlabs/winding";
 
