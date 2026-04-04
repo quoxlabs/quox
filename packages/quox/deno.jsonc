@@ -1,18 +1,14 @@
 {
   "name": "@quoxlabs/quox",
   "version": "0.0.1-alpha.3",
+  "exports": "./mod.ts",
+  "license": "MIT",
   "tasks": {
     "wasmbuild": "deno run -A jsr:@deno/wasmbuild@0.21.1",
     "patch": "deno run -A scripts/patch-webgpu.ts", // needed until https://github.com/denoland/deno/issues/33151
     "build": "deno task wasmbuild --debug --skip-opt && deno task patch",
     "build:prod": "deno task wasmbuild && deno task patch"
   },
-  "exports": "./mod.ts",
-  "imports": {
-    "@std/fs": "jsr:@std/fs@^1.0.22",
-    "@std/path": "jsr:@std/path@^1.1.4"
-  },
-  "license": "MIT",
   "publish": {
     "include": [
       "./mod.ts",
