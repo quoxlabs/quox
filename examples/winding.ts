@@ -1,4 +1,4 @@
-import { load } from "./mod.ts";
+import { load } from "../packages/winding/mod.ts";
 
 async function sleep(ms: number) {
   await new Promise((r) => setTimeout(r, ms));

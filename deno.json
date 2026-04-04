@@ -1,7 +1,7 @@
 {
   "tasks": {
-    "dev": "cd packages/quox && deno task build:debug",
     "build": "cd packages/quox && deno task build",
+    "build:prod": "cd packages/quox && deno task build:prod",
     "ok": "deno fmt --check && deno lint && deno check"
   },
   "fmt": {
@@ -15,14 +15,5 @@
       ]
     }
   },
-  "workspace": ["./packages/quox", "./packages/winding"],
-  "exclude": ["packages/browserbrowserbrowser"],
-  "compilerOptions": {
-    "jsx": "react-jsx",
-    "jsxImportSource": "preact"
-  },
-  "imports": {
-    "preact": "npm:preact@^10.29.0",
-    "preact-render-to-string": "npm:preact-render-to-string@^6.6.7"
-  }
+  "workspace": ["./packages/quox", "./packages/winding"]
 }
