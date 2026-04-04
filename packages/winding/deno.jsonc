@@ -2,6 +2,7 @@
   "name": "@quoxlabs/winding",
   "version": "0.0.2",
   "exports": "./mod.ts",
+  "license": "MIT",
   "tasks": {
     "ok": "deno fmt --check && deno lint && deno check"
   }
