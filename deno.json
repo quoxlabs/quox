@@ -16,7 +16,6 @@
     }
   },
   "workspace": ["./packages/quox", "./packages/winding"],
-  "exclude": ["packages/browserbrowserbrowser"],
   "compilerOptions": {
     "jsx": "react-jsx",
     "jsxImportSource": "preact"
