@@ -1,6 +1,8 @@
+// @ts-types="./lib/quox.d.ts"
 import { QuoxRenderer as WasmRenderer } from "./lib/quox.js";
 import { load as windingLoad } from "@quoxlabs/winding";
 import type { Library as WindingLibrary, UIEvent as WindingUIEvent, Window as WindingWindow } from "@quoxlabs/winding";
+import type { VNode } from "preact";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -192,6 +194,18 @@ export async function renderRawHTML(html: string, options?: LoadOptions): Promis
   const win = await QuoxWindow.create(html, options);
   win.start();
   return win;
+}
+
+/**
+ * Render a Preact component tree to a native window.
+ *
+ * The component is serialised to an HTML string via `preact-render-to-string`,
+ * then handed to {@link renderRawHTML} for WASM/WebGPU rendering.
+ */
+export async function renderToWindow(vnode: VNode, options?: LoadOptions): Promise<QuoxWindow> {
+  const { render: renderToString } = await import("preact-render-to-string");
+  const html = `<!DOCTYPE html><html><body>${renderToString(vnode)}</body></html>`;
+  return await renderRawHTML(html, options);
 }
 
 if (import.meta.main) {

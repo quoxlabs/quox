@@ -13,5 +13,9 @@
       "./mod.ts",
       "./lib/"
     ]
+  },
+  "imports": {
+    "preact": "npm:preact@^10.29.1",
+    "preact-render-to-string": "npm:preact-render-to-string@^6.6.7"
   }
 }
