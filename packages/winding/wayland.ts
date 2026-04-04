@@ -47,7 +47,7 @@ function dlsymRequired(
   name: string,
 ): Deno.PointerObject {
   const pointer = libdl.symbols.dlsym(handle, cStr(name));
-  if (!pointer) throw new Error(`Failed to resolve symbol ${name}`);
+  if (!pointer) throw new Error(`winding failed to resolve symbol ${name}`);
   return pointer;
 }
 
@@ -138,7 +138,7 @@ class WaylandWindow implements Window {
       0,
       args(0n, BigInt(Deno.UnsafePointer.value(surface))),
     );
-    if (!xdgSurface) throw new Error("Failed to create xdg_surface");
+    if (!xdgSurface) throw new Error("winding failed to create xdg_surface");
     this.#xdgSurface = xdgSurface;
 
     // Create xdg_toplevel
@@ -425,7 +425,7 @@ class WaylandLibrary implements Library {
     this.wl = Deno.dlopen(LIBWAYLAND_CLIENT_SO, waylandSymbols);
     // Retrieve an existing loader handle for dlsym without loading a second time.
     const wlHandle = this.libdl.symbols.dlopen(cStr(LIBWAYLAND_CLIENT_SO), RTLD_NOW | RTLD_NOLOAD);
-    if (!wlHandle) throw new Error(`Failed to get existing ${LIBWAYLAND_CLIENT_SO} handle via libdl`);
+    if (!wlHandle) throw new Error(`winding failed to get existing ${LIBWAYLAND_CLIENT_SO} handle via libdl`);
     this.#wlHandle = wlHandle;
     const {
       mem,
@@ -456,7 +456,7 @@ class WaylandLibrary implements Library {
 
     // NULL asks libwayland to use the default display from the environment.
     const display = sym.wl_display_connect(null);
-    if (!display) throw new Error("Failed to connect to Wayland display");
+    if (!display) throw new Error("winding failed to connect to Wayland display");
     this.display = display;
 
     this.noop = new Deno.UnsafeCallback({ parameters: [], result: "void" }, () => {});
@@ -484,7 +484,7 @@ class WaylandLibrary implements Library {
       0,
       args(0n),
     );
-    if (!registry) throw new Error("Failed to get Wayland registry");
+    if (!registry) throw new Error("winding failed to get Wayland registry");
 
     // Registry global callback: bind compositor, shm, seat, xdg_wm_base
     const globalCb = new Deno.UnsafeCallback(
