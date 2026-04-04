@@ -1,13 +1,5 @@
 import type { Library, LoadLibrary, UIEvent, Window } from "./types.ts";
-import {
-  waylandSymbols,
-  WlOp,
-  WlSeatCap,
-  WlShmFormat,
-  xdgSurfaceIface,
-  xdgToplevelIface,
-  xdgWmBaseIface,
-} from "./wayland_ffi.ts";
+import { buildXdgIfaces, waylandSymbols, WlOp, WlSeatCap, WlShmFormat } from "./wayland_ffi.ts";
 
 // ---------------------------------------------------------------------------
 // libc helpers (memfd, mmap, poll) — needed for shared-memory pixel buffers
@@ -121,7 +113,7 @@ class WaylandWindow implements Window {
     const xdgSurface = sym.wl_proxy_marshal_array_flags(
       lib.xdgWmBase!,
       WlOp.XDG_WM_BASE_GET_XDG_SURFACE,
-      xdgSurfaceIface,
+      lib.xdgSurfaceIface,
       sym.wl_proxy_get_version(lib.xdgWmBase!),
       0,
       args(0n, BigInt(Deno.UnsafePointer.value(surface))),
@@ -133,7 +125,7 @@ class WaylandWindow implements Window {
     const xdgToplevel = sym.wl_proxy_marshal_array_flags(
       xdgSurface,
       WlOp.XDG_SURFACE_GET_TOPLEVEL,
-      xdgToplevelIface,
+      lib.xdgToplevelIface,
       sym.wl_proxy_get_version(xdgSurface),
       0,
       args(0n),
@@ -362,6 +354,12 @@ class WaylandLibrary implements Library {
   readonly libc: Deno.DynamicLibrary<typeof libcSymbols>;
   readonly wl: Deno.DynamicLibrary<typeof waylandSymbols>;
   readonly display: Deno.PointerObject;
+  // XDG interface structs — built lazily in the constructor, mem kept alive to
+  // prevent the pinned buffer from being GC'd.
+  readonly #xdgMem: Uint8Array<ArrayBuffer>;
+  readonly xdgWmBaseIface: Deno.PointerObject;
+  readonly xdgSurfaceIface: Deno.PointerObject;
+  readonly xdgToplevelIface: Deno.PointerObject;
   readonly windows = new Set<WaylandWindow>();
   // Globals bound from registry — set during init roundtrip
   compositor: Deno.PointerObject | null = null;
@@ -383,6 +381,11 @@ class WaylandLibrary implements Library {
   constructor() {
     this.libc = Deno.dlopen("libc.so.6", libcSymbols);
     this.wl = Deno.dlopen("libwayland-client.so.0", waylandSymbols);
+    const { mem, xdgWmBaseIface, xdgSurfaceIface, xdgToplevelIface } = buildXdgIfaces();
+    this.#xdgMem = mem;
+    this.xdgWmBaseIface = xdgWmBaseIface;
+    this.xdgSurfaceIface = xdgSurfaceIface;
+    this.xdgToplevelIface = xdgToplevelIface;
     const sym = this.wl.symbols;
 
     const display = sym.wl_display_connect(cStr(""));
@@ -454,7 +457,7 @@ class WaylandLibrary implements Library {
       ifacePtr = Deno.UnsafePointer.create(sym.wl_seat_interface);
       version = Math.min(offered, 5);
     } else if (iface === "xdg_wm_base") {
-      ifacePtr = xdgWmBaseIface;
+      ifacePtr = this.xdgWmBaseIface;
       version = Math.min(offered, 7);
     } else {
       return;

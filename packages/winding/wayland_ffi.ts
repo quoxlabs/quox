@@ -21,113 +21,124 @@
 //   +16 wl_interface **types  (8)  ← NULL; signature is sufficient
 // ---------------------------------------------------------------------------
 
-const _MEM = new Uint8Array(8192); // all xdg struct data lives here
-let _off = 0;
-const _base = BigInt(Deno.UnsafePointer.value(Deno.UnsafePointer.of(_MEM)));
-const _dv = new DataView(_MEM.buffer);
-
-function _alloc(n: number): number {
-  const o = _off;
-  _off += n;
-  if (_off > _MEM.byteLength) throw new Error("xdg interface memory overflow");
-  return o;
-}
-
-function _cstr(s: string): number {
-  const o = _alloc(s.length + 1);
-  for (let i = 0; i < s.length; i++) _MEM[o + i] = s.charCodeAt(i);
-  return o; // _MEM[o + s.length] is already 0 (Uint8Array zero-init)
-}
-
-function _align8(): void {
-  _off = (_off + 7) & ~7;
-}
-
-// Build a contiguous array of wl_message structs. All name/sig strings are
-// allocated first, then the message structs are laid out contiguously so the
-// wl_interface can point to them as an array.
-function _buildMsgs(msgs: [string, string][]): number {
-  if (msgs.length === 0) return 0;
-  const namePtrs = msgs.map(([n]) => _base + BigInt(_cstr(n)));
-  const sigPtrs = msgs.map(([, s]) => _base + BigInt(_cstr(s)));
-  _align8();
-  const arr = _alloc(24 * msgs.length);
-  for (let i = 0; i < msgs.length; i++) {
-    const o = arr + i * 24;
-    _dv.setBigUint64(o, namePtrs[i], true);
-    _dv.setBigUint64(o + 8, sigPtrs[i], true);
-    _dv.setBigUint64(o + 16, 0n, true); // types = NULL
-  }
-  return arr;
-}
-
-function _buildIface(
-  name: string,
-  version: number,
-  methods: [string, string][],
-  events: [string, string][],
-): bigint {
-  const methodsOff = _buildMsgs(methods);
-  const eventsOff = _buildMsgs(events);
-  const nameOff = _cstr(name);
-  _align8();
-  const o = _alloc(40);
-  _dv.setBigUint64(o, _base + BigInt(nameOff), true);
-  _dv.setInt32(o + 8, version, true);
-  _dv.setInt32(o + 12, methods.length, true);
-  _dv.setBigUint64(o + 16, methodsOff > 0 ? _base + BigInt(methodsOff) : 0n, true);
-  _dv.setInt32(o + 24, events.length, true);
-  _dv.setBigUint64(o + 32, eventsOff > 0 ? _base + BigInt(eventsOff) : 0n, true);
-  return _base + BigInt(o);
+export interface XdgIfaces {
+  /** Pinned buffer — must be kept alive for the lifetime of the library. */
+  mem: Uint8Array<ArrayBuffer>;
+  xdgWmBaseIface: Deno.PointerObject;
+  xdgSurfaceIface: Deno.PointerObject;
+  xdgToplevelIface: Deno.PointerObject;
 }
 
 // All request/event signatures come from xdg-shell-client-protocol-code.h.
-export const xdgWmBaseIface = Deno.UnsafePointer.create(
-  _buildIface("xdg_wm_base", 7, [
-    ["destroy", ""],
-    ["create_positioner", "n"],
-    ["get_xdg_surface", "no"],
-    ["pong", "u"],
-  ], [
-    ["ping", "u"],
-  ]),
-)!;
+// Called once inside WaylandLibrary's constructor so no FFI work happens at
+// module-load time.
+export function buildXdgIfaces(): XdgIfaces {
+  const mem = new Uint8Array(8192) as Uint8Array<ArrayBuffer>;
+  let off = 0;
+  const base = BigInt(Deno.UnsafePointer.value(Deno.UnsafePointer.of(mem)));
+  const dv = new DataView(mem.buffer);
 
-export const xdgSurfaceIface = Deno.UnsafePointer.create(
-  _buildIface("xdg_surface", 7, [
-    ["destroy", ""],
-    ["get_toplevel", "n"],
-    ["get_popup", "n?oo"],
-    ["set_window_geometry", "iiii"],
-    ["ack_configure", "u"],
-  ], [
-    ["configure", "u"],
-  ]),
-)!;
+  function alloc(n: number): number {
+    const o = off;
+    off += n;
+    if (off > mem.byteLength) throw new Error("xdg interface memory overflow");
+    return o;
+  }
 
-export const xdgToplevelIface = Deno.UnsafePointer.create(
-  _buildIface("xdg_toplevel", 7, [
-    ["destroy", ""],
-    ["set_parent", "?o"],
-    ["set_title", "s"],
-    ["set_app_id", "s"],
-    ["show_window_menu", "ouii"],
-    ["move", "ou"],
-    ["resize", "ouu"],
-    ["set_max_size", "ii"],
-    ["set_min_size", "ii"],
-    ["set_maximized", ""],
-    ["unset_maximized", ""],
-    ["set_fullscreen", "?o"],
-    ["unset_fullscreen", ""],
-    ["set_minimized", ""],
-  ], [
-    ["configure", "iia"],
-    ["close", ""],
-    ["configure_bounds", "4ii"],
-    ["wm_capabilities", "5a"],
-  ]),
-)!;
+  function cstr(s: string): number {
+    const o = alloc(s.length + 1);
+    for (let i = 0; i < s.length; i++) mem[o + i] = s.charCodeAt(i);
+    return o;
+  }
+
+  function align8(): void {
+    off = (off + 7) & ~7;
+  }
+
+  function buildMsgs(msgs: [string, string][]): number {
+    if (msgs.length === 0) return 0;
+    const namePtrs = msgs.map(([n]) => base + BigInt(cstr(n)));
+    const sigPtrs = msgs.map(([, s]) => base + BigInt(cstr(s)));
+    align8();
+    const arr = alloc(24 * msgs.length);
+    for (let i = 0; i < msgs.length; i++) {
+      const o = arr + i * 24;
+      dv.setBigUint64(o, namePtrs[i], true);
+      dv.setBigUint64(o + 8, sigPtrs[i], true);
+      dv.setBigUint64(o + 16, 0n, true); // types = NULL
+    }
+    return arr;
+  }
+
+  function buildIface(
+    name: string,
+    version: number,
+    methods: [string, string][],
+    events: [string, string][],
+  ): bigint {
+    const methodsOff = buildMsgs(methods);
+    const eventsOff = buildMsgs(events);
+    const nameOff = cstr(name);
+    align8();
+    const o = alloc(40);
+    dv.setBigUint64(o, base + BigInt(nameOff), true);
+    dv.setInt32(o + 8, version, true);
+    dv.setInt32(o + 12, methods.length, true);
+    dv.setBigUint64(o + 16, methodsOff > 0 ? base + BigInt(methodsOff) : 0n, true);
+    dv.setInt32(o + 24, events.length, true);
+    dv.setBigUint64(o + 32, eventsOff > 0 ? base + BigInt(eventsOff) : 0n, true);
+    return base + BigInt(o);
+  }
+
+  const xdgWmBaseIface = Deno.UnsafePointer.create(
+    buildIface("xdg_wm_base", 7, [
+      ["destroy", ""],
+      ["create_positioner", "n"],
+      ["get_xdg_surface", "no"],
+      ["pong", "u"],
+    ], [
+      ["ping", "u"],
+    ]),
+  )!;
+
+  const xdgSurfaceIface = Deno.UnsafePointer.create(
+    buildIface("xdg_surface", 7, [
+      ["destroy", ""],
+      ["get_toplevel", "n"],
+      ["get_popup", "n?oo"],
+      ["set_window_geometry", "iiii"],
+      ["ack_configure", "u"],
+    ], [
+      ["configure", "u"],
+    ]),
+  )!;
+
+  const xdgToplevelIface = Deno.UnsafePointer.create(
+    buildIface("xdg_toplevel", 7, [
+      ["destroy", ""],
+      ["set_parent", "?o"],
+      ["set_title", "s"],
+      ["set_app_id", "s"],
+      ["show_window_menu", "ouii"],
+      ["move", "ou"],
+      ["resize", "ouu"],
+      ["set_max_size", "ii"],
+      ["set_min_size", "ii"],
+      ["set_maximized", ""],
+      ["unset_maximized", ""],
+      ["set_fullscreen", "?o"],
+      ["unset_fullscreen", ""],
+      ["set_minimized", ""],
+    ], [
+      ["configure", "iia"],
+      ["close", ""],
+      ["configure_bounds", "4ii"],
+      ["wm_capabilities", "5a"],
+    ]),
+  )!;
+
+  return { mem, xdgWmBaseIface, xdgSurfaceIface, xdgToplevelIface };
+}
 
 // ---------------------------------------------------------------------------
 // Protocol opcodes
