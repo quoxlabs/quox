@@ -18,7 +18,7 @@ import { load as Win32Load } from "./win32.ts";
 import { load as WaylandLoad } from "./wayland.ts";
 
 export const load: LoadLibrary = () => {
-  if (Deno.permissions.requestSync({ name: "ffi" }).state === "denied") {
+  if (Deno.permissions.requestSync({ name: "ffi" }).state !== "granted") {
     throw new Error("quox cannot run without FFI access");
   }
   if (Deno.build.os === "windows") return Win32Load();
