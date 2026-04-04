@@ -6,6 +6,7 @@ Currently, it supports:
 
 - Windows
 - Linux (X11)
+- Linux (Wayland)
 
 Contributions are welcome!
 
