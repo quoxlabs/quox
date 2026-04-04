@@ -1,14 +1,16 @@
-name: check
+name: publish
 
 on:
   push:
     branches:
       - main
-  pull_request:
 
 jobs:
-  check:
+  publish:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v6
       - uses: denoland/setup-deno@v2
@@ -24,8 +26,5 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('packages/quox/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
-      - run: deno fmt --check
-      - run: deno lint
-      - run: deno task build
-      - run: deno check
-      - run: deno publish --dry-run
+      - run: deno task build:prod
+      - run: deno publish
