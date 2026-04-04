@@ -1,5 +1,5 @@
 import type { Library, LoadLibrary, UIEvent, Window } from "./src/../types.ts";
-import { x11functions } from "./x11_ffi.ts";
+import { x11functions, XEventMask, XEventType } from "./x11_ffi.ts";
 
 function cString(s: string): Uint8Array<ArrayBuffer> {
   const buf = new Uint8Array(s.length + 1) as Uint8Array<ArrayBuffer>;
@@ -8,76 +8,12 @@ function cString(s: string): Uint8Array<ArrayBuffer> {
 }
 
 // All event masks except:
-//   - PointerMotionHint (bit 7): throttles MotionNotify to one hint per entry
+//   - PointerMotionHintMask (bit 7): throttles MotionNotify to one hint per entry
 //     and requires XQueryPointer acknowledgement, making cursor tracking choppy.
-//   - ResizeRedirect (bit 18): blocks the WM from resizing the window, causing
+//   - ResizeRedirectMask (bit 18): blocks the WM from resizing the window, causing
 //     the drawable to stay at its initial size while synthetic ConfigureNotify
 //     events report the intended (larger) dimensions.
-const ALL_X_EV_MASKS = 0x1fbff7fn;
-enum _XEvMask {
-  NoEvent = 0,
-  KeyPress = 1 << 0,
-  KeyRelease = 1 << 1,
-  ButtonPress = 1 << 2,
-  ButtonRelease = 1 << 3,
-  EnterWindow = 1 << 4,
-  LeaveWindow = 1 << 5,
-  PointerMotion = 1 << 6,
-  PointerMotionHint = 1 << 7,
-  Button1Motion = 1 << 8,
-  Button2Motion = 1 << 9,
-  Button3Motion = 1 << 10,
-  Button4Motion = 1 << 11,
-  Button5Motion = 1 << 12,
-  ButtonMotion = 1 << 13,
-  KeymapState = 1 << 14,
-  Exposure = 1 << 15,
-  VisibilityChange = 1 << 16,
-  StructureNotify = 1 << 17,
-  ResizeRedirect = 1 << 18,
-  SubstructureNotify = 1 << 19,
-  SubstructureRedirect = 1 << 20,
-  FocusChange = 1 << 21,
-  PropertyChange = 1 << 22,
-  ColormapChange = 1 << 23,
-  OwnerGrabButton = 1 << 24,
-}
-
-enum XEvType {
-  KeyPress = 2,
-  KeyRelease,
-  ButtonPress,
-  ButtonRelease,
-  MotionNotify,
-  EnterNotify,
-  LeaveNotify,
-  FocusIn,
-  FocusOut,
-  KeymapNotify,
-  Expose,
-  GraphicsExpose,
-  NoExpose,
-  VisibilityNotify,
-  CreateNotify,
-  DestroyNotify,
-  UnmapNotify,
-  MapNotify,
-  MapRequest,
-  ReparentNotify,
-  ConfigureNotify,
-  ConfigureRequest,
-  GravityNotify,
-  ResizeRequest,
-  CirculateNotify,
-  CirculateRequest,
-  PropertyNotify,
-  SelectionClear,
-  SelectionRequest,
-  SelectionNotify,
-  ColormapNotify,
-  ClientMessage,
-  MappingNotify,
-}
+const ALL_X_EV_MASKS = 0x1ffffff & ~(XEventMask.PointerMotionHintMask | XEventMask.ResizeRedirectMask);
 
 class X11Window implements Window {
   readonly id: bigint;
@@ -114,7 +50,7 @@ class X11Window implements Window {
     const attrs = new BigUint64Array([0n]); // None pixmap
     lib.X11.symbols.XChangeWindowAttributes(lib.display, window, CW_BACK_PIXMAP, attrs);
 
-    lib.X11.symbols.XSelectInput(lib.display, window, ALL_X_EV_MASKS);
+    lib.X11.symbols.XSelectInput(lib.display, window, BigInt(ALL_X_EV_MASKS));
 
     // Ask the window manager to send WM_DELETE_WINDOW via ClientMessage instead
     // of forcibly killing the process when the user closes the window.
@@ -129,7 +65,7 @@ class X11Window implements Window {
     this.#width = w;
     this.#height = h;
 
-    this.#gc = lib.X11.symbols.XCreateGC(lib.display, window, 0, 0n) as bigint;
+    this.#gc = lib.X11.symbols.XCreateGC(lib.display, window, 0n, null) as bigint;
     const visual = lib.X11.symbols.XDefaultVisual(lib.display, 0);
     this.#imageBuf = new Uint8Array(w * h * 4);
     const image = lib.X11.symbols.XCreateImage(
@@ -222,7 +158,7 @@ class X11Library implements Library {
   readonly wmDeleteWindow: bigint;
   constructor() {
     this.X11 = Deno.dlopen("libX11.so", x11functions);
-    const display = this.X11.symbols.XOpenDisplay(0n);
+    const display = this.X11.symbols.XOpenDisplay(null);
     if (display == null) throw new Error("Failed to open display");
     this.display = display;
     const screen = this.X11.symbols.XDefaultScreenOfDisplay(display);
@@ -272,11 +208,11 @@ function importEvent(
 ): UIEvent | undefined {
   const type = view.getInt32(0, true);
   switch (type) {
-    case XEvType.KeyPress:
+    case XEventType.KeyPress:
       return { type: "keydown", keycode: view.getInt32(84, true) };
-    case XEvType.KeyRelease:
+    case XEventType.KeyRelease:
       return { type: "keyup", keycode: view.getInt32(84, true) };
-    case XEvType.ButtonPress: {
+    case XEventType.ButtonPress: {
       const btn = view.getInt32(84, true);
       if (btn === 4) return { type: "wheel", deltaX: 0, deltaY: -1 };
       if (btn === 5) return { type: "wheel", deltaX: 0, deltaY: 1 };
@@ -284,26 +220,26 @@ function importEvent(
       if (button === undefined) return undefined;
       return { type: "mousedown", button };
     }
-    case XEvType.ButtonRelease: {
+    case XEventType.ButtonRelease: {
       const btn = view.getInt32(84, true);
       if (btn === 4 || btn === 5) return undefined; // wheel has no release
       const button = BUTTONS[btn];
       if (button === undefined) return undefined;
       return { type: "mouseup", button };
     }
-    case XEvType.MotionNotify:
+    case XEventType.MotionNotify:
       return {
         type: "mousemove",
         x: view.getInt32(64, true),
         y: view.getInt32(68, true),
       };
-    case XEvType.ConfigureNotify: {
+    case XEventType.ConfigureNotify: {
       // XConfigureEvent: width at offset 56, height at offset 60.
       const width = view.getInt32(56, true);
       const height = view.getInt32(60, true);
       return { type: "resize", width, height };
     }
-    case XEvType.ClientMessage: {
+    case XEventType.ClientMessage: {
       // XClientMessageEvent: message_type (Atom) at offset 40, data.l[0] at offset 56.
       // Check for WM_DELETE_WINDOW sent via WM_PROTOCOLS.
       const msgType = view.getBigUint64(40, true);
