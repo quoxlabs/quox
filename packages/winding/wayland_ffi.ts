@@ -33,15 +33,15 @@ export interface XdgIfaces {
 // Called once inside WaylandLibrary's constructor so no FFI work happens at
 // module-load time.
 export function buildXdgIfaces(): XdgIfaces {
-  const mem = new Uint8Array(8192) as Uint8Array<ArrayBuffer>;
+  const mem = new Uint8Array(8192);
   let off = 0;
-  const base = BigInt(Deno.UnsafePointer.value(Deno.UnsafePointer.of(mem)));
+  const base = Deno.UnsafePointer.value(Deno.UnsafePointer.of(mem));
   const dv = new DataView(mem.buffer);
 
   function alloc(n: number): number {
     const o = off;
     off += n;
-    if (off > mem.byteLength) throw new Error("xdg interface memory overflow");
+    if (off > mem.byteLength) throw new Error("winding xdg interface memory overflow");
     return o;
   }
 
@@ -194,9 +194,9 @@ export const WlShmFormat = {
 
 // wl_seat::capabilities bitmask
 export const WlSeatCap = {
-  POINTER: 1,
-  KEYBOARD: 2,
-  TOUCH: 4,
+  POINTER: 1 << 0,
+  KEYBOARD: 1 << 1,
+  TOUCH: 1 << 2,
 } as const;
 
 // ---------------------------------------------------------------------------
@@ -219,7 +219,7 @@ export const waylandSymbols = {
   wl_display_cancel_read: { parameters: ["pointer"], result: "void" },
   wl_display_read_events: { parameters: ["pointer"], result: "i32" },
   // Proxy operations
-  // args ("buffer") is union wl_argument* — pass BigUint64Array, one 8-byte
+  // args ("buffer") is union wl_argument* -- pass BigUint64Array, one 8-byte
   // slot per argument in message signature order.
   wl_proxy_marshal_array_flags: {
     parameters: ["pointer", "u32", "pointer", "u32", "u32", "buffer"],
@@ -228,7 +228,7 @@ export const waylandSymbols = {
   wl_proxy_add_listener: { parameters: ["pointer", "pointer", "pointer"], result: "i32" },
   wl_proxy_destroy: { parameters: ["pointer"], result: "void" },
   wl_proxy_get_version: { parameters: ["pointer"], result: "u32" },
-  // Interface data symbols — values are bigint addresses of the C globals
+  // Interface data symbols -- values are bigint addresses of the C globals
   wl_registry_interface: { type: "usize" },
   wl_compositor_interface: { type: "usize" },
   wl_shm_interface: { type: "usize" },

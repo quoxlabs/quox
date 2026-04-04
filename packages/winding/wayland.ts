@@ -25,7 +25,7 @@ const MFD_CLOEXEC = 1;
 const POLLIN = 1;
 
 function cStr(s: string): Uint8Array<ArrayBuffer> {
-  const b = new Uint8Array(s.length + 1) as Uint8Array<ArrayBuffer>;
+  const b = new Uint8Array(s.length + 1);
   for (let i = 0; i < s.length; i++) b[i] = s.charCodeAt(i);
   return b;
 }
@@ -33,7 +33,7 @@ function cStr(s: string): Uint8Array<ArrayBuffer> {
 // Encode args for wl_proxy_marshal_array_flags. Each slot is one union wl_argument
 // (8 bytes). Pass as "buffer" param so Deno hands libwayland a raw pointer.
 function args(...vals: bigint[]): BigUint64Array<ArrayBuffer> {
-  return new BigUint64Array(vals.length === 0 ? [0n] : vals) as BigUint64Array<ArrayBuffer>;
+  return new BigUint64Array(vals.length === 0 ? [0n] : vals);
 }
 
 // ---------------------------------------------------------------------------
@@ -55,15 +55,15 @@ type AnyCallback = { pointer: Deno.PointerObject; close(): void };
 // handlers[i] is the callback for event i; unhandled slots get noop.
 // ---------------------------------------------------------------------------
 function makeVtable(
-  handlers: (AnyCallback | null)[],
+  handlers: Array<AnyCallback | null>,
   totalSlots: number,
   noop: AnyCallback,
 ): BigUint64Array<ArrayBuffer> {
-  const vtable = new BigUint64Array(Math.max(handlers.length, totalSlots)) as BigUint64Array<ArrayBuffer>;
-  const noopPtr = BigInt(Deno.UnsafePointer.value(noop.pointer));
+  const vtable = new BigUint64Array(Math.max(handlers.length, totalSlots));
+  const noopPtr = Deno.UnsafePointer.value(noop.pointer);
   for (let i = 0; i < vtable.length; i++) {
     const cb = i < handlers.length ? handlers[i] : null;
-    vtable[i] = cb ? BigInt(Deno.UnsafePointer.value(cb.pointer)) : noopPtr;
+    vtable[i] = cb ? Deno.UnsafePointer.value(cb.pointer) : noopPtr;
   }
   return vtable;
 }
@@ -87,13 +87,13 @@ class WaylandWindow implements Window {
   #shmPtr: Deno.PointerObject | null = null;
   #shmSize = 0;
   #buffer: Deno.PointerObject | null = null;
-  #width = 0;
-  #height = 0;
+  #width: number;
+  #height: number;
   // Pending configure serial from xdg_surface
   #pendingSerial = 0;
   #configured = false;
 
-  constructor(readonly lib: WaylandLibrary, w = 800, h = 600) {
+  constructor(readonly lib: WaylandLibrary, w: number, h: number) {
     const sym = lib.wl.symbols;
     const surfaceIfacePtr = Deno.UnsafePointer.create(lib.wl.symbols.wl_surface_interface);
 
@@ -106,7 +106,7 @@ class WaylandWindow implements Window {
       0,
       args(0n),
     );
-    if (!surface) throw new Error("Failed to create wl_surface");
+    if (!surface) throw new Error("winding failed to create wl_surface");
     this.#surface = surface;
 
     // Create xdg_surface wrapping the wl_surface
@@ -130,16 +130,16 @@ class WaylandWindow implements Window {
       0,
       args(0n),
     );
-    if (!xdgToplevel) throw new Error("Failed to create xdg_toplevel");
+    if (!xdgToplevel) throw new Error("winding failed to create xdg_toplevel");
     this.#xdgToplevel = xdgToplevel;
 
     this.#width = w;
     this.#height = h;
 
     this.#setupListeners();
-    this.#setTitle("Winding");
+    this.#setTitle("winding");
 
-    // Initial empty commit — compositor will reply with configure
+    // Initial empty commit -- compositor will reply with configure
     sym.wl_proxy_marshal_array_flags(
       this.#surface,
       WlOp.SURFACE_COMMIT,
@@ -178,7 +178,7 @@ class WaylandWindow implements Window {
         this.#pendingSerial = serial;
       },
     );
-    // xdg_surface has exactly 1 event (configure) — use our built interface's count.
+    // xdg_surface has exactly 1 event (configure) -- use our built interface's count.
     this.#surfaceVtable = makeVtable([this.#xdgSurfaceConfigure], 1, noop);
     sym.wl_proxy_add_listener(this.#xdgSurface, Deno.UnsafePointer.of(this.#surfaceVtable), null);
 
@@ -213,7 +213,7 @@ class WaylandWindow implements Window {
       null,
       sym.wl_proxy_get_version(this.#xdgToplevel),
       0,
-      args(BigInt(Deno.UnsafePointer.value(Deno.UnsafePointer.of(titleBuf)))),
+      args(Deno.UnsafePointer.value(Deno.UnsafePointer.of(titleBuf))),
     );
   }
 
@@ -232,8 +232,8 @@ class WaylandWindow implements Window {
       this.#width = width;
       this.#height = height;
       this.#shmFd = this.lib.libc.symbols.memfd_create(cStr("winding-shm"), MFD_CLOEXEC);
-      if (this.#shmFd < 0) throw new Error("memfd_create failed");
-      if (this.lib.libc.symbols.ftruncate(this.#shmFd, BigInt(size)) !== 0) throw new Error("ftruncate failed");
+      if (this.#shmFd < 0) throw new Error("winding memfd_create failed");
+      if (this.lib.libc.symbols.ftruncate(this.#shmFd, BigInt(size)) !== 0) throw new Error("winding ftruncate failed");
       const mapped = this.lib.libc.symbols.mmap(
         null,
         BigInt(size),
@@ -242,7 +242,7 @@ class WaylandWindow implements Window {
         this.#shmFd,
         0n,
       );
-      if (!mapped || BigInt(Deno.UnsafePointer.value(mapped)) === MAP_FAILED) throw new Error("mmap failed");
+      if (!mapped || BigInt(Deno.UnsafePointer.value(mapped)) === MAP_FAILED) throw new Error("winding mmap failed");
       this.#shmPtr = mapped;
       this.#shmSize = size;
 
@@ -255,7 +255,7 @@ class WaylandWindow implements Window {
         0,
         args(0n, BigInt(this.#shmFd), BigInt(size)),
       );
-      if (!pool) throw new Error("wl_shm_create_pool failed");
+      if (!pool) throw new Error("winding wl_shm_create_pool failed");
 
       this.#buffer = sym.wl_proxy_marshal_array_flags(
         pool,
@@ -266,17 +266,17 @@ class WaylandWindow implements Window {
         args(0n, 0n, BigInt(width), BigInt(height), BigInt(width * 4), BigInt(WlShmFormat.ARGB8888)),
       );
       sym.wl_proxy_marshal_array_flags(pool, WlOp.SHM_POOL_DESTROY, null, sym.wl_proxy_get_version(pool), 1, args());
-      if (!this.#buffer) throw new Error("wl_shm_pool_create_buffer failed");
+      if (!this.#buffer) throw new Error("winding wl_shm_pool_create_buffer failed");
     }
 
-    // Write pixels: RGBA → ARGB8888 (stored as BGRA in little-endian memory)
+    // Write pixels: RGBA -> ARGB8888 (stored as BGRA in little-endian memory)
     const dest = new Uint8Array(
       new Deno.UnsafePointerView(this.#shmPtr!).getArrayBuffer(size),
     );
     for (let i = 0; i < rgba.length; i += 4) {
-      dest[i] = rgba[i + 2]; // B ← src R
+      dest[i] = rgba[i + 2]; // B <- src R
       dest[i + 1] = rgba[i + 1]; // G
-      dest[i + 2] = rgba[i]; // R ← src B
+      dest[i + 2] = rgba[i]; // R <- src B
       dest[i + 3] = rgba[i + 3]; // A
     }
 
@@ -288,12 +288,12 @@ class WaylandWindow implements Window {
       v,
       0,
       args(
-        BigInt(Deno.UnsafePointer.value(this.#buffer!)),
+        Deno.UnsafePointer.value(this.#buffer!),
         0n,
         0n,
       ),
     );
-    // Use damage_buffer (opcode 9, since wl_surface version ≥ 4) to avoid scaling
+    // Use damage_buffer (opcode 9, since wl_surface version >= 4) to avoid scaling
     sym.wl_proxy_marshal_array_flags(
       this.#surface,
       WlOp.SURFACE_DAMAGE_BUFFER,
@@ -354,14 +354,14 @@ class WaylandLibrary implements Library {
   readonly libc: Deno.DynamicLibrary<typeof libcSymbols>;
   readonly wl: Deno.DynamicLibrary<typeof waylandSymbols>;
   readonly display: Deno.PointerObject;
-  // XDG interface structs — built lazily in the constructor, mem kept alive to
+  // XDG interface structs -- built lazily in the constructor, mem kept alive to
   // prevent the pinned buffer from being GC'd.
   readonly #xdgMem: Uint8Array<ArrayBuffer>;
   readonly xdgWmBaseIface: Deno.PointerObject;
   readonly xdgSurfaceIface: Deno.PointerObject;
   readonly xdgToplevelIface: Deno.PointerObject;
   readonly windows = new Set<WaylandWindow>();
-  // Globals bound from registry — set during init roundtrip
+  // Globals bound from registry -- set during init roundtrip
   compositor: Deno.PointerObject | null = null;
   shm: Deno.PointerObject | null = null;
   xdgWmBase: Deno.PointerObject | null = null;
@@ -379,7 +379,7 @@ class WaylandLibrary implements Library {
   #pollFd = new Uint8Array(8) as Uint8Array<ArrayBuffer>; // struct pollfd {int fd; short events; short revents;}
 
   constructor() {
-    this.libc = Deno.dlopen("libc.so.6", libcSymbols);
+    this.libc = Deno.dlopen("libc.so.6", libcSymbols); // needed to perform a few syscalls
     this.wl = Deno.dlopen("libwayland-client.so.0", waylandSymbols);
     const { mem, xdgWmBaseIface, xdgSurfaceIface, xdgToplevelIface } = buildXdgIfaces();
     this.#xdgMem = mem;
@@ -472,7 +472,7 @@ class WaylandLibrary implements Library {
       0,
       args(
         BigInt(name),
-        BigInt(Deno.UnsafePointer.value(Deno.UnsafePointer.of(ifaceName))),
+        Deno.UnsafePointer.value(Deno.UnsafePointer.of(ifaceName)),
         BigInt(version),
         0n,
       ),
@@ -618,11 +618,9 @@ class WaylandLibrary implements Library {
     this.#events.push(event);
   }
 
-  openWindow(x = 0, y = 0, w = 800, h = 600): WaylandWindow {
-    void x;
-    void y;
+  openWindow(_x = 0, _y = 0, w = 800, h = 600): WaylandWindow {
     if (!this.compositor || !this.shm || !this.xdgWmBase) {
-      throw new Error("Wayland globals not ready (compositor/shm/xdg_wm_base missing)");
+      throw new Error("winding wayland globals not ready (compositor/shm/xdg_wm_base missing)");
     }
     return new WaylandWindow(this, w, h);
   }
@@ -631,7 +629,7 @@ class WaylandLibrary implements Library {
     const sym = this.wl.symbols;
     sym.wl_display_flush(this.display);
 
-    // Non-blocking read: prepare_read → poll fd → read_events or cancel_read
+    // Non-blocking read: prepare_read -> poll fd -> read_events or cancel_read
     if (sym.wl_display_prepare_read(this.display) === 0) {
       new DataView(this.#pollFd.buffer).setInt16(6, 0, true); // clear revents
       const ready = this.libc.symbols.poll(this.#pollFd, 1, 0);

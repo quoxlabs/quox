@@ -35,7 +35,7 @@ export interface CloseEvent extends WindowEvent {
 export interface Window {
   [Symbol.dispose]: () => void;
   close(): void;
-  /** Blit an RGBA pixel buffer to the window. Width and height must match the window dimensions. */
+  /** Blit (bit-block transfer) an RGBA pixel buffer to the window. Width and height must match the window dimensions. */
   blit(rgba: Uint8Array, width: number, height: number): void;
 }
 
