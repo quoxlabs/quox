@@ -37,7 +37,7 @@ This has the following interesting properties:
 - `deno --allow-ffi https://quox.dev/main.tsx` runs a full native desktop app without installation
 - `deno install` installs a native desktop app
 - `deno compile` creates standalone binaries of your app for Linux/Windows/Mac (even cross-platform)
-- `deno run --unstable-hmr main.tsx` lets you develop your app with hot module replacement
+- `deno --watch-hmr main.tsx` lets you develop your app with hot module replacement
 
 It has a lot of nice benefits:
 
