@@ -1,36 +1,43 @@
 # quox (/quarks/)
 
-More than just Electron.
+Brings the web stack to the desktop.
 
-Simple. Speedy. Small. Secure.
+- **Simple.** A full desktop app in 2 lines of code.
+- **Speedy.** Hardware-accelerated layouting and rendering.
+- **Small.** Tiny on disk, tiny at runtime.
+- **Secure.** Fully contained in Deno's secure sandbox.
 
-quox lets you write TSX, and render it to a native application window on any OS. Without a build step.
+quox (pronounced like _quarks_) lets you write TSX, and render it to a native application window on any OS. Without a
+build step.
 
-Built on top of Deno, blitz, FFI. Free and open-source.
+Built on top of Deno, blitz, Wasm, WebGPU, and FFI. Free and open-source.
 
-quox is not anywhere close to being ready It only really works as a hello world example. Until then, imagine this:
+This project is very young. Try it if you like bleeding edges, but don't make your business depend on it just yet.
 
-```ts
-// main.tsx
-import { renderRawHTML } from "jsr:@quoxlabs/quox@0.0.1-alpha.3";
+quox already works as a hello world example. Paste the following code to `main.tsx`:
 
-await renderRawHTML("<h1>Hello, world!</h1>");
+```tsx
+/** @jsxImportSource npm:preact */
+
+import { renderToWindow } from "jsr:@quoxlabs/quox";
+
+await renderToWindow(<h1>Hello, world!</h1>);
 ```
 
 Running
 
 ```sh
-deno run --allow-ffi --allow-env main.tsx
+deno --allow-ffi main.tsx
 ```
 
 will open a native window on your machine with "Hello, world!" rendered to it.
 
-This will enable:
+This has the following interesting properties:
 
-- `deno run -A https://example.com/main.tsx` runs a native desktop app without installation
-- `deno install -A https://example.com/main.tsx` installs a native desktop app
-- `deno compile` creates standalone binaries of your app for Linux/Windows/Mac
-- `deno run --unstable-hmr main.tsx` lets you develop your app with hot module replacement
+- `deno --allow-ffi https://quox.dev/main.tsx` runs a full native desktop app without installation
+- `deno install` installs a native desktop app
+- `deno compile` creates standalone binaries of your app for Linux/Windows/Mac (even cross-platform)
+- `deno --watch-hmr main.tsx` lets you develop your app with hot module replacement
 
 It has a lot of nice benefits:
 

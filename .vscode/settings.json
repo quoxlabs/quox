@@ -1,4 +1,9 @@
 {
   "editor.formatOnSave": true,
-  "rust-analyzer.linkedProjects": ["packages/quox/Cargo.toml"]
+  "rust-analyzer.linkedProjects": [
+    "packages/quox/Cargo.toml"
+  ],
+  "[typescript]": {
+    "editor.defaultFormatter": "denoland.vscode-deno"
+  }
 }

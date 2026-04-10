@@ -1,6 +1,6 @@
 {
   "name": "@quoxlabs/quox",
-  "version": "0.0.1-alpha.3",
+  "version": "0.0.2",
   "exports": "./mod.ts",
   "license": "MIT",
   "tasks": {

@@ -1,11 +1,13 @@
 # winding
 
-winding is a cross-platform windowing library that does not need bindings to any external binaries (except for the system itself).
+winding is a cross-platform windowing library that does not need bindings to any external binaries (except for the
+system itself).
 
 Currently, it supports:
 
 - Windows
 - Linux (X11)
+- Linux (Wayland)
 
 Contributions are welcome!
 

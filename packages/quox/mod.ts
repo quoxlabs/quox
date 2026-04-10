@@ -21,15 +21,13 @@ export type QuoxMouseButtonEvent = { type: "mousedown" | "mouseup"; button: numb
 export type QuoxMouseWheelEvent = { type: "wheel"; deltaX: number; deltaY: number };
 export type QuoxKeyboardEvent = {
   type: "keydown" | "keyup";
-  /** X11 keycode as decimal string (e.g. "38" for 'a'). */
   key: string;
-  /** X11 keycode as decimal string (same value). */
-  code: string;
+  code: number;
 };
 export type QuoxResizeEvent = { type: "resize"; width: number; height: number };
 export type QuoxCloseEvent = { type: "close" };
 
-export interface LoadOptions {
+export interface WindowOptions {
   /** Width of the window in pixels (default 800). */
   width?: number;
   /** Height of the window in pixels (default 600). */
@@ -53,9 +51,9 @@ function mapWindingEvent(ev: WindingUIEvent): QuoxInputEvent | null {
     case "wheel":
       return { type: "wheel", deltaX: ev.deltaX, deltaY: ev.deltaY };
     case "keydown":
-      return { type: "keydown", key: String(ev.keycode), code: String(ev.keycode) };
+      return { type: "keydown", key: String(ev.keycode), code: ev.keycode };
     case "keyup":
-      return { type: "keyup", key: String(ev.keycode), code: String(ev.keycode) };
+      return { type: "keyup", key: String(ev.keycode), code: ev.keycode };
     case "resize":
       return { type: "resize", width: ev.width, height: ev.height };
     case "close":
@@ -92,7 +90,7 @@ export class QuoxWindow implements Disposable {
   }
 
   /** Open a window and create a WASM renderer for the given HTML. */
-  static async create(html: string, options: LoadOptions = {}): Promise<QuoxWindow> {
+  static async create(html: string, options: WindowOptions = {}): Promise<QuoxWindow> {
     const width = options.width ?? 800;
     const height = options.height ?? 600;
 
@@ -190,7 +188,7 @@ export class QuoxWindow implements Disposable {
  * Open a window, render the given HTML string via WASM/WebGPU, and
  * start the render loop.
  */
-export async function renderRawHTML(html: string, options?: LoadOptions): Promise<QuoxWindow> {
+export async function renderRawHTML(html: string, options?: WindowOptions): Promise<QuoxWindow> {
   const win = await QuoxWindow.create(html, options);
   win.start();
   return win;
@@ -202,9 +200,9 @@ export async function renderRawHTML(html: string, options?: LoadOptions): Promis
  * The component is serialised to an HTML string via `preact-render-to-string`,
  * then handed to {@link renderRawHTML} for WASM/WebGPU rendering.
  */
-export async function renderToWindow(vnode: VNode, options?: LoadOptions): Promise<QuoxWindow> {
+export async function renderToWindow(jsx: VNode, options?: WindowOptions): Promise<QuoxWindow> {
   const { render: renderToString } = await import("preact-render-to-string");
-  const html = `<!DOCTYPE html><html><body>${renderToString(vnode)}</body></html>`;
+  const html = `<!DOCTYPE html><html><body>${renderToString(jsx)}</body></html>`;
   return await renderRawHTML(html, options);
 }
 

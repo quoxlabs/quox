@@ -5,8 +5,7 @@
     "ok": "deno fmt --check && deno lint && deno check"
   },
   "fmt": {
-    "lineWidth": 120,
-    "proseWrap": "never"
+    "lineWidth": 120
   },
   "lint": {
     "rules": {
