@@ -70,9 +70,18 @@ export class QuoxWindow implements Disposable {
   readonly #win: WindingWindow;
   #width: number;
   #height: number;
+  #pendingWidth: number | null = null;
+  #pendingHeight: number | null = null;
+  #pendingScrollX = 0;
+  #pendingScrollY = 0;
   readonly #renderer: WasmRenderer;
-  #intervalId: ReturnType<typeof setInterval> | null = null;
-  #rendering = false;
+  #eventIntervalId: ReturnType<typeof setInterval> | null = null;
+  #presenting = false;
+  #presentationQueued = false;
+  #presentationRequested = false;
+  #stopped = false;
+  #disposed = false;
+  #rendererFreed = false;
   readonly #listeners: Array<(event: QuoxInputEvent) => void> = [];
   readonly document: QuoxDocument;
 
@@ -88,7 +97,11 @@ export class QuoxWindow implements Disposable {
     this.#width = width;
     this.#height = height;
     this.#renderer = renderer;
-    this.document = new QuoxDocument(renderer);
+    this.document = new QuoxDocument(
+      renderer,
+      () => this.#requestPresentation(),
+      () => this.#assertActiveDocument(),
+    );
   }
 
   /** Open a blank window with a live document. */
@@ -103,22 +116,16 @@ export class QuoxWindow implements Disposable {
     return new QuoxWindow(lib, win, width, height, renderer);
   }
 
-  /** Start the render loop (~60 fps). */
+  /** Start polling native events and presenting requested frames. */
   start(): void {
-    if (this.#intervalId !== null) return;
-    this.#intervalId = setInterval(async () => {
-      if (this.#rendering) return;
-      this.#rendering = true;
-      try {
-        await this.#tick();
-      } finally {
-        this.#rendering = false;
-      }
-    }, 16);
+    if (this.#stopped) return;
+    if (this.#eventIntervalId !== null) return;
+    this.#eventIntervalId = setInterval(() => this.#pumpEvents(), 16);
   }
 
-  async #tick(): Promise<void> {
-    // Drain all pending events and forward input events to listeners.
+  #pumpEvents(): void {
+    if (this.#presenting) return;
+
     let ev: WindingUIEvent | undefined;
     while ((ev = this.#lib.event()) !== undefined) {
       const mapped = mapWindingEvent(ev);
@@ -134,31 +141,81 @@ export class QuoxWindow implements Disposable {
       if (mapped.type === "resize") {
         this.#width = mapped.width;
         this.#height = mapped.height;
-        // Propagate new dimensions to the WASM renderer so Blitz/Vello reflows
-        // the layout at the correct viewport size.
-        this.#renderer.resize(mapped.width, mapped.height);
+        this.#pendingWidth = mapped.width;
+        this.#pendingHeight = mapped.height;
+        this.#requestPresentation();
       }
 
       if (mapped.type === "wheel") {
-        // Scale raw wheel notches (±1) to pixels so the viewport scrolls a
-        // comfortable distance per tick.
-        this.#renderer.scroll(
-          Math.round(mapped.deltaX * SCROLL_SPEED),
-          Math.round(mapped.deltaY * SCROLL_SPEED),
-        );
+        this.#pendingScrollX += Math.round(mapped.deltaX * SCROLL_SPEED);
+        this.#pendingScrollY += Math.round(mapped.deltaY * SCROLL_SPEED);
+        this.#requestPresentation();
       }
 
       for (const cb of this.#listeners) cb(mapped);
     }
-
-    // Render the live document via WebGPU in WASM.
-    const rgba = await this.#renderer.render();
-
-    // Blit RGBA buffer to the window (conversion to native pixel format is handled by winding).
-    this.#win.blit(rgba, this.#width, this.#height);
   }
 
-  /** Register a callback that is invoked for every input event during a tick. */
+  #requestPresentation(): void {
+    if (this.#stopped || this.#disposed) return;
+    this.#presentationRequested = true;
+    this.#queuePresentation();
+  }
+
+  #assertActiveDocument(): void {
+    if (this.#stopped || this.#disposed || this.#rendererFreed) {
+      throw new Error("window is not active");
+    }
+    if (this.#presenting) {
+      throw new Error("document is unavailable while presentation is in progress");
+    }
+  }
+
+  #queuePresentation(): void {
+    if (this.#presentationQueued) return;
+    this.#presentationQueued = true;
+    queueMicrotask(() => {
+      this.#presentationQueued = false;
+      void this.#presentIfRequested();
+    });
+  }
+
+  async #presentIfRequested(): Promise<void> {
+    if (this.#stopped || this.#disposed || this.#presenting || !this.#presentationRequested) return;
+
+    this.#presentationRequested = false;
+    this.#presenting = true;
+    try {
+      this.#applyPendingRendererState();
+      const rgba = await this.#renderer.render();
+      if (!this.#stopped && !this.#disposed) {
+        this.#win.blit(rgba, this.#width, this.#height);
+      }
+    } finally {
+      this.#presenting = false;
+      if (this.#stopped) {
+        this.#releaseRenderer();
+      } else if (this.#presentationRequested) {
+        this.#queuePresentation();
+      }
+    }
+  }
+
+  #applyPendingRendererState(): void {
+    if (this.#pendingWidth !== null && this.#pendingHeight !== null) {
+      this.#renderer.resize(this.#pendingWidth, this.#pendingHeight);
+      this.#pendingWidth = null;
+      this.#pendingHeight = null;
+    }
+
+    if (this.#pendingScrollX !== 0 || this.#pendingScrollY !== 0) {
+      this.#renderer.scroll(this.#pendingScrollX, this.#pendingScrollY);
+      this.#pendingScrollX = 0;
+      this.#pendingScrollY = 0;
+    }
+  }
+
+  /** Register a callback that is invoked for every input event. */
   addEventListener(callback: (event: QuoxInputEvent) => void): void {
     this.#listeners.push(callback);
   }
@@ -169,16 +226,28 @@ export class QuoxWindow implements Disposable {
     if (idx >= 0) this.#listeners.splice(idx, 1);
   }
 
-  /** Stop the render loop and free WASM resources. */
+  /** Stop event polling and free WASM resources. */
   stop(): void {
-    if (this.#intervalId !== null) {
-      clearInterval(this.#intervalId);
-      this.#intervalId = null;
+    if (this.#stopped) return;
+    this.#stopped = true;
+    if (this.#eventIntervalId !== null) {
+      clearInterval(this.#eventIntervalId);
+      this.#eventIntervalId = null;
     }
+    if (!this.#presenting) {
+      this.#releaseRenderer();
+    }
+  }
+
+  #releaseRenderer(): void {
+    if (this.#rendererFreed) return;
     this.#renderer.free();
+    this.#rendererFreed = true;
   }
 
   [Symbol.dispose](): void {
+    if (this.#disposed) return;
+    this.#disposed = true;
     this.stop();
     this.#win.close();
     this.#lib.close();
