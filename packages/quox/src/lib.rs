@@ -1,9 +1,8 @@
 use anyrender_vello::VelloScenePainter;
-use blitz_dom::{DocumentConfig, FontContext, Point};
+use blitz_dom::{FontContext, Point};
 use blitz_html::HtmlDocument;
 use blitz_paint::paint_scene;
-use blitz_traits::net::DummyNetProvider;
-use blitz_traits::shell::{ColorScheme, DummyShellProvider, Viewport};
+use blitz_traits::shell::{ColorScheme, Viewport};
 use linebender_resource_handle::Blob;
 use std::sync::Arc;
 use vello::wgpu::{
@@ -14,18 +13,9 @@ use vello::{AaConfig, AaSupport, RenderParams, Renderer, RendererOptions, Scene}
 use wasm_bindgen::prelude::*;
 use wgpu_context::WGPUContext;
 
-const LIBERATION_SANS: &[u8] = include_bytes!("../assets/LiberationSans-Regular.ttf");
+mod dom;
 
-/// Prepend a `<style>` that names our embedded font explicitly so that blitz's
-/// CSS resolver finds it (the generic-family map is empty on wasm32).
-fn inject_font_css(html: &str) -> String {
-    const STYLE: &str = "<style>html,body,*{font-family:'Liberation Sans',sans-serif;}</style>";
-    if let Some(pos) = html.find("</head>") {
-        format!("{}{}{}", &html[..pos], STYLE, &html[pos..])
-    } else {
-        format!("{STYLE}{html}")
-    }
-}
+const LIBERATION_SANS: &[u8] = include_bytes!("../assets/LiberationSans-Regular.ttf");
 
 #[wasm_bindgen(start)]
 pub fn start() {
@@ -39,61 +29,24 @@ pub fn start() {
 /// e.g. via X11 FFI using `XPutImage`.
 #[wasm_bindgen]
 pub struct QuoxRenderer {
-    html: String,
     width: u32,
     height: u32,
-    scroll_x: u32,
-    scroll_y: u32,
+    scroll_x: f64,
+    scroll_y: f64,
+    pub(crate) document: HtmlDocument,
     context: WGPUContext,
     dev_id: usize,
     renderer: Renderer,
-    font_ctx: FontContext,
 }
 
 #[wasm_bindgen]
+#[allow(clippy::missing_errors_doc)]
 impl QuoxRenderer {
-    /// Initialise a renderer with the given HTML and viewport dimensions.
+    /// Initialise a renderer with a blank live document and viewport dimensions.
     ///
     /// Acquires a WebGPU device; must be `await`ed.
-    pub async fn create(html: &str, width: u32, height: u32) -> Result<QuoxRenderer, JsValue> {
-        let mut context = WGPUContext::new();
-        let dev_id = context
-            .find_or_create_device(None)
-            .await
-            .map_err(|e| JsValue::from_str(&format!("WebGPU device: {e:?}")))?;
-
-        let renderer = Renderer::new(
-            &context.device_pool[dev_id].device,
-            RendererOptions {
-                use_cpu: false,
-                num_init_threads: None,
-                antialiasing_support: AaSupport::area_only(),
-                pipeline_cache: None,
-            },
-        )
-        .map_err(|e| JsValue::from_str(&format!("Vello renderer: {e:?}")))?;
-
-        let mut font_ctx = FontContext::default();
-        font_ctx
-            .collection
-            .register_fonts(Blob::new(Arc::new(LIBERATION_SANS) as _), None);
-
-        Ok(QuoxRenderer {
-            html: html.to_owned(),
-            width: width.max(1),
-            height: height.max(1),
-            scroll_x: 0,
-            scroll_y: 0,
-            context,
-            dev_id,
-            renderer,
-            font_ctx,
-        })
-    }
-
-    /// Replace the HTML document being rendered.
-    pub fn set_html(&mut self, html: &str) {
-        self.html = html.to_owned();
+    pub async fn create(width: u32, height: u32) -> Result<QuoxRenderer, JsValue> {
+        Self::create_renderer(width, height).await
     }
 
     /// Resize the rendering viewport.
@@ -105,8 +58,8 @@ impl QuoxRenderer {
     /// Scroll the viewport by the given pixel delta. Negative values scroll
     /// towards the top/left; the position is clamped to 0 at the origin.
     pub fn scroll(&mut self, delta_x: i32, delta_y: i32) {
-        self.scroll_x = self.scroll_x.saturating_add_signed(delta_x);
-        self.scroll_y = self.scroll_y.saturating_add_signed(delta_y);
+        self.scroll_x = (self.scroll_x + f64::from(delta_x)).max(0.0);
+        self.scroll_y = (self.scroll_y + f64::from(delta_y)).max(0.0);
     }
 
     /// Render the current HTML and return a flat `width × height × 4`
@@ -115,35 +68,16 @@ impl QuoxRenderer {
         let w = self.width;
         let h = self.height;
 
-        // Re-create the document each frame so HtmlDocument (which uses Rc
-        // internally and is therefore not Send/Sync) never needs to be stored
-        // in the struct.
-        //
-        // On wasm32-unknown-unknown fontique's system-font backend is a no-op,
-        // so generic CSS families (sans-serif, etc.) have no mapping. Inject
-        // an explicit font-family rule that names the font we embedded.
-        let html_with_font = inject_font_css(&self.html);
-        let mut doc = HtmlDocument::from_html(
-            &html_with_font,
-            DocumentConfig {
-                base_url: Some("https://example.com".to_string()),
-                net_provider: Some(Arc::new(DummyNetProvider::default())),
-                shell_provider: Some(Arc::new(DummyShellProvider)),
-                font_ctx: Some(self.font_ctx.clone()),
-                ..Default::default()
-            },
-        );
-        doc.set_viewport(Viewport::new(w, h, 1.0, ColorScheme::Light));
-        doc.resolve(0.0);
+        self.document
+            .set_viewport(Viewport::new(w, h, 1.0, ColorScheme::Light));
+        self.document.resolve(0.0);
 
-        // Clamp scroll offsets to the laid-out content size so the viewport
-        // can never scroll past the end of the document.
-        let content = doc.root_element().final_layout.size;
-        self.scroll_x = self.scroll_x.min((content.width as u32).saturating_sub(w));
-        self.scroll_y = self.scroll_y.min((content.height as u32).saturating_sub(h));
-        doc.set_viewport_scroll(Point {
-            x: self.scroll_x as f64,
-            y: self.scroll_y as f64,
+        let content = self.document.root_element().final_layout.size;
+        self.scroll_x = self.scroll_x.min(scroll_limit(content.width, w));
+        self.scroll_y = self.scroll_y.min(scroll_limit(content.height, h));
+        self.document.set_viewport_scroll(Point {
+            x: self.scroll_x,
+            y: self.scroll_y,
         });
 
         let device_handle = self.context.device_pool[self.dev_id].clone();
@@ -168,7 +102,7 @@ impl QuoxRenderer {
 
         let mut scene = Scene::new();
         let mut painter = VelloScenePainter::new(&mut scene);
-        paint_scene(&mut painter, &*doc, 1.0, w, h, 0, 0);
+        paint_scene(&mut painter, &self.document, 1.0, w, h, 0, 0);
 
         self.renderer
             .render_to_texture(
@@ -187,7 +121,7 @@ impl QuoxRenderer {
 
         let row_bytes = w * 4;
         let padded_row_bytes = row_bytes.next_multiple_of(256);
-        let out_size = (padded_row_bytes as u64) * (h as u64);
+        let out_size = u64::from(padded_row_bytes) * u64::from(h);
         let gpu_buffer = device_handle.device.create_buffer(&BufferDescriptor {
             label: Some("quox-readback"),
             size: out_size,
@@ -241,4 +175,46 @@ impl QuoxRenderer {
 
         Ok(rgba)
     }
+}
+
+impl QuoxRenderer {
+    async fn create_renderer(width: u32, height: u32) -> Result<QuoxRenderer, JsValue> {
+        let mut context = WGPUContext::new();
+        let dev_id = context
+            .find_or_create_device(None)
+            .await
+            .map_err(|e| JsValue::from_str(&format!("WebGPU device: {e:?}")))?;
+
+        let renderer = Renderer::new(
+            &context.device_pool[dev_id].device,
+            RendererOptions {
+                use_cpu: false,
+                num_init_threads: None,
+                antialiasing_support: AaSupport::area_only(),
+                pipeline_cache: None,
+            },
+        )
+        .map_err(|e| JsValue::from_str(&format!("Vello renderer: {e:?}")))?;
+
+        let mut font_ctx = FontContext::default();
+        font_ctx
+            .collection
+            .register_fonts(Blob::new(Arc::new(LIBERATION_SANS) as _), None);
+        let document = dom::blank_document(font_ctx.clone());
+
+        Ok(QuoxRenderer {
+            width: width.max(1),
+            height: height.max(1),
+            scroll_x: 0.0,
+            scroll_y: 0.0,
+            document,
+            context,
+            dev_id,
+            renderer,
+        })
+    }
+}
+
+fn scroll_limit(content_length: f32, viewport_length: u32) -> f64 {
+    (f64::from(content_length) - f64::from(viewport_length)).max(0.0)
 }

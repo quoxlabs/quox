@@ -10,6 +10,7 @@
   },
   "publish": {
     "include": [
+      "./dom.ts",
       "./mod.ts",
       "./lib/"
     ]

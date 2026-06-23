@@ -1,4 +1,4 @@
-import { renderRawHTML } from "../packages/quox/mod.ts";
+import { openWindow } from "../packages/quox/mod.ts";
 
 const html = `
 <!DOCTYPE html>
@@ -10,7 +10,8 @@ const html = `
 </html>`;
 
 if (import.meta.main) {
-  const window = await renderRawHTML(html);
+  const window = await openWindow();
+  window.document.documentElement.innerHTML = html;
 
   window.addEventListener((event) => {
     switch (event.type) {

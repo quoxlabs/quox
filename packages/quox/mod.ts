@@ -1,8 +1,11 @@
 // @ts-types="./lib/quox.d.ts"
 import { QuoxRenderer as WasmRenderer } from "./lib/quox.js";
+import { QuoxDocument } from "./dom.ts";
 import { load as windingLoad } from "@quoxlabs/winding";
 import type { Library as WindingLibrary, UIEvent as WindingUIEvent, Window as WindingWindow } from "@quoxlabs/winding";
 import type { VNode } from "preact";
+
+export { QuoxDocument, QuoxElement, QuoxNode, QuoxText } from "./dom.ts";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -39,6 +42,7 @@ export interface WindowOptions {
 // ---------------------------------------------------------------------------
 
 const BUTTON_INDEX: Record<"left" | "middle" | "right", number> = { left: 0, middle: 1, right: 2 };
+const SCROLL_SPEED = 40;
 
 function mapWindingEvent(ev: WindingUIEvent): QuoxInputEvent | null {
   switch (ev.type) {
@@ -61,10 +65,6 @@ function mapWindingEvent(ev: WindingUIEvent): QuoxInputEvent | null {
   }
 }
 
-// ---------------------------------------------------------------------------
-// QuoxWindow
-// ---------------------------------------------------------------------------
-
 export class QuoxWindow implements Disposable {
   readonly #lib: WindingLibrary;
   readonly #win: WindingWindow;
@@ -74,6 +74,7 @@ export class QuoxWindow implements Disposable {
   #intervalId: ReturnType<typeof setInterval> | null = null;
   #rendering = false;
   readonly #listeners: Array<(event: QuoxInputEvent) => void> = [];
+  readonly document: QuoxDocument;
 
   private constructor(
     lib: WindingLibrary,
@@ -87,16 +88,17 @@ export class QuoxWindow implements Disposable {
     this.#width = width;
     this.#height = height;
     this.#renderer = renderer;
+    this.document = new QuoxDocument(renderer);
   }
 
-  /** Open a window and create a WASM renderer for the given HTML. */
-  static async create(html: string, options: WindowOptions = {}): Promise<QuoxWindow> {
+  /** Open a blank window with a live document. */
+  static async create(options: WindowOptions = {}): Promise<QuoxWindow> {
     const width = options.width ?? 800;
     const height = options.height ?? 600;
 
     const lib = windingLoad();
     const win = lib.openWindow(0, 0, width, height);
-    const renderer = await WasmRenderer.create(html, width, height);
+    const renderer = await WasmRenderer.create(width, height);
 
     return new QuoxWindow(lib, win, width, height, renderer);
   }
@@ -140,7 +142,6 @@ export class QuoxWindow implements Disposable {
       if (mapped.type === "wheel") {
         // Scale raw wheel notches (±1) to pixels so the viewport scrolls a
         // comfortable distance per tick.
-        const SCROLL_SPEED = 40;
         this.#renderer.scroll(
           Math.round(mapped.deltaX * SCROLL_SPEED),
           Math.round(mapped.deltaY * SCROLL_SPEED),
@@ -150,7 +151,7 @@ export class QuoxWindow implements Disposable {
       for (const cb of this.#listeners) cb(mapped);
     }
 
-    // Render HTML via WebGPU in WASM.
+    // Render the live document via WebGPU in WASM.
     const rgba = await this.#renderer.render();
 
     // Blit RGBA buffer to the window (conversion to native pixel format is handled by winding).
@@ -184,12 +185,9 @@ export class QuoxWindow implements Disposable {
   }
 }
 
-/**
- * Open a window, render the given HTML string via WASM/WebGPU, and
- * start the render loop.
- */
-export async function renderRawHTML(html: string, options?: WindowOptions): Promise<QuoxWindow> {
-  const win = await QuoxWindow.create(html, options);
+/** Open a blank native window with a live mutable document. */
+export async function openWindow(options?: WindowOptions): Promise<QuoxWindow> {
+  const win = await QuoxWindow.create(options);
   win.start();
   return win;
 }
@@ -197,16 +195,18 @@ export async function renderRawHTML(html: string, options?: WindowOptions): Prom
 /**
  * Render a Preact component tree to a native window.
  *
- * The component is serialised to an HTML string via `preact-render-to-string`,
- * then handed to {@link renderRawHTML} for WASM/WebGPU rendering.
+ * The component is serialised to an HTML fragment and inserted into the live
+ * document body.
  */
 export async function renderToWindow(jsx: VNode, options?: WindowOptions): Promise<QuoxWindow> {
   const { render: renderToString } = await import("preact-render-to-string");
-  const html = `<!DOCTYPE html><html><body>${renderToString(jsx)}</body></html>`;
-  return await renderRawHTML(html, options);
+  const win = await openWindow(options);
+  win.document.body.innerHTML = renderToString(jsx);
+  return win;
 }
 
 if (import.meta.main) {
-  const win = await renderRawHTML("<h1>Hello from Blitz WASM + X11</h1>");
+  const win = await openWindow();
+  win.document.body.innerHTML = "<h1>Hello from Blitz WASM + X11</h1>";
   console.log("Window open:", win);
 }

@@ -1,4 +1,4 @@
-import { renderRawHTML } from "../packages/quox/mod.ts";
+import { openWindow } from "../packages/quox/mod.ts";
 
 const html = `
 <!DOCTYPE html>
@@ -152,5 +152,6 @@ const html = `
 </html>`;
 
 if (import.meta.main) {
-  await renderRawHTML(html);
+  const win = await openWindow();
+  win.document.documentElement.innerHTML = html;
 }

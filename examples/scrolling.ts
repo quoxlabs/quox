@@ -1,4 +1,4 @@
-import { renderRawHTML } from "../packages/quox/mod.ts";
+import { openWindow } from "../packages/quox/mod.ts";
 
 const sections = Array.from({ length: 24 }, (_, index) => {
   const sectionNumber = index + 1;
@@ -118,7 +118,8 @@ const html = `
 </html>`;
 
 if (import.meta.main) {
-  const window = await renderRawHTML(html, { width: 760, height: 520 });
+  const window = await openWindow({ width: 760, height: 520 });
+  window.document.documentElement.innerHTML = html;
 
   window.addEventListener((event) => {
     switch (event.type) {
