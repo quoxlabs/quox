@@ -1,5 +1,5 @@
 use anyrender_vello::VelloScenePainter;
-use blitz_dom::{DocumentConfig, FontContext};
+use blitz_dom::{DocumentConfig, FontContext, Point};
 use blitz_html::HtmlDocument;
 use blitz_paint::paint_scene;
 use blitz_traits::net::DummyNetProvider;
@@ -141,6 +141,10 @@ impl QuoxRenderer {
         let content = doc.root_element().final_layout.size;
         self.scroll_x = self.scroll_x.min((content.width as u32).saturating_sub(w));
         self.scroll_y = self.scroll_y.min((content.height as u32).saturating_sub(h));
+        doc.set_viewport_scroll(Point {
+            x: self.scroll_x as f64,
+            y: self.scroll_y as f64,
+        });
 
         let device_handle = self.context.device_pool[self.dev_id].clone();
 
@@ -164,7 +168,7 @@ impl QuoxRenderer {
 
         let mut scene = Scene::new();
         let mut painter = VelloScenePainter::new(&mut scene);
-        paint_scene(&mut painter, &*doc, 1.0, w, h, self.scroll_x, self.scroll_y);
+        paint_scene(&mut painter, &*doc, 1.0, w, h, 0, 0);
 
         self.renderer
             .render_to_texture(

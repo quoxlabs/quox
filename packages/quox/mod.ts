@@ -71,7 +71,7 @@ export class QuoxWindow implements Disposable {
   #width: number;
   #height: number;
   readonly #renderer: WasmRenderer;
-  #intervalId: number | null = null;
+  #intervalId: ReturnType<typeof setInterval> | null = null;
   #rendering = false;
   readonly #listeners: Array<(event: QuoxInputEvent) => void> = [];
 
