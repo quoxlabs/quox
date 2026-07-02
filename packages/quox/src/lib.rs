@@ -1,7 +1,7 @@
 use anyrender_vello::VelloScenePainter;
 use blitz_dom::{
-    BaseDocument, DEFAULT_CSS, DocumentConfig, FontContext, LocalName, NodeData, Point, QualName,
-    ns,
+    BaseDocument, DEFAULT_CSS, DocumentConfig, DocumentMutator, FontContext, LocalName, NodeData,
+    Point, QualName, ns,
 };
 use blitz_html::{HtmlDocument, HtmlProvider};
 use blitz_paint::paint_scene;
@@ -60,6 +60,10 @@ pub struct QuoxRenderer {
 }
 
 impl QuoxRenderer {
+    fn mutate(&mut self) -> DocumentMutator<'_> {
+        self.document.mutate()
+    }
+
     fn ensure_node(&self, node_id: usize) -> Result<(), JsValue> {
         self.document
             .get_node(node_id)
@@ -164,7 +168,7 @@ impl QuoxRenderer {
     /// Remove a node from the retained document.
     pub fn remove_node(&mut self, node_id: usize) -> Result<(), JsValue> {
         self.ensure_node(node_id)?;
-        self.document.mutate().remove_node(node_id);
+        self.mutate().remove_node(node_id);
         Ok(())
     }
 
@@ -172,9 +176,7 @@ impl QuoxRenderer {
     pub fn append_child(&mut self, parent_id: usize, child_id: usize) -> Result<(), JsValue> {
         self.ensure_node(parent_id)?;
         self.ensure_node(child_id)?;
-        self.document
-            .mutate()
-            .append_children(parent_id, &[child_id]);
+        self.mutate().append_children(parent_id, &[child_id]);
         Ok(())
     }
 
@@ -194,16 +196,13 @@ impl QuoxRenderer {
         value: &str,
     ) -> Result<(), JsValue> {
         self.ensure_element(node_id)?;
-        self.document
-            .mutate()
-            .set_attribute(node_id, html_name(name), value);
+        self.mutate().set_attribute(node_id, html_name(name), value);
         Ok(())
     }
 
     /// Create an element node in the retained document.
     pub fn create_element(&mut self, tag_name: &str) -> Result<usize, JsValue> {
         let node_id = self
-            .document
             .mutate()
             .create_element(html_name(&tag_name.to_ascii_lowercase()), Vec::new());
         Ok(node_id)
@@ -212,13 +211,13 @@ impl QuoxRenderer {
     /// Replace an element's children by parsing an HTML fragment through Blitz's mutator.
     pub fn set_inner_html(&mut self, node_id: usize, html: &str) -> Result<(), JsValue> {
         self.ensure_element(node_id)?;
-        self.document.mutate().set_inner_html(node_id, html);
+        self.mutate().set_inner_html(node_id, html);
         Ok(())
     }
 
     /// Create a text node in the retained document.
     pub fn create_text_node(&mut self, text: &str) -> Result<usize, JsValue> {
-        let node_id = self.document.mutate().create_text_node(text);
+        let node_id = self.mutate().create_text_node(text);
         Ok(node_id)
     }
 
@@ -230,9 +229,7 @@ impl QuoxRenderer {
     /// Remove an element attribute.
     pub fn remove_attribute(&mut self, node_id: usize, name: &str) -> Result<(), JsValue> {
         self.ensure_element(node_id)?;
-        self.document
-            .mutate()
-            .clear_attribute(node_id, html_name(name));
+        self.mutate().clear_attribute(node_id, html_name(name));
         Ok(())
     }
 
@@ -244,7 +241,7 @@ impl QuoxRenderer {
             .ok_or_else(|| invalid_node(node_id))?;
         let is_text_node = matches!(&node.data, NodeData::Text(_));
 
-        let mut mutator = self.document.mutate();
+        let mut mutator = self.mutate();
         if is_text_node {
             mutator.set_node_text(node_id, value);
         } else {
