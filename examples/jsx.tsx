@@ -1,5 +1,5 @@
 /** @jsxImportSource npm:preact@10.29.1 */
-import { renderToWindow } from "../packages/quox/mod.ts";
+import { openWindow } from "../packages/quox/mod.ts";
 
 const MyDescription = () => {
   return (
@@ -22,5 +22,5 @@ function App() {
 }
 
 if (import.meta.main) {
-  await renderToWindow(<App />);
+  await openWindow({ innerHTML: <App /> });
 }

@@ -1,7 +1,6 @@
 {
   "version": "5",
   "specifiers": {
-    "npm:preact-render-to-string@6.6.7": "6.6.7_preact@10.29.1",
     "npm:preact-render-to-string@^6.6.7": "6.6.7_preact@10.29.1",
     "npm:preact@10.29.1": "10.29.1",
     "npm:preact@^10.29.1": "10.29.1"

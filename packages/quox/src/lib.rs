@@ -1,6 +1,9 @@
 use anyrender_vello::VelloScenePainter;
-use blitz_dom::{DocumentConfig, FontContext, Point};
-use blitz_html::HtmlDocument;
+use blitz_dom::{
+    BaseDocument, DEFAULT_CSS, DocumentConfig, FontContext, LocalName, NodeData, Point, QualName,
+    ns,
+};
+use blitz_html::{HtmlDocument, HtmlProvider};
 use blitz_paint::paint_scene;
 use blitz_traits::net::DummyNetProvider;
 use blitz_traits::shell::{ColorScheme, DummyShellProvider, Viewport};
@@ -15,16 +18,23 @@ use wasm_bindgen::prelude::*;
 use wgpu_context::WGPUContext;
 
 const LIBERATION_SANS: &[u8] = include_bytes!("../assets/LiberationSans-Regular.ttf");
+const FONT_CSS: &str = "html,body,*{font-family:'Liberation Sans',sans-serif;}";
+const BLANK_HTML: &str = "<!DOCTYPE html><html><head></head><body></body></html>";
 
-/// Prepend a `<style>` that names our embedded font explicitly so that blitz's
-/// CSS resolver finds it (the generic-family map is empty on wasm32).
-fn inject_font_css(html: &str) -> String {
-    const STYLE: &str = "<style>html,body,*{font-family:'Liberation Sans',sans-serif;}</style>";
-    if let Some(pos) = html.find("</head>") {
-        format!("{}{}{}", &html[..pos], STYLE, &html[pos..])
-    } else {
-        format!("{STYLE}{html}")
+fn html_name(local_name: &str) -> QualName {
+    QualName {
+        prefix: None,
+        ns: ns!(html),
+        local: LocalName::from(local_name),
     }
+}
+
+fn invalid_node(node_id: usize) -> JsValue {
+    JsValue::from_str(&format!("Invalid DOM node id: {node_id}"))
+}
+
+fn invalid_element(node_id: usize) -> JsValue {
+    JsValue::from_str(&format!("DOM node id is not an element: {node_id}"))
 }
 
 #[wasm_bindgen(start)]
@@ -39,7 +49,7 @@ pub fn start() {
 /// e.g. via X11 FFI using `XPutImage`.
 #[wasm_bindgen]
 pub struct QuoxRenderer {
-    html: String,
+    document: BaseDocument,
     width: u32,
     height: u32,
     scroll_x: u32,
@@ -47,15 +57,49 @@ pub struct QuoxRenderer {
     context: WGPUContext,
     dev_id: usize,
     renderer: Renderer,
-    font_ctx: FontContext,
+}
+
+impl QuoxRenderer {
+    fn ensure_node(&self, node_id: usize) -> Result<(), JsValue> {
+        self.document
+            .get_node(node_id)
+            .map(|_| ())
+            .ok_or_else(|| invalid_node(node_id))
+    }
+
+    fn ensure_element(&self, node_id: usize) -> Result<(), JsValue> {
+        self.document
+            .get_node(node_id)
+            .ok_or_else(|| invalid_node(node_id))?
+            .element_data()
+            .map(|_| ())
+            .ok_or_else(|| invalid_element(node_id))
+    }
+
+    fn child_element_by_tag(&self, parent_id: usize, tag_name: &str) -> Result<usize, JsValue> {
+        let parent = self
+            .document
+            .get_node(parent_id)
+            .ok_or_else(|| invalid_node(parent_id))?;
+
+        parent
+            .children
+            .iter()
+            .find_map(|child_id| {
+                let child = self.document.get_node(*child_id)?;
+                let element = child.element_data()?;
+                (element.name.local.as_ref() == tag_name).then_some(*child_id)
+            })
+            .ok_or_else(|| JsValue::from_str(&format!("Missing <{tag_name}> element")))
+    }
 }
 
 #[wasm_bindgen]
 impl QuoxRenderer {
-    /// Initialise a renderer with the given HTML and viewport dimensions.
+    /// Initialise a renderer with a blank live document and viewport dimensions.
     ///
     /// Acquires a WebGPU device; must be `await`ed.
-    pub async fn create(html: &str, width: u32, height: u32) -> Result<QuoxRenderer, JsValue> {
+    pub async fn create(width: u32, height: u32) -> Result<QuoxRenderer, JsValue> {
         let mut context = WGPUContext::new();
         let dev_id = context
             .find_or_create_device(None)
@@ -78,8 +122,22 @@ impl QuoxRenderer {
             .collection
             .register_fonts(Blob::new(Arc::new(LIBERATION_SANS) as _), None);
 
+        let document = HtmlDocument::from_html(
+            BLANK_HTML,
+            DocumentConfig {
+                base_url: Some("https://example.com".to_string()),
+                net_provider: Some(Arc::new(DummyNetProvider::default())),
+                shell_provider: Some(Arc::new(DummyShellProvider)),
+                html_parser_provider: Some(Arc::new(HtmlProvider)),
+                ua_stylesheets: Some(vec![DEFAULT_CSS.to_string(), FONT_CSS.to_string()]),
+                font_ctx: Some(font_ctx),
+                ..Default::default()
+            },
+        )
+        .into_inner();
+
         Ok(QuoxRenderer {
-            html: html.to_owned(),
+            document,
             width: width.max(1),
             height: height.max(1),
             scroll_x: 0,
@@ -87,13 +145,7 @@ impl QuoxRenderer {
             context,
             dev_id,
             renderer,
-            font_ctx,
         })
-    }
-
-    /// Replace the HTML document being rendered.
-    pub fn set_html(&mut self, html: &str) {
-        self.html = html.to_owned();
     }
 
     /// Resize the rendering viewport.
@@ -109,39 +161,129 @@ impl QuoxRenderer {
         self.scroll_y = self.scroll_y.saturating_add_signed(delta_y);
     }
 
+    /// Remove a node from the retained document.
+    pub fn remove_node(&mut self, node_id: usize) -> Result<(), JsValue> {
+        self.ensure_node(node_id)?;
+        self.document.mutate().remove_node(node_id);
+        Ok(())
+    }
+
+    // Append `child_id` to `parent_id`.
+    pub fn append_child(&mut self, parent_id: usize, child_id: usize) -> Result<(), JsValue> {
+        self.ensure_node(parent_id)?;
+        self.ensure_node(child_id)?;
+        self.document
+            .mutate()
+            .append_children(parent_id, &[child_id]);
+        Ok(())
+    }
+
+    /// Return a node's text content.
+    pub fn text_content(&self, node_id: usize) -> Result<String, JsValue> {
+        self.document
+            .get_node(node_id)
+            .map(|node| node.text_content())
+            .ok_or_else(|| invalid_node(node_id))
+    }
+
+    /// Set an element attribute.
+    pub fn set_attribute(
+        &mut self,
+        node_id: usize,
+        name: &str,
+        value: &str,
+    ) -> Result<(), JsValue> {
+        self.ensure_element(node_id)?;
+        self.document
+            .mutate()
+            .set_attribute(node_id, html_name(name), value);
+        Ok(())
+    }
+
+    /// Create an element node in the retained document.
+    pub fn create_element(&mut self, tag_name: &str) -> Result<usize, JsValue> {
+        let node_id = self
+            .document
+            .mutate()
+            .create_element(html_name(&tag_name.to_ascii_lowercase()), Vec::new());
+        Ok(node_id)
+    }
+
+    /// Replace an element's children by parsing an HTML fragment through Blitz's mutator.
+    pub fn set_inner_html(&mut self, node_id: usize, html: &str) -> Result<(), JsValue> {
+        self.ensure_element(node_id)?;
+        self.document.mutate().set_inner_html(node_id, html);
+        Ok(())
+    }
+
+    /// Create a text node in the retained document.
+    pub fn create_text_node(&mut self, text: &str) -> Result<usize, JsValue> {
+        let node_id = self.document.mutate().create_text_node(text);
+        Ok(node_id)
+    }
+
+    /// Return the root `<html>` element node id.
+    pub fn document_element(&self) -> Result<usize, JsValue> {
+        Ok(self.document.root_element().id)
+    }
+
+    /// Remove an element attribute.
+    pub fn remove_attribute(&mut self, node_id: usize, name: &str) -> Result<(), JsValue> {
+        self.ensure_element(node_id)?;
+        self.document
+            .mutate()
+            .clear_attribute(node_id, html_name(name));
+        Ok(())
+    }
+
+    /// Replace a node's text content.
+    pub fn set_text_content(&mut self, node_id: usize, value: &str) -> Result<(), JsValue> {
+        let node = self
+            .document
+            .get_node(node_id)
+            .ok_or_else(|| invalid_node(node_id))?;
+        let is_text_node = matches!(&node.data, NodeData::Text(_));
+
+        let mut mutator = self.document.mutate();
+        if is_text_node {
+            mutator.set_node_text(node_id, value);
+        } else {
+            mutator.remove_and_drop_all_children(node_id);
+            if !value.is_empty() {
+                let text_id = mutator.create_text_node(value);
+                mutator.append_children(node_id, &[text_id]);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Return the document `<body>` node id.
+    pub fn body(&self) -> Result<usize, JsValue> {
+        self.child_element_by_tag(self.document_element()?, "body")
+    }
+
+    /// Return the document `<head>` node id.
+    pub fn head(&self) -> Result<usize, JsValue> {
+        self.child_element_by_tag(self.document_element()?, "head")
+    }
+
     /// Render the current HTML and return a flat `width × height × 4`
     /// RGBA byte buffer (`TextureFormat::Rgba8Unorm`).
     pub async fn render(&mut self) -> Result<Vec<u8>, JsValue> {
         let w = self.width;
         let h = self.height;
 
-        // Re-create the document each frame so HtmlDocument (which uses Rc
-        // internally and is therefore not Send/Sync) never needs to be stored
-        // in the struct.
-        //
-        // On wasm32-unknown-unknown fontique's system-font backend is a no-op,
-        // so generic CSS families (sans-serif, etc.) have no mapping. Inject
-        // an explicit font-family rule that names the font we embedded.
-        let html_with_font = inject_font_css(&self.html);
-        let mut doc = HtmlDocument::from_html(
-            &html_with_font,
-            DocumentConfig {
-                base_url: Some("https://example.com".to_string()),
-                net_provider: Some(Arc::new(DummyNetProvider::default())),
-                shell_provider: Some(Arc::new(DummyShellProvider)),
-                font_ctx: Some(self.font_ctx.clone()),
-                ..Default::default()
-            },
-        );
-        doc.set_viewport(Viewport::new(w, h, 1.0, ColorScheme::Light));
-        doc.resolve(0.0);
+        self.document
+            .set_viewport(Viewport::new(w, h, 1.0, ColorScheme::Light));
+        self.document.resolve(0.0);
 
         // Clamp scroll offsets to the laid-out content size so the viewport
         // can never scroll past the end of the document.
-        let content = doc.root_element().final_layout.size;
+        let content = self.document.root_element().final_layout.size;
         self.scroll_x = self.scroll_x.min((content.width as u32).saturating_sub(w));
         self.scroll_y = self.scroll_y.min((content.height as u32).saturating_sub(h));
-        doc.set_viewport_scroll(Point {
+        self.document.set_viewport_scroll(Point {
             x: self.scroll_x as f64,
             y: self.scroll_y as f64,
         });
@@ -168,7 +310,7 @@ impl QuoxRenderer {
 
         let mut scene = Scene::new();
         let mut painter = VelloScenePainter::new(&mut scene);
-        paint_scene(&mut painter, &*doc, 1.0, w, h, 0, 0);
+        paint_scene(&mut painter, &self.document, 1.0, w, h, 0, 0);
 
         self.renderer
             .render_to_texture(
