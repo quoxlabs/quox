@@ -20,7 +20,10 @@ use wgpu_context::WGPUContext;
 
 const LIBERATION_SANS: &[u8] = include_bytes!("../assets/LiberationSans-Regular.ttf");
 const FONT_CSS: &str = "html,body,*{font-family:'Liberation Sans',sans-serif;}";
-const BLANK_HTML: &str = "<!DOCTYPE html><html><head></head><body></body></html>";
+
+fn initial_html(head: &str, body: &str) -> String {
+    format!("<!DOCTYPE html><html><head>{head}</head><body>{body}</body></html>")
+}
 
 fn html_name(local_name: &str) -> QualName {
     QualName {
@@ -120,10 +123,15 @@ impl QuoxRendererState {
 
 #[wasm_bindgen]
 impl QuoxRenderer {
-    /// Initialise a renderer with a blank live document and viewport dimensions.
+    /// Initialise a renderer with a live document and viewport dimensions.
     ///
     /// Acquires a WebGPU device; must be `await`ed.
-    pub async fn create(width: u32, height: u32) -> Result<QuoxRenderer, JsValue> {
+    pub async fn create(
+        width: u32,
+        height: u32,
+        head: &str,
+        body: &str,
+    ) -> Result<QuoxRenderer, JsValue> {
         let mut context = WGPUContext::new();
         let dev_id = context
             .find_or_create_device(None)
@@ -147,7 +155,7 @@ impl QuoxRenderer {
             .register_fonts(Blob::new(Arc::new(LIBERATION_SANS) as _), None);
 
         let document = HtmlDocument::from_html(
-            BLANK_HTML,
+            &initial_html(head, body),
             DocumentConfig {
                 base_url: Some("https://example.com".to_string()),
                 net_provider: Some(Arc::new(DummyNetProvider::default())),

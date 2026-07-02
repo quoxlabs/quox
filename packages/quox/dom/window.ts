@@ -2,6 +2,7 @@
 import { QuoxRenderer as WasmRenderer } from "../lib/quox.js";
 import { load as windingLoad } from "@quoxlabs/winding";
 import type { Library as WindingLibrary, UIEvent as WindingUIEvent, Window as WindingWindow } from "@quoxlabs/winding";
+import { render as renderToString } from "preact-render-to-string";
 import { QuoxDocument } from "./document.ts";
 import type { QuoxInnerHTML } from "./node.ts";
 
@@ -36,6 +37,10 @@ export interface WindowOptions {
 }
 
 const BUTTON_INDEX: Record<"left" | "middle" | "right", number> = { left: 0, middle: 1, right: 2 };
+
+function innerHTMLToString(value: QuoxInnerHTML | undefined): string {
+  return value === undefined ? "" : typeof value === "string" ? value : renderToString(value);
+}
 
 function mapWindingEvent(ev: WindingUIEvent): QuoxInputEvent | null {
   switch (ev.type) {
@@ -93,24 +98,18 @@ export class QuoxWindow implements Disposable {
     );
   }
 
-  /** Open a blank window and create a WASM renderer with a live document. */
+  /** Open a window and create a WASM renderer with a live document. */
   static async create(options: WindowOptions = {}): Promise<QuoxWindow> {
     const width = options.width ?? 800;
     const height = options.height ?? 600;
+    const head = innerHTMLToString(options.head);
+    const body = innerHTMLToString(options.body);
 
     const lib = windingLoad();
     const win = lib.openWindow(0, 0, width, height);
-    const renderer = await WasmRenderer.create(width, height);
-    const quoxWindow = new QuoxWindow(lib, win, width, height, renderer);
+    const renderer = await WasmRenderer.create(width, height, head, body);
 
-    if (options.head !== undefined) {
-      quoxWindow.document.head.innerHTML = options.head;
-    }
-    if (options.body !== undefined) {
-      quoxWindow.document.body.innerHTML = options.body;
-    }
-
-    return quoxWindow;
+    return new QuoxWindow(lib, win, width, height, renderer);
   }
 
   /** Start native event polling and queue an initial render. */
