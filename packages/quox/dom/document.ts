@@ -1,29 +1,35 @@
 import type { QuoxRenderer as WasmRenderer } from "../lib/quox.js";
-import { QuoxElement, QuoxText, type RequestRender } from "./node.ts";
+import { attachDocumentInternals, type RequestRender } from "./internals.ts";
+import { QuoxElement, QuoxText } from "./node.ts";
 
 export class QuoxDocument {
+  readonly #renderer: WasmRenderer;
+
   constructor(
-    private readonly renderer: WasmRenderer,
-    private readonly requestRender: RequestRender,
-  ) {}
+    renderer: WasmRenderer,
+    requestRender: RequestRender,
+  ) {
+    this.#renderer = renderer;
+    attachDocumentInternals(this, { renderer, requestRender });
+  }
 
   get documentElement(): QuoxElement {
-    return new QuoxElement(this.renderer, this.renderer.document_element(), this.requestRender);
+    return new QuoxElement(this, this.#renderer.document_element());
   }
 
   get head(): QuoxElement {
-    return new QuoxElement(this.renderer, this.renderer.head(), this.requestRender);
+    return new QuoxElement(this, this.#renderer.head());
   }
 
   get body(): QuoxElement {
-    return new QuoxElement(this.renderer, this.renderer.body(), this.requestRender);
+    return new QuoxElement(this, this.#renderer.body());
   }
 
   createElement(tagName: string): QuoxElement {
-    return new QuoxElement(this.renderer, this.renderer.create_element(tagName), this.requestRender);
+    return new QuoxElement(this, this.#renderer.create_element(tagName));
   }
 
   createTextNode(text: string): QuoxText {
-    return new QuoxText(this.renderer, this.renderer.create_text_node(text), this.requestRender);
+    return new QuoxText(this, this.#renderer.create_text_node(text));
   }
 }

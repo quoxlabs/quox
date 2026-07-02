@@ -1,62 +1,63 @@
-import type { QuoxRenderer as WasmRenderer } from "../lib/quox.js";
 import type { VNode } from "preact";
 import { render as renderToString } from "preact-render-to-string";
+import type { QuoxDocument } from "./document.ts";
+import { documentInternals } from "./internals.ts";
 
-export type RequestRender = () => void;
 export type QuoxInnerHTML = string | VNode;
 
 export class QuoxNode {
-  protected constructor(
-    protected readonly renderer: WasmRenderer,
+  constructor(
+    readonly ownerDocument: QuoxDocument,
     readonly nodeId: number,
-    protected readonly requestRender: RequestRender,
   ) {}
 
   get textContent(): string {
-    return this.renderer.text_content(this.nodeId);
+    return documentInternals(this.ownerDocument).renderer.text_content(this.nodeId);
   }
 
   set textContent(value: string | null) {
-    this.renderer.set_text_content(this.nodeId, value ?? "");
-    this.requestRender();
+    const { renderer, requestRender } = documentInternals(this.ownerDocument);
+    renderer.set_text_content(this.nodeId, value ?? "");
+    requestRender();
   }
 
   appendChild<T extends QuoxNode>(child: T): T {
-    this.renderer.append_child(this.nodeId, child.nodeId);
-    this.requestRender();
+    if (child.ownerDocument !== this.ownerDocument) {
+      throw new TypeError("node belongs to a different document");
+    }
+
+    const { renderer, requestRender } = documentInternals(this.ownerDocument);
+    renderer.append_child(this.nodeId, child.nodeId);
+    requestRender();
     return child;
   }
 
   remove(): void {
-    this.renderer.remove_node(this.nodeId);
-    this.requestRender();
+    const { renderer, requestRender } = documentInternals(this.ownerDocument);
+    renderer.remove_node(this.nodeId);
+    requestRender();
   }
 }
 
 export class QuoxElement extends QuoxNode {
-  constructor(renderer: WasmRenderer, nodeId: number, requestRender: RequestRender) {
-    super(renderer, nodeId, requestRender);
-  }
-
   set innerHTML(value: QuoxInnerHTML) {
-    const stringValue = typeof value === "string" ? value : renderToString(value);
-    this.renderer.set_inner_html(this.nodeId, stringValue);
-    this.requestRender();
+    const { renderer, requestRender } = documentInternals(this.ownerDocument);
+    const html = typeof value === "string" ? value : renderToString(value);
+    renderer.set_inner_html(this.nodeId, html);
+    requestRender();
   }
 
   setAttribute(name: string, value: string): void {
-    this.renderer.set_attribute(this.nodeId, name, value);
-    this.requestRender();
+    const { renderer, requestRender } = documentInternals(this.ownerDocument);
+    renderer.set_attribute(this.nodeId, name, value);
+    requestRender();
   }
 
   removeAttribute(name: string): void {
-    this.renderer.remove_attribute(this.nodeId, name);
-    this.requestRender();
+    const { renderer, requestRender } = documentInternals(this.ownerDocument);
+    renderer.remove_attribute(this.nodeId, name);
+    requestRender();
   }
 }
 
-export class QuoxText extends QuoxNode {
-  constructor(renderer: WasmRenderer, nodeId: number, requestRender: RequestRender) {
-    super(renderer, nodeId, requestRender);
-  }
-}
+export class QuoxText extends QuoxNode {}
