@@ -29,8 +29,10 @@ export interface WindowOptions {
   width?: number;
   /** Height of the window in pixels (default 600). */
   height?: number;
-  /** Initial content for `document.documentElement.innerHTML`. */
-  innerHTML?: QuoxInnerHTML;
+  /** Initial content for `document.head.innerHTML`. */
+  head?: QuoxInnerHTML;
+  /** Initial content for `document.body.innerHTML`. */
+  body?: QuoxInnerHTML;
 }
 
 const BUTTON_INDEX: Record<"left" | "middle" | "right", number> = { left: 0, middle: 1, right: 2 };
@@ -101,8 +103,11 @@ export class QuoxWindow implements Disposable {
     const renderer = await WasmRenderer.create(width, height);
     const quoxWindow = new QuoxWindow(lib, win, width, height, renderer);
 
-    if (options.innerHTML !== undefined) {
-      quoxWindow.document.documentElement.innerHTML = options.innerHTML;
+    if (options.head !== undefined) {
+      quoxWindow.document.head.innerHTML = options.head;
+    }
+    if (options.body !== undefined) {
+      quoxWindow.document.body.innerHTML = options.body;
     }
 
     return quoxWindow;

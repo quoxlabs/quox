@@ -20,7 +20,7 @@ quox already works as a hello world example. Paste the following code to `main.t
 /** @jsxImportSource npm:preact */
 import { openWindow } from "jsr:@quoxlabs/quox";
 
-await openWindow({ innerHTML: <h1>Hello, world!</h1> });
+await openWindow({ body: <h1>Hello, world!</h1> });
 ```
 
 Running
