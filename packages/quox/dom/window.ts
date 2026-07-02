@@ -68,6 +68,7 @@ export class QuoxWindow implements Disposable {
   #needsRender = false;
   #stopped = false;
   #disposed = false;
+  #rendererFreed = false;
   readonly #listeners: Array<(event: QuoxInputEvent) => void> = [];
   readonly document: QuoxDocument;
 
@@ -83,7 +84,11 @@ export class QuoxWindow implements Disposable {
     this.#width = width;
     this.#height = height;
     this.#renderer = renderer;
-    this.document = new QuoxDocument(renderer, () => this.#requestRender());
+    this.document = new QuoxDocument(
+      renderer,
+      () => this.#requestRender(),
+      () => this.#assertActiveDocument(),
+    );
   }
 
   /** Open a blank window and create a WASM renderer with a live document. */
@@ -163,6 +168,12 @@ export class QuoxWindow implements Disposable {
     }, 0);
   }
 
+  #assertActiveDocument(): void {
+    if (this.#stopped || this.#disposed || this.#rendererFreed) {
+      throw new Error("window is not active");
+    }
+  }
+
   async #renderIfNeeded(): Promise<void> {
     if (this.#stopped || this.#disposed || this.#rendering || !this.#needsRender) return;
 
@@ -207,7 +218,13 @@ export class QuoxWindow implements Disposable {
       this.#intervalId = null;
     }
 
+    this.#releaseRenderer();
+  }
+
+  #releaseRenderer(): void {
+    if (this.#rendererFreed) return;
     this.#renderer.free();
+    this.#rendererFreed = true;
   }
 
   [Symbol.dispose](): void {
