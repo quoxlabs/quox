@@ -30,6 +30,14 @@ fn html_name(local_name: &str) -> QualName {
     }
 }
 
+fn attr_name(local_name: &str) -> QualName {
+    QualName {
+        prefix: None,
+        ns: ns!(),
+        local: LocalName::from(local_name),
+    }
+}
+
 fn invalid_node(node_id: usize) -> JsValue {
     JsValue::from_str(&format!("Invalid DOM node id: {node_id}"))
 }
@@ -217,7 +225,7 @@ impl QuoxRenderer {
         let mut state = self.state.borrow_mut();
         state.ensure_element(node_id)?;
         state.mutate_document(|mutator| {
-            mutator.set_attribute(node_id, html_name(name), value);
+            mutator.set_attribute(node_id, attr_name(name), value);
             Ok(())
         })
     }
@@ -257,7 +265,7 @@ impl QuoxRenderer {
         let mut state = self.state.borrow_mut();
         state.ensure_element(node_id)?;
         state.mutate_document(|mutator| {
-            mutator.clear_attribute(node_id, html_name(name));
+            mutator.clear_attribute(node_id, attr_name(name));
             Ok(())
         })
     }
