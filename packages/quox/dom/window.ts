@@ -157,10 +157,10 @@ export class QuoxWindow implements Disposable {
     if (this.#renderQueued) return;
 
     this.#renderQueued = true;
-    queueMicrotask(() => {
+    setTimeout(() => {
       this.#renderQueued = false;
       void this.#renderIfNeeded();
-    });
+    }, 0);
   }
 
   async #renderIfNeeded(): Promise<void> {
@@ -168,13 +168,15 @@ export class QuoxWindow implements Disposable {
 
     this.#rendering = true;
     this.#needsRender = false;
+    const renderWidth = this.#width;
+    const renderHeight = this.#height;
     try {
       // Render the retained Blitz document via WebGPU in WASM.
       const rgba = await this.#renderer.render();
 
       if (!this.#stopped && !this.#disposed) {
         // Blit RGBA buffer to the window (conversion to native pixel format is handled by winding).
-        this.#win.blit(rgba, this.#width, this.#height);
+        this.#win.blit(rgba, renderWidth, renderHeight);
       }
     } catch (err) {
       console.error("Quox render failed:", err);

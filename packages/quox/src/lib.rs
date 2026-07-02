@@ -8,6 +8,7 @@ use blitz_paint::paint_scene;
 use blitz_traits::net::DummyNetProvider;
 use blitz_traits::shell::{ColorScheme, DummyShellProvider, Viewport};
 use linebender_resource_handle::Blob;
+use std::cell::RefCell;
 use std::sync::Arc;
 use vello::wgpu::{
     self, BufferDescriptor, BufferUsages, Extent3d, TexelCopyBufferInfo, TexelCopyBufferLayout,
@@ -49,6 +50,10 @@ pub fn start() {
 /// e.g. via X11 FFI using `XPutImage`.
 #[wasm_bindgen]
 pub struct QuoxRenderer {
+    state: RefCell<QuoxRendererState>,
+}
+
+struct QuoxRendererState {
     document: BaseDocument,
     width: u32,
     height: u32,
@@ -59,9 +64,16 @@ pub struct QuoxRenderer {
     renderer: Renderer,
 }
 
-impl QuoxRenderer {
-    fn mutate(&mut self) -> DocumentMutator<'_> {
-        self.document.mutate()
+impl QuoxRendererState {
+    fn mutate_document<T>(
+        &mut self,
+        op: impl FnOnce(&mut DocumentMutator<'_>) -> Result<T, JsValue>,
+    ) -> Result<T, JsValue> {
+        let mut mutator = self.document.mutate();
+        let result = op(&mut mutator);
+        drop(mutator);
+
+        result
     }
 
     fn ensure_node(&self, node_id: usize) -> Result<(), JsValue> {
@@ -141,218 +153,252 @@ impl QuoxRenderer {
         .into_inner();
 
         Ok(QuoxRenderer {
-            document,
-            width: width.max(1),
-            height: height.max(1),
-            scroll_x: 0,
-            scroll_y: 0,
-            context,
-            dev_id,
-            renderer,
+            state: RefCell::new(QuoxRendererState {
+                document,
+                width: width.max(1),
+                height: height.max(1),
+                scroll_x: 0,
+                scroll_y: 0,
+                context,
+                dev_id,
+                renderer,
+            }),
         })
     }
 
     /// Resize the rendering viewport.
-    pub fn resize(&mut self, width: u32, height: u32) {
-        self.width = width.max(1);
-        self.height = height.max(1);
+    pub fn resize(&self, width: u32, height: u32) {
+        let mut state = self.state.borrow_mut();
+        state.width = width.max(1);
+        state.height = height.max(1);
     }
 
     /// Scroll the viewport by the given pixel delta. Negative values scroll
     /// towards the top/left; the position is clamped to 0 at the origin.
-    pub fn scroll(&mut self, delta_x: i32, delta_y: i32) {
-        self.scroll_x = self.scroll_x.saturating_add_signed(delta_x);
-        self.scroll_y = self.scroll_y.saturating_add_signed(delta_y);
+    pub fn scroll(&self, delta_x: i32, delta_y: i32) {
+        let mut state = self.state.borrow_mut();
+        state.scroll_x = state.scroll_x.saturating_add_signed(delta_x);
+        state.scroll_y = state.scroll_y.saturating_add_signed(delta_y);
     }
 
     /// Remove a node from the retained document.
-    pub fn remove_node(&mut self, node_id: usize) -> Result<(), JsValue> {
-        self.ensure_node(node_id)?;
-        self.mutate().remove_node(node_id);
-        Ok(())
+    pub fn remove_node(&self, node_id: usize) -> Result<(), JsValue> {
+        let mut state = self.state.borrow_mut();
+        state.ensure_node(node_id)?;
+        state.mutate_document(|mutator| {
+            mutator.remove_node(node_id);
+            Ok(())
+        })
     }
 
     // Append `child_id` to `parent_id`.
-    pub fn append_child(&mut self, parent_id: usize, child_id: usize) -> Result<(), JsValue> {
-        self.ensure_node(parent_id)?;
-        self.ensure_node(child_id)?;
-        self.mutate().append_children(parent_id, &[child_id]);
-        Ok(())
+    pub fn append_child(&self, parent_id: usize, child_id: usize) -> Result<(), JsValue> {
+        let mut state = self.state.borrow_mut();
+        state.ensure_node(parent_id)?;
+        state.ensure_node(child_id)?;
+        state.mutate_document(|mutator| {
+            mutator.append_children(parent_id, &[child_id]);
+            Ok(())
+        })
     }
 
     /// Return a node's text content.
     pub fn text_content(&self, node_id: usize) -> Result<String, JsValue> {
-        self.document
+        let state = self.state.borrow();
+        state
+            .document
             .get_node(node_id)
             .map(|node| node.text_content())
             .ok_or_else(|| invalid_node(node_id))
     }
 
     /// Set an element attribute.
-    pub fn set_attribute(
-        &mut self,
-        node_id: usize,
-        name: &str,
-        value: &str,
-    ) -> Result<(), JsValue> {
-        self.ensure_element(node_id)?;
-        self.mutate().set_attribute(node_id, html_name(name), value);
-        Ok(())
+    pub fn set_attribute(&self, node_id: usize, name: &str, value: &str) -> Result<(), JsValue> {
+        let mut state = self.state.borrow_mut();
+        state.ensure_element(node_id)?;
+        state.mutate_document(|mutator| {
+            mutator.set_attribute(node_id, html_name(name), value);
+            Ok(())
+        })
     }
 
     /// Create an element node in the retained document.
-    pub fn create_element(&mut self, tag_name: &str) -> Result<usize, JsValue> {
-        let node_id = self
-            .mutate()
-            .create_element(html_name(&tag_name.to_ascii_lowercase()), Vec::new());
-        Ok(node_id)
+    pub fn create_element(&self, tag_name: &str) -> Result<usize, JsValue> {
+        let mut state = self.state.borrow_mut();
+        state.mutate_document(|mutator| {
+            Ok(mutator.create_element(html_name(&tag_name.to_ascii_lowercase()), Vec::new()))
+        })
     }
 
     /// Replace an element's children by parsing an HTML fragment through Blitz's mutator.
-    pub fn set_inner_html(&mut self, node_id: usize, html: &str) -> Result<(), JsValue> {
-        self.ensure_element(node_id)?;
-        self.mutate().set_inner_html(node_id, html);
-        Ok(())
+    pub fn set_inner_html(&self, node_id: usize, html: &str) -> Result<(), JsValue> {
+        let mut state = self.state.borrow_mut();
+        state.ensure_element(node_id)?;
+        state.mutate_document(|mutator| {
+            mutator.set_inner_html(node_id, html);
+            Ok(())
+        })
     }
 
     /// Create a text node in the retained document.
-    pub fn create_text_node(&mut self, text: &str) -> Result<usize, JsValue> {
-        let node_id = self.mutate().create_text_node(text);
-        Ok(node_id)
+    pub fn create_text_node(&self, text: &str) -> Result<usize, JsValue> {
+        let mut state = self.state.borrow_mut();
+        state.mutate_document(|mutator| Ok(mutator.create_text_node(text)))
     }
 
     /// Return the root `<html>` element node id.
     pub fn document_element(&self) -> Result<usize, JsValue> {
-        Ok(self.document.root_element().id)
+        let state = self.state.borrow();
+        Ok(state.document.root_element().id)
     }
 
     /// Remove an element attribute.
-    pub fn remove_attribute(&mut self, node_id: usize, name: &str) -> Result<(), JsValue> {
-        self.ensure_element(node_id)?;
-        self.mutate().clear_attribute(node_id, html_name(name));
-        Ok(())
+    pub fn remove_attribute(&self, node_id: usize, name: &str) -> Result<(), JsValue> {
+        let mut state = self.state.borrow_mut();
+        state.ensure_element(node_id)?;
+        state.mutate_document(|mutator| {
+            mutator.clear_attribute(node_id, html_name(name));
+            Ok(())
+        })
     }
 
     /// Replace a node's text content.
-    pub fn set_text_content(&mut self, node_id: usize, value: &str) -> Result<(), JsValue> {
-        let node = self
-            .document
-            .get_node(node_id)
-            .ok_or_else(|| invalid_node(node_id))?;
-        let is_text_node = matches!(&node.data, NodeData::Text(_));
+    pub fn set_text_content(&self, node_id: usize, value: &str) -> Result<(), JsValue> {
+        let mut state = self.state.borrow_mut();
+        let is_text_node = {
+            let node = state
+                .document
+                .get_node(node_id)
+                .ok_or_else(|| invalid_node(node_id))?;
+            matches!(&node.data, NodeData::Text(_))
+        };
 
-        let mut mutator = self.mutate();
-        if is_text_node {
-            mutator.set_node_text(node_id, value);
-        } else {
-            mutator.remove_and_drop_all_children(node_id);
-            if !value.is_empty() {
-                let text_id = mutator.create_text_node(value);
-                mutator.append_children(node_id, &[text_id]);
+        state.mutate_document(|mutator| {
+            if is_text_node {
+                mutator.set_node_text(node_id, value);
+            } else {
+                mutator.remove_and_drop_all_children(node_id);
+                if !value.is_empty() {
+                    let text_id = mutator.create_text_node(value);
+                    mutator.append_children(node_id, &[text_id]);
+                }
             }
-        }
 
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Return the document `<body>` node id.
     pub fn body(&self) -> Result<usize, JsValue> {
-        self.child_element_by_tag(self.document_element()?, "body")
+        let state = self.state.borrow();
+        state.child_element_by_tag(state.document.root_element().id, "body")
     }
 
     /// Return the document `<head>` node id.
     pub fn head(&self) -> Result<usize, JsValue> {
-        self.child_element_by_tag(self.document_element()?, "head")
+        let state = self.state.borrow();
+        state.child_element_by_tag(state.document.root_element().id, "head")
     }
 
     /// Render the current HTML and return a flat `width × height × 4`
     /// RGBA byte buffer (`TextureFormat::Rgba8Unorm`).
-    pub async fn render(&mut self) -> Result<Vec<u8>, JsValue> {
-        let w = self.width;
-        let h = self.height;
+    pub async fn render(&self) -> Result<Vec<u8>, JsValue> {
+        let (_texture, gpu_buffer, row_bytes, padded_row_bytes, w, h) = {
+            let mut state = self.state.borrow_mut();
+            let w = state.width;
+            let h = state.height;
 
-        self.document
-            .set_viewport(Viewport::new(w, h, 1.0, ColorScheme::Light));
-        self.document.resolve(0.0);
+            state
+                .document
+                .set_viewport(Viewport::new(w, h, 1.0, ColorScheme::Light));
+            state.document.resolve(0.0);
 
-        // Clamp scroll offsets to the laid-out content size so the viewport
-        // can never scroll past the end of the document.
-        let content = self.document.root_element().final_layout.size;
-        self.scroll_x = self.scroll_x.min((content.width as u32).saturating_sub(w));
-        self.scroll_y = self.scroll_y.min((content.height as u32).saturating_sub(h));
-        self.document.set_viewport_scroll(Point {
-            x: self.scroll_x as f64,
-            y: self.scroll_y as f64,
-        });
+            // Clamp scroll offsets to the laid-out content size so the viewport
+            // can never scroll past the end of the document.
+            let content = state.document.root_element().final_layout.size;
+            state.scroll_x = state.scroll_x.min((content.width as u32).saturating_sub(w));
+            state.scroll_y = state
+                .scroll_y
+                .min((content.height as u32).saturating_sub(h));
+            let scroll_x = state.scroll_x;
+            let scroll_y = state.scroll_y;
+            state.document.set_viewport_scroll(Point {
+                x: scroll_x as f64,
+                y: scroll_y as f64,
+            });
 
-        let device_handle = self.context.device_pool[self.dev_id].clone();
+            let device_handle = state.context.device_pool[state.dev_id].clone();
 
-        let texture = device_handle.device.create_texture(&TextureDescriptor {
-            label: Some("quox-target"),
-            size: Extent3d {
-                width: w,
-                height: h,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format: TextureFormat::Rgba8Unorm,
-            usage: TextureUsages::RENDER_ATTACHMENT
-                | TextureUsages::COPY_SRC
-                | TextureUsages::STORAGE_BINDING,
-            view_formats: &[],
-        });
-        let texture_view = texture.create_view(&TextureViewDescriptor::default());
-
-        let mut scene = Scene::new();
-        let mut painter = VelloScenePainter::new(&mut scene);
-        paint_scene(&mut painter, &self.document, 1.0, w, h, 0, 0);
-
-        self.renderer
-            .render_to_texture(
-                &device_handle.device,
-                &device_handle.queue,
-                &scene,
-                &texture_view,
-                &RenderParams {
-                    base_color: vello::peniko::Color::WHITE,
+            let texture = device_handle.device.create_texture(&TextureDescriptor {
+                label: Some("quox-target"),
+                size: Extent3d {
                     width: w,
                     height: h,
-                    antialiasing_method: AaConfig::Area,
+                    depth_or_array_layers: 1,
                 },
-            )
-            .map_err(|e| JsValue::from_str(&format!("Vello render: {e:?}")))?;
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: TextureFormat::Rgba8Unorm,
+                usage: TextureUsages::RENDER_ATTACHMENT
+                    | TextureUsages::COPY_SRC
+                    | TextureUsages::STORAGE_BINDING,
+                view_formats: &[],
+            });
+            let texture_view = texture.create_view(&TextureViewDescriptor::default());
 
-        let row_bytes = w * 4;
-        let padded_row_bytes = row_bytes.next_multiple_of(256);
-        let out_size = (padded_row_bytes as u64) * (h as u64);
-        let gpu_buffer = device_handle.device.create_buffer(&BufferDescriptor {
-            label: Some("quox-readback"),
-            size: out_size,
-            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+            let mut scene = Scene::new();
+            let mut painter = VelloScenePainter::new(&mut scene);
+            paint_scene(&mut painter, &state.document, 1.0, w, h, 0, 0);
 
-        let mut encoder =
-            device_handle
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("quox-copy"),
-                });
-        encoder.copy_texture_to_buffer(
-            texture.as_image_copy(),
-            TexelCopyBufferInfo {
-                buffer: &gpu_buffer,
-                layout: TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(padded_row_bytes),
-                    rows_per_image: None,
+            state
+                .renderer
+                .render_to_texture(
+                    &device_handle.device,
+                    &device_handle.queue,
+                    &scene,
+                    &texture_view,
+                    &RenderParams {
+                        base_color: vello::peniko::Color::WHITE,
+                        width: w,
+                        height: h,
+                        antialiasing_method: AaConfig::Area,
+                    },
+                )
+                .map_err(|e| JsValue::from_str(&format!("Vello render: {e:?}")))?;
+
+            let row_bytes = w * 4;
+            let padded_row_bytes = row_bytes.next_multiple_of(256);
+            let out_size = (padded_row_bytes as u64) * (h as u64);
+            let gpu_buffer = device_handle.device.create_buffer(&BufferDescriptor {
+                label: Some("quox-readback"),
+                size: out_size,
+                usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+            let mut encoder =
+                device_handle
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("quox-copy"),
+                    });
+            encoder.copy_texture_to_buffer(
+                texture.as_image_copy(),
+                TexelCopyBufferInfo {
+                    buffer: &gpu_buffer,
+                    layout: TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded_row_bytes),
+                        rows_per_image: None,
+                    },
                 },
-            },
-            texture.size(),
-        );
-        device_handle.queue.submit([encoder.finish()]);
+                texture.size(),
+            );
+            device_handle.queue.submit([encoder.finish()]);
+
+            (texture, gpu_buffer, row_bytes, padded_row_bytes, w, h)
+        };
 
         let mut rgba = vec![0u8; (w as usize) * (h as usize) * 4];
         let buf_slice = gpu_buffer.slice(..);
