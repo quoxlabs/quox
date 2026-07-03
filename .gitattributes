@@ -1,0 +1,6 @@
+# Normalize all text files to use LF line endings in the repository,
+# regardless of the platform they are checked out or committed on.
+* text=auto eol=lf
+
+# Explicitly mark known binary files so Git never touches their line endings.
+*.ttf binary
