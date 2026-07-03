@@ -1,7 +1,9 @@
 {
   "name": "@quoxlabs/quox",
   "version": "0.0.3",
-  "exports": "./mod.ts",
+  "exports": {
+    ".": "./mod.ts"
+  },
   "license": "MIT",
   "tasks": {
     "wasmbuild": "deno run -A jsr:@deno/wasmbuild@0.21.1",
@@ -14,9 +16,5 @@
       "./dom/",
       "./lib/"
     ]
-  },
-  "imports": {
-    "preact": "npm:preact@^10.29.1",
-    "preact-render-to-string": "npm:preact-render-to-string@^6.6.7"
   }
 }

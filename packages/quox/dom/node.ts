@@ -1,9 +1,7 @@
-import type { VNode } from "preact";
-import { render as renderToString } from "preact-render-to-string";
 import type { QuoxDocument } from "./document.ts";
 import { documentInternals } from "./internals.ts";
 
-export type QuoxInnerHTML = string | VNode;
+export type QuoxInnerHTML = string;
 
 export class QuoxNode {
   constructor(
@@ -42,7 +40,7 @@ export class QuoxNode {
 export class QuoxElement extends QuoxNode {
   set innerHTML(value: QuoxInnerHTML) {
     const { renderer, requestRender } = documentInternals(this.ownerDocument);
-    const html = typeof value === "string" ? value : renderToString(value);
+    const html = value;
     renderer.set_inner_html(this.nodeId, html);
     requestRender();
   }
