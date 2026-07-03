@@ -1,6 +1,5 @@
 /** @jsxImportSource @quoxlabs/jsx */
 import { openWindow } from "../packages/quox/mod.ts";
-import { mountRenderable } from "../packages/jsx/mod.ts";
 
 const head = (
   <style>
@@ -28,7 +27,5 @@ const App = () => (
 );
 
 if (import.meta.main) {
-  const win = await openWindow();
-  mountRenderable(win.document.head, head);
-  mountRenderable(win.document.body, <App />);
+  await openWindow({ head, body: <App /> });
 }
