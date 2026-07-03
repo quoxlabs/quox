@@ -19,8 +19,10 @@ quox already works as a hello world example. Paste the following code to `main.t
 ```tsx
 /** @jsxImportSource jsr:@quoxlabs/jsx */
 import { openWindow } from "jsr:@quoxlabs/quox";
+import { mountRenderable } from "jsr:@quoxlabs/jsx";
 
-await openWindow({ body: <h1>Hello, world!</h1> });
+const win = await openWindow();
+mountRenderable(win.document.body, <h1>Hello, world!</h1>);
 ```
 
 Running
