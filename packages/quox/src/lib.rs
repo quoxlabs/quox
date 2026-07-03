@@ -137,8 +137,14 @@ impl QuoxRendererState {
         }))
     }
 
+    /// Find the document's `<title>` element, if any. Mirrors the HTML spec's tolerance for a
+    /// missing `<head>` (e.g. after `document.head.remove()`) by returning `None` rather than
+    /// failing, so title lookups never break unrelated DOM operations.
     fn title_element(&self) -> Result<Option<usize>, JsValue> {
-        let head_id = self.child_element_by_tag(self.document.root_element().id, "head")?;
+        let Some(head_id) = self.optional_child_element_by_tag(self.document.root_element().id, "head")?
+        else {
+            return Ok(None);
+        };
         self.optional_child_element_by_tag(head_id, "title")
     }
 }
@@ -340,9 +346,14 @@ impl QuoxRenderer {
     }
 
     /// Replace the first document `<title>` text, creating the element in `<head>` if needed.
+    /// Mirrors the HTML spec's `document.title` setter: if there is no `<head>` (e.g. after
+    /// `document.head.remove()`), this is a no-op rather than an error.
     pub fn set_title(&self, value: &str) -> Result<(), JsValue> {
         let mut state = self.state.borrow_mut();
-        let head_id = state.child_element_by_tag(state.document.root_element().id, "head")?;
+        let Some(head_id) = state.optional_child_element_by_tag(state.document.root_element().id, "head")?
+        else {
+            return Ok(());
+        };
         let existing_title_id = state.optional_child_element_by_tag(head_id, "title")?;
 
         state.mutate_document(|mutator| {
