@@ -30,6 +30,8 @@ export const gdi32functions = {
 export const user32functions = {
   GetDC: { parameters: ["pointer"], result: "pointer" },
   ReleaseDC: { parameters: ["pointer", "pointer"], result: "i32" },
+  SetCapture: { parameters: ["pointer"], result: "pointer" },
+  ReleaseCapture: { parameters: [], result: "bool" },
   LoadCursorW: { parameters: ["pointer", "usize"], result: "usize" },
   RegisterClassExW: {
     parameters: ["buffer"],
@@ -66,3 +68,25 @@ export const user32functions = {
     result: "usize",
   },
 } as const satisfies Deno.ForeignLibraryInterface;
+
+/** Window message identifiers handled by wndProc. See WinUser.h. */
+export enum WM {
+  KEYDOWN = 0x0100,
+  KEYUP = 0x0101,
+  SYSKEYDOWN = 0x0104,
+  SYSKEYUP = 0x0105,
+  SIZE = 0x0005,
+  CLOSE = 0x0010,
+  MOUSEMOVE = 0x0200,
+  LBUTTONDOWN = 0x0201,
+  LBUTTONUP = 0x0202,
+  RBUTTONDOWN = 0x0204,
+  RBUTTONUP = 0x0205,
+  MBUTTONDOWN = 0x0207,
+  MBUTTONUP = 0x0208,
+  MOUSEWHEEL = 0x020A,
+  MOUSEHWHEEL = 0x020E,
+}
+
+/** Wheel delta per notch, see WHEEL_DELTA in WinUser.h. */
+export const WHEEL_DELTA = 120;
