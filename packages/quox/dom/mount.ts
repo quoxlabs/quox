@@ -13,17 +13,18 @@ type NormalizedVNode = {
 export type QuoxRenderable = string | number | bigint | boolean | null | undefined | object | QuoxRenderable[];
 
 /** Mount a JSX value (from any recognized runtime) into `parent`, returning the created nodes. */
-export function mount(parent: QuoxElement, value: QuoxRenderable): QuoxNode[] {
-  const nodes = createNodes(parent.ownerDocument, value);
+export async function mount(parent: QuoxElement, value: QuoxRenderable): Promise<QuoxNode[]> {
+  const nodes = await createNodes(parent.ownerDocument, value);
   for (const node of nodes) parent.appendChild(node);
   return nodes;
 }
 
-function createNodes(document: QuoxDocument, value: unknown): QuoxNode[] {
+async function createNodes(document: QuoxDocument, value: unknown): Promise<QuoxNode[]> {
   if (value === null || value === undefined || typeof value === "boolean") return [];
 
   if (Array.isArray(value)) {
-    return value.flatMap((child) => createNodes(document, child));
+    const groups = await Promise.all(value.map((child) => createNodes(document, child)));
+    return groups.flat();
   }
 
   switch (typeof value) {
@@ -50,16 +51,13 @@ function createNodes(document: QuoxDocument, value: unknown): QuoxNode[] {
 
   if (typeof vnode.type === "function") {
     const component = vnode.type as (props: QuoxProps & { children?: unknown }) => unknown;
-    const rendered = component(componentProps(vnode));
-    if (isPromiseLike(rendered)) {
-      throw new TypeError("Async Quox components are not supported yet.");
-    }
+    const rendered = await component(componentProps(vnode));
     return createNodes(document, rendered);
   }
 
   const element = document.createElement(vnode.type);
   applyProps(element, vnode.props);
-  for (const node of createNodes(document, vnode.children)) {
+  for (const node of await createNodes(document, vnode.children)) {
     element.appendChild(node);
   }
 
@@ -138,12 +136,4 @@ function attributeName(name: string): string {
     default:
       return name;
   }
-}
-
-function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
-  return (
-    (typeof value === "object" || typeof value === "function") &&
-    value !== null &&
-    typeof (value as { then?: unknown }).then === "function"
-  );
 }

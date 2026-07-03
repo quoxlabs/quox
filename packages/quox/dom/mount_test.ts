@@ -1,5 +1,5 @@
 import { createVNode, Fragment, type QuoxRenderable, type QuoxVNodeType } from "@quoxlabs/jsx";
-import { assert, assertEquals, assertThrows } from "@std/assert";
+import { assert, assertEquals, assertRejects } from "@std/assert";
 import type { QuoxRenderer as WasmRenderer } from "../lib/quox.js";
 import { QuoxDocument } from "./document.ts";
 import { getElementFunctionProps } from "./handlers.ts";
@@ -93,7 +93,7 @@ function createTestDocument(): {
   };
 }
 
-Deno.test("mount walks fragments, function components, and nested arrays", () => {
+Deno.test("mount walks fragments, function components, and nested arrays", async () => {
   const { renderer, root } = createTestDocument();
   const Leaf = (props: { label: string; children?: QuoxRenderable }) =>
     createVNode("span", {
@@ -101,7 +101,7 @@ Deno.test("mount walks fragments, function components, and nested arrays", () =>
       children: [props.label, props.children],
     });
 
-  mount(
+  await mount(
     root,
     createVNode(Fragment, {
       children: [
@@ -138,10 +138,10 @@ Deno.test("mount walks fragments, function components, and nested arrays", () =>
   ]);
 });
 
-Deno.test("mount lowers props and stores function-valued DOM props", () => {
+Deno.test("mount lowers props and stores function-valued DOM props", async () => {
   const { renderer, root } = createTestDocument();
   const onClick = () => "clicked";
-  const [node] = mount(
+  const [node] = await mount(
     root,
     createVNode("label", {
       className: "cta",
@@ -178,24 +178,74 @@ Deno.test("mount lowers props and stores function-valued DOM props", () => {
   assert(getElementFunctionProps(node as QuoxElement)?.get("onClick") === onClick, "onClick was not stored");
 });
 
-Deno.test("mount rejects unsupported object attributes", () => {
+Deno.test("mount rejects unsupported object attributes", async () => {
   const { root } = createTestDocument();
 
-  assertThrows(
+  await assertRejects(
     () => mount(root, createVNode("div", { value: { nested: true } })),
     TypeError,
     'Cannot set object value as "value" attribute.',
   );
 });
 
-Deno.test("mount rejects async function components", () => {
-  const { root } = createTestDocument();
-  const AsyncComponent = (() => Promise.resolve(createVNode("p", null))) as unknown as QuoxVNodeType;
+Deno.test("mount awaits async function components", async () => {
+  const { renderer, root } = createTestDocument();
+  const AsyncComponent = (() => Promise.resolve(createVNode("p", { children: "hi" }))) as unknown as QuoxVNodeType;
 
-  assertThrows(
-    () => mount(root, createVNode(AsyncComponent, null)),
-    TypeError,
-    "Async Quox components are not supported yet.",
+  await mount(root, createVNode(AsyncComponent, null));
+
+  assertEquals(renderer.operations, [
+    { type: "create_element", id: 1, tagName: "p" },
+    { type: "create_text_node", id: 2, text: "hi" },
+    { type: "append_child", parentId: 1, childId: 2 },
+    { type: "append_child", parentId: 0, childId: 1 },
+  ]);
+});
+
+Deno.test("mount preserves source order when concurrent async siblings resolve out of order", async () => {
+  const { renderer, root } = createTestDocument();
+  let resolveFirst!: (v: unknown) => void;
+  let resolveSecond!: (v: unknown) => void;
+  const First = (() => new Promise((resolve) => { resolveFirst = resolve; })) as unknown as QuoxVNodeType;
+  const Second = (() => new Promise((resolve) => { resolveSecond = resolve; })) as unknown as QuoxVNodeType;
+
+  const pending = mount(root, [
+    createVNode(First, null),
+    createVNode(Second, null),
+  ]);
+
+  resolveSecond(createVNode("span", { children: "second" }));
+  resolveFirst(createVNode("span", { children: "first" }));
+
+  await pending;
+
+  assertEquals(
+    renderer.operations.filter((op) => op.type === "create_text_node").map((op) => (op as { text: string }).text),
+    ["first", "second"],
+  );
+});
+
+Deno.test("mount propagates rejection from an async function component", async () => {
+  const { root } = createTestDocument();
+  const Failing = (() => Promise.reject(new Error("boom"))) as unknown as QuoxVNodeType;
+
+  await assertRejects(
+    () => mount(root, createVNode(Failing, null)),
+    Error,
+    "boom",
+  );
+});
+
+Deno.test("mount propagates a synchronous throw from a function component as a rejection", async () => {
+  const { root } = createTestDocument();
+  const Throws = (() => {
+    throw new Error("sync boom");
+  }) as unknown as QuoxVNodeType;
+
+  await assertRejects(
+    () => mount(root, createVNode(Throws, null)),
+    Error,
+    "sync boom",
   );
 });
 
@@ -208,10 +258,10 @@ function createPreactLikeVNode(
   return Object.assign(Object.create(null), { type, props, key: null, ref: null });
 }
 
-Deno.test("mount recognizes duck-typed Preact-shaped vnodes", () => {
+Deno.test("mount recognizes duck-typed Preact-shaped vnodes", async () => {
   const { renderer, root } = createTestDocument();
 
-  mount(
+  await mount(
     root,
     createPreactLikeVNode("h1", { className: "title", children: "Hi" }),
   );
@@ -225,12 +275,12 @@ Deno.test("mount recognizes duck-typed Preact-shaped vnodes", () => {
   ]);
 });
 
-Deno.test("mount resolves Preact-shaped fragments and function components without special-casing", () => {
+Deno.test("mount resolves Preact-shaped fragments and function components without special-casing", async () => {
   const { renderer, root } = createTestDocument();
   const PreactFragment = (props: { children?: unknown }) => props.children;
   const Leaf = (props: { label: string }) => createPreactLikeVNode("span", { children: props.label });
 
-  mount(
+  await mount(
     root,
     createPreactLikeVNode(PreactFragment, {
       children: [

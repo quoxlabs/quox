@@ -44,9 +44,9 @@ function contentToString(value: QuoxWindowContent | undefined): string {
   return typeof value === "string" ? value : "";
 }
 
-function mountWindowContent(parent: QuoxElement, value: QuoxWindowContent | undefined): void {
+async function mountWindowContent(parent: QuoxElement, value: QuoxWindowContent | undefined): Promise<void> {
   if (value === undefined || typeof value === "string") return;
-  mount(parent, value);
+  await mount(parent, value);
 }
 
 function mapWindingEvent(ev: WindingUIEvent): QuoxInputEvent | null {
@@ -118,8 +118,8 @@ export class QuoxWindow implements Disposable {
     const quoxWindow = new QuoxWindow(lib, win, width, height, renderer);
 
     try {
-      mountWindowContent(quoxWindow.document.head, options.head);
-      mountWindowContent(quoxWindow.document.body, options.body);
+      await mountWindowContent(quoxWindow.document.head, options.head);
+      await mountWindowContent(quoxWindow.document.body, options.body);
     } catch (error) {
       quoxWindow[Symbol.dispose]();
       throw error;

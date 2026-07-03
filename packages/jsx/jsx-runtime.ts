@@ -7,8 +7,8 @@ export type QuoxStyle = string | QuoxStyleObject;
 export type QuoxProps = Record<string, unknown>;
 export type QuoxComponent<P extends QuoxProps = QuoxProps> = (
   props: P & { children?: QuoxRenderable },
-) => QuoxRenderable;
-type AnyQuoxComponent = (props: never) => QuoxRenderable;
+) => QuoxRenderable | Promise<QuoxRenderable>;
+type AnyQuoxComponent = (props: never) => QuoxRenderable | Promise<QuoxRenderable>;
 export type QuoxVNodeType = string | AnyQuoxComponent;
 export type QuoxRenderable =
   | QuoxVNode
