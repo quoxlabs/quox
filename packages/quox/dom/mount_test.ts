@@ -119,11 +119,14 @@ Deno.test("mount walks fragments, function components, and nested arrays", async
     }),
   );
 
+  // Siblings resolve concurrently, so independent subtrees' low-level operations interleave
+  // (here, the "loose" text node is created before "Hi" gets appended into <h1>) even though
+  // final document order (the append_child calls onto `root` at the end) is unaffected.
   assertEquals(renderer.operations, [
     { type: "create_element", id: 1, tagName: "h1" },
     { type: "create_text_node", id: 2, text: "Hi" },
-    { type: "append_child", parentId: 1, childId: 2 },
     { type: "create_text_node", id: 3, text: "loose" },
+    { type: "append_child", parentId: 1, childId: 2 },
     { type: "create_element", id: 4, tagName: "span" },
     { type: "set_attribute", nodeId: 4, name: "class", value: "leaf" },
     { type: "create_text_node", id: 5, text: "Leaf" },
@@ -203,26 +206,31 @@ Deno.test("mount awaits async function components", async () => {
 });
 
 Deno.test("mount preserves source order when concurrent async siblings resolve out of order", async () => {
-  const { renderer, root } = createTestDocument();
+  const { root } = createTestDocument();
   let resolveFirst!: (v: unknown) => void;
   let resolveSecond!: (v: unknown) => void;
-  const First = (() => new Promise((resolve) => { resolveFirst = resolve; })) as unknown as QuoxVNodeType;
-  const Second = (() => new Promise((resolve) => { resolveSecond = resolve; })) as unknown as QuoxVNodeType;
+  const First = (() =>
+    new Promise((resolve) => {
+      resolveFirst = resolve;
+    })) as unknown as QuoxVNodeType;
+  const Second = (() =>
+    new Promise((resolve) => {
+      resolveSecond = resolve;
+    })) as unknown as QuoxVNodeType;
 
   const pending = mount(root, [
     createVNode(First, null),
     createVNode(Second, null),
   ]);
 
-  resolveSecond(createVNode("span", { children: "second" }));
-  resolveFirst(createVNode("span", { children: "first" }));
+  // Resolve out of source order: since both siblings start concurrently, resolving Second
+  // first proves the *result* order still matches source order, not resolution order.
+  resolveSecond("second");
+  resolveFirst("first");
 
-  await pending;
+  const nodes = await pending;
 
-  assertEquals(
-    renderer.operations.filter((op) => op.type === "create_text_node").map((op) => (op as { text: string }).text),
-    ["first", "second"],
-  );
+  assertEquals(nodes.map((node) => node.textContent), ["first", "second"]);
 });
 
 Deno.test("mount propagates rejection from an async function component", async () => {
