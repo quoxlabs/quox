@@ -40,10 +40,11 @@ Deno.test("serializeQuoxStyle preserves custom properties and kebab-cases normal
     serializeQuoxStyle({
       "--accent": "red",
       backgroundColor: "var(--accent)",
+      width: 100,
       WebkitLineClamp: 2,
       display: null,
     }),
-    "--accent:red;background-color:var(--accent);-webkit-line-clamp:2",
+    "--accent:red;background-color:var(--accent);width:100;-webkit-line-clamp:2",
   );
 });
 
