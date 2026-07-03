@@ -181,6 +181,23 @@ Deno.test("mount lowers props and stores function-valued DOM props", async () =>
   assert(getElementFunctionProps(node as QuoxElement)?.get("onClick") === onClick, "onClick was not stored");
 });
 
+Deno.test("mount kebab-cases vendor-prefixed style properties", async () => {
+  const { renderer, root } = createTestDocument();
+
+  await mount(
+    root,
+    createVNode("div", {
+      style: { WebkitLineClamp: 2, display: null },
+    }),
+  );
+
+  assertEquals(renderer.operations, [
+    { type: "create_element", id: 1, tagName: "div" },
+    { type: "set_attribute", nodeId: 1, name: "style", value: "-webkit-line-clamp:2" },
+    { type: "append_child", parentId: 0, childId: 1 },
+  ]);
+});
+
 Deno.test("mount rejects unsupported object attributes", async () => {
   const { root } = createTestDocument();
 

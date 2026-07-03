@@ -66,25 +66,6 @@ export function isQuoxVNode(value: unknown): value is QuoxVNode {
   return typeof value === "object" && value !== null && (value as QuoxVNode).$$typeof === QUOX_VNODE;
 }
 
-export function serializeQuoxStyle(style: QuoxStyle): string {
-  if (typeof style === "string") return style;
-
-  const declarations: string[] = [];
-  for (const [rawName, value] of Object.entries(style)) {
-    if (value === null || value === undefined || typeof value === "boolean") continue;
-    declarations.push(`${stylePropertyName(rawName)}:${String(value)}`);
-  }
-
-  return declarations.join(";");
-}
-
-function stylePropertyName(name: string): string {
-  if (name.startsWith("--")) return name;
-
-  const kebab = name.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`);
-  return kebab.startsWith("ms-") ? `-${kebab}` : kebab;
-}
-
 function normalizeKey(value: unknown): QuoxKey {
   return typeof value === "string" || typeof value === "number" ? value : null;
 }

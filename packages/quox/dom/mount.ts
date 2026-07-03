@@ -1,7 +1,12 @@
-import { Fragment, isQuoxVNode, type QuoxProps, type QuoxStyle, serializeQuoxStyle } from "@quoxlabs/jsx";
 import type { QuoxDocument } from "./document.ts";
 import { setElementFunctionProp } from "./handlers.ts";
 import type { QuoxElement, QuoxNode } from "./node.ts";
+
+const QUOX_VNODE = Symbol.for("quox.vnode");
+
+type QuoxProps = Record<string, unknown>;
+type QuoxStyleValue = string | number | boolean | null | undefined;
+type QuoxStyle = string | Record<string, QuoxStyleValue>;
 
 type NormalizedVNode = {
   type: string | ((props: never) => unknown);
@@ -45,10 +50,6 @@ async function createNodes(document: QuoxDocument, value: unknown): Promise<Quox
     throw new TypeError("Unsupported object in Quox render tree.");
   }
 
-  if (vnode.type === Fragment) {
-    return createNodes(document, vnode.children);
-  }
-
   if (typeof vnode.type === "function") {
     const component = vnode.type as (props: QuoxProps & { children?: unknown }) => unknown;
     const rendered = await component(componentProps(vnode));
@@ -69,7 +70,7 @@ async function createNodes(document: QuoxDocument, value: unknown): Promise<Quox
  * Add a branch here to support another runtime.
  */
 function normalizeVNode(value: object): NormalizedVNode | null {
-  if (isQuoxVNode(value)) {
+  if (isQuoxLikeVNode(value)) {
     return { type: value.type, props: value.props, children: value.children };
   }
 
@@ -79,6 +80,16 @@ function normalizeVNode(value: object): NormalizedVNode | null {
   }
 
   return null;
+}
+
+/**
+ * Duck-types Quox's own vnode shape without importing `@quoxlabs/jsx`. `Symbol.for` is a global
+ * registry keyed by string, so this reproduces the exact marker `createVNode` tags every vnode
+ * with, the same way `Symbol.for('react.element')` lets tools recognize React elements without
+ * depending on React.
+ */
+function isQuoxLikeVNode(value: object): value is NormalizedVNode {
+  return "$$typeof" in value && (value as { $$typeof: unknown }).$$typeof === QUOX_VNODE;
 }
 
 /**
@@ -136,4 +147,23 @@ function attributeName(name: string): string {
     default:
       return name;
   }
+}
+
+function serializeQuoxStyle(style: QuoxStyle): string {
+  if (typeof style === "string") return style;
+
+  const declarations: string[] = [];
+  for (const [rawName, value] of Object.entries(style)) {
+    if (value === null || value === undefined || typeof value === "boolean") continue;
+    declarations.push(`${stylePropertyName(rawName)}:${String(value)}`);
+  }
+
+  return declarations.join(";");
+}
+
+function stylePropertyName(name: string): string {
+  if (name.startsWith("--")) return name;
+
+  const kebab = name.replace(/[A-Z]/g, (letter) => `-${letter.toLowerCase()}`);
+  return kebab.startsWith("ms-") ? `-${kebab}` : kebab;
 }
