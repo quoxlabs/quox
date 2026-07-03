@@ -20,7 +20,7 @@ quox already works as a hello world example. Paste the following code to `main.t
 /** @jsxImportSource jsr:@quoxlabs/jsx */
 import { openWindow } from "jsr:@quoxlabs/quox";
 
-await openWindow({ body: <h1>Hello, world!</h1> });
+await openWindow(<h1>Hello, world!</h1>);
 ```
 
 Running

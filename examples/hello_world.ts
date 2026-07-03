@@ -5,5 +5,5 @@ const body = `
 <p>Meow!</p>`;
 
 if (import.meta.main) {
-  await openWindow({ body });
+  await openWindow(body);
 }
