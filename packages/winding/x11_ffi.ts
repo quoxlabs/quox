@@ -237,7 +237,6 @@ export const x11functions = {
   XFreeModifiermap: { parameters: ["pointer"], result: "i32" },
   XFreePixmap: { parameters: ["pointer", "usize"], result: "i32" },
   XFreeStringList: { parameters: ["pointer"], result: "void" },
-  XFreeThreads: { parameters: [], result: "i32" },
   XGContextFromGC: { parameters: ["usize"], result: "usize" },
   XGeometry: {
     parameters: [
