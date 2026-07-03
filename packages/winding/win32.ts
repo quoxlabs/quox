@@ -1,11 +1,22 @@
 import type { Library, LoadLibrary, UIEvent, Window } from "./types.ts";
-import { gdi32functions, kernel32functions, user32functions } from "./win32_ffi.ts";
+import { gdi32functions, kernel32functions, user32functions, WHEEL_DELTA, WM } from "./win32_ffi.ts";
 
 // BITMAPINFOHEADER is 40 bytes; for 32bpp BI_RGB no color table follows, so
 // this buffer alone is a valid BITMAPINFO for SetDIBitsToDevice.
 const BITMAPINFOHEADER_SIZE = 40;
 const BI_RGB = 0;
 const DIB_RGB_COLORS = 0;
+
+const DOWN_BUTTON: Partial<Record<WM, "left" | "middle" | "right">> = {
+  [WM.LBUTTONDOWN]: "left",
+  [WM.MBUTTONDOWN]: "middle",
+  [WM.RBUTTONDOWN]: "right",
+};
+const UP_BUTTON: Partial<Record<WM, "left" | "middle" | "right">> = {
+  [WM.LBUTTONUP]: "left",
+  [WM.MBUTTONUP]: "middle",
+  [WM.RBUTTONUP]: "right",
+};
 
 class Win32Window implements Window {
   readonly id: bigint;
@@ -114,6 +125,10 @@ class Win32Library implements Library {
     result: "usize";
   }>;
   #event: UIEvent | undefined;
+  // Tracks how many mouse buttons are currently held, so capture is only
+  // released once the last button of a (possibly multi-button) drag is
+  // released rather than on every individual button-up.
+  #captureCount = 0;
   constructor() {
     this.kernel32 = Deno.dlopen("kernel32", kernel32functions);
     this.user32 = Deno.dlopen("user32", user32functions);
@@ -137,7 +152,7 @@ class Win32Library implements Library {
     }, (hWnd, uMsg, wParam, lParam) => {
       const win = this.windows.get(BigInt(Deno.UnsafePointer.value(hWnd)));
       switch (uMsg) {
-        case 0x0005: { // WM_SIZE
+        case WM.SIZE: {
           const w = Number(BigInt(lParam) & 0xFFFFn);
           const h = Number((BigInt(lParam) >> 16n) & 0xFFFFn);
           if (w > 0 && h > 0) {
@@ -145,12 +160,12 @@ class Win32Library implements Library {
           }
           break;
         }
-        case 0x0010: // WM_CLOSE
+        case WM.CLOSE:
           this.#event = { type: "close", window: win };
           // Return without calling DefWindowProcW to prevent immediate window
           // destruction; let the application decide when to tear down.
           return 0n;
-        case 0x200: { // WM_MOUSEMOVE
+        case WM.MOUSEMOVE: {
           this.#event = {
             type: "mousemove",
             x: Number(BigInt(lParam) & 0xFFFFn),
@@ -159,6 +174,56 @@ class Win32Library implements Library {
           };
           break;
         }
+        case WM.LBUTTONDOWN:
+        case WM.MBUTTONDOWN:
+        case WM.RBUTTONDOWN: {
+          // Capture the mouse so drags that leave the client area (e.g.
+          // dragging a scrollbar thumb) still deliver the eventual button-up,
+          // matching X11's implicit passive grab on button press.
+          if (this.#captureCount++ === 0) this.user32.symbols.SetCapture(hWnd);
+          this.#event = { type: "mousedown", button: DOWN_BUTTON[uMsg as WM]!, window: win };
+          break;
+        }
+        case WM.LBUTTONUP:
+        case WM.MBUTTONUP:
+        case WM.RBUTTONUP: {
+          if (this.#captureCount > 0 && --this.#captureCount === 0) {
+            this.user32.symbols.ReleaseCapture();
+          }
+          this.#event = { type: "mouseup", button: UP_BUTTON[uMsg as WM]!, window: win };
+          break;
+        }
+        case WM.MOUSEWHEEL:
+        case WM.MOUSEHWHEEL: {
+          // wParam's high word is a *signed* 16-bit tilt/rotation amount, in
+          // multiples of WHEEL_DELTA per notch (unlike the unsigned x/y words
+          // read elsewhere in this file).
+          const raw = Number((BigInt(wParam) >> 16n) & 0xFFFFn);
+          const signed = raw > 0x7FFF ? raw - 0x10000 : raw;
+          const notches = signed / WHEEL_DELTA;
+          this.#event = uMsg === WM.MOUSEWHEEL
+            // Win32 reports a positive vertical delta for "rotated away from
+            // the user" (scroll up); every other winding backend uses the
+            // opposite convention (positive deltaY = scroll down), so flip it.
+            ? { type: "wheel", deltaX: 0, deltaY: -notches, window: win }
+            // Horizontal tilt-right is already positive in both Win32 and the
+            // other backends (see Wayland's unflipped axis===1 handling), so
+            // no sign flip is needed here.
+            : { type: "wheel", deltaX: notches, deltaY: 0, window: win };
+          break;
+        }
+        case WM.KEYDOWN:
+        // Alt-held key combinations arrive as WM_SYSKEYDOWN instead of
+        // WM_KEYDOWN; fold them into the same "keydown" event since winding
+        // has no separate "system key" event type. DefWindowProcW still runs
+        // below, so system behaviors (Alt+F4, the system menu, ...) keep working.
+        case WM.SYSKEYDOWN:
+          this.#event = { type: "keydown", keycode: Number(wParam), window: win };
+          break;
+        case WM.KEYUP:
+        case WM.SYSKEYUP:
+          this.#event = { type: "keyup", keycode: Number(wParam), window: win };
+          break;
       }
       return this.user32.symbols.DefWindowProcW(hWnd, uMsg, wParam, lParam);
     });
