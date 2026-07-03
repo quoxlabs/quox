@@ -3,7 +3,7 @@ import { QuoxRenderer as WasmRenderer } from "../lib/quox.js";
 import { load as windingLoad } from "@quoxlabs/winding";
 import type { Library as WindingLibrary, UIEvent as WindingUIEvent, Window as WindingWindow } from "@quoxlabs/winding";
 import { QuoxDocument } from "./document.ts";
-import { mount, type QuoxRenderable } from "./mount.ts";
+import { isVNode, mount, type QuoxRenderable } from "./mount.ts";
 import type { QuoxElement, QuoxInnerHTML } from "./node.ts";
 
 export type QuoxInputEvent =
@@ -42,6 +42,13 @@ export interface WindowOptions {
 
 const DEFAULT_WINDOW_TITLE = "quox";
 const BUTTON_INDEX: Record<"left" | "middle" | "right", number> = { left: 0, middle: 1, right: 2 };
+
+/** Anything that isn't itself renderable content (a string, array, or vnode) is an options bag. */
+function isWindowOptions(value: QuoxWindowContent | WindowOptions | undefined): value is WindowOptions {
+  if (value === undefined) return true;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  return !isVNode(value);
+}
 
 function contentToString(value: QuoxWindowContent | undefined): string {
   return typeof value === "string" ? value : "";
@@ -270,8 +277,12 @@ export class QuoxWindow implements Disposable {
 
 /**
  * Open a blank native window with a live DOM facade backed by Blitz's WASM document mutator.
+ *
+ * Accepts either a `WindowOptions` bag, or content (an HTML string or JSX) as shorthand for
+ * `{ body: content }`.
  */
-export async function openWindow(options?: WindowOptions): Promise<QuoxWindow> {
+export async function openWindow(arg?: QuoxWindowContent | WindowOptions): Promise<QuoxWindow> {
+  const options = isWindowOptions(arg) ? arg : { body: arg };
   const win = await QuoxWindow.create(options);
   win.start();
   return win;
