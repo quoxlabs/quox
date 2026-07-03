@@ -124,11 +124,7 @@ export class QuoxWindow implements Disposable {
     try {
       await mountWindowContent(quoxWindow.document.head, options.head);
       await mountWindowContent(quoxWindow.document.body, options.body);
-      if (options.title !== undefined) {
-        quoxWindow.setTitle(options.title);
-      } else {
-        quoxWindow.#win.setTitle(quoxWindow.document.title || DEFAULT_WINDOW_TITLE);
-      }
+      quoxWindow.setTitle(options.title ?? (quoxWindow.document.title || DEFAULT_WINDOW_TITLE));
     } catch (error) {
       quoxWindow[Symbol.dispose]();
       throw error;
