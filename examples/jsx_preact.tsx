@@ -1,4 +1,4 @@
-/** @jsxImportSource @quoxlabs/jsx */
+/** @jsxImportSource npm:preact */
 import { openWindow } from "../packages/quox/mod.ts";
 
 const head = (
@@ -27,5 +27,7 @@ const App = () => (
 );
 
 if (import.meta.main) {
+  // Same openWindow({ head, body }) call as examples/jsx.tsx — quox recognizes Preact's vnode
+  // shape by duck typing and mounts it directly, without ever depending on the `preact` package.
   await openWindow({ head, body: <App /> });
 }

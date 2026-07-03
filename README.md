@@ -17,7 +17,7 @@ This project is very young. Try it if you like bleeding edges, but don't make yo
 quox already works as a hello world example. Paste the following code to `main.tsx`:
 
 ```tsx
-/** @jsxImportSource npm:preact */
+/** @jsxImportSource jsr:@quoxlabs/jsx */
 import { openWindow } from "jsr:@quoxlabs/quox";
 
 await openWindow({ body: <h1>Hello, world!</h1> });
