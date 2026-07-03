@@ -43,7 +43,7 @@ const head = `
     </style>
   `;
 
-const win = await openWindow({ width: 640, height: 360, head });
+const win = await openWindow({ width: 640, height: 360, title: "Live document", head });
 
 const main = win.document.createElement("main");
 const title = win.document.createElement("h1");
@@ -63,4 +63,5 @@ setInterval(() => {
   title.textContent = tick % 2 === 0 ? "Live document" : "Mutated document";
   title.setAttribute("class", tick % 2 === 0 ? "warm" : "cool");
   status.textContent = `Tick ${tick}`;
+  win.document.title = `Live document - tick ${tick}`;
 }, 700);
