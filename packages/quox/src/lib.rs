@@ -119,6 +119,28 @@ impl QuoxRendererState {
             })
             .ok_or_else(|| JsValue::from_str(&format!("Missing <{tag_name}> element")))
     }
+
+    fn optional_child_element_by_tag(
+        &self,
+        parent_id: usize,
+        tag_name: &str,
+    ) -> Result<Option<usize>, JsValue> {
+        let parent = self
+            .document
+            .get_node(parent_id)
+            .ok_or_else(|| invalid_node(parent_id))?;
+
+        Ok(parent.children.iter().find_map(|child_id| {
+            let child = self.document.get_node(*child_id)?;
+            let element = child.element_data()?;
+            (element.name.local.as_ref() == tag_name).then_some(*child_id)
+        }))
+    }
+
+    fn title_element(&self) -> Result<Option<usize>, JsValue> {
+        let head_id = self.child_element_by_tag(self.document.root_element().id, "head")?;
+        self.optional_child_element_by_tag(head_id, "title")
+    }
 }
 
 #[wasm_bindgen]
@@ -228,6 +250,19 @@ impl QuoxRenderer {
             .ok_or_else(|| invalid_node(node_id))
     }
 
+    /// Return the document title.
+    pub fn title(&self) -> Result<String, JsValue> {
+        let state = self.state.borrow();
+        match state.title_element()? {
+            Some(node_id) => state
+                .document
+                .get_node(node_id)
+                .map(|node| node.text_content())
+                .ok_or_else(|| invalid_node(node_id)),
+            None => Ok(String::new()),
+        }
+    }
+
     /// Set an element attribute.
     pub fn set_attribute(&self, node_id: usize, name: &str, value: &str) -> Result<(), JsValue> {
         let mut state = self.state.borrow_mut();
@@ -298,6 +333,29 @@ impl QuoxRenderer {
                     let text_id = mutator.create_text_node(value);
                     mutator.append_children(node_id, &[text_id]);
                 }
+            }
+
+            Ok(())
+        })
+    }
+
+    /// Replace the first document `<title>` text, creating the element in `<head>` if needed.
+    pub fn set_title(&self, value: &str) -> Result<(), JsValue> {
+        let mut state = self.state.borrow_mut();
+        let head_id = state.child_element_by_tag(state.document.root_element().id, "head")?;
+        let existing_title_id = state.optional_child_element_by_tag(head_id, "title")?;
+
+        state.mutate_document(|mutator| {
+            let title_id = existing_title_id.unwrap_or_else(|| {
+                let title_id = mutator.create_element(html_name("title"), Vec::new());
+                mutator.append_children(head_id, &[title_id]);
+                title_id
+            });
+
+            mutator.remove_and_drop_all_children(title_id);
+            if !value.is_empty() {
+                let text_id = mutator.create_text_node(value);
+                mutator.append_children(title_id, &[text_id]);
             }
 
             Ok(())
