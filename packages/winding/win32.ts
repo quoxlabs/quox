@@ -18,6 +18,14 @@ const UP_BUTTON: Partial<Record<WM, "left" | "middle" | "right">> = {
   [WM.RBUTTONUP]: "right",
 };
 
+function wideStringBuffer(value: string): ArrayBuffer {
+  const buffer = new ArrayBuffer((value.length + 1) * 2);
+  const view = new Uint16Array(buffer);
+  for (let i = 0; i < value.length; i++) view[i] = value.charCodeAt(i);
+  view[value.length] = 0;
+  return buffer;
+}
+
 class Win32Window implements Window {
   readonly id: bigint;
   readonly #hwnd: Deno.PointerObject;
@@ -43,6 +51,11 @@ class Win32Window implements Window {
     this.#hwnd = window;
     this.id = BigInt(Deno.UnsafePointer.value(window));
     lib.windows.set(this.id, this);
+  }
+
+  setTitle(title: string): void {
+    const ok = this.lib.user32.symbols.SetWindowTextW(this.#hwnd, wideStringBuffer(title));
+    if (!ok) throw new Error(this.lib.getLastError());
   }
 
   /**
@@ -111,14 +124,7 @@ class Win32Library implements Library {
   readonly gdi32: Deno.DynamicLibrary<typeof gdi32functions>;
   #wndClass = new ArrayBuffer(80);
   #classNameBuffer = (() => {
-    const name = "Winding";
-    const classNameBuffer = new ArrayBuffer((name.length + 1) * 2);
-    const classNameU16 = new Uint16Array(classNameBuffer);
-    for (let i = 0; i < name.length; i++) {
-      classNameU16[i] = name.charCodeAt(i);
-    }
-    classNameU16[name.length] = 0;
-    return classNameBuffer;
+    return wideStringBuffer("Winding");
   })();
   #wndProc: Deno.UnsafeCallback<{
     parameters: ["pointer", "u32", "usize", "usize"];

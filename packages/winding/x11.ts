@@ -2,9 +2,11 @@ import type { Library, LoadLibrary, UIEvent, Window } from "./src/../types.ts";
 import { x11functions, XEventMask, XEventType } from "./x11_ffi.ts";
 
 function cString(s: string): Uint8Array<ArrayBuffer> {
-  const buf = new Uint8Array(s.length + 1) as Uint8Array<ArrayBuffer>;
-  for (let i = 0; i < s.length; i++) buf[i] = s.charCodeAt(i);
-  return buf;
+  return new TextEncoder().encode(`${s}\0`);
+}
+
+function utf8Bytes(s: string): Uint8Array<ArrayBuffer> {
+  return new TextEncoder().encode(s);
 }
 
 // All event masks except:
@@ -86,6 +88,23 @@ class X11Window implements Window {
     lib.windows.set(this.id, this);
   }
 
+  setTitle(title: string): void {
+    const titleBytes = utf8Bytes(title);
+    const titleBuffer = titleBytes.length > 0 ? titleBytes : new Uint8Array(1);
+    this.lib.X11.symbols.XChangeProperty(
+      this.lib.display,
+      this.id,
+      this.lib.netWmName,
+      this.lib.utf8String,
+      8,
+      0,
+      titleBuffer,
+      titleBytes.length,
+    );
+    this.lib.X11.symbols.XStoreName(this.lib.display, this.id, cString(title));
+    this.lib.X11.symbols.XFlush(this.lib.display);
+  }
+
   /**
    * Copy an RGBA pixel buffer to the X11 window. The buffer must be
    * `width * height * 4` bytes. Internally converts to X11 TrueColor BGRX
@@ -156,6 +175,8 @@ class X11Library implements Library {
   readonly windows = new Map<bigint, X11Window>();
   readonly wmProtocols: bigint;
   readonly wmDeleteWindow: bigint;
+  readonly netWmName: bigint;
+  readonly utf8String: bigint;
   constructor() {
     this.X11 = Deno.dlopen("libX11.so", x11functions);
     const display = this.X11.symbols.XOpenDisplay(null);
@@ -168,6 +189,8 @@ class X11Library implements Library {
     this.wmDeleteWindow = BigInt(
       this.X11.symbols.XInternAtom(display, cString("WM_DELETE_WINDOW"), 0),
     );
+    this.netWmName = BigInt(this.X11.symbols.XInternAtom(display, cString("_NET_WM_NAME"), 0));
+    this.utf8String = BigInt(this.X11.symbols.XInternAtom(display, cString("UTF8_STRING"), 0));
   }
   openWindow(x = 0, y = 0, w = 800, h = 600): X11Window {
     return new X11Window(this, x, y, w, h);

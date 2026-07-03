@@ -16,6 +16,7 @@ class FakeRenderer {
   readonly operations: Operation[] = [];
   #nextNodeId = 1;
   readonly #text = new Map<number, string>();
+  #title = "";
 
   create_element(tagName: string): number {
     const id = this.#nextNodeId++;
@@ -40,6 +41,14 @@ class FakeRenderer {
 
   text_content(nodeId: number): string {
     return this.#text.get(nodeId) ?? "";
+  }
+
+  title(): string {
+    return this.#title;
+  }
+
+  set_title(value: string): void {
+    this.#title = value;
   }
 
   set_text_content(nodeId: number, value: string): void {
@@ -73,7 +82,7 @@ class FakeRenderer {
   }
 }
 
-function createTestDocument(): {
+function createTestDocument(setNativeTitle?: (title: string) => void): {
   document: QuoxDocument;
   renderer: FakeRenderer;
   root: QuoxElement;
@@ -84,6 +93,7 @@ function createTestDocument(): {
     renderer as unknown as WasmRenderer,
     noop,
     noop,
+    setNativeTitle,
   );
 
   return {
@@ -92,6 +102,39 @@ function createTestDocument(): {
     root: new QuoxElement(document, 0),
   };
 }
+
+Deno.test("document.title reads and writes the renderer title", () => {
+  const nativeTitles: string[] = [];
+  let renderCount = 0;
+  const renderer = new FakeRenderer();
+  const document = new QuoxDocument(
+    renderer as unknown as WasmRenderer,
+    () => {
+      renderCount += 1;
+    },
+    () => undefined,
+    (title) => nativeTitles.push(title),
+  );
+
+  assertEquals(document.title, "");
+
+  document.title = "Quox Notes";
+
+  assertEquals(document.title, "Quox Notes");
+  assertEquals(renderer.title(), "Quox Notes");
+  assertEquals(nativeTitles, ["Quox Notes"]);
+  assertEquals(renderCount, 1);
+});
+
+Deno.test("document title syncs to native title after DOM mutations", () => {
+  const nativeTitles: string[] = [];
+  const { document, renderer, root } = createTestDocument((title) => nativeTitles.push(title));
+
+  renderer.set_title("Changed elsewhere");
+  root.appendChild(document.createTextNode("trigger mutation"));
+
+  assertEquals(nativeTitles, ["Changed elsewhere"]);
+});
 
 Deno.test("mount walks fragments, function components, and nested arrays", async () => {
   const { renderer, root } = createTestDocument();

@@ -202,6 +202,13 @@ class DarwinWindow implements Window {
     return this.#height;
   }
 
+  setTitle(title: string): void {
+    const { sel, send } = this.lib.ffi;
+    const titleString = makeNSString(this.lib.ffi, title);
+    send.void_id(this.nsWindow, sel("setTitle:"), titleString);
+    send.void(titleString, sel("release"));
+  }
+
   blit(rgba: Uint8Array, width: number, height: number): void {
     const { cf, cg, sel, send } = this.lib.ffi;
     this.#prevImageBuf = this.#imageBuf;
