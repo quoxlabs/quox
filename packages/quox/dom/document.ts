@@ -2,18 +2,58 @@ import type { QuoxRenderer as WasmRenderer } from "../lib/quox.js";
 import { type AssertActive, attachDocumentInternals, type RequestRender } from "./internals.ts";
 import { QuoxElement, QuoxText } from "./node.ts";
 
+type SetNativeTitle = (title: string) => void;
+
 export class QuoxDocument {
   readonly #renderer: WasmRenderer;
+  readonly #requestRender: RequestRender;
   readonly #assertActive: AssertActive;
+  readonly #setNativeTitle: SetNativeTitle;
+  #currentTitle: string;
 
   constructor(
     renderer: WasmRenderer,
     requestRender: RequestRender,
     assertActive: AssertActive,
+    setNativeTitle: SetNativeTitle = () => undefined,
   ) {
     this.#renderer = renderer;
+    this.#requestRender = requestRender;
     this.#assertActive = assertActive;
-    attachDocumentInternals(this, { renderer, requestRender, assertActive });
+    this.#setNativeTitle = setNativeTitle;
+    this.#currentTitle = renderer.title();
+    attachDocumentInternals(this, {
+      renderer,
+      requestRender,
+      assertActive,
+      syncTitle: () => {
+        this.#syncTitle();
+      },
+    });
+  }
+
+  get title(): string {
+    return this.#syncTitle();
+  }
+
+  set title(value: string) {
+    this.#assertActive();
+    const title = String(value);
+    this.#renderer.set_title(title);
+    this.#currentTitle = title;
+    this.#setNativeTitle(title);
+    this.#requestRender();
+  }
+
+  #syncTitle(): string {
+    this.#assertActive();
+    const title = this.#renderer.title();
+    if (title !== this.#currentTitle) {
+      this.#currentTitle = title;
+      this.#setNativeTitle(title);
+    }
+
+    return title;
   }
 
   get documentElement(): QuoxElement {

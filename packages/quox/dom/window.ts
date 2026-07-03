@@ -32,12 +32,15 @@ export interface WindowOptions {
   width?: number;
   /** Height of the window in pixels (default 600). */
   height?: number;
+  /** Native window title. Overrides any initial `<title>` in `head`. */
+  title?: string;
   /** Initial content for `document.head`: an HTML string, or JSX from any recognized runtime. */
   head?: QuoxWindowContent;
   /** Initial content for `document.body`: an HTML string, or JSX from any recognized runtime. */
   body?: QuoxWindowContent;
 }
 
+const DEFAULT_WINDOW_TITLE = "quox";
 const BUTTON_INDEX: Record<"left" | "middle" | "right", number> = { left: 0, middle: 1, right: 2 };
 
 function contentToString(value: QuoxWindowContent | undefined): string {
@@ -102,6 +105,7 @@ export class QuoxWindow implements Disposable {
       renderer,
       () => this.#requestRender(),
       () => this.#assertActiveDocument(),
+      (title) => this.#win.setTitle(title),
     );
   }
 
@@ -120,6 +124,11 @@ export class QuoxWindow implements Disposable {
     try {
       await mountWindowContent(quoxWindow.document.head, options.head);
       await mountWindowContent(quoxWindow.document.body, options.body);
+      if (options.title !== undefined) {
+        quoxWindow.setTitle(options.title);
+      } else {
+        quoxWindow.#win.setTitle(quoxWindow.document.title || DEFAULT_WINDOW_TITLE);
+      }
     } catch (error) {
       quoxWindow[Symbol.dispose]();
       throw error;
@@ -226,6 +235,11 @@ export class QuoxWindow implements Disposable {
   removeEventListener(callback: (event: QuoxInputEvent) => void): void {
     const idx = this.#listeners.indexOf(callback);
     if (idx >= 0) this.#listeners.splice(idx, 1);
+  }
+
+  /** Set the native window title via `document.title`. */
+  setTitle(title: string): void {
+    this.document.title = title;
   }
 
   /** Stop the render loop and free WASM resources. */
