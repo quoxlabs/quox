@@ -1,13 +1,6 @@
 import type { Library, LoadLibrary, UIEvent, Window } from "./src/../types.ts";
 import { x11functions, XEventMask, XEventType } from "./x11_ffi.ts";
-
-function cString(s: string): Uint8Array<ArrayBuffer> {
-  return new TextEncoder().encode(`${s}\0`);
-}
-
-function utf8Bytes(s: string): Uint8Array<ArrayBuffer> {
-  return new TextEncoder().encode(s);
-}
+import { utf8Bytes, utf8CString as cString } from "./text_encoding.ts";
 
 // XStoreName sets the legacy WM_NAME property, which is read as Latin-1 by clients that don't
 // understand the EWMH _NET_WM_NAME/UTF8_STRING property set below. Encoding it as UTF-8 there

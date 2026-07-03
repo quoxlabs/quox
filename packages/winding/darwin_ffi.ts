@@ -5,11 +5,9 @@
 // requires a fixed parameter/result shape per symbol, so the Darwin backend
 // opens `libobjc` once per distinct call shape and shares those handles.
 
-export function cStr(s: string): Uint8Array<ArrayBuffer> {
-  const buf = new Uint8Array(s.length + 1) as Uint8Array<ArrayBuffer>;
-  for (let i = 0; i < s.length; i++) buf[i] = s.charCodeAt(i);
-  return buf;
-}
+// `initWithUTF8String:` and friends require genuine UTF-8 bytes.
+import { utf8CString as cStr } from "./text_encoding.ts";
+export { cStr };
 
 export const LIBOBJC = "/usr/lib/libobjc.dylib";
 export const APPKIT = "/System/Library/Frameworks/AppKit.framework/AppKit";
