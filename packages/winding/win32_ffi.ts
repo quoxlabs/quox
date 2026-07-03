@@ -7,7 +7,29 @@ export const kernel32functions = {
   },
 } as const satisfies Deno.ForeignLibraryInterface;
 
+export const gdi32functions = {
+  SetDIBitsToDevice: {
+    parameters: [
+      "pointer",
+      "i32",
+      "i32",
+      "u32",
+      "u32",
+      "i32",
+      "i32",
+      "u32",
+      "u32",
+      "buffer",
+      "buffer",
+      "u32",
+    ],
+    result: "i32",
+  },
+} as const satisfies Deno.ForeignLibraryInterface;
+
 export const user32functions = {
+  GetDC: { parameters: ["pointer"], result: "pointer" },
+  ReleaseDC: { parameters: ["pointer", "pointer"], result: "i32" },
   LoadCursorW: { parameters: ["pointer", "usize"], result: "usize" },
   RegisterClassExW: {
     parameters: ["buffer"],
