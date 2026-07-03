@@ -9,7 +9,7 @@ export class QuoxDocument {
   readonly #requestRender: RequestRender;
   readonly #assertActive: AssertActive;
   readonly #setNativeTitle: SetNativeTitle;
-  #currentTitle: string;
+  #lastNativeTitle: string;
 
   constructor(
     renderer: WasmRenderer,
@@ -21,39 +21,37 @@ export class QuoxDocument {
     this.#requestRender = requestRender;
     this.#assertActive = assertActive;
     this.#setNativeTitle = setNativeTitle;
-    this.#currentTitle = renderer.title();
-    attachDocumentInternals(this, {
-      renderer,
-      requestRender,
-      assertActive,
-      syncTitle: () => {
-        this.#syncTitle();
-      },
-    });
+    this.#lastNativeTitle = renderer.title();
+    attachDocumentInternals(this, { renderer, requestRender, assertActive });
   }
 
   get title(): string {
-    return this.#syncTitle();
+    this.#assertActive();
+    return this.#renderer.title();
   }
 
   set title(value: string) {
     this.#assertActive();
     const title = String(value);
     this.#renderer.set_title(title);
-    this.#currentTitle = title;
+    this.#lastNativeTitle = title;
     this.#setNativeTitle(title);
     this.#requestRender();
   }
 
-  #syncTitle(): string {
+  /**
+   * Push the live `<title>` text to the native window if it changed since the last push. Called
+   * once per render pass so title-affecting DOM edits (e.g. appending a `<title>` element, or
+   * editing one via `textContent`/`innerHTML`) reach the OS without every DOM mutation in the
+   * document paying for a `<head>` lookup.
+   */
+  syncNativeTitle(): void {
     this.#assertActive();
     const title = this.#renderer.title();
-    if (title !== this.#currentTitle) {
-      this.#currentTitle = title;
+    if (title !== this.#lastNativeTitle) {
+      this.#lastNativeTitle = title;
       this.#setNativeTitle(title);
     }
-
-    return title;
   }
 
   get documentElement(): QuoxElement {
