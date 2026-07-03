@@ -65,15 +65,15 @@ async function createNodes(document: QuoxDocument, value: unknown): Promise<Quox
   return [element];
 }
 
-/**
- * Recognize a vnode produced by any supported JSX runtime and normalize it to a common shape.
- * Add a branch here to support another runtime.
- */
 /** True if `value` looks like a vnode from any JSX runtime `mount` recognizes (see `normalizeVNode`). */
 export function isVNode(value: unknown): boolean {
   return typeof value === "object" && value !== null && !Array.isArray(value) && normalizeVNode(value) !== null;
 }
 
+/**
+ * Recognize a vnode produced by any supported JSX runtime and normalize it to a common shape.
+ * Add a branch here to support another runtime.
+ */
 function normalizeVNode(value: object): NormalizedVNode | null {
   if (isQuoxLikeVNode(value)) {
     return { type: value.type, props: value.props, children: value.children };
