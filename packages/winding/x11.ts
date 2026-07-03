@@ -9,6 +9,18 @@ function utf8Bytes(s: string): Uint8Array<ArrayBuffer> {
   return new TextEncoder().encode(s);
 }
 
+// XStoreName sets the legacy WM_NAME property, which is read as Latin-1 by clients that don't
+// understand the EWMH _NET_WM_NAME/UTF8_STRING property set below. Encoding it as UTF-8 there
+// would corrupt non-ASCII titles for those clients, so approximate as Latin-1 instead.
+function latin1CString(s: string): Uint8Array<ArrayBuffer> {
+  const buf = new Uint8Array(s.length + 1) as Uint8Array<ArrayBuffer>;
+  for (let i = 0; i < s.length; i++) {
+    const code = s.charCodeAt(i);
+    buf[i] = code <= 0xff ? code : 0x3f; // '?' for characters outside Latin-1
+  }
+  return buf;
+}
+
 // All event masks except:
 //   - PointerMotionHintMask (bit 7): throttles MotionNotify to one hint per entry
 //     and requires XQueryPointer acknowledgement, making cursor tracking choppy.
@@ -101,7 +113,7 @@ class X11Window implements Window {
       titleBuffer,
       titleBytes.length,
     );
-    this.lib.X11.symbols.XStoreName(this.lib.display, this.id, cString(title));
+    this.lib.X11.symbols.XStoreName(this.lib.display, this.id, latin1CString(title));
     this.lib.X11.symbols.XFlush(this.lib.display);
   }
 
