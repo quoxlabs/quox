@@ -3,13 +3,11 @@ import type { QuoxDocument } from "./document.ts";
 
 export type RequestRender = () => void;
 export type AssertActive = () => void;
-export type SyncTitle = () => void;
 
 type DocumentInternals = {
   readonly renderer: WasmRenderer;
   readonly requestRender: RequestRender;
   readonly assertActive: AssertActive;
-  readonly syncTitle: SyncTitle;
 };
 
 const internals = new WeakMap<QuoxDocument, DocumentInternals>();

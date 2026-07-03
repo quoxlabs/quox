@@ -126,13 +126,26 @@ Deno.test("document.title reads and writes the renderer title", () => {
   assertEquals(renderCount, 1);
 });
 
-Deno.test("document title syncs to native title after DOM mutations", () => {
+Deno.test("document.title reads live renderer state without side effects", () => {
   const nativeTitles: string[] = [];
-  const { document, renderer, root } = createTestDocument((title) => nativeTitles.push(title));
+  const { document, renderer } = createTestDocument((title) => nativeTitles.push(title));
 
   renderer.set_title("Changed elsewhere");
-  root.appendChild(document.createTextNode("trigger mutation"));
 
+  assertEquals(document.title, "Changed elsewhere");
+  assertEquals(nativeTitles, []);
+});
+
+Deno.test("syncNativeTitle pushes title changes made via generic DOM mutation", () => {
+  const nativeTitles: string[] = [];
+  const { document, renderer } = createTestDocument((title) => nativeTitles.push(title));
+
+  renderer.set_title("Changed elsewhere");
+  document.syncNativeTitle();
+
+  assertEquals(nativeTitles, ["Changed elsewhere"]);
+
+  document.syncNativeTitle();
   assertEquals(nativeTitles, ["Changed elsewhere"]);
 });
 

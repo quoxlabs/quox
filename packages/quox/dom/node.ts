@@ -14,9 +14,8 @@ export class QuoxNode {
   }
 
   set textContent(value: string | null) {
-    const { renderer, requestRender, syncTitle } = documentInternals(this.ownerDocument);
+    const { renderer, requestRender } = documentInternals(this.ownerDocument);
     renderer.set_text_content(this.nodeId, value ?? "");
-    syncTitle();
     requestRender();
   }
 
@@ -25,27 +24,24 @@ export class QuoxNode {
       throw new TypeError("node belongs to a different document");
     }
 
-    const { renderer, requestRender, syncTitle } = documentInternals(this.ownerDocument);
+    const { renderer, requestRender } = documentInternals(this.ownerDocument);
     renderer.append_child(this.nodeId, child.nodeId);
-    syncTitle();
     requestRender();
     return child;
   }
 
   remove(): void {
-    const { renderer, requestRender, syncTitle } = documentInternals(this.ownerDocument);
+    const { renderer, requestRender } = documentInternals(this.ownerDocument);
     renderer.remove_node(this.nodeId);
-    syncTitle();
     requestRender();
   }
 }
 
 export class QuoxElement extends QuoxNode {
   set innerHTML(value: QuoxInnerHTML) {
-    const { renderer, requestRender, syncTitle } = documentInternals(this.ownerDocument);
+    const { renderer, requestRender } = documentInternals(this.ownerDocument);
     const html = value;
     renderer.set_inner_html(this.nodeId, html);
-    syncTitle();
     requestRender();
   }
 

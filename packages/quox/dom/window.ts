@@ -211,6 +211,8 @@ export class QuoxWindow implements Disposable {
     const renderWidth = this.#width;
     const renderHeight = this.#height;
     try {
+      this.document.syncNativeTitle();
+
       // Render the retained Blitz document via WebGPU in WASM.
       const rgba = await this.#renderer.render();
 
