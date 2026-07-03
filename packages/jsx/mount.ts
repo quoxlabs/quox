@@ -1,14 +1,13 @@
+import { type QuoxDocument, type QuoxElement, type QuoxNode, setElementFunctionProp } from "@quoxlabs/quox";
 import {
+  Fragment,
   isQuoxVNode,
   type QuoxProps,
   type QuoxRenderable,
   type QuoxStyle,
   type QuoxVNode,
   serializeQuoxStyle,
-} from "@quoxlabs/jsx";
-import type { QuoxDocument } from "./document.ts";
-import { type QuoxFunctionProp, setElementFunctionProp } from "./handlers.ts";
-import type { QuoxElement, QuoxNode } from "./node.ts";
+} from "./jsx-runtime.ts";
 
 export function mountRenderable(parent: QuoxElement, value: QuoxRenderable): QuoxNode[] {
   const nodes = createNodes(parent.ownerDocument, value);
@@ -40,6 +39,10 @@ function createNodes(document: QuoxDocument, value: unknown): QuoxNode[] {
     throw new TypeError("Unsupported object in Quox render tree.");
   }
 
+  if (value.type === Fragment) {
+    return createNodes(document, value.children);
+  }
+
   if (typeof value.type === "function") {
     const component = value.type as (props: QuoxProps & { children?: QuoxRenderable }) => unknown;
     const rendered = component(componentProps(value));
@@ -68,7 +71,7 @@ function applyProps(element: QuoxElement, props: QuoxProps): void {
     if (value === null || value === undefined || value === false) continue;
 
     if (typeof value === "function") {
-      setElementFunctionProp(element, rawName, value as QuoxFunctionProp);
+      setElementFunctionProp(element, rawName, value as (...args: unknown[]) => unknown);
       continue;
     }
 

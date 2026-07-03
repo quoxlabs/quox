@@ -1,9 +1,6 @@
-import { createVNode, Fragment, type QuoxRenderable, type QuoxVNodeType } from "@quoxlabs/jsx";
-import type { QuoxRenderer as WasmRenderer } from "../lib/quox.js";
-import { QuoxDocument } from "./document.ts";
-import { getDocumentFunctionProps } from "./handlers.ts";
+import { getElementFunctionProps, QuoxDocument, QuoxElement } from "@quoxlabs/quox";
+import { createVNode, Fragment, type QuoxRenderable, type QuoxVNodeType } from "./jsx-runtime.ts";
 import { mountRenderable } from "./mount.ts";
-import { QuoxElement } from "./node.ts";
 
 type Operation =
   | { type: "create_element"; id: number; tagName: string }
@@ -80,7 +77,7 @@ function createTestDocument(): {
   const renderer = new FakeRenderer();
   const noop = () => undefined;
   const document = new QuoxDocument(
-    renderer as unknown as WasmRenderer,
+    renderer as unknown as ConstructorParameters<typeof QuoxDocument>[0],
     noop,
     noop,
   );
@@ -159,7 +156,7 @@ Deno.test("mountRenderable walks fragments, function components, and nested arra
 });
 
 Deno.test("mountRenderable lowers props and stores function-valued DOM props", () => {
-  const { document, renderer, root } = createTestDocument();
+  const { renderer, root } = createTestDocument();
   const onClick = () => "clicked";
   const [node] = mountRenderable(
     root,
@@ -195,7 +192,7 @@ Deno.test("mountRenderable lowers props and stores function-valued DOM props", (
     { type: "append_child", parentId: 1, childId: 2 },
     { type: "append_child", parentId: 0, childId: 1 },
   ]);
-  assert(getDocumentFunctionProps(document)?.get(node.nodeId)?.get("onClick") === onClick, "onClick was not stored");
+  assert(getElementFunctionProps(node as QuoxElement)?.get("onClick") === onClick, "onClick was not stored");
 });
 
 Deno.test("mountRenderable rejects unsupported object attributes", () => {

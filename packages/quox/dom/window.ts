@@ -2,10 +2,8 @@
 import { QuoxRenderer as WasmRenderer } from "../lib/quox.js";
 import { load as windingLoad } from "@quoxlabs/winding";
 import type { Library as WindingLibrary, UIEvent as WindingUIEvent, Window as WindingWindow } from "@quoxlabs/winding";
-import type { QuoxRenderable } from "@quoxlabs/jsx";
 import { QuoxDocument } from "./document.ts";
-import type { QuoxElement, QuoxInnerHTML } from "./node.ts";
-import { mountRenderable } from "./mount.ts";
+import type { QuoxInnerHTML } from "./node.ts";
 
 export type QuoxInputEvent =
   | QuoxMouseMoveEvent
@@ -25,7 +23,6 @@ export type QuoxKeyboardEvent = {
 };
 export type QuoxResizeEvent = { type: "resize"; width: number; height: number };
 export type QuoxCloseEvent = { type: "close" };
-export type QuoxWindowContent = QuoxInnerHTML | QuoxRenderable;
 
 export interface WindowOptions {
   /** Width of the window in pixels (default 800). */
@@ -33,20 +30,15 @@ export interface WindowOptions {
   /** Height of the window in pixels (default 600). */
   height?: number;
   /** Initial content for `document.head.innerHTML`. */
-  head?: QuoxWindowContent;
+  head?: QuoxInnerHTML;
   /** Initial content for `document.body.innerHTML`. */
-  body?: QuoxWindowContent;
+  body?: QuoxInnerHTML;
 }
 
 const BUTTON_INDEX: Record<"left" | "middle" | "right", number> = { left: 0, middle: 1, right: 2 };
 
-function innerHTMLToString(value: QuoxWindowContent | undefined): string {
-  return typeof value === "string" ? value : "";
-}
-
-function mountWindowContent(parent: QuoxElement, value: QuoxWindowContent | undefined): void {
-  if (value === undefined || typeof value === "string") return;
-  mountRenderable(parent, value);
+function innerHTMLToString(value: QuoxInnerHTML | undefined): string {
+  return value === undefined ? "" : value;
 }
 
 function mapWindingEvent(ev: WindingUIEvent): QuoxInputEvent | null {
@@ -115,17 +107,8 @@ export class QuoxWindow implements Disposable {
     const lib = windingLoad();
     const win = lib.openWindow(0, 0, width, height);
     const renderer = await WasmRenderer.create(width, height, head, body);
-    const quoxWindow = new QuoxWindow(lib, win, width, height, renderer);
 
-    try {
-      mountWindowContent(quoxWindow.document.head, options.head);
-      mountWindowContent(quoxWindow.document.body, options.body);
-    } catch (error) {
-      quoxWindow[Symbol.dispose]();
-      throw error;
-    }
-
-    return quoxWindow;
+    return new QuoxWindow(lib, win, width, height, renderer);
   }
 
   /** Start native event polling and queue an initial render. */
