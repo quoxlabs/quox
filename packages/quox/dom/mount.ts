@@ -1,5 +1,4 @@
 import {
-  Fragment,
   isQuoxVNode,
   type QuoxProps,
   type QuoxRenderable,
@@ -39,10 +38,6 @@ function createNodes(document: QuoxDocument, value: unknown): QuoxNode[] {
 
   if (!isQuoxVNode(value)) {
     throw new TypeError("Unsupported object in Quox render tree.");
-  }
-
-  if (value.type === Fragment) {
-    return createNodes(document, value.children);
   }
 
   if (typeof value.type === "function") {
