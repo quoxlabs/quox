@@ -2,7 +2,8 @@
   "version": "5",
   "specifiers": {
     "jsr:@std/assert@^1.0.19": "1.0.19",
-    "jsr:@std/internal@^1.0.12": "1.0.14"
+    "jsr:@std/internal@^1.0.12": "1.0.14",
+    "npm:preact@*": "10.29.3"
   },
   "jsr": {
     "@std/assert@1.0.19": {
@@ -15,9 +16,19 @@
       "integrity": "291516b3d4c35024d6ffbc0a9df5bf4c64116e05b50012cf846710152d2ffdf7"
     }
   },
+  "npm": {
+    "preact@10.29.3": {
+      "integrity": "sha512-D9NL1GAnJZhc3RndVs4gDdxEeU9TcHgywMrhhOsnpdlvFjdbx0gAsLUnH6JEhlJH5giL7Tx5biWPUSEXE/HPzw=="
+    }
+  },
   "workspace": {
     "members": {
       "packages/jsx": {
+        "dependencies": [
+          "jsr:@std/assert@^1.0.19"
+        ]
+      },
+      "packages/quox": {
         "dependencies": [
           "jsr:@std/assert@^1.0.19"
         ]
