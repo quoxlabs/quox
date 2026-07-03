@@ -1,15 +1,19 @@
-import { type QuoxDocument, type QuoxElement, type QuoxNode, setElementFunctionProp } from "@quoxlabs/quox";
-import {
-  Fragment,
-  isQuoxVNode,
-  type QuoxProps,
-  type QuoxRenderable,
-  type QuoxStyle,
-  type QuoxVNode,
-  serializeQuoxStyle,
-} from "./jsx-runtime.ts";
+import { Fragment, isQuoxVNode, type QuoxProps, type QuoxStyle, serializeQuoxStyle } from "@quoxlabs/jsx";
+import type { QuoxDocument } from "./document.ts";
+import { setElementFunctionProp } from "./handlers.ts";
+import type { QuoxElement, QuoxNode } from "./node.ts";
 
-export function mountRenderable(parent: QuoxElement, value: QuoxRenderable): QuoxNode[] {
+type NormalizedVNode = {
+  type: string | ((props: never) => unknown);
+  props: QuoxProps;
+  children: unknown;
+};
+
+/** A JSX value produced by any JSX runtime `mount` recognizes (see `normalizeVNode`), or plain content. */
+export type QuoxRenderable = string | number | bigint | boolean | null | undefined | object | QuoxRenderable[];
+
+/** Mount a JSX value (from any recognized runtime) into `parent`, returning the created nodes. */
+export function mount(parent: QuoxElement, value: QuoxRenderable): QuoxNode[] {
   const nodes = createNodes(parent.ownerDocument, value);
   for (const node of nodes) parent.appendChild(node);
   return nodes;
@@ -35,33 +39,60 @@ function createNodes(document: QuoxDocument, value: unknown): QuoxNode[] {
       throw new TypeError(`Unsupported Quox renderable value: ${String(value)}`);
   }
 
-  if (!isQuoxVNode(value)) {
+  const vnode = normalizeVNode(value);
+  if (vnode === null) {
     throw new TypeError("Unsupported object in Quox render tree.");
   }
 
-  if (value.type === Fragment) {
-    return createNodes(document, value.children);
+  if (vnode.type === Fragment) {
+    return createNodes(document, vnode.children);
   }
 
-  if (typeof value.type === "function") {
-    const component = value.type as (props: QuoxProps & { children?: QuoxRenderable }) => unknown;
-    const rendered = component(componentProps(value));
+  if (typeof vnode.type === "function") {
+    const component = vnode.type as (props: QuoxProps & { children?: unknown }) => unknown;
+    const rendered = component(componentProps(vnode));
     if (isPromiseLike(rendered)) {
       throw new TypeError("Async Quox components are not supported yet.");
     }
     return createNodes(document, rendered);
   }
 
-  const element = document.createElement(value.type);
-  applyProps(element, value.props);
-  for (const node of createNodes(document, value.children)) {
+  const element = document.createElement(vnode.type);
+  applyProps(element, vnode.props);
+  for (const node of createNodes(document, vnode.children)) {
     element.appendChild(node);
   }
 
   return [element];
 }
 
-function componentProps(vnode: QuoxVNode): QuoxProps & { children?: QuoxRenderable } {
+/**
+ * Recognize a vnode produced by any supported JSX runtime and normalize it to a common shape.
+ * Add a branch here to support another runtime.
+ */
+function normalizeVNode(value: object): NormalizedVNode | null {
+  if (isQuoxVNode(value)) {
+    return { type: value.type, props: value.props, children: value.children };
+  }
+
+  if (isPreactLikeVNode(value)) {
+    const { children, ...props } = value.props ?? {};
+    return { type: value.type as NormalizedVNode["type"], props, children };
+  }
+
+  return null;
+}
+
+/**
+ * Duck-types Preact's vnode shape without depending on `preact`. Preact tags every vnode with
+ * `constructor: undefined` as an anti-forgery marker (the same check `preact/compat`'s
+ * `isValidElement` uses); plain object literals have `constructor === Object`.
+ */
+function isPreactLikeVNode(value: object): value is { type: unknown; props: QuoxProps | null } {
+  return "type" in value && "props" in value && (value as { constructor?: unknown }).constructor === undefined;
+}
+
+function componentProps(vnode: NormalizedVNode): QuoxProps & { children?: unknown } {
   return vnode.children === undefined ? vnode.props : { ...vnode.props, children: vnode.children };
 }
 

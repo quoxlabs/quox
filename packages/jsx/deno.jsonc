@@ -15,7 +15,6 @@
       "./mod.ts",
       "./jsx-runtime.ts",
       "./jsx-dev-runtime.ts",
-      "./mount.ts",
       "./README.md"
     ]
   },

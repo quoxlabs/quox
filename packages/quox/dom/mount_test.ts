@@ -1,7 +1,10 @@
-import { getElementFunctionProps, QuoxDocument, QuoxElement } from "@quoxlabs/quox";
+import { createVNode, Fragment, type QuoxRenderable, type QuoxVNodeType } from "@quoxlabs/jsx";
 import { assert, assertEquals, assertThrows } from "@std/assert";
-import { createVNode, Fragment, type QuoxRenderable, type QuoxVNodeType } from "./jsx-runtime.ts";
-import { mountRenderable } from "./mount.ts";
+import type { QuoxRenderer as WasmRenderer } from "../lib/quox.js";
+import { QuoxDocument } from "./document.ts";
+import { getElementFunctionProps } from "./handlers.ts";
+import { mount } from "./mount.ts";
+import { QuoxElement } from "./node.ts";
 
 type Operation =
   | { type: "create_element"; id: number; tagName: string }
@@ -78,7 +81,7 @@ function createTestDocument(): {
   const renderer = new FakeRenderer();
   const noop = () => undefined;
   const document = new QuoxDocument(
-    renderer as unknown as ConstructorParameters<typeof QuoxDocument>[0],
+    renderer as unknown as WasmRenderer,
     noop,
     noop,
   );
@@ -90,7 +93,7 @@ function createTestDocument(): {
   };
 }
 
-Deno.test("mountRenderable walks fragments, function components, and nested arrays", () => {
+Deno.test("mount walks fragments, function components, and nested arrays", () => {
   const { renderer, root } = createTestDocument();
   const Leaf = (props: { label: string; children?: QuoxRenderable }) =>
     createVNode("span", {
@@ -98,7 +101,7 @@ Deno.test("mountRenderable walks fragments, function components, and nested arra
       children: [props.label, props.children],
     });
 
-  mountRenderable(
+  mount(
     root,
     createVNode(Fragment, {
       children: [
@@ -135,10 +138,10 @@ Deno.test("mountRenderable walks fragments, function components, and nested arra
   ]);
 });
 
-Deno.test("mountRenderable lowers props and stores function-valued DOM props", () => {
+Deno.test("mount lowers props and stores function-valued DOM props", () => {
   const { renderer, root } = createTestDocument();
   const onClick = () => "clicked";
-  const [node] = mountRenderable(
+  const [node] = mount(
     root,
     createVNode("label", {
       className: "cta",
@@ -175,23 +178,76 @@ Deno.test("mountRenderable lowers props and stores function-valued DOM props", (
   assert(getElementFunctionProps(node as QuoxElement)?.get("onClick") === onClick, "onClick was not stored");
 });
 
-Deno.test("mountRenderable rejects unsupported object attributes", () => {
+Deno.test("mount rejects unsupported object attributes", () => {
   const { root } = createTestDocument();
 
   assertThrows(
-    () => mountRenderable(root, createVNode("div", { value: { nested: true } })),
+    () => mount(root, createVNode("div", { value: { nested: true } })),
     TypeError,
     'Cannot set object value as "value" attribute.',
   );
 });
 
-Deno.test("mountRenderable rejects async function components", () => {
+Deno.test("mount rejects async function components", () => {
   const { root } = createTestDocument();
   const AsyncComponent = (() => Promise.resolve(createVNode("p", null))) as unknown as QuoxVNodeType;
 
   assertThrows(
-    () => mountRenderable(root, createVNode(AsyncComponent, null)),
+    () => mount(root, createVNode(AsyncComponent, null)),
     TypeError,
     "Async Quox components are not supported yet.",
   );
+});
+
+// A plain object shaped like a Preact vnode: `type`, `props`, and `constructor: undefined`
+// (Preact's own anti-forgery marker). No `preact` import is used anywhere in this test.
+function createPreactLikeVNode(
+  type: string | ((props: Record<string, unknown>) => unknown),
+  props: Record<string, unknown> | null,
+): object {
+  return Object.assign(Object.create(null), { type, props, key: null, ref: null });
+}
+
+Deno.test("mount recognizes duck-typed Preact-shaped vnodes", () => {
+  const { renderer, root } = createTestDocument();
+
+  mount(
+    root,
+    createPreactLikeVNode("h1", { className: "title", children: "Hi" }),
+  );
+
+  assertEquals(renderer.operations, [
+    { type: "create_element", id: 1, tagName: "h1" },
+    { type: "set_attribute", nodeId: 1, name: "class", value: "title" },
+    { type: "create_text_node", id: 2, text: "Hi" },
+    { type: "append_child", parentId: 1, childId: 2 },
+    { type: "append_child", parentId: 0, childId: 1 },
+  ]);
+});
+
+Deno.test("mount resolves Preact-shaped fragments and function components without special-casing", () => {
+  const { renderer, root } = createTestDocument();
+  const PreactFragment = (props: { children?: unknown }) => props.children;
+  const Leaf = (props: { label: string }) => createPreactLikeVNode("span", { children: props.label });
+
+  mount(
+    root,
+    createPreactLikeVNode(PreactFragment, {
+      children: [
+        createPreactLikeVNode("p", { children: "loose" }),
+        createPreactLikeVNode(Leaf as unknown as (props: Record<string, unknown>) => unknown, { label: "Leaf" }),
+      ],
+    }),
+  );
+
+  assertEquals(renderer.operations, [
+    { type: "create_element", id: 1, tagName: "p" },
+    { type: "create_text_node", id: 2, text: "loose" },
+    { type: "append_child", parentId: 1, childId: 2 },
+    { type: "create_element", id: 3, tagName: "span" },
+    { type: "create_text_node", id: 4, text: "Leaf" },
+    { type: "append_child", parentId: 3, childId: 4 },
+    { type: "append_child", parentId: 0, childId: 1 },
+    { type: "append_child", parentId: 0, childId: 3 },
+  ]);
 });
