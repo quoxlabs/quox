@@ -1,6 +1,6 @@
 {
   "name": "@quoxlabs/jsx",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "exports": {
     ".": "./mod.ts",
     "./jsx-runtime": "./jsx-runtime.ts",
