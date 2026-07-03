@@ -1,0 +1,21 @@
+{
+  "name": "@quoxlabs/jsx",
+  "version": "0.0.1",
+  "exports": {
+    ".": "./mod.ts",
+    "./jsx-runtime": "./jsx-runtime.ts",
+    "./jsx-dev-runtime": "./jsx-dev-runtime.ts"
+  },
+  "license": "MIT",
+  "tasks": {
+    "ok": "deno fmt --check && deno lint && deno check"
+  },
+  "publish": {
+    "include": [
+      "./mod.ts",
+      "./jsx-runtime.ts",
+      "./jsx-dev-runtime.ts",
+      "./README.md"
+    ]
+  }
+}

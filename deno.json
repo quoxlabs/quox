@@ -14,5 +14,5 @@
       ]
     }
   },
-  "workspace": ["./packages/quox", "./packages/winding"]
+  "workspace": ["./packages/jsx", "./packages/quox", "./packages/winding"]
 }
