@@ -1,13 +1,6 @@
 import type { Library, LoadLibrary, UIEvent, Window } from "./src/../types.ts";
 import { x11functions, XEventMask, XEventType } from "./x11_ffi.ts";
-
-function cString(s: string): Uint8Array<ArrayBuffer> {
-  return new TextEncoder().encode(`${s}\0`);
-}
-
-function utf8Bytes(s: string): Uint8Array<ArrayBuffer> {
-  return new TextEncoder().encode(s);
-}
+import { utf8Bytes, utf8CString as cString } from "./text_encoding.ts";
 
 // All event masks except:
 //   - PointerMotionHintMask (bit 7): throttles MotionNotify to one hint per entry

@@ -8,6 +8,7 @@ import {
   WlSeatCap,
   WlShmFormat,
 } from "./wayland_ffi.ts";
+import { utf8CString as cStr } from "./text_encoding.ts";
 
 // ---------------------------------------------------------------------------
 // libc helpers (memfd, mmap, poll) — needed for shared-memory pixel buffers
@@ -34,12 +35,6 @@ const POLLIN = 1;
 const RTLD_NOW = 0x2;
 const RTLD_NOLOAD = 0x4;
 const LIBWAYLAND_CLIENT_SO = "libwayland-client.so.0";
-
-function cStr(s: string): Uint8Array<ArrayBuffer> {
-  const b = new Uint8Array(s.length + 1);
-  for (let i = 0; i < s.length; i++) b[i] = s.charCodeAt(i);
-  return b;
-}
 
 function dlsymRequired(
   libdl: Deno.DynamicLibrary<typeof libdlSymbols>,
