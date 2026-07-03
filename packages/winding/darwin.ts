@@ -1,16 +1,22 @@
 import type { Library, LoadLibrary, UIEvent, Window } from "./types.ts";
 import {
-  addMethod,
-  allocateClassPair,
-  cf,
-  cg,
+  addMethod as runtimeAddMethod,
+  allocateClassPair as runtimeAllocateClassPair,
+  APPKIT,
+  cfSymbols,
+  cgSymbols,
+  CORE_FOUNDATION,
+  CORE_GRAPHICS,
   cStr,
-  getClass,
+  getClass as runtimeGetClass,
+  LIBOBJC,
+  NSPOINT,
+  NSRECT,
+  type ObjcRuntime,
   readStructF64,
-  registerClassPair,
   RGBA_BITMAP_INFO,
-  sel,
-  send,
+  runtimeSymbols,
+  sel as runtimeSel,
 } from "./darwin_ffi.ts";
 
 // NSWindowStyleMask: Titled | Closable | Resizable | Miniaturizable
@@ -18,6 +24,99 @@ const NS_WINDOW_STYLE_MASK = 1 | 2 | 8 | 4;
 const NS_BACKING_STORE_BUFFERED = 2n;
 const NS_APPLICATION_ACTIVATION_POLICY_REGULAR = 0n;
 const NS_EVENT_MASK_ANY = 0xFFFFFFFFFFFFFFFFn;
+
+type Closeable = { close(): void };
+
+function openMsgSend<
+  const P extends readonly Deno.NativeType[],
+  const R extends Deno.NativeResultType,
+>(libraries: Closeable[], parameters: P, result: R) {
+  const lib = Deno.dlopen(
+    LIBOBJC,
+    {
+      objc_msgSend: { parameters, result },
+    } as const,
+  );
+  libraries.push(lib);
+  return lib.symbols.objc_msgSend;
+}
+
+function openMsgSendSymbols(libraries: Closeable[]) {
+  // One `objc_msgSend` handle per distinct call shape we need. All calls take
+  // (receiver, selector, ...args); extra unused argument slots are never passed.
+  return {
+    id: openMsgSend(libraries, ["pointer", "pointer"], "pointer"),
+    id_cstr: openMsgSend(libraries, ["pointer", "pointer", "buffer"], "pointer"),
+    id_rectU64U64Bool: openMsgSend(
+      libraries,
+      ["pointer", "pointer", NSRECT, "u64", "u64", "bool"],
+      "pointer",
+    ),
+    id_u64PtrPtrBool: openMsgSend(
+      libraries,
+      ["pointer", "pointer", "u64", "pointer", "pointer", "bool"],
+      "pointer",
+    ),
+    void: openMsgSend(libraries, ["pointer", "pointer"], "void"),
+    void_id: openMsgSend(libraries, ["pointer", "pointer", "pointer"], "void"),
+    void_bool: openMsgSend(libraries, ["pointer", "pointer", "bool"], "void"),
+    void_i64: openMsgSend(libraries, ["pointer", "pointer", "i64"], "void"),
+    point: openMsgSend(libraries, ["pointer", "pointer"], NSPOINT),
+    rect: openMsgSend(libraries, ["pointer", "pointer"], NSRECT),
+    f64: openMsgSend(libraries, ["pointer", "pointer"], "f64"),
+    u16: openMsgSend(libraries, ["pointer", "pointer"], "u16"),
+    i64: openMsgSend(libraries, ["pointer", "pointer"], "i64"),
+    u64: openMsgSend(libraries, ["pointer", "pointer"], "u64"),
+  } as const;
+}
+
+function openDarwinFfi() {
+  const opened: Closeable[] = [];
+  try {
+    // Load AppKit into the process so its Objective-C classes become resolvable;
+    // we never call anything through this handle directly.
+    const appKit = Deno.dlopen(APPKIT, {});
+    opened.push(appKit);
+
+    const runtime: ObjcRuntime = Deno.dlopen(LIBOBJC, runtimeSymbols);
+    opened.push(runtime);
+
+    const send = openMsgSendSymbols(opened);
+
+    const cg = Deno.dlopen(CORE_GRAPHICS, cgSymbols);
+    opened.push(cg);
+
+    const cf = Deno.dlopen(CORE_FOUNDATION, cfSymbols);
+    opened.push(cf);
+
+    return {
+      appKit,
+      runtime,
+      send,
+      cg,
+      cf,
+      getClass: (name: string) => runtimeGetClass(runtime, name),
+      sel: (name: string) => runtimeSel(runtime, name),
+      allocateClassPair: (superclass: Deno.PointerObject, name: string) =>
+        runtimeAllocateClassPair(runtime, superclass, name),
+      registerClassPair: runtime.symbols.objc_registerClassPair,
+      addMethod: (
+        cls: Deno.PointerObject,
+        selector: Deno.PointerValue,
+        imp: Deno.PointerValue,
+        typeEncoding: string,
+      ) => runtimeAddMethod(runtime, cls, selector, imp, typeEncoding),
+      close: () => {
+        for (let i = opened.length - 1; i >= 0; i--) opened[i].close();
+      },
+    };
+  } catch (err) {
+    for (let i = opened.length - 1; i >= 0; i--) opened[i].close();
+    throw err;
+  }
+}
+
+type DarwinFfi = ReturnType<typeof openDarwinFfi>;
 
 // NSEventType values (AppKit/NSEvent.h)
 const NSEventType = {
@@ -36,7 +135,8 @@ const NSEventType = {
   OtherMouseDragged: 27n,
 } as const;
 
-function makeNSString(s: string): Deno.PointerValue {
+function makeNSString(ffi: DarwinFfi, s: string): Deno.PointerValue {
+  const { getClass, sel, send } = ffi;
   const alloc = send.id(getClass("NSString"), sel("alloc"));
   return send.id_cstr(alloc, sel("initWithUTF8String:"), cStr(s));
 }
@@ -61,6 +161,7 @@ class DarwinWindow implements Window {
   #prevImageBuf: Uint8Array | undefined;
 
   constructor(readonly lib: DarwinLibrary, x = 0, y = 0, w = 800, h = 600) {
+    const { getClass, sel, send } = lib.ffi;
     const alloc = send.id(getClass("NSWindow"), sel("alloc"));
     const rect = new Float64Array([x, y, w, h]);
     const win = send.id_rectU64U64Bool(
@@ -102,6 +203,7 @@ class DarwinWindow implements Window {
   }
 
   blit(rgba: Uint8Array, width: number, height: number): void {
+    const { cf, cg, sel, send } = this.lib.ffi;
     this.#prevImageBuf = this.#imageBuf;
     // Own a stable copy: the caller's buffer isn't guaranteed to outlive this call.
     const buf = new Uint8Array(rgba);
@@ -143,8 +245,9 @@ class DarwinWindow implements Window {
 const BUTTONS = [, "left", "middle", "right"] as const;
 
 class DarwinLibrary implements Library {
+  readonly ffi: DarwinFfi;
   readonly nsApp: Deno.PointerValue;
-  readonly colorSpace: Deno.PointerValue;
+  readonly colorSpace: Deno.PointerObject;
   readonly delegateClass: Deno.PointerObject;
   readonly windows = new Map<bigint, DarwinWindow>();
   readonly delegates = new Map<bigint, DarwinWindow>();
@@ -159,12 +262,24 @@ class DarwinLibrary implements Library {
   #queue: UIEvent[] = [];
 
   constructor() {
+    this.ffi = openDarwinFfi();
+    const {
+      addMethod,
+      allocateClassPair,
+      cg,
+      getClass,
+      registerClassPair,
+      sel,
+      send,
+    } = this.ffi;
     this.nsApp = send.id(getClass("NSApplication"), sel("sharedApplication"));
     send.void_i64(this.nsApp, sel("setActivationPolicy:"), NS_APPLICATION_ACTIVATION_POLICY_REGULAR);
     send.void(this.nsApp, sel("finishLaunching"));
     this.#distantPast = send.id(getClass("NSDate"), sel("distantPast"));
-    this.#runLoopMode = makeNSString("kCFRunLoopDefaultMode");
-    this.colorSpace = cg.symbols.CGColorSpaceCreateDeviceRGB();
+    this.#runLoopMode = makeNSString(this.ffi, "kCFRunLoopDefaultMode");
+    const colorSpace = cg.symbols.CGColorSpaceCreateDeviceRGB();
+    if (colorSpace === null) throw new Error("winding(darwin): CGColorSpaceCreateDeviceRGB failed");
+    this.colorSpace = colorSpace;
 
     this.#shouldCloseCallback = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer", "pointer"], result: "bool" },
@@ -200,6 +315,7 @@ class DarwinLibrary implements Library {
   }
 
   event(): UIEvent | undefined {
+    const { sel, send } = this.ffi;
     if (this.#queue.length) return this.#queue.shift();
     while (true) {
       const event = send.id_u64PtrPtrBool(
@@ -228,10 +344,13 @@ class DarwinLibrary implements Library {
   close(): void {
     this.#shouldCloseCallback.close();
     this.#didResizeCallback.close();
+    this.ffi.cf.symbols.CFRelease(this.colorSpace);
+    this.ffi.close();
   }
 }
 
 function importEvent(event: Deno.PointerValue, lib: DarwinLibrary): UIEvent | undefined {
+  const { sel, send } = lib.ffi;
   const type = send.u64(event, sel("type"));
   const windowPtr = send.id(event, sel("window"));
   const window = windowPtr !== null ? lib.windows.get(pointerId(windowPtr)) : undefined;
