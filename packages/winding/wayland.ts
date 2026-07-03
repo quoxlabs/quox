@@ -157,7 +157,7 @@ class WaylandWindow implements Window {
     this.#height = h;
 
     this.#setupListeners();
-    this.#setTitle("winding");
+    this.setTitle("winding");
 
     // Initial empty commit -- compositor will reply with configure
     sym.wl_proxy_marshal_array_flags(
@@ -226,7 +226,7 @@ class WaylandWindow implements Window {
     this.#configured = true;
   }
 
-  #setTitle(title: string): void {
+  setTitle(title: string): void {
     const sym = this.lib.wl.symbols;
     const titleBuf = cStr(title);
     sym.wl_proxy_marshal_array_flags(
@@ -237,6 +237,7 @@ class WaylandWindow implements Window {
       0,
       args(Deno.UnsafePointer.value(Deno.UnsafePointer.of(titleBuf))),
     );
+    sym.wl_display_flush(this.lib.display);
   }
 
   /**

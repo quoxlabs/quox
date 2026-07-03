@@ -32,6 +32,7 @@ export const user32functions = {
   ReleaseDC: { parameters: ["pointer", "pointer"], result: "i32" },
   SetCapture: { parameters: ["pointer"], result: "pointer" },
   ReleaseCapture: { parameters: [], result: "bool" },
+  SetWindowTextW: { parameters: ["pointer", "buffer"], result: "bool" },
   LoadCursorW: { parameters: ["pointer", "usize"], result: "usize" },
   RegisterClassExW: {
     parameters: ["buffer"],
