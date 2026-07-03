@@ -11,10 +11,10 @@ export function cStr(s: string): Uint8Array<ArrayBuffer> {
   return buf;
 }
 
-export const LIBOBJC = "/usr/lib/libobjc.dylib";
-export const APPKIT = "/System/Library/Frameworks/AppKit.framework/AppKit";
-export const CORE_GRAPHICS = "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics";
-export const CORE_FOUNDATION = "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation";
+export const LIBOBJC = "libobjc.dylib";
+export const APPKIT = "AppKit";
+export const CORE_GRAPHICS = "CoreGraphics";
+export const CORE_FOUNDATION = "CoreFoundation";
 
 export const runtimeSymbols = {
   objc_getClass: { parameters: ["buffer"], result: "pointer" },
