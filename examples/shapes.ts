@@ -1,10 +1,7 @@
-import { renderRawHTML } from "../packages/quox/mod.ts";
+import { openWindow } from "../packages/quox/mod.ts";
 
-const html = `
-<!DOCTYPE html>
-<html>
-<head>
-  <style>
+const head = `
+<style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
 
     body {
@@ -105,10 +102,9 @@ const html = `
     .d5 { background: #4be1ff; }
     .d6 { background: #b44bff; }
     .d7 { background: #ff4b6e; opacity: 0.5; }
-  </style>
-</head>
-<body>
+  </style>`;
 
+const body = `
   <div class="circles">
     <div class="circle c1"></div>
     <div class="circle c2"></div>
@@ -148,9 +144,8 @@ const html = `
     <div class="diamond d7"></div>
   </div>
 
-</body>
-</html>`;
+`;
 
 if (import.meta.main) {
-  await renderRawHTML(html);
+  await openWindow({ head, body });
 }

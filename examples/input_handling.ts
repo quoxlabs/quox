@@ -1,16 +1,11 @@
-import { renderRawHTML } from "../packages/quox/mod.ts";
+import { openWindow } from "../packages/quox/mod.ts";
 
-const html = `
-<!DOCTYPE html>
-<html>
-  <body>
-    <h1>Input Handling Demo</h1>
-    <p>Move the mouse, click, scroll, or type to see events in the console.</p>
-  </body>
-</html>`;
+const body = `
+<h1>Input Handling Demo</h1>
+<p>Move the mouse, click, scroll, or type to see events in the console.</p>`;
 
 if (import.meta.main) {
-  const window = await renderRawHTML(html);
+  const window = await openWindow({ body });
 
   window.addEventListener((event) => {
     switch (event.type) {

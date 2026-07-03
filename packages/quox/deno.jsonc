@@ -11,6 +11,7 @@
   "publish": {
     "include": [
       "./mod.ts",
+      "./dom/",
       "./lib/"
     ]
   },

@@ -1,14 +1,9 @@
-import { renderRawHTML } from "../packages/quox/mod.ts";
+import { openWindow } from "../packages/quox/mod.ts";
 
-const html = `
-<!DOCTYPE html>
-<html>
-  <body>
-    <h1>Hello, World! 😸</h1>
-    <p>Meow!</p>
-  </body>
-</html>`;
+const body = `
+<h1>Hello, World! 😸</h1>
+<p>Meow!</p>`;
 
 if (import.meta.main) {
-  await renderRawHTML(html);
+  await openWindow({ body });
 }
