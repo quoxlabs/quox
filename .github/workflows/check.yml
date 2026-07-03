@@ -17,15 +17,9 @@ jobs:
         with:
           deno-version: v2.x
           cache: true
-      - uses: actions/cache@v4
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            packages/quox/target
-          key: ${{ runner.os }}-cargo-check-${{ hashFiles('packages/quox/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-check-
+          workspaces: packages/quox
       - run: deno fmt --check
       - run: deno lint
       - run: deno task build
