@@ -17,14 +17,8 @@ jobs:
         with:
           deno-version: v2.x
           cache: true
-      - uses: actions/cache@v4
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            packages/quox/target
-          key: ${{ runner.os }}-cargo-publish-${{ hashFiles('packages/quox/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-publish-
+          workspaces: packages/quox
       - run: deno task build:prod
       - run: deno publish
