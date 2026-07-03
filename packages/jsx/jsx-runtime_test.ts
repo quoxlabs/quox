@@ -1,22 +1,5 @@
+import { assertEquals, assertThrows } from "@std/assert";
 import { createVNode, Fragment, isQuoxVNode, type QuoxVNodeType, serializeQuoxStyle } from "./jsx-runtime.ts";
-
-function assertEquals(actual: unknown, expected: unknown): void {
-  if (Object.is(actual, expected)) return;
-  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
-    throw new Error(`Expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
-  }
-}
-
-function assertThrows(fn: () => void, message: string): void {
-  try {
-    fn();
-  } catch (error) {
-    if (error instanceof Error && error.message.includes(message)) return;
-    throw error;
-  }
-
-  throw new Error("Expected function to throw");
-}
 
 Deno.test("createVNode stores type, props, children, and key", () => {
   const vnode = createVNode("h1", { id: "title", children: "Hello" }, "main");
@@ -61,6 +44,7 @@ Deno.test("async components can be detected by a renderer mount walker", () => {
         throw new TypeError("Async Quox components are not supported yet.");
       }
     },
+    TypeError,
     "Async Quox components are not supported yet.",
   );
 });

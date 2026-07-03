@@ -1,4 +1,5 @@
 import { getElementFunctionProps, QuoxDocument, QuoxElement } from "@quoxlabs/quox";
+import { assert, assertEquals, assertThrows } from "@std/assert";
 import { createVNode, Fragment, type QuoxRenderable, type QuoxVNodeType } from "./jsx-runtime.ts";
 import { mountRenderable } from "./mount.ts";
 
@@ -87,27 +88,6 @@ function createTestDocument(): {
     renderer,
     root: new QuoxElement(document, 0),
   };
-}
-
-function assertEquals(actual: unknown, expected: unknown): void {
-  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
-    throw new Error(`Expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
-  }
-}
-
-function assert(condition: boolean, message: string): void {
-  if (!condition) throw new Error(message);
-}
-
-function assertThrows(fn: () => void, message: string): void {
-  try {
-    fn();
-  } catch (error) {
-    if (error instanceof Error && error.message.includes(message)) return;
-    throw error;
-  }
-
-  throw new Error("Expected function to throw");
 }
 
 Deno.test("mountRenderable walks fragments, function components, and nested arrays", () => {
@@ -200,6 +180,7 @@ Deno.test("mountRenderable rejects unsupported object attributes", () => {
 
   assertThrows(
     () => mountRenderable(root, createVNode("div", { value: { nested: true } })),
+    TypeError,
     'Cannot set object value as "value" attribute.',
   );
 });
@@ -210,6 +191,7 @@ Deno.test("mountRenderable rejects async function components", () => {
 
   assertThrows(
     () => mountRenderable(root, createVNode(AsyncComponent, null)),
+    TypeError,
     "Async Quox components are not supported yet.",
   );
 });

@@ -18,5 +18,8 @@
       "./mount.ts",
       "./README.md"
     ]
+  },
+  "imports": {
+    "@std/assert": "jsr:@std/assert@^1.0.19"
   }
 }
