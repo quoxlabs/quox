@@ -16,12 +16,14 @@ import type { LoadLibrary } from "./types.ts";
 import { load as X11Load } from "./x11.ts";
 import { load as Win32Load } from "./win32.ts";
 import { load as WaylandLoad } from "./wayland.ts";
+import { load as DarwinLoad } from "./darwin.ts";
 
 export const load: LoadLibrary = () => {
   if (Deno.permissions.requestSync({ name: "ffi" }).state !== "granted") {
     throw new Error("quox cannot run without FFI access");
   }
   if (Deno.build.os === "windows") return Win32Load();
+  if (Deno.build.os === "darwin") return DarwinLoad();
   // Prefer Wayland when WAYLAND_DISPLAY is set; fall back to X11 otherwise.
   if (
     Deno.permissions.querySync({ name: "env", variable: "WAYLAND_DISPLAY" }).state === "granted" &&
