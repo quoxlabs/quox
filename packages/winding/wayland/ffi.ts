@@ -274,3 +274,17 @@ export const libdlSymbols = {
   dlsym: { parameters: ["pointer", "buffer"], result: "pointer" },
   dlclose: { parameters: ["pointer"], result: "i32" },
 } as const;
+
+export const xkbSymbols = {
+  xkb_context_new: { parameters: ["i32"], result: "pointer" },
+  xkb_context_unref: { parameters: ["pointer"], result: "void" },
+  xkb_keymap_new_from_buffer: { parameters: ["pointer", "pointer", "usize", "i32", "i32"], result: "pointer" },
+  xkb_keymap_unref: { parameters: ["pointer"], result: "void" },
+  xkb_state_new: { parameters: ["pointer"], result: "pointer" },
+  xkb_state_unref: { parameters: ["pointer"], result: "void" },
+  xkb_state_update_mask: {
+    parameters: ["pointer", "u32", "u32", "u32", "u32", "u32", "u32"],
+    result: "u32",
+  },
+  xkb_state_mod_name_is_active: { parameters: ["pointer", "buffer", "i32"], result: "i32" },
+} as const;

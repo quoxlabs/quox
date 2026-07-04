@@ -5,7 +5,15 @@ export interface WindowEvent {
   type: string;
   window?: Window;
 }
-export interface KeyEvent extends WindowEvent {
+export interface KeyModifiers {
+  shiftKey: boolean;
+  ctrlKey: boolean;
+  altKey: boolean;
+  metaKey: boolean;
+  /** Command on Darwin, otherwise Control. */
+  accelKey: boolean;
+}
+export interface KeyEvent extends WindowEvent, KeyModifiers {
   type: "keydown" | "keyup";
   /** Native, unnormalized platform key identifier. */
   keycode: number;

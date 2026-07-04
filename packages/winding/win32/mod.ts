@@ -1,4 +1,4 @@
-import type { Library, LoadLibrary, UIEvent, Window } from "../types.ts";
+import type { KeyModifiers, Library, LoadLibrary, UIEvent, Window } from "../types.ts";
 import { getDomCode } from "./dom_code.ts";
 import { gdi32functions, kernel32functions, user32functions, WHEEL_DELTA, WM } from "./ffi.ts";
 
@@ -7,6 +7,11 @@ import { gdi32functions, kernel32functions, user32functions, WHEEL_DELTA, WM } f
 const BITMAPINFOHEADER_SIZE = 40;
 const BI_RGB = 0;
 const DIB_RGB_COLORS = 0;
+const VK_SHIFT = 0x10;
+const VK_CONTROL = 0x11;
+const VK_MENU = 0x12;
+const VK_LWIN = 0x5b;
+const VK_RWIN = 0x5c;
 
 const DOWN_BUTTON: Partial<Record<WM, "left" | "middle" | "right">> = {
   [WM.LBUTTONDOWN]: "left",
@@ -25,6 +30,21 @@ function wideStringBuffer(value: string): ArrayBuffer {
   for (let i = 0; i < value.length; i++) view[i] = value.charCodeAt(i);
   view[value.length] = 0;
   return buffer;
+}
+
+function isKeyDown(lib: Win32Library, virtualKey: number): boolean {
+  return (lib.user32.symbols.GetKeyState(virtualKey) & 0x8000) !== 0;
+}
+
+function getModifiers(lib: Win32Library): KeyModifiers {
+  const ctrlKey = isKeyDown(lib, VK_CONTROL);
+  return {
+    shiftKey: isKeyDown(lib, VK_SHIFT),
+    ctrlKey,
+    altKey: isKeyDown(lib, VK_MENU),
+    metaKey: isKeyDown(lib, VK_LWIN) || isKeyDown(lib, VK_RWIN),
+    accelKey: ctrlKey,
+  };
 }
 
 class Win32Window implements Window {
@@ -225,11 +245,23 @@ class Win32Library implements Library {
         // has no separate "system key" event type. DefWindowProcW still runs
         // below, so system behaviors (Alt+F4, the system menu, ...) keep working.
         case WM.SYSKEYDOWN:
-          this.#event = { type: "keydown", keycode: Number(wParam), code: getDomCode(lParam), window: win };
+          this.#event = {
+            type: "keydown",
+            keycode: Number(wParam),
+            code: getDomCode(lParam),
+            ...getModifiers(this),
+            window: win,
+          };
           break;
         case WM.KEYUP:
         case WM.SYSKEYUP:
-          this.#event = { type: "keyup", keycode: Number(wParam), code: getDomCode(lParam), window: win };
+          this.#event = {
+            type: "keyup",
+            keycode: Number(wParam),
+            code: getDomCode(lParam),
+            ...getModifiers(this),
+            window: win,
+          };
           break;
       }
       return this.user32.symbols.DefWindowProcW(hWnd, uMsg, wParam, lParam);
