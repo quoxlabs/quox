@@ -2,8 +2,7 @@
   "tasks": {
     "build": "cd packages/quox && deno task build",
     "build:prod": "cd packages/quox && deno task build:prod",
-    "ok": "deno fmt --check && deno lint && deno test && deno check",
-    "test": "deno test"
+    "ok": "deno fmt --check && deno lint && deno test && deno check"
   },
   "fmt": {
     "lineWidth": 120
