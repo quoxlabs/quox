@@ -1,5 +1,5 @@
-import type { Library, LoadLibrary, UIEvent, Window } from "./types.ts";
-import { gdi32functions, kernel32functions, user32functions, WHEEL_DELTA, WM } from "./win32_ffi.ts";
+import type { Library, LoadLibrary, UIEvent, Window } from "../types.ts";
+import { gdi32functions, kernel32functions, user32functions, WHEEL_DELTA, WM } from "./ffi.ts";
 
 // BITMAPINFOHEADER is 40 bytes; for 32bpp BI_RGB no color table follows, so
 // this buffer alone is a valid BITMAPINFO for SetDIBitsToDevice.

@@ -13,10 +13,10 @@ export type {
   WindowEvent,
 } from "./types.ts";
 import type { LoadLibrary } from "./types.ts";
-import { load as X11Load } from "./x11.ts";
-import { load as Win32Load } from "./win32.ts";
-import { load as WaylandLoad } from "./wayland.ts";
-import { load as DarwinLoad } from "./darwin.ts";
+import { load as X11Load } from "./x11/mod.ts";
+import { load as Win32Load } from "./win32/mod.ts";
+import { load as WaylandLoad } from "./wayland/mod.ts";
+import { load as DarwinLoad } from "./darwin/mod.ts";
 
 export const load: LoadLibrary = () => {
   if (Deno.permissions.requestSync({ name: "ffi" }).state !== "granted") {

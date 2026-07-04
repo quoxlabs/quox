@@ -1,14 +1,6 @@
-import type { Library, LoadLibrary, UIEvent, Window } from "./types.ts";
-import {
-  buildXdgIfaces,
-  libdlSymbols,
-  waylandSymbols,
-  WlCursorShape,
-  WlOp,
-  WlSeatCap,
-  WlShmFormat,
-} from "./wayland_ffi.ts";
-import { utf8CString as cStr } from "./text_encoding.ts";
+import type { Library, LoadLibrary, UIEvent, Window } from "../types.ts";
+import { utf8CString as cStr } from "../text_encoding.ts";
+import { buildXdgIfaces, libdlSymbols, waylandSymbols, WlCursorShape, WlOp, WlSeatCap, WlShmFormat } from "./ffi.ts";
 
 // ---------------------------------------------------------------------------
 // libc helpers (memfd, mmap, poll) — needed for shared-memory pixel buffers

@@ -1,4 +1,4 @@
-import type { Library, LoadLibrary, UIEvent, Window } from "./types.ts";
+import type { Library, LoadLibrary, UIEvent, Window } from "../types.ts";
 import {
   addMethod as runtimeAddMethod,
   allocateClassPair as runtimeAllocateClassPair,
@@ -17,7 +17,7 @@ import {
   RGBA_BITMAP_INFO,
   runtimeSymbols,
   sel as runtimeSel,
-} from "./darwin_ffi.ts";
+} from "./ffi.ts";
 
 // NSWindowStyleMask: Titled | Closable | Resizable | Miniaturizable
 const NS_WINDOW_STYLE_MASK = 1 | 2 | 8 | 4;
