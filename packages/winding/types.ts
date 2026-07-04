@@ -7,7 +7,10 @@ export interface WindowEvent {
 }
 export interface KeyEvent extends WindowEvent {
   type: "keydown" | "keyup";
+  /** Native, unnormalized platform key identifier. */
   keycode: number;
+  /** DOM KeyboardEvent.code-style physical key identifier. */
+  code: string;
 }
 export interface ButtonEvent extends WindowEvent {
   type: "mousedown" | "mouseup";

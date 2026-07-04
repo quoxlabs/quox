@@ -20,7 +20,7 @@ export type QuoxMouseWheelEvent = { type: "wheel"; deltaX: number; deltaY: numbe
 export type QuoxKeyboardEvent = {
   type: "keydown" | "keyup";
   key: string;
-  code: number;
+  code: string;
 };
 export type QuoxResizeEvent = { type: "resize"; width: number; height: number };
 export type QuoxCloseEvent = { type: "close" };
@@ -70,9 +70,9 @@ function mapWindingEvent(ev: WindingUIEvent): QuoxInputEvent | null {
     case "wheel":
       return { type: "wheel", deltaX: ev.deltaX, deltaY: ev.deltaY };
     case "keydown":
-      return { type: "keydown", key: String(ev.keycode), code: ev.keycode };
+      return { type: "keydown", key: String(ev.keycode), code: ev.code };
     case "keyup":
-      return { type: "keyup", key: String(ev.keycode), code: ev.keycode };
+      return { type: "keyup", key: String(ev.keycode), code: ev.code };
     case "resize":
       return { type: "resize", width: ev.width, height: ev.height };
     case "close":

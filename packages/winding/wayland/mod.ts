@@ -1,5 +1,6 @@
 import type { Library, LoadLibrary, UIEvent, Window } from "../types.ts";
 import { utf8CString as cStr } from "../text_encoding.ts";
+import { getDomCode } from "./dom_code.ts";
 import { buildXdgIfaces, libdlSymbols, waylandSymbols, WlCursorShape, WlOp, WlSeatCap, WlShmFormat } from "./ffi.ts";
 
 // ---------------------------------------------------------------------------
@@ -698,7 +699,7 @@ class WaylandLibrary implements Library {
       // (data, keyboard, serial, time, key, state)
       { parameters: ["pointer", "pointer", "u32", "u32", "u32", "u32"], result: "void" },
       (_data, _kb, _serial, _time, key, state) => {
-        this.#events.push({ type: state ? "keydown" : "keyup", keycode: key });
+        this.#events.push({ type: state ? "keydown" : "keyup", keycode: key, code: getDomCode(key) });
       },
     );
     this.#listeners.push(keyCb);

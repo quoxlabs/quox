@@ -1,5 +1,6 @@
 import type { Library, LoadLibrary, UIEvent, Window } from "../types.ts";
 import { utf8Bytes, utf8CString as cString } from "../text_encoding.ts";
+import { getDomCode } from "./dom_code.ts";
 import { x11functions, XEventMask, XEventType } from "./ffi.ts";
 
 // XStoreName sets the legacy WM_NAME property, which is read as Latin-1 by clients that don't
@@ -236,10 +237,14 @@ function importEvent(
 ): UIEvent | undefined {
   const type = view.getInt32(0, true);
   switch (type) {
-    case XEventType.KeyPress:
-      return { type: "keydown", keycode: view.getInt32(84, true) };
-    case XEventType.KeyRelease:
-      return { type: "keyup", keycode: view.getInt32(84, true) };
+    case XEventType.KeyPress: {
+      const keycode = view.getInt32(84, true);
+      return { type: "keydown", keycode, code: getDomCode(keycode) };
+    }
+    case XEventType.KeyRelease: {
+      const keycode = view.getInt32(84, true);
+      return { type: "keyup", keycode, code: getDomCode(keycode) };
+    }
     case XEventType.ButtonPress: {
       const btn = view.getInt32(84, true);
       if (btn === 4) return { type: "wheel", deltaX: 0, deltaY: -1 };

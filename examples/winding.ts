@@ -17,7 +17,7 @@ while (true) {
   console.log(event);
 
   // Close and quit if q is pressed
-  if (event?.type === "keydown" && event.keycode === 24 /* q */) {
+  if (event?.type === "keydown" && event.code === "KeyQ") {
     break;
   }
 }

@@ -1,4 +1,5 @@
 import type { Library, LoadLibrary, UIEvent, Window } from "../types.ts";
+import { getDomCode } from "./dom_code.ts";
 import {
   addMethod as runtimeAddMethod,
   allocateClassPair as runtimeAllocateClassPair,
@@ -394,10 +395,14 @@ function importEvent(event: Deno.PointerValue, lib: DarwinLibrary): UIEvent | un
       const deltaY = send.f64(event, sel("deltaY"));
       return { type: "wheel", deltaX: -deltaX, deltaY: -deltaY, window };
     }
-    case NSEventType.KeyDown:
-      return { type: "keydown", keycode: send.u16(event, sel("keyCode")), window };
-    case NSEventType.KeyUp:
-      return { type: "keyup", keycode: send.u16(event, sel("keyCode")), window };
+    case NSEventType.KeyDown: {
+      const keycode = send.u16(event, sel("keyCode"));
+      return { type: "keydown", keycode, code: getDomCode(keycode), window };
+    }
+    case NSEventType.KeyUp: {
+      const keycode = send.u16(event, sel("keyCode"));
+      return { type: "keyup", keycode, code: getDomCode(keycode), window };
+    }
     default:
       return undefined;
   }

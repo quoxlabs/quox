@@ -1,4 +1,5 @@
 import type { Library, LoadLibrary, UIEvent, Window } from "../types.ts";
+import { getDomCode } from "./dom_code.ts";
 import { gdi32functions, kernel32functions, user32functions, WHEEL_DELTA, WM } from "./ffi.ts";
 
 // BITMAPINFOHEADER is 40 bytes; for 32bpp BI_RGB no color table follows, so
@@ -224,11 +225,11 @@ class Win32Library implements Library {
         // has no separate "system key" event type. DefWindowProcW still runs
         // below, so system behaviors (Alt+F4, the system menu, ...) keep working.
         case WM.SYSKEYDOWN:
-          this.#event = { type: "keydown", keycode: Number(wParam), window: win };
+          this.#event = { type: "keydown", keycode: Number(wParam), code: getDomCode(lParam), window: win };
           break;
         case WM.KEYUP:
         case WM.SYSKEYUP:
-          this.#event = { type: "keyup", keycode: Number(wParam), window: win };
+          this.#event = { type: "keyup", keycode: Number(wParam), code: getDomCode(lParam), window: win };
           break;
       }
       return this.user32.symbols.DefWindowProcW(hWnd, uMsg, wParam, lParam);
