@@ -18,7 +18,6 @@ blitz-html = { git = "https://github.com/DioxusLabs/blitz", rev = "4c9fb2820dc74
 blitz-paint = { git = "https://github.com/DioxusLabs/blitz", rev = "4c9fb2820dc74860d3b2d972493fa4e9fa83eb48", package = "blitz-paint" }
 blitz-traits = { git = "https://github.com/DioxusLabs/blitz", rev = "4c9fb2820dc74860d3b2d972493fa4e9fa83eb48", package = "blitz-traits" }
 console_error_panic_hook = "0.1"
-futures-intrusive = "0.5"
 vello = "0.8"
 wasm-bindgen = "=0.2.106"
 wasm-bindgen-futures = "=0.4.56"

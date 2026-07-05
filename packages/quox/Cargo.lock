@@ -1785,7 +1785,6 @@ dependencies = [
  "blitz-paint",
  "blitz-traits",
  "console_error_panic_hook",
- "futures-intrusive",
  "linebender_resource_handle",
  "vello",
  "wasm-bindgen",

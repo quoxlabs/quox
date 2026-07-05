@@ -1,25 +1,13 @@
 import type { KeyModifiers, Library, LoadLibrary, UIEvent, Window } from "../types.ts";
 import { utf8CString as cStr } from "../text_encoding.ts";
 import { getDomCode } from "./dom_code.ts";
-import {
-  buildXdgIfaces,
-  libdlSymbols,
-  waylandSymbols,
-  WlCursorShape,
-  WlOp,
-  WlSeatCap,
-  WlShmFormat,
-  xkbSymbols,
-} from "./ffi.ts";
+import { buildXdgIfaces, libdlSymbols, waylandSymbols, WlCursorShape, WlOp, WlSeatCap, xkbSymbols } from "./ffi.ts";
 
 // ---------------------------------------------------------------------------
-// libc helpers (memfd, mmap, poll) — needed for shared-memory pixel buffers
-// and non-blocking event polling.
+// libc helpers for keymap mmap and non-blocking event polling.
 // ---------------------------------------------------------------------------
 
 const libcSymbols = {
-  memfd_create: { parameters: ["buffer", "u32"], result: "i32" },
-  ftruncate: { parameters: ["i32", "i64"], result: "i32" },
   // mmap(addr, length, prot, flags, fd, offset)
   mmap: { parameters: ["pointer", "usize", "i32", "i32", "i32", "i64"], result: "pointer" },
   munmap: { parameters: ["pointer", "usize"], result: "i32" },
@@ -29,11 +17,8 @@ const libcSymbols = {
 } as const satisfies Deno.ForeignLibraryInterface;
 
 const PROT_READ = 0x1;
-const PROT_WRITE = 0x2;
-const MAP_SHARED = 0x01;
 const MAP_PRIVATE = 0x02;
 const MAP_FAILED = 0xFFFFFFFFFFFFFFFFn;
-const MFD_CLOEXEC = 1;
 const POLLIN = 1;
 const RTLD_NOW = 0x2;
 const RTLD_NOLOAD = 0x4;
@@ -126,17 +111,11 @@ class WaylandWindow implements Window {
   #xdgSurfaceConfigure!: AnyCallback;
   #toplevelConfigure!: AnyCallback;
   #toplevelClose!: AnyCallback;
-  // SHM buffer
-  #shmFd = -1;
-  #shmPtr: Deno.PointerObject | null = null;
-  #shmSize = 0;
-  #buffer: Deno.PointerObject | null = null;
   #width: number;
   #height: number;
   #windowSurface: Deno.UnsafeWindowSurface | null = null;
   // Pending configure serial from xdg_surface
   #pendingSerial = 0;
-  #configured = false;
 
   constructor(readonly lib: WaylandLibrary, w: number, h: number) {
     const sym = lib.wl.symbols;
@@ -250,7 +229,6 @@ class WaylandWindow implements Window {
       args(BigInt(this.#pendingSerial)),
     );
     this.#pendingSerial = 0;
-    this.#configured = true;
   }
 
   setTitle(title: string): void {
@@ -279,126 +257,12 @@ class WaylandWindow implements Window {
     return this.#windowSurface;
   }
 
-  /**
-   * Copy an RGBA pixel buffer to the Wayland surface. Converts to ARGB8888
-   * (the most widely supported wl_shm format) before blitting.
-   */
-  blit(rgba: Uint8Array, width: number, height: number): void {
-    const sym = this.lib.wl.symbols;
-    // Ack each configure serial before committing the next frame.
-    this.#ackPendingConfigure();
-    if (!this.#configured) return; // wait for first configure roundtrip
-    const size = width * height * 4;
-
-    // Recreate SHM storage when dimensions change
-    if (width !== this.#width || height !== this.#height || this.#shmFd < 0) {
-      this.#destroyShmBuffer();
-      this.#width = width;
-      this.#height = height;
-      this.#shmFd = this.lib.libc.symbols.memfd_create(cStr("winding-shm"), MFD_CLOEXEC);
-      if (this.#shmFd < 0) throw new Error("winding memfd_create failed");
-      if (this.lib.libc.symbols.ftruncate(this.#shmFd, BigInt(size)) !== 0) throw new Error("winding ftruncate failed");
-      const mapped = this.lib.libc.symbols.mmap(
-        null,
-        BigInt(size),
-        PROT_READ | PROT_WRITE,
-        MAP_SHARED,
-        this.#shmFd,
-        0n,
-      );
-      if (!mapped || BigInt(Deno.UnsafePointer.value(mapped)) === MAP_FAILED) throw new Error("winding mmap failed");
-      this.#shmPtr = mapped;
-      this.#shmSize = size;
-
-      // Create wl_shm_pool from fd, then a wl_buffer from the pool
-      const pool = sym.wl_proxy_marshal_array_flags(
-        this.lib.shm!,
-        WlOp.SHM_CREATE_POOL,
-        this.lib.ifaces.shmPool,
-        sym.wl_proxy_get_version(this.lib.shm!),
-        0,
-        args(0n, BigInt(this.#shmFd), BigInt(size)),
-      );
-      if (!pool) throw new Error("winding wl_shm_create_pool failed");
-
-      this.#buffer = sym.wl_proxy_marshal_array_flags(
-        pool,
-        WlOp.SHM_POOL_CREATE_BUFFER,
-        this.lib.ifaces.buffer,
-        sym.wl_proxy_get_version(pool),
-        0,
-        args(0n, 0n, BigInt(width), BigInt(height), BigInt(width * 4), BigInt(WlShmFormat.ARGB8888)),
-      );
-      sym.wl_proxy_marshal_array_flags(pool, WlOp.SHM_POOL_DESTROY, null, sym.wl_proxy_get_version(pool), 1, args());
-      if (!this.#buffer) throw new Error("winding wl_shm_pool_create_buffer failed");
-    }
-
-    // Write pixels: RGBA -> ARGB8888 (stored as BGRA in little-endian memory)
-    const dest = new Uint8Array(
-      new Deno.UnsafePointerView(this.#shmPtr!).getArrayBuffer(size),
-    );
-    for (let i = 0; i < rgba.length; i += 4) {
-      dest[i] = rgba[i + 2]; // B <- src R
-      dest[i + 1] = rgba[i + 1]; // G
-      dest[i + 2] = rgba[i]; // R <- src B
-      dest[i + 3] = rgba[i + 3]; // A
-    }
-
-    const v = sym.wl_proxy_get_version(this.#surface);
-    sym.wl_proxy_marshal_array_flags(
-      this.#surface,
-      WlOp.SURFACE_ATTACH,
-      null,
-      v,
-      0,
-      args(
-        Deno.UnsafePointer.value(this.#buffer!),
-        0n,
-        0n,
-      ),
-    );
-    // Use damage_buffer (opcode 9, since wl_surface version >= 4) to avoid scaling
-    sym.wl_proxy_marshal_array_flags(
-      this.#surface,
-      WlOp.SURFACE_DAMAGE_BUFFER,
-      null,
-      v,
-      0,
-      args(
-        0n,
-        0n,
-        BigInt(width),
-        BigInt(height),
-      ),
-    );
-    sym.wl_proxy_marshal_array_flags(this.#surface, WlOp.SURFACE_COMMIT, null, v, 0, args());
-    sym.wl_display_flush(this.lib.display);
-  }
-
-  #destroyShmBuffer(): void {
-    const sym = this.lib.wl.symbols;
-    if (this.#buffer) {
-      sym.wl_proxy_marshal_array_flags(this.#buffer, WlOp.BUFFER_DESTROY, null, 1, 1, args());
-      this.#buffer = null;
-    }
-    if (this.#shmPtr && this.#shmSize > 0) {
-      this.lib.libc.symbols.munmap(this.#shmPtr, BigInt(this.#shmSize));
-      this.#shmPtr = null;
-      this.#shmSize = 0;
-    }
-    if (this.#shmFd >= 0) {
-      this.lib.libc.symbols.close(this.#shmFd);
-      this.#shmFd = -1;
-    }
-  }
-
   [Symbol.dispose](): void {
     this.close();
   }
 
   close(): void {
     this.lib.windows.delete(this);
-    this.#destroyShmBuffer();
     const sym = this.lib.wl.symbols;
     const f = 1; // WL_MARSHAL_FLAG_DESTROY
     sym.wl_proxy_marshal_array_flags(this.#xdgToplevel, WlOp.XDG_TOPLEVEL_DESTROY, null, 1, f, args());
@@ -433,9 +297,6 @@ class WaylandLibrary implements Library {
   readonly ifaces: {
     registry: Deno.PointerObject;
     compositor: Deno.PointerObject;
-    shm: Deno.PointerObject;
-    shmPool: Deno.PointerObject;
-    buffer: Deno.PointerObject;
     surface: Deno.PointerObject;
     seat: Deno.PointerObject;
     pointer: Deno.PointerObject;
@@ -444,7 +305,6 @@ class WaylandLibrary implements Library {
   readonly windows = new Set<WaylandWindow>();
   // Globals bound from registry -- set during init roundtrip
   compositor: Deno.PointerObject | null = null;
-  shm: Deno.PointerObject | null = null;
   xdgWmBase: Deno.PointerObject | null = null;
   #cursorShapeManager: Deno.PointerObject | null = null;
   #cursorShapeDevice: Deno.PointerObject | null = null;
@@ -493,9 +353,6 @@ class WaylandLibrary implements Library {
     this.ifaces = {
       registry: dlsymRequired(this.libdl, wlHandle, "wl_registry_interface"),
       compositor: dlsymRequired(this.libdl, wlHandle, "wl_compositor_interface"),
-      shm: dlsymRequired(this.libdl, wlHandle, "wl_shm_interface"),
-      shmPool: dlsymRequired(this.libdl, wlHandle, "wl_shm_pool_interface"),
-      buffer: dlsymRequired(this.libdl, wlHandle, "wl_buffer_interface"),
       surface: dlsymRequired(this.libdl, wlHandle, "wl_surface_interface"),
       seat: dlsymRequired(this.libdl, wlHandle, "wl_seat_interface"),
       pointer: dlsymRequired(this.libdl, wlHandle, "wl_pointer_interface"),
@@ -535,7 +392,7 @@ class WaylandLibrary implements Library {
     );
     if (!registry) throw new Error("winding failed to get Wayland registry");
 
-    // Registry global callback: bind compositor, shm, seat, xdg_wm_base
+    // Registry global callback: bind compositor, seat, xdg_wm_base
     const globalCb = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer", "u32", "pointer", "u32"], result: "void" },
       (_data, reg, name, ifacePtr, version) => {
@@ -566,9 +423,6 @@ class WaylandLibrary implements Library {
     if (iface === "wl_compositor") {
       ifacePtr = this.ifaces.compositor;
       version = Math.min(offered, 4);
-    } else if (iface === "wl_shm") {
-      ifacePtr = this.ifaces.shm;
-      version = Math.min(offered, 1);
     } else if (iface === "wl_seat") {
       ifacePtr = this.ifaces.seat;
       version = Math.min(offered, 5);
@@ -599,7 +453,6 @@ class WaylandLibrary implements Library {
     if (!proxy) return;
 
     if (iface === "wl_compositor") this.compositor = proxy;
-    else if (iface === "wl_shm") this.shm = proxy;
     else if (iface === "wl_seat") this.#seat = proxy;
     else if (iface === "xdg_wm_base") {
       this.xdgWmBase = proxy;
@@ -855,8 +708,8 @@ class WaylandLibrary implements Library {
   }
 
   openWindow(_x = 0, _y = 0, w = 800, h = 600): WaylandWindow {
-    if (!this.compositor || !this.shm || !this.xdgWmBase) {
-      throw new Error("winding wayland globals not ready (compositor/shm/xdg_wm_base missing)");
+    if (!this.compositor || !this.xdgWmBase) {
+      throw new Error("winding wayland globals not ready (compositor/xdg_wm_base missing)");
     }
     return new WaylandWindow(this, w, h);
   }

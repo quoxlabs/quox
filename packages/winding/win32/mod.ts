@@ -1,12 +1,6 @@
 import type { KeyModifiers, Library, LoadLibrary, UIEvent, Window } from "../types.ts";
 import { getDomCode } from "./dom_code.ts";
-import { gdi32functions, kernel32functions, user32functions, WHEEL_DELTA, WM } from "./ffi.ts";
-
-// BITMAPINFOHEADER is 40 bytes; for 32bpp BI_RGB no color table follows, so
-// this buffer alone is a valid BITMAPINFO for SetDIBitsToDevice.
-const BITMAPINFOHEADER_SIZE = 40;
-const BI_RGB = 0;
-const DIB_RGB_COLORS = 0;
+import { kernel32functions, user32functions, WHEEL_DELTA, WM } from "./ffi.ts";
 const VK_SHIFT = 0x10;
 const VK_CONTROL = 0x11;
 const VK_MENU = 0x12;
@@ -50,8 +44,6 @@ function getModifiers(lib: Win32Library): KeyModifiers {
 class Win32Window implements Window {
   readonly id: bigint;
   readonly #hwnd: Deno.PointerObject;
-  #bgra = new Uint8Array(0) as Uint8Array<ArrayBuffer>;
-  #bmi = new ArrayBuffer(BITMAPINFOHEADER_SIZE);
   #width: number;
   #height: number;
 
@@ -97,59 +89,6 @@ class Win32Window implements Window {
       height: this.#height,
     });
   }
-
-  /**
-   * Copy an RGBA pixel buffer to the window's client area via GDI. Converts
-   * to a top-down 32bpp BGRA DIB (matching the BGRX reordering used by the
-   * X11 backend) and blits it with `SetDIBitsToDevice`.
-   */
-  blit(rgba: Uint8Array, width: number, height: number): void {
-    const byteLength = width * height * 4;
-    if (this.#bgra.byteLength !== byteLength) {
-      this.#bgra = new Uint8Array(byteLength) as Uint8Array<ArrayBuffer>;
-    }
-    const bgra = this.#bgra;
-    for (let i = 0; i < rgba.length; i += 4) {
-      bgra[i] = rgba[i + 2]; // B ← R
-      bgra[i + 1] = rgba[i + 1]; // G
-      bgra[i + 2] = rgba[i]; // R ← B
-      bgra[i + 3] = rgba[i + 3]; // A
-    }
-
-    const dv = new DataView(this.#bmi);
-    dv.setUint32(0, BITMAPINFOHEADER_SIZE, true); // biSize
-    dv.setInt32(4, width, true); // biWidth
-    dv.setInt32(8, -height, true); // biHeight (negative = top-down)
-    dv.setUint16(12, 1, true); // biPlanes
-    dv.setUint16(14, 32, true); // biBitCount
-    dv.setUint32(16, BI_RGB, true); // biCompression
-    dv.setUint32(20, byteLength, true); // biSizeImage
-    dv.setInt32(24, 0, true); // biXPelsPerMeter
-    dv.setInt32(28, 0, true); // biYPelsPerMeter
-    dv.setUint32(32, 0, true); // biClrUsed
-    dv.setUint32(36, 0, true); // biClrImportant
-
-    const hdc = this.lib.user32.symbols.GetDC(this.#hwnd);
-    if (hdc == null) throw new Error(this.lib.getLastError());
-    try {
-      this.lib.gdi32.symbols.SetDIBitsToDevice(
-        hdc,
-        0,
-        0,
-        width,
-        height,
-        0,
-        0,
-        0,
-        height,
-        bgra,
-        this.#bmi,
-        DIB_RGB_COLORS,
-      );
-    } finally {
-      this.lib.user32.symbols.ReleaseDC(this.#hwnd, hdc);
-    }
-  }
   [Symbol.dispose]() {
     this.close();
   }
@@ -161,7 +100,6 @@ class Win32Window implements Window {
 class Win32Library implements Library {
   readonly kernel32: Deno.DynamicLibrary<typeof kernel32functions>;
   readonly user32: Deno.DynamicLibrary<typeof user32functions>;
-  readonly gdi32: Deno.DynamicLibrary<typeof gdi32functions>;
   readonly instance: Deno.PointerValue;
   #wndClass = new ArrayBuffer(80);
   #classNameBuffer = (() => {
@@ -179,7 +117,6 @@ class Win32Library implements Library {
   constructor() {
     this.kernel32 = Deno.dlopen("kernel32", kernel32functions);
     this.user32 = Deno.dlopen("user32", user32functions);
-    this.gdi32 = Deno.dlopen("gdi32", gdi32functions);
 
     const wndClassDv = new DataView(this.#wndClass);
     let off = 0;
@@ -391,7 +328,6 @@ class Win32Library implements Library {
   }
   close(): void {
     this.#wndProc.close();
-    this.gdi32.close();
     this.user32.close();
     this.kernel32.close();
   }

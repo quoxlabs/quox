@@ -40,11 +40,6 @@ function getModifiers(state: number): KeyModifiers {
 
 class X11Window implements Window {
   readonly id: bigint;
-  readonly #gc: bigint;
-  #image: Deno.PointerValue;
-  // imageBuf is kept as a field so XCreateImage's internal pointer remains
-  // valid for the entire lifetime of each image.
-  #imageBuf: Uint8Array;
   #width: number;
   #height: number;
 
@@ -88,24 +83,6 @@ class X11Window implements Window {
     this.#width = w;
     this.#height = h;
 
-    this.#gc = lib.X11.symbols.XCreateGC(lib.display, window, 0n, null) as bigint;
-    const visual = lib.X11.symbols.XDefaultVisual(lib.display, 0);
-    this.#imageBuf = new Uint8Array(w * h * 4);
-    const image = lib.X11.symbols.XCreateImage(
-      lib.display,
-      visual,
-      24,
-      2,
-      0,
-      this.#imageBuf as Uint8Array<ArrayBuffer>,
-      w,
-      h,
-      32,
-      0,
-    );
-    if (!image) throw new Error("XCreateImage failed");
-    this.#image = image;
-
     lib.windows.set(this.id, this);
   }
 
@@ -139,61 +116,6 @@ class X11Window implements Window {
       width: this.#width,
       height: this.#height,
     });
-  }
-
-  /**
-   * Copy an RGBA pixel buffer to the X11 window. The buffer must be
-   * `width * height * 4` bytes. Internally converts to X11 TrueColor BGRX
-   * (little-endian) before blitting.
-   *
-   * If the dimensions differ from the last blit, the XImage is recreated to
-   * match the new size.
-   */
-  blit(rgba: Uint8Array, width: number, height: number): void {
-    if (width !== this.#width || height !== this.#height) {
-      this.#width = width;
-      this.#height = height;
-      this.#imageBuf = new Uint8Array(width * height * 4);
-      const visual = this.lib.X11.symbols.XDefaultVisual(this.lib.display, 0);
-      // The old XImage is intentionally not destroyed: XDestroyImage would try
-      // to free the JS-managed imageBuf pointer. We simply let the reference
-      // go stale; the tiny XImage struct is an acceptable one-time leak per
-      // resize event.
-      const image = this.lib.X11.symbols.XCreateImage(
-        this.lib.display,
-        visual,
-        24,
-        2,
-        0,
-        this.#imageBuf as Uint8Array<ArrayBuffer>,
-        width,
-        height,
-        32,
-        0,
-      );
-      if (!image) throw new Error("XCreateImage failed on resize");
-      this.#image = image;
-    }
-    const buf = this.#imageBuf;
-    for (let i = 0; i < rgba.length; i += 4) {
-      buf[i] = rgba[i + 2]; // B ← R
-      buf[i + 1] = rgba[i + 1]; // G
-      buf[i + 2] = rgba[i]; // R ← B
-      buf[i + 3] = 0; // padding
-    }
-    this.lib.X11.symbols.XPutImage(
-      this.lib.display,
-      this.id,
-      this.#gc,
-      this.#image,
-      0,
-      0,
-      0,
-      0,
-      this.#width,
-      this.#height,
-    );
-    this.lib.X11.symbols.XFlush(this.lib.display);
   }
 
   [Symbol.dispose](): void {

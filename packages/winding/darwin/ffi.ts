@@ -1,4 +1,4 @@
-// Minimal Objective-C runtime + AppKit/CoreGraphics FFI bindings.
+// Minimal Objective-C runtime + AppKit FFI bindings.
 //
 // macOS has no stable C ABI for windowing (unlike X11/Win32): everything goes
 // through the Objective-C message-dispatch runtime (`objc_msgSend`). Deno's FFI
@@ -11,8 +11,6 @@ export { cStr };
 
 export const LIBOBJC = "/usr/lib/libobjc.dylib";
 export const APPKIT = "/System/Library/Frameworks/AppKit.framework/AppKit";
-export const CORE_GRAPHICS = "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics";
-export const CORE_FOUNDATION = "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation";
 
 export const runtimeSymbols = {
   objc_getClass: { parameters: ["buffer"], result: "pointer" },
@@ -57,39 +55,6 @@ export function addMethod(
 // platform ABI, including the arm64/x86_64 large-struct-by-reference rules.
 export const NSRECT = { struct: ["f64", "f64", "f64", "f64"] } as const;
 export const NSPOINT = { struct: ["f64", "f64"] } as const;
-
-// CoreGraphics / CoreFoundation plain C functions (not Objective-C messages).
-export const cgSymbols = {
-  CGColorSpaceCreateDeviceRGB: { parameters: [], result: "pointer" },
-  CGDataProviderCreateWithData: {
-    parameters: ["pointer", "buffer", "usize", "pointer"],
-    result: "pointer",
-  },
-  CGImageCreate: {
-    parameters: [
-      "usize",
-      "usize",
-      "usize",
-      "usize",
-      "usize",
-      "pointer",
-      "u32",
-      "pointer",
-      "pointer",
-      "bool",
-      "i32",
-    ],
-    result: "pointer",
-  },
-} as const satisfies Deno.ForeignLibraryInterface;
-
-export const cfSymbols = {
-  CFRelease: { parameters: ["pointer"], result: "void" },
-} as const satisfies Deno.ForeignLibraryInterface;
-
-// kCGImageAlphaLast | kCGBitmapByteOrderDefault: straight (non-premultiplied)
-// alpha, RGBA byte order — matches the RGBA buffer winding's callers hand us.
-export const RGBA_BITMAP_INFO = 3;
 
 export function readStructF64(view: Uint8Array, offset: number): number {
   return new DataView(view.buffer, view.byteOffset, view.byteLength).getFloat64(offset, true);

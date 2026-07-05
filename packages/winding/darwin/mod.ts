@@ -4,10 +4,6 @@ import {
   addMethod as runtimeAddMethod,
   allocateClassPair as runtimeAllocateClassPair,
   APPKIT,
-  cfSymbols,
-  cgSymbols,
-  CORE_FOUNDATION,
-  CORE_GRAPHICS,
   cStr,
   getClass as runtimeGetClass,
   LIBOBJC,
@@ -15,7 +11,6 @@ import {
   NSRECT,
   type ObjcRuntime,
   readStructF64,
-  RGBA_BITMAP_INFO,
   runtimeSymbols,
   sel as runtimeSel,
 } from "./ffi.ts";
@@ -88,18 +83,10 @@ function openDarwinFfi() {
 
     const send = openMsgSendSymbols(opened);
 
-    const cg = Deno.dlopen(CORE_GRAPHICS, cgSymbols);
-    opened.push(cg);
-
-    const cf = Deno.dlopen(CORE_FOUNDATION, cfSymbols);
-    opened.push(cf);
-
     return {
       appKit,
       runtime,
       send,
-      cg,
-      cf,
       getClass: (name: string) => runtimeGetClass(runtime, name),
       sel: (name: string) => runtimeSel(runtime, name),
       allocateClassPair: (superclass: Deno.PointerObject, name: string) =>
@@ -167,16 +154,9 @@ class DarwinWindow implements Window {
   readonly id: bigint;
   readonly nsWindow: Deno.PointerValue;
   readonly contentView: Deno.PointerValue;
-  readonly #layer: Deno.PointerValue;
   readonly #delegate: Deno.PointerValue;
   #width: number;
   #height: number;
-  // Kept alive for one extra frame: CGImage/CGDataProvider wrap this memory
-  // without copying it, and CALayer's `contents` assignment is composited
-  // asynchronously, so the previous frame's buffer must outlive the call that
-  // replaces it.
-  #imageBuf: Uint8Array | undefined;
-  #prevImageBuf: Uint8Array | undefined;
 
   constructor(readonly lib: DarwinLibrary, x = 0, y = 0, w = 800, h = 600) {
     const { getClass, sel, send } = lib.ffi;
@@ -203,7 +183,6 @@ class DarwinWindow implements Window {
 
     this.contentView = send.id(win, sel("contentView"));
     send.void_bool(this.contentView, sel("setWantsLayer:"), true);
-    this.#layer = send.id(this.contentView, sel("layer"));
 
     send.void_bool(win, sel("makeKeyAndOrderFront:"), false);
     send.void_bool(lib.nsApp, sel("activateIgnoringOtherApps:"), true);
@@ -237,37 +216,6 @@ class DarwinWindow implements Window {
     });
   }
 
-  blit(rgba: Uint8Array, width: number, height: number): void {
-    const { cf, cg, sel, send } = this.lib.ffi;
-    this.#prevImageBuf = this.#imageBuf;
-    // Own a stable copy: the caller's buffer isn't guaranteed to outlive this call.
-    const buf = new Uint8Array(rgba);
-    this.#imageBuf = buf;
-
-    const provider = cg.symbols.CGDataProviderCreateWithData(null, buf, BigInt(buf.byteLength), null);
-    if (provider === null) throw new Error("winding(darwin): CGDataProviderCreateWithData failed");
-    const image = cg.symbols.CGImageCreate(
-      BigInt(width),
-      BigInt(height),
-      8n,
-      32n,
-      BigInt(width * 4),
-      this.lib.colorSpace,
-      RGBA_BITMAP_INFO,
-      provider,
-      null,
-      false,
-      0,
-    );
-    cf.symbols.CFRelease(provider);
-    if (image === null) throw new Error("winding(darwin): CGImageCreate failed");
-    send.void_id(this.#layer, sel("setContents:"), image);
-    cf.symbols.CFRelease(image);
-
-    this.#width = width;
-    this.#height = height;
-  }
-
   [Symbol.dispose](): void {
     this.close();
   }
@@ -282,7 +230,6 @@ const BUTTONS = [, "left", "middle", "right"] as const;
 class DarwinLibrary implements Library {
   readonly ffi: DarwinFfi;
   readonly nsApp: Deno.PointerValue;
-  readonly colorSpace: Deno.PointerObject;
   readonly delegateClass: Deno.PointerObject;
   readonly windows = new Map<bigint, DarwinWindow>();
   readonly delegates = new Map<bigint, DarwinWindow>();
@@ -301,7 +248,6 @@ class DarwinLibrary implements Library {
     const {
       addMethod,
       allocateClassPair,
-      cg,
       getClass,
       registerClassPair,
       sel,
@@ -312,9 +258,6 @@ class DarwinLibrary implements Library {
     send.void(this.nsApp, sel("finishLaunching"));
     this.#distantPast = send.id(getClass("NSDate"), sel("distantPast"));
     this.#runLoopMode = makeNSString(this.ffi, "kCFRunLoopDefaultMode");
-    const colorSpace = cg.symbols.CGColorSpaceCreateDeviceRGB();
-    if (colorSpace === null) throw new Error("winding(darwin): CGColorSpaceCreateDeviceRGB failed");
-    this.colorSpace = colorSpace;
 
     this.#shouldCloseCallback = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer", "pointer"], result: "bool" },
@@ -379,7 +322,6 @@ class DarwinLibrary implements Library {
   close(): void {
     this.#shouldCloseCallback.close();
     this.#didResizeCallback.close();
-    this.ffi.cf.symbols.CFRelease(this.colorSpace);
     this.ffi.close();
   }
 }
