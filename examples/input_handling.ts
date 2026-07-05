@@ -21,11 +21,13 @@ if (import.meta.main) {
 
   window.addEventListener((event) => {
     switch (event.type) {
-      case "mousemove":
+      case "mousemove": {
+        const hit = window.document.nodeFromPoint(event.x, event.y);
         console.log(
-          `Mouse moved to (${event.x.toFixed(1)}, ${event.y.toFixed(1)})`,
+          `Mouse moved to (${event.x.toFixed(1)}, ${event.y.toFixed(1)}); hit node: ${hit?.nodeId ?? "none"}`,
         );
         break;
+      }
       case "mousedown":
       case "mouseup":
         console.log(

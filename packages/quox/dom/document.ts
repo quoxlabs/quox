@@ -1,6 +1,6 @@
 import type { QuoxRenderer as WasmRenderer } from "../lib/quox.js";
 import { type AssertActive, attachDocumentInternals, type RequestRender } from "./internals.ts";
-import { QuoxElement, QuoxText } from "./node.ts";
+import { QuoxElement, QuoxNode, QuoxText } from "./node.ts";
 
 type SetNativeTitle = (title: string) => void;
 
@@ -67,6 +67,17 @@ export class QuoxDocument {
   get body(): QuoxElement {
     this.#assertActive();
     return new QuoxElement(this, this.#renderer.body());
+  }
+
+  /**
+   * Return the DOM node at the given viewport-pixel coordinates (the same coordinate
+   * space `mousemove` events use), or `null` if nothing is there. Does not distinguish
+   * element vs. text hits.
+   */
+  nodeFromPoint(x: number, y: number): QuoxNode | null {
+    this.#assertActive();
+    const nodeId = this.#renderer.node_from_point(x, y);
+    return nodeId === undefined ? null : new QuoxNode(this, nodeId);
   }
 
   createElement(tagName: string): QuoxElement {
