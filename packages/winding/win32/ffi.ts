@@ -35,6 +35,7 @@ export const user32functions = {
   ReleaseCapture: { parameters: [], result: "bool" },
   SetWindowTextW: { parameters: ["pointer", "buffer"], result: "bool" },
   LoadCursorW: { parameters: ["pointer", "usize"], result: "usize" },
+  TrackMouseEvent: { parameters: ["buffer"], result: "bool" },
   RegisterClassExW: {
     parameters: ["buffer"],
     result: "u16",
@@ -79,7 +80,10 @@ export enum WM {
   SYSKEYUP = 0x0105,
   SIZE = 0x0005,
   CLOSE = 0x0010,
+  SETFOCUS = 0x0007,
+  KILLFOCUS = 0x0008,
   MOUSEMOVE = 0x0200,
+  MOUSELEAVE = 0x02A3,
   LBUTTONDOWN = 0x0201,
   LBUTTONUP = 0x0202,
   RBUTTONDOWN = 0x0204,
@@ -92,3 +96,6 @@ export enum WM {
 
 /** Wheel delta per notch, see WHEEL_DELTA in WinUser.h. */
 export const WHEEL_DELTA = 120;
+
+/** `wParam` value for `WM_SIZE` meaning the window was just minimized. See WinUser.h. */
+export const SIZE_MINIMIZED = 1;

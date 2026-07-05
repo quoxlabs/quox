@@ -1,6 +1,6 @@
 import type { KeyModifiers, Library, LoadLibrary, UIEvent, Window } from "../types.ts";
 import { getDomCode } from "./dom_code.ts";
-import { gdi32functions, kernel32functions, user32functions, WHEEL_DELTA, WM } from "./ffi.ts";
+import { gdi32functions, kernel32functions, SIZE_MINIMIZED, user32functions, WHEEL_DELTA, WM } from "./ffi.ts";
 
 // BITMAPINFOHEADER is 40 bytes; for 32bpp BI_RGB no color table follows, so
 // this buffer alone is a valid BITMAPINFO for SetDIBitsToDevice.
@@ -10,8 +10,14 @@ const DIB_RGB_COLORS = 0;
 const VK_SHIFT = 0x10;
 const VK_CONTROL = 0x11;
 const VK_MENU = 0x12;
+const VK_CAPITAL = 0x14;
 const VK_LWIN = 0x5b;
 const VK_RWIN = 0x5c;
+
+// TRACKMOUSEEVENT: cbSize(4) + dwFlags(4) + hwndTrack(8, 8-byte aligned) +
+// dwHoverTime(4) + 4 bytes trailing padding to the struct's 8-byte alignment = 24 bytes.
+const TRACKMOUSEEVENT_SIZE = 24;
+const TME_LEAVE = 0x00000002;
 
 const DOWN_BUTTON: Partial<Record<WM, "left" | "middle" | "right">> = {
   [WM.LBUTTONDOWN]: "left",
@@ -36,6 +42,12 @@ function isKeyDown(lib: Win32Library, virtualKey: number): boolean {
   return (lib.user32.symbols.GetKeyState(virtualKey) & 0x8000) !== 0;
 }
 
+// GetKeyState's low bit reports a key's *toggle* state (on/off), as opposed to the high bit
+// `isKeyDown` reads for "is currently held". Only meaningful for toggle keys (Caps/Num/Scroll Lock).
+function isToggled(lib: Win32Library, virtualKey: number): boolean {
+  return (lib.user32.symbols.GetKeyState(virtualKey) & 0x0001) !== 0;
+}
+
 function getModifiers(lib: Win32Library): KeyModifiers {
   const ctrlKey = isKeyDown(lib, VK_CONTROL);
   return {
@@ -44,7 +56,24 @@ function getModifiers(lib: Win32Library): KeyModifiers {
     altKey: isKeyDown(lib, VK_MENU),
     metaKey: isKeyDown(lib, VK_LWIN) || isKeyDown(lib, VK_RWIN),
     accelKey: ctrlKey,
+    capsLock: isToggled(lib, VK_CAPITAL),
   };
+}
+
+/**
+ * Arm a one-shot `WM_MOUSELEAVE` for `hWnd`. Win32 doesn't report the pointer leaving a
+ * window on its own (unlike X11's `LeaveNotify`); the window has to opt in via
+ * `TrackMouseEvent`, and tracking is consumed by the very `WM_MOUSELEAVE` it requests, so it
+ * must be re-armed on every `WM_MOUSEMOVE` to reliably catch the next leave.
+ */
+function trackMouseLeave(lib: Win32Library, hWnd: Deno.PointerValue): void {
+  const buf = new ArrayBuffer(TRACKMOUSEEVENT_SIZE);
+  const dv = new DataView(buf);
+  dv.setUint32(0, TRACKMOUSEEVENT_SIZE, true); // cbSize
+  dv.setUint32(4, TME_LEAVE, true); // dwFlags
+  dv.setBigUint64(8, BigInt(Deno.UnsafePointer.value(hWnd)), true); // hwndTrack
+  dv.setUint32(16, 0, true); // dwHoverTime (unused without TME_HOVER)
+  lib.user32.symbols.TrackMouseEvent(buf);
 }
 
 class Win32Window implements Window {
@@ -52,6 +81,8 @@ class Win32Window implements Window {
   readonly #hwnd: Deno.PointerObject;
   #bgra = new Uint8Array(0) as Uint8Array<ArrayBuffer>;
   #bmi = new ArrayBuffer(BITMAPINFOHEADER_SIZE);
+  /** Tracks minimized state so `WM_SIZE` transitions map to a single `visibilitychange` event instead of firing on every resize message. */
+  minimized = false;
 
   constructor(readonly lib: Win32Library, classNameBuf: ArrayBuffer) {
     const window = lib.user32.symbols.CreateWindowExW(
@@ -182,7 +213,11 @@ class Win32Library implements Library {
         case WM.SIZE: {
           const w = Number(BigInt(lParam) & 0xFFFFn);
           const h = Number((BigInt(lParam) >> 16n) & 0xFFFFn);
-          if (w > 0 && h > 0) {
+          const minimized = Number(wParam) === SIZE_MINIMIZED;
+          if (win !== undefined && minimized !== win.minimized) {
+            win.minimized = minimized;
+            this.#event = { type: "visibilitychange", visible: !minimized, window: win };
+          } else if (w > 0 && h > 0) {
             this.#event = { type: "resize", width: w, height: h, window: win };
           }
           break;
@@ -192,7 +227,16 @@ class Win32Library implements Library {
           // Return without calling DefWindowProcW to prevent immediate window
           // destruction; let the application decide when to tear down.
           return 0n;
+        case WM.SETFOCUS:
+          this.#event = { type: "focus", window: win };
+          break;
+        case WM.KILLFOCUS:
+          this.#event = { type: "blur", window: win };
+          break;
         case WM.MOUSEMOVE: {
+          // Re-arm on every move: `WM_MOUSELEAVE` tracking is consumed by the leave
+          // event itself, so it must be requested again to catch the next one.
+          trackMouseLeave(this, hWnd);
           this.#event = {
             type: "mousemove",
             x: Number(BigInt(lParam) & 0xFFFFn),
@@ -201,6 +245,9 @@ class Win32Library implements Library {
           };
           break;
         }
+        case WM.MOUSELEAVE:
+          this.#event = { type: "mouseleave", window: win };
+          break;
         case WM.LBUTTONDOWN:
         case WM.MBUTTONDOWN:
         case WM.RBUTTONDOWN: {
