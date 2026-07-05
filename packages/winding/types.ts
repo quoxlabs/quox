@@ -1,4 +1,13 @@
-export type UIEvent = KeyEvent | ButtonEvent | MoveEvent | WheelEvent | ResizeEvent | CloseEvent;
+export type UIEvent =
+  | KeyEvent
+  | ButtonEvent
+  | MoveEvent
+  | WheelEvent
+  | ResizeEvent
+  | CloseEvent
+  | EnterLeaveEvent
+  | FocusChangeEvent
+  | VisibilityEvent;
 export type UIEventType = UIEvent["type"];
 
 export interface WindowEvent {
@@ -12,6 +21,8 @@ export interface KeyModifiers {
   metaKey: boolean;
   /** Command on Darwin, otherwise Control. */
   accelKey: boolean;
+  /** Only populated by the X11 backend for now; other backends omit it. */
+  capsLock?: boolean;
 }
 export interface KeyEvent extends WindowEvent, KeyModifiers {
   type: "keydown" | "keyup";
@@ -41,6 +52,19 @@ export interface ResizeEvent extends WindowEvent {
 }
 export interface CloseEvent extends WindowEvent {
   type: "close";
+}
+/** Fired when the pointer enters/leaves the window's bounds. */
+export interface EnterLeaveEvent extends WindowEvent {
+  type: "mouseenter" | "mouseleave";
+}
+/** Fired when the window (not a DOM element) gains/loses OS-level input focus. */
+export interface FocusChangeEvent extends WindowEvent {
+  type: "focus" | "blur";
+}
+/** Fired when the window is minimized/restored. */
+export interface VisibilityEvent extends WindowEvent {
+  type: "visibilitychange";
+  visible: boolean;
 }
 
 export interface Window {

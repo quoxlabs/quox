@@ -12,7 +12,10 @@ export type QuoxInputEvent =
   | QuoxMouseWheelEvent
   | QuoxKeyboardEvent
   | QuoxResizeEvent
-  | QuoxCloseEvent;
+  | QuoxCloseEvent
+  | QuoxMouseEnterLeaveEvent
+  | QuoxFocusChangeEvent
+  | QuoxVisibilityEvent;
 
 export type QuoxMouseMoveEvent = { type: "mousemove"; x: number; y: number };
 export type QuoxMouseButtonEvent = { type: "mousedown" | "mouseup"; button: number };
@@ -26,9 +29,16 @@ export type QuoxKeyboardEvent = {
   altKey: boolean;
   metaKey: boolean;
   accelKey: boolean;
+  capsLock: boolean;
 };
 export type QuoxResizeEvent = { type: "resize"; width: number; height: number };
 export type QuoxCloseEvent = { type: "close" };
+/** Fired when the pointer enters/leaves the window's bounds. */
+export type QuoxMouseEnterLeaveEvent = { type: "mouseenter" | "mouseleave" };
+/** Fired when the window (not a DOM element) gains/loses OS-level input focus. */
+export type QuoxFocusChangeEvent = { type: "focus" | "blur" };
+/** Fired when the window is minimized/restored. */
+export type QuoxVisibilityEvent = { type: "visibilitychange"; visible: boolean };
 
 export type QuoxWindowContent = QuoxInnerHTML | QuoxRenderable;
 
@@ -47,6 +57,9 @@ export interface WindowOptions {
 
 const DEFAULT_WINDOW_TITLE = "quox";
 const BUTTON_INDEX: Record<"left" | "middle" | "right", number> = { left: 0, middle: 1, right: 2 };
+/** `MouseEventButtons` bitmask values, indexed by `BUTTON_INDEX`'s ordinal (left/middle/right). */
+const BUTTON_INDEX_TO_BIT = [1, 4, 2] as const;
+const WHEEL_SCROLL_SPEED = 40;
 
 /** Anything that isn't itself renderable content (a string, array, or vnode) is an options bag. */
 function isWindowOptions(value: QuoxWindowContent | WindowOptions | undefined): value is WindowOptions {
@@ -84,6 +97,7 @@ function mapWindingEvent(ev: WindingUIEvent): QuoxInputEvent | null {
         altKey: ev.altKey,
         metaKey: ev.metaKey,
         accelKey: ev.accelKey,
+        capsLock: ev.capsLock ?? false,
       };
     case "keyup":
       return {
@@ -95,11 +109,22 @@ function mapWindingEvent(ev: WindingUIEvent): QuoxInputEvent | null {
         altKey: ev.altKey,
         metaKey: ev.metaKey,
         accelKey: ev.accelKey,
+        capsLock: ev.capsLock ?? false,
       };
     case "resize":
       return { type: "resize", width: ev.width, height: ev.height };
     case "close":
       return { type: "close" };
+    case "mouseenter":
+      return { type: "mouseenter" };
+    case "mouseleave":
+      return { type: "mouseleave" };
+    case "focus":
+      return { type: "focus" };
+    case "blur":
+      return { type: "blur" };
+    case "visibilitychange":
+      return { type: "visibilitychange", visible: ev.visible };
   }
 }
 
@@ -116,6 +141,10 @@ export class QuoxWindow implements Disposable {
   #stopped = false;
   #disposed = false;
   #rendererFreed = false;
+  #visible = true;
+  #buttonsDown = 0;
+  #lastPointerX = 0;
+  #lastPointerY = 0;
   readonly #listeners: Array<(event: QuoxInputEvent) => void> = [];
   readonly document: QuoxDocument;
 
@@ -195,15 +224,65 @@ export class QuoxWindow implements Disposable {
         this.#requestRender();
       }
 
+      if (mapped.type === "mousemove") {
+        this.#lastPointerX = mapped.x;
+        this.#lastPointerY = mapped.y;
+        this.document.dispatchPointerMove(mapped.x, mapped.y, this.#buttonsDown);
+      }
+
+      if (mapped.type === "mousedown") {
+        this.#buttonsDown |= BUTTON_INDEX_TO_BIT[mapped.button] ?? 0;
+        this.document.dispatchPointerDown(this.#lastPointerX, this.#lastPointerY, mapped.button, this.#buttonsDown);
+      }
+
+      if (mapped.type === "mouseup") {
+        this.document.dispatchPointerUp(this.#lastPointerX, this.#lastPointerY, mapped.button, this.#buttonsDown);
+        this.#buttonsDown &= ~(BUTTON_INDEX_TO_BIT[mapped.button] ?? 0);
+      }
+
       if (mapped.type === "wheel") {
         // Scale raw wheel notches (±1) to pixels so the viewport scrolls a
         // comfortable distance per tick.
-        const SCROLL_SPEED = 40;
-        this.#renderer.scroll(
-          Math.round(mapped.deltaX * SCROLL_SPEED),
-          Math.round(mapped.deltaY * SCROLL_SPEED),
+        this.document.dispatchWheel(
+          this.#lastPointerX,
+          this.#lastPointerY,
+          mapped.deltaX * WHEEL_SCROLL_SPEED,
+          mapped.deltaY * WHEEL_SCROLL_SPEED,
+          this.#buttonsDown,
         );
-        this.#requestRender();
+      }
+
+      if (mapped.type === "mouseleave") {
+        // The pointer left the window entirely, so no further `mousemove` will arrive to
+        // naturally clear whatever was last hovered.
+        this.document.clearHover();
+      }
+
+      if (mapped.type === "keydown") {
+        this.document.dispatchKeyDown(
+          mapped.code,
+          mapped.shiftKey,
+          mapped.ctrlKey,
+          mapped.altKey,
+          mapped.metaKey,
+          mapped.capsLock,
+        );
+      }
+
+      if (mapped.type === "keyup") {
+        this.document.dispatchKeyUp(
+          mapped.code,
+          mapped.shiftKey,
+          mapped.ctrlKey,
+          mapped.altKey,
+          mapped.metaKey,
+          mapped.capsLock,
+        );
+      }
+
+      if (mapped.type === "visibilitychange") {
+        this.#visible = mapped.visible;
+        if (mapped.visible) this.#requestRender();
       }
 
       for (const cb of this.#listeners) cb(mapped);
@@ -231,6 +310,9 @@ export class QuoxWindow implements Disposable {
 
   async #renderIfNeeded(): Promise<void> {
     if (this.#stopped || this.#disposed || this.#rendering || !this.#needsRender) return;
+    // Skip the actual render while minimized, but leave `#needsRender` set so becoming
+    // visible again immediately catches up. Event polling itself is never gated.
+    if (!this.#visible) return;
 
     this.#rendering = true;
     this.#needsRender = false;

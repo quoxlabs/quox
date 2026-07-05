@@ -6,7 +6,7 @@
   },
   "license": "MIT",
   "tasks": {
-    "wasmbuild": "deno run -A jsr:@deno/wasmbuild@0.21.1",
+    "wasmbuild": "deno run -A jsr:@deno/wasmbuild@0.22.0",
     "build": "deno task wasmbuild --debug --skip-opt",
     "build:prod": "deno task wasmbuild"
   },
