@@ -141,7 +141,8 @@ impl QuoxRendererState {
     /// missing `<head>` (e.g. after `document.head.remove()`) by returning `None` rather than
     /// failing, so title lookups never break unrelated DOM operations.
     fn title_element(&self) -> Result<Option<usize>, JsValue> {
-        let Some(head_id) = self.optional_child_element_by_tag(self.document.root_element().id, "head")?
+        let Some(head_id) =
+            self.optional_child_element_by_tag(self.document.root_element().id, "head")?
         else {
             return Ok(None);
         };
@@ -223,6 +224,16 @@ impl QuoxRenderer {
         let mut state = self.state.borrow_mut();
         state.scroll_x = state.scroll_x.saturating_add_signed(delta_x);
         state.scroll_y = state.scroll_y.saturating_add_signed(delta_y);
+    }
+
+    /// Return the id of the topmost DOM node at the given viewport-pixel coordinates
+    /// (top-left origin, unscaled — the same space `mousemove` events report), or `None`
+    /// if nothing is hit (e.g. before the first `render()`, or the point is outside the
+    /// document). Delegates to Blitz's own hit-testing, which already accounts for
+    /// per-node scroll offsets and stacking-context/z-index ordering.
+    pub fn node_from_point(&self, x: f32, y: f32) -> Option<usize> {
+        let state = self.state.borrow();
+        state.document.hit(x, y).map(|hit| hit.node_id)
     }
 
     /// Remove a node from the retained document.
@@ -350,7 +361,8 @@ impl QuoxRenderer {
     /// `document.head.remove()`), this is a no-op rather than an error.
     pub fn set_title(&self, value: &str) -> Result<(), JsValue> {
         let mut state = self.state.borrow_mut();
-        let Some(head_id) = state.optional_child_element_by_tag(state.document.root_element().id, "head")?
+        let Some(head_id) =
+            state.optional_child_element_by_tag(state.document.root_element().id, "head")?
         else {
             return Ok(());
         };
