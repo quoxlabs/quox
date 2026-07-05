@@ -9,6 +9,7 @@ import {
   WlOp,
   WlSeatCap,
   WlShmFormat,
+  XdgToplevelState,
   xkbSymbols,
 } from "./ffi.ts";
 
@@ -45,6 +46,7 @@ const XKB_KEYMAP_FORMAT_TEXT_V1 = 1;
 const XKB_KEYMAP_COMPILE_NO_FLAGS = 0;
 const XKB_STATE_MODS_EFFECTIVE = 1 << 3;
 const XKB_SHIFT_MASK = 1 << 0;
+const XKB_LOCK_MASK = 1 << 1;
 const XKB_CONTROL_MASK = 1 << 2;
 const XKB_ALT_MASK = 1 << 3;
 const XKB_META_MASK = 1 << 6;
@@ -52,6 +54,8 @@ const XKB_MOD_SHIFT = cStr("Shift");
 const XKB_MOD_CONTROL = cStr("Control");
 const XKB_MOD_ALT = cStr("Mod1");
 const XKB_MOD_META = cStr("Mod4");
+// "Lock" is XKB's real-modifier name for Caps Lock (the same convention X11 uses).
+const XKB_MOD_LOCK = cStr("Lock");
 
 function getModifiers(mask: number): KeyModifiers {
   const ctrlKey = (mask & XKB_CONTROL_MASK) !== 0;
@@ -61,6 +65,7 @@ function getModifiers(mask: number): KeyModifiers {
     altKey: (mask & XKB_ALT_MASK) !== 0,
     metaKey: (mask & XKB_META_MASK) !== 0,
     accelKey: ctrlKey,
+    capsLock: (mask & XKB_LOCK_MASK) !== 0,
   };
 }
 
@@ -87,6 +92,26 @@ function args(...vals: bigint[]): BigUint64Array<ArrayBuffer> {
 // ---------------------------------------------------------------------------
 function readEventCount(ifaceAddr: bigint): number {
   return new Deno.UnsafePointerView(Deno.UnsafePointer.create(ifaceAddr)!).getUint32(24);
+}
+
+// ---------------------------------------------------------------------------
+// Check whether a `states: array` argument (a `struct wl_array *`, as delivered to e.g.
+// xdg_toplevel::configure) contains a given uint32 value.
+// wl_array layout (24 bytes, 64-bit): size_t size(8) + size_t alloc(8) + void *data(8).
+// ---------------------------------------------------------------------------
+function hasXdgToplevelState(statesPtr: Deno.PointerValue, state: number): boolean {
+  if (!statesPtr) return false;
+  const arrayView = new Deno.UnsafePointerView(statesPtr);
+  const size = Number(arrayView.getBigUint64(0));
+  if (size <= 0) return false;
+  const dataPtr = Deno.UnsafePointer.create(arrayView.getBigUint64(16));
+  if (!dataPtr) return false;
+
+  const dataView = new Deno.UnsafePointerView(dataPtr);
+  for (let offset = 0; offset < size; offset += 4) {
+    if (dataView.getUint32(offset) === state) return true;
+  }
+  return false;
 }
 
 // Structural subset of Deno.UnsafeCallback used for heterogeneous collections.
@@ -136,6 +161,9 @@ class WaylandWindow implements Window {
   // Pending configure serial from xdg_surface
   #pendingSerial = 0;
   #configured = false;
+  // Last-seen `suspended` bit from xdg_toplevel::configure's states array, used to only
+  // push a `visibilitychange` event when it actually flips.
+  #suspended = false;
 
   constructor(readonly lib: WaylandLibrary, w: number, h: number) {
     const sym = lib.wl.symbols;
@@ -217,9 +245,15 @@ class WaylandWindow implements Window {
     // xdg_toplevel listener: event 0 = configure(w:i,h:i,states:a), event 1 = close
     this.#toplevelConfigure = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer", "i32", "i32", "pointer"], result: "void" },
-      (_data, _toplevel, width, height, _states) => {
+      (_data, _toplevel, width, height, states) => {
         if (width > 0 && height > 0) {
           this.lib.pushEvent({ type: "resize", width, height });
+        }
+
+        const suspended = hasXdgToplevelState(states, XdgToplevelState.SUSPENDED);
+        if (suspended !== this.#suspended) {
+          this.#suspended = suspended;
+          this.lib.pushEvent({ type: "visibilitychange", visible: !suspended });
         }
       },
     );
@@ -685,6 +719,14 @@ class WaylandLibrary implements Library {
       { parameters: ["pointer", "pointer", "u32", "pointer", "i32", "i32"], result: "void" },
       (_data, _ptr, serial) => {
         this.#setDefaultCursorShape(serial);
+        this.#events.push({ type: "mouseenter" });
+      },
+    );
+    const leaveCb = new Deno.UnsafeCallback(
+      // (data, pointer, serial, surface)
+      { parameters: ["pointer", "pointer", "u32", "pointer"], result: "void" },
+      () => {
+        this.#events.push({ type: "mouseleave" });
       },
     );
     const motionCb = new Deno.UnsafeCallback(
@@ -714,10 +756,10 @@ class WaylandLibrary implements Library {
         else if (axis === 1) this.#events.push({ type: "wheel", deltaX: delta, deltaY: 0 });
       },
     );
-    this.#listeners.push(enterCb, motionCb, buttonCb, axisCb);
+    this.#listeners.push(enterCb, leaveCb, motionCb, buttonCb, axisCb);
     const ptrEventCount = readEventCount(Deno.UnsafePointer.value(this.ifaces.pointer));
     const ptrVtable = makeVtable(
-      [enterCb, null, motionCb, buttonCb, axisCb],
+      [enterCb, leaveCb, motionCb, buttonCb, axisCb],
       ptrEventCount,
       this.noop,
     );
@@ -778,6 +820,7 @@ class WaylandLibrary implements Library {
       altKey: active(XKB_MOD_ALT),
       metaKey: active(XKB_MOD_META),
       accelKey: ctrlKey,
+      capsLock: active(XKB_MOD_LOCK),
     };
   }
 
@@ -800,6 +843,20 @@ class WaylandLibrary implements Library {
       { parameters: ["pointer", "pointer", "u32", "i32", "u32"], result: "void" },
       (_data, _kb, format, fd, size) => {
         this.#loadKeymap(format, fd, size);
+      },
+    );
+    const kbEnterCb = new Deno.UnsafeCallback(
+      // (data, keyboard, serial, surface, keys)
+      { parameters: ["pointer", "pointer", "u32", "pointer", "pointer"], result: "void" },
+      () => {
+        this.#events.push({ type: "focus" });
+      },
+    );
+    const kbLeaveCb = new Deno.UnsafeCallback(
+      // (data, keyboard, serial, surface)
+      { parameters: ["pointer", "pointer", "u32", "pointer"], result: "void" },
+      () => {
+        this.#events.push({ type: "blur" });
       },
     );
     const keyCb = new Deno.UnsafeCallback(
@@ -826,9 +883,9 @@ class WaylandLibrary implements Library {
         }
       },
     );
-    this.#listeners.push(keymapCb, keyCb, modifiersCb);
+    this.#listeners.push(keymapCb, kbEnterCb, kbLeaveCb, keyCb, modifiersCb);
     const kbEventCount = readEventCount(Deno.UnsafePointer.value(this.ifaces.keyboard));
-    const kbVtable = makeVtable([keymapCb, null, null, keyCb, modifiersCb], kbEventCount, this.noop);
+    const kbVtable = makeVtable([keymapCb, kbEnterCb, kbLeaveCb, keyCb, modifiersCb], kbEventCount, this.noop);
     this.#vtables.push(kbVtable);
     sym.wl_proxy_add_listener(keyboard, Deno.UnsafePointer.of(kbVtable), null);
   }

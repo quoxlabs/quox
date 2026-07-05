@@ -232,6 +232,16 @@ export const WlCursorShape = {
   DEFAULT: 1,
 } as const;
 
+// `xdg_toplevel_state` enum value from xdg-shell (available since xdg_toplevel v6): reported
+// in `xdg_toplevel::configure`'s `states` array when the surface isn't currently visible
+// (e.g. minimized, or scrolled to another workspace). The closest Wayland analog to X11's
+// UnmapNotify/Win32's SW_MINIMIZE — there's no separate "unmapped" surface event to listen
+// for instead. Compositors that don't support it simply never set the bit, which degrades
+// safely to "always visible" (today's behavior).
+export const XdgToplevelState = {
+  SUSPENDED: 9,
+} as const;
+
 // ---------------------------------------------------------------------------
 // libwayland-client FFI symbols
 // Functions are declared with parameters/result; interface data symbols use
