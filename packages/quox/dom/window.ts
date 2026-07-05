@@ -123,6 +123,7 @@ export class QuoxWindow implements Disposable {
   #rendererFreed = false;
   #surface: Deno.UnsafeWindowSurface | null = null;
   #surfaceRenderTarget: CanvasLikeSurface | null = null;
+  #surfaceContext: GPUCanvasContext | null = null;
   readonly #listeners: Array<(event: QuoxInputEvent) => void> = [];
   readonly document: QuoxDocument;
 
@@ -199,6 +200,7 @@ export class QuoxWindow implements Disposable {
         // Propagate new dimensions to the WASM renderer so Blitz/Vello reflows
         // the layout at the correct viewport size.
         this.#renderer.resize(mapped.width, mapped.height);
+        this.#resetSurfaceTarget(mapped.width, mapped.height);
         this.#requestRender();
       }
 
@@ -266,7 +268,11 @@ export class QuoxWindow implements Disposable {
       const target: CanvasLikeSurface = {
         width: surface.width,
         height: surface.height,
-        getContext: (contextId, options) => surface.getContext(contextId, options) as GPUCanvasContext | null,
+        getContext: (contextId, options) => {
+          const context = surface.getContext(contextId, options) as GPUCanvasContext | null;
+          this.#surfaceContext = context;
+          return context;
+        },
       };
       this.#surface = surface;
       this.#surfaceRenderTarget = target;
@@ -278,6 +284,20 @@ export class QuoxWindow implements Disposable {
   #resizeSurfaceTarget(target: CanvasLikeSurface, width: number, height: number): void {
     target.width = width;
     target.height = height;
+  }
+
+  #resetSurfaceTarget(width: number, height: number): void {
+    this.#renderer.reset_surface();
+    this.#surfaceContext?.unconfigure();
+    this.#surfaceContext = null;
+
+    if (this.#surface !== null) {
+      this.#surface.width = width;
+      this.#surface.height = height;
+    }
+    if (this.#surfaceRenderTarget !== null) {
+      this.#resizeSurfaceTarget(this.#surfaceRenderTarget, width, height);
+    }
   }
 
   /** Register a callback that is invoked for every input event during a tick. */
@@ -306,6 +326,7 @@ export class QuoxWindow implements Disposable {
       this.#intervalId = null;
     }
 
+    this.#resetSurfaceTarget(this.#width, this.#height);
     this.#releaseRenderer();
   }
 
