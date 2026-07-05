@@ -48,7 +48,7 @@ export interface Window {
   close(): void;
   /** Set the native window title. */
   setTitle(title: string): void;
-  /** Create a presentable WebGPU surface for this native window. Requires `--unstable-webgpu`. */
+  /** Create a presentable WebGPU surface for this native window`. */
   windowSurface(): Deno.UnsafeWindowSurface;
 }
 
