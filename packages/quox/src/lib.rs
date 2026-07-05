@@ -49,6 +49,65 @@ fn invalid_element(node_id: usize) -> JsValue {
     JsValue::from_str(&format!("DOM node id is not an element: {node_id}"))
 }
 
+/// Convert viewport-pixel coordinates (the space `mousemove` events report) into Blitz's
+/// page-space coordinates (viewport coordinates plus the current scroll offset), or
+/// `None` if the point is non-finite or outside the viewport bounds.
+fn viewport_point_to_page(
+    x: f32,
+    y: f32,
+    width: u32,
+    height: u32,
+    scroll_x: u32,
+    scroll_y: u32,
+) -> Option<(f32, f32)> {
+    if !x.is_finite() || !y.is_finite() {
+        return None;
+    }
+    if x < 0.0 || y < 0.0 || x >= width as f32 || y >= height as f32 {
+        return None;
+    }
+
+    Some((x + scroll_x as f32, y + scroll_y as f32))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::viewport_point_to_page;
+
+    #[test]
+    fn rejects_non_finite_coordinates() {
+        assert_eq!(viewport_point_to_page(f32::NAN, 10.0, 800, 600, 0, 0), None);
+        assert_eq!(
+            viewport_point_to_page(10.0, f32::INFINITY, 800, 600, 0, 0),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_viewport_coordinates() {
+        assert_eq!(viewport_point_to_page(-1.0, 10.0, 800, 600, 0, 0), None);
+        assert_eq!(viewport_point_to_page(10.0, -1.0, 800, 600, 0, 0), None);
+        assert_eq!(viewport_point_to_page(800.0, 10.0, 800, 600, 0, 0), None);
+        assert_eq!(viewport_point_to_page(10.0, 600.0, 800, 600, 0, 0), None);
+    }
+
+    #[test]
+    fn passes_through_unscrolled_coordinates() {
+        assert_eq!(
+            viewport_point_to_page(10.0, 20.0, 800, 600, 0, 0),
+            Some((10.0, 20.0))
+        );
+    }
+
+    #[test]
+    fn adds_scroll_offset_to_reach_page_coordinates() {
+        assert_eq!(
+            viewport_point_to_page(10.0, 20.0, 800, 600, 50, 100),
+            Some((60.0, 120.0))
+        );
+    }
+}
+
 #[wasm_bindgen(start)]
 pub fn start() {
     console_error_panic_hook::set_once();
@@ -141,11 +200,39 @@ impl QuoxRendererState {
     /// missing `<head>` (e.g. after `document.head.remove()`) by returning `None` rather than
     /// failing, so title lookups never break unrelated DOM operations.
     fn title_element(&self) -> Result<Option<usize>, JsValue> {
-        let Some(head_id) = self.optional_child_element_by_tag(self.document.root_element().id, "head")?
+        let Some(head_id) =
+            self.optional_child_element_by_tag(self.document.root_element().id, "head")?
         else {
             return Ok(None);
         };
         self.optional_child_element_by_tag(head_id, "title")
+    }
+
+    /// Resolve layout for the current viewport/scroll state. Shared by `render()` and
+    /// `node_from_point()` so hit-testing never sees stale geometry — mirrors how browsers
+    /// force a layout flush before geometry queries like `elementFromPoint`.
+    fn sync_layout(&mut self) {
+        self.document.set_viewport(Viewport::new(
+            self.width,
+            self.height,
+            1.0,
+            ColorScheme::Light,
+        ));
+        self.document.resolve(0.0);
+
+        // Clamp scroll offsets to the laid-out content size so the viewport
+        // can never scroll past the end of the document.
+        let content = self.document.root_element().final_layout.size;
+        self.scroll_x = self
+            .scroll_x
+            .min((content.width as u32).saturating_sub(self.width));
+        self.scroll_y = self
+            .scroll_y
+            .min((content.height as u32).saturating_sub(self.height));
+        self.document.set_viewport_scroll(Point {
+            x: self.scroll_x as f64,
+            y: self.scroll_y as f64,
+        });
     }
 }
 
@@ -223,6 +310,27 @@ impl QuoxRenderer {
         let mut state = self.state.borrow_mut();
         state.scroll_x = state.scroll_x.saturating_add_signed(delta_x);
         state.scroll_y = state.scroll_y.saturating_add_signed(delta_y);
+    }
+
+    /// Return the id of the topmost DOM node at the given viewport-pixel coordinates
+    /// (top-left origin, unscaled — the same space `mousemove` events report), or `None`
+    /// if nothing is hit (e.g. the point is outside the viewport, or nothing is there).
+    /// Forces a layout resolve first, then delegates to Blitz's own hit-testing — which
+    /// still has a known TODO for z-index disambiguation among plain overlapping siblings
+    /// (see Blitz's `Node::hit`), so overlapping-sibling ordering isn't fully guaranteed.
+    pub fn node_from_point(&self, x: f32, y: f32) -> Option<usize> {
+        let mut state = self.state.borrow_mut();
+        state.sync_layout();
+
+        let (page_x, page_y) = viewport_point_to_page(
+            x,
+            y,
+            state.width,
+            state.height,
+            state.scroll_x,
+            state.scroll_y,
+        )?;
+        state.document.hit(page_x, page_y).map(|hit| hit.node_id)
     }
 
     /// Remove a node from the retained document.
@@ -350,7 +458,8 @@ impl QuoxRenderer {
     /// `document.head.remove()`), this is a no-op rather than an error.
     pub fn set_title(&self, value: &str) -> Result<(), JsValue> {
         let mut state = self.state.borrow_mut();
-        let Some(head_id) = state.optional_child_element_by_tag(state.document.root_element().id, "head")?
+        let Some(head_id) =
+            state.optional_child_element_by_tag(state.document.root_element().id, "head")?
         else {
             return Ok(());
         };
@@ -390,27 +499,9 @@ impl QuoxRenderer {
     pub async fn render(&self) -> Result<Vec<u8>, JsValue> {
         let (_texture, gpu_buffer, row_bytes, padded_row_bytes, w, h) = {
             let mut state = self.state.borrow_mut();
+            state.sync_layout();
             let w = state.width;
             let h = state.height;
-
-            state
-                .document
-                .set_viewport(Viewport::new(w, h, 1.0, ColorScheme::Light));
-            state.document.resolve(0.0);
-
-            // Clamp scroll offsets to the laid-out content size so the viewport
-            // can never scroll past the end of the document.
-            let content = state.document.root_element().final_layout.size;
-            state.scroll_x = state.scroll_x.min((content.width as u32).saturating_sub(w));
-            state.scroll_y = state
-                .scroll_y
-                .min((content.height as u32).saturating_sub(h));
-            let scroll_x = state.scroll_x;
-            let scroll_y = state.scroll_y;
-            state.document.set_viewport_scroll(Point {
-                x: scroll_x as f64,
-                y: scroll_y as f64,
-            });
 
             let device_handle = state.context.device_pool[state.dev_id].clone();
 
