@@ -82,15 +82,19 @@ class FakeRenderer {
   }
 
   #hitNodeId: number | undefined = undefined;
+  #lastHitPoint: { x: number; y: number } | undefined;
 
   node_from_point(x: number, y: number): number | undefined {
-    void x;
-    void y;
+    this.#lastHitPoint = { x, y };
     return this.#hitNodeId;
   }
 
   setHitNodeId(id: number | undefined): void {
     this.#hitNodeId = id;
+  }
+
+  get lastHitPoint(): { x: number; y: number } | undefined {
+    return this.#lastHitPoint;
   }
 }
 
@@ -410,4 +414,13 @@ Deno.test("document.nodeFromPoint wraps the hit node id", () => {
 
   assert(hit instanceof QuoxNode);
   assertEquals(hit?.nodeId, 5);
+});
+
+Deno.test("document.nodeFromPoint forwards coordinates unchanged", () => {
+  const { document, renderer } = createTestDocument();
+  renderer.setHitNodeId(5);
+
+  document.nodeFromPoint(12.5, 34.5);
+
+  assertEquals(renderer.lastHitPoint, { x: 12.5, y: 34.5 });
 });
