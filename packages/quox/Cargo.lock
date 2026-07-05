@@ -1790,6 +1790,7 @@ dependencies = [
  "vello",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "web-sys",
  "wgpu_context",
 ]
 

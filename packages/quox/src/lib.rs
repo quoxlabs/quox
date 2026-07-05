@@ -11,12 +11,15 @@ use linebender_resource_handle::Blob;
 use std::cell::RefCell;
 use std::sync::Arc;
 use vello::wgpu::{
-    self, BufferDescriptor, BufferUsages, Extent3d, TexelCopyBufferInfo, TexelCopyBufferLayout,
-    TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureViewDescriptor,
+    self, BufferDescriptor, BufferUsages, CompositeAlphaMode, Extent3d, PresentMode, SurfaceTarget,
+    TexelCopyBufferInfo, TexelCopyBufferLayout, TextureDescriptor, TextureDimension, TextureFormat,
+    TextureUsages, TextureViewDescriptor,
 };
 use vello::{AaConfig, AaSupport, RenderParams, Renderer, RendererOptions, Scene};
-use wasm_bindgen::prelude::*;
-use wgpu_context::WGPUContext;
+use wasm_bindgen::{JsCast, prelude::*};
+use wgpu_context::{
+    SurfaceRenderer, SurfaceRendererConfiguration, TextureConfiguration, WGPUContext,
+};
 
 const LIBERATION_SANS: &[u8] = include_bytes!("../assets/LiberationSans-Regular.ttf");
 const FONT_CSS: &str = "html,body,*{font-family:'Liberation Sans',sans-serif;}";
@@ -73,6 +76,7 @@ struct QuoxRendererState {
     context: WGPUContext,
     dev_id: usize,
     renderer: Renderer,
+    canvas_surface: Option<SurfaceRenderer<'static>>,
 }
 
 impl QuoxRendererState {
@@ -255,6 +259,7 @@ impl QuoxRenderer {
                 context,
                 dev_id,
                 renderer,
+                canvas_surface: None,
             }),
         })
     }
@@ -433,6 +438,101 @@ impl QuoxRenderer {
     pub fn head(&self) -> Result<usize, JsValue> {
         let state = self.state.borrow();
         state.child_element_by_tag(state.document.root_element().id, "head")
+    }
+
+    /// Drop the cached WebGPU surface so the next render creates a fresh one.
+    pub fn reset_surface(&self) {
+        self.state.borrow_mut().canvas_surface = None;
+    }
+
+    /// Render the current HTML directly into a canvas-like WebGPU surface.
+    pub async fn render_to_canvas(&self, surface_target: JsValue) -> Result<(), JsValue> {
+        let needs_surface = self.state.borrow().canvas_surface.is_none();
+        if needs_surface {
+            // Deno.UnsafeWindowSurface is not an actual OffscreenCanvas, but
+            // wgpu's web backend only needs the structural `getContext`,
+            // `width`, and `height` members that both objects provide.
+            let surface_target = surface_target.unchecked_into::<web_sys::OffscreenCanvas>();
+            let (width, height, mut context) = {
+                let mut state = self.state.borrow_mut();
+                (
+                    state.width,
+                    state.height,
+                    std::mem::take(&mut state.context),
+                )
+            };
+
+            let surface_result = context
+                .create_surface(
+                    SurfaceTarget::OffscreenCanvas(surface_target),
+                    SurfaceRendererConfiguration {
+                        usage: TextureUsages::RENDER_ATTACHMENT,
+                        formats: vec![TextureFormat::Rgba8Unorm, TextureFormat::Bgra8Unorm],
+                        width,
+                        height,
+                        present_mode: PresentMode::AutoVsync,
+                        desired_maximum_frame_latency: 2,
+                        alpha_mode: CompositeAlphaMode::Auto,
+                        view_formats: vec![],
+                    },
+                    Some(TextureConfiguration {
+                        usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
+                    }),
+                )
+                .await;
+
+            let mut state = self.state.borrow_mut();
+            state.context = context;
+            let surface = surface_result
+                .map_err(|e| JsValue::from_str(&format!("WebGPU canvas surface: {e:?}")))?;
+
+            let dev_id = surface.dev_id;
+            state.use_device(dev_id)?;
+            state.canvas_surface = Some(surface);
+        }
+
+        let mut state = self.state.borrow_mut();
+        let (scene, w, h) = state.build_scene();
+        let QuoxRendererState {
+            renderer,
+            canvas_surface,
+            ..
+        } = &mut *state;
+        let surface = canvas_surface
+            .as_mut()
+            .ok_or_else(|| JsValue::from_str("WebGPU canvas surface was not initialized"))?;
+        if surface.config.width != w || surface.config.height != h {
+            surface.resize(w, h);
+        }
+
+        surface
+            .ensure_current_surface_texture()
+            .map_err(|e| JsValue::from_str(&format!("WebGPU surface texture: {e:?}")))?;
+        let texture_view = surface
+            .target_texture_view()
+            .map_err(|e| JsValue::from_str(&format!("WebGPU surface texture view: {e:?}")))?;
+
+        renderer
+            .render_to_texture(
+                surface.device(),
+                surface.queue(),
+                &scene,
+                &texture_view,
+                &RenderParams {
+                    base_color: vello::peniko::Color::WHITE,
+                    width: w,
+                    height: h,
+                    antialiasing_method: AaConfig::Area,
+                },
+            )
+            .map_err(|e| JsValue::from_str(&format!("Vello render: {e:?}")))?;
+
+        drop(texture_view);
+        surface
+            .maybe_blit_and_present()
+            .map_err(|e| JsValue::from_str(&format!("WebGPU present: {e:?}")))?;
+
+        Ok(())
     }
 
     /// Render the current HTML and return a flat `width × height × 4`
