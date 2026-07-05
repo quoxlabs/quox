@@ -88,6 +88,16 @@ class Win32Window implements Window {
     this.#height = height;
   }
 
+  windowSurface(): Deno.UnsafeWindowSurface {
+    return new Deno.UnsafeWindowSurface({
+      system: "win32",
+      windowHandle: this.#hwnd,
+      displayHandle: this.lib.instance,
+      width: this.#width,
+      height: this.#height,
+    });
+  }
+
   /**
    * Copy an RGBA pixel buffer to the window's client area via GDI. Converts
    * to a top-down 32bpp BGRA DIB (matching the BGRX reordering used by the
@@ -152,6 +162,7 @@ class Win32Library implements Library {
   readonly kernel32: Deno.DynamicLibrary<typeof kernel32functions>;
   readonly user32: Deno.DynamicLibrary<typeof user32functions>;
   readonly gdi32: Deno.DynamicLibrary<typeof gdi32functions>;
+  readonly instance: Deno.PointerValue;
   #wndClass = new ArrayBuffer(80);
   #classNameBuffer = (() => {
     return wideStringBuffer("Winding");
@@ -292,6 +303,7 @@ class Win32Library implements Library {
     // hInstance
     const instance = this.kernel32.symbols.GetModuleHandleW(null);
     if (BigInt(instance) == 0n) throw new Error(this.getLastError());
+    this.instance = Deno.UnsafePointer.create(BigInt(instance));
     wndClassDv.setBigUint64(off, BigInt(instance), true);
     off += 8;
 

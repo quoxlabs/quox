@@ -48,6 +48,8 @@ export interface Window {
   close(): void;
   /** Set the native window title. */
   setTitle(title: string): void;
+  /** Create a presentable WebGPU surface for this native window. Requires `--unstable-webgpu`. */
+  windowSurface(): Deno.UnsafeWindowSurface;
   /** Blit (bit-block transfer) an RGBA pixel buffer to the window. Width and height must match the window dimensions. */
   blit(rgba: Uint8Array, width: number, height: number): void;
 }

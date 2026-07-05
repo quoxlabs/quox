@@ -227,6 +227,16 @@ class DarwinWindow implements Window {
     send.void(titleString, sel("release"));
   }
 
+  windowSurface(): Deno.UnsafeWindowSurface {
+    return new Deno.UnsafeWindowSurface({
+      system: "cocoa",
+      windowHandle: null,
+      displayHandle: this.contentView,
+      width: this.#width,
+      height: this.#height,
+    });
+  }
+
   blit(rgba: Uint8Array, width: number, height: number): void {
     const { cf, cg, sel, send } = this.lib.ffi;
     this.#prevImageBuf = this.#imageBuf;

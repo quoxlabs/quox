@@ -131,6 +131,16 @@ class X11Window implements Window {
     this.#height = height;
   }
 
+  windowSurface(): Deno.UnsafeWindowSurface {
+    return new Deno.UnsafeWindowSurface({
+      system: "x11",
+      windowHandle: Deno.UnsafePointer.create(this.id),
+      displayHandle: this.lib.display,
+      width: this.#width,
+      height: this.#height,
+    });
+  }
+
   /**
    * Copy an RGBA pixel buffer to the X11 window. The buffer must be
    * `width * height * 4` bytes. Internally converts to X11 TrueColor BGRX

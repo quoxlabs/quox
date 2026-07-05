@@ -133,6 +133,7 @@ class WaylandWindow implements Window {
   #buffer: Deno.PointerObject | null = null;
   #width: number;
   #height: number;
+  #windowSurface: Deno.UnsafeWindowSurface | null = null;
   // Pending configure serial from xdg_surface
   #pendingSerial = 0;
   #configured = false;
@@ -264,6 +265,18 @@ class WaylandWindow implements Window {
       args(Deno.UnsafePointer.value(Deno.UnsafePointer.of(titleBuf))),
     );
     sym.wl_display_flush(this.lib.display);
+  }
+
+  windowSurface(): Deno.UnsafeWindowSurface {
+    this.#ackPendingConfigure();
+    this.#windowSurface ??= new Deno.UnsafeWindowSurface({
+      system: "wayland",
+      windowHandle: this.#surface,
+      displayHandle: this.lib.display,
+      width: this.#width,
+      height: this.#height,
+    });
+    return this.#windowSurface;
   }
 
   /**
