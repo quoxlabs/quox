@@ -25,10 +25,15 @@ const NS_WINDOW_STYLE_MASK = 1 | 2 | 8 | 4;
 const NS_BACKING_STORE_BUFFERED = 2n;
 const NS_APPLICATION_ACTIVATION_POLICY_REGULAR = 0n;
 const NS_EVENT_MASK_ANY = 0xFFFFFFFFFFFFFFFFn;
+const NS_EVENT_MODIFIER_FLAG_CAPS_LOCK = 1n << 16n;
 const NS_EVENT_MODIFIER_FLAG_SHIFT = 1n << 17n;
 const NS_EVENT_MODIFIER_FLAG_CONTROL = 1n << 18n;
 const NS_EVENT_MODIFIER_FLAG_OPTION = 1n << 19n;
 const NS_EVENT_MODIFIER_FLAG_COMMAND = 1n << 20n;
+// NSTrackingAreaOptions: MouseEnteredAndExited | ActiveInKeyWindow | InVisibleRect. The rect
+// passed to `initWithRect:` is ignored when InVisibleRect is set — AppKit tracks the owning
+// view's visible rect automatically, so the area stays correct across resizes for free.
+const NS_TRACKING_AREA_OPTIONS = 0x01 | 0x20 | 0x200;
 
 type Closeable = { close(): void };
 
@@ -55,6 +60,11 @@ function openMsgSendSymbols(libraries: Closeable[]) {
     id_rectU64U64Bool: openMsgSend(
       libraries,
       ["pointer", "pointer", NSRECT, "u64", "u64", "bool"],
+      "pointer",
+    ),
+    id_rectU64PtrPtr: openMsgSend(
+      libraries,
+      ["pointer", "pointer", NSRECT, "u64", "pointer", "pointer"],
       "pointer",
     ),
     id_u64PtrPtrBool: openMsgSend(
@@ -160,6 +170,7 @@ function getModifiers(event: Deno.PointerValue, lib: DarwinLibrary): KeyModifier
     altKey: (flags & NS_EVENT_MODIFIER_FLAG_OPTION) !== 0n,
     metaKey,
     accelKey: metaKey,
+    capsLock: (flags & NS_EVENT_MODIFIER_FLAG_CAPS_LOCK) !== 0n,
   };
 }
 
@@ -204,6 +215,21 @@ class DarwinWindow implements Window {
     this.contentView = send.id(win, sel("contentView"));
     send.void_bool(this.contentView, sel("setWantsLayer:"), true);
     this.#layer = send.id(this.contentView, sel("layer"));
+
+    // Tracking area to receive mouseEntered:/mouseExited: on our delegate (registered as its
+    // owner below), which AppKit invokes directly rather than delivering as queued NSEvents.
+    const trackingAreaAlloc = send.id(getClass("NSTrackingArea"), sel("alloc"));
+    const zeroRect = new Float64Array(4);
+    const trackingArea = send.id_rectU64PtrPtr(
+      trackingAreaAlloc,
+      sel("initWithRect:options:owner:userInfo:"),
+      zeroRect,
+      BigInt(NS_TRACKING_AREA_OPTIONS),
+      this.#delegate,
+      null,
+    );
+    send.void_id(this.contentView, sel("addTrackingArea:"), trackingArea);
+    send.void(trackingArea, sel("release"));
 
     send.void_bool(win, sel("makeKeyAndOrderFront:"), false);
     send.void_bool(lib.nsApp, sel("activateIgnoringOtherApps:"), true);
@@ -284,6 +310,24 @@ class DarwinLibrary implements Library {
   readonly #didResizeCallback: Deno.UnsafeCallback<
     { parameters: ["pointer", "pointer", "pointer"]; result: "void" }
   >;
+  readonly #mouseEnteredCallback: Deno.UnsafeCallback<
+    { parameters: ["pointer", "pointer", "pointer"]; result: "void" }
+  >;
+  readonly #mouseExitedCallback: Deno.UnsafeCallback<
+    { parameters: ["pointer", "pointer", "pointer"]; result: "void" }
+  >;
+  readonly #didBecomeKeyCallback: Deno.UnsafeCallback<
+    { parameters: ["pointer", "pointer", "pointer"]; result: "void" }
+  >;
+  readonly #didResignKeyCallback: Deno.UnsafeCallback<
+    { parameters: ["pointer", "pointer", "pointer"]; result: "void" }
+  >;
+  readonly #didMiniaturizeCallback: Deno.UnsafeCallback<
+    { parameters: ["pointer", "pointer", "pointer"]; result: "void" }
+  >;
+  readonly #didDeminiaturizeCallback: Deno.UnsafeCallback<
+    { parameters: ["pointer", "pointer", "pointer"]; result: "void" }
+  >;
   #queue: UIEvent[] = [];
 
   constructor() {
@@ -329,9 +373,66 @@ class DarwinLibrary implements Library {
       },
     );
 
+    this.#mouseEnteredCallback = new Deno.UnsafeCallback(
+      { parameters: ["pointer", "pointer", "pointer"], result: "void" },
+      (self) => {
+        const window = this.delegates.get(pointerId(self));
+        this.#queue.push({ type: "mouseenter", window });
+      },
+    );
+    this.#mouseExitedCallback = new Deno.UnsafeCallback(
+      { parameters: ["pointer", "pointer", "pointer"], result: "void" },
+      (self) => {
+        const window = this.delegates.get(pointerId(self));
+        this.#queue.push({ type: "mouseleave", window });
+      },
+    );
+    this.#didBecomeKeyCallback = new Deno.UnsafeCallback(
+      { parameters: ["pointer", "pointer", "pointer"], result: "void" },
+      (self) => {
+        const window = this.delegates.get(pointerId(self));
+        this.#queue.push({ type: "focus", window });
+      },
+    );
+    this.#didResignKeyCallback = new Deno.UnsafeCallback(
+      { parameters: ["pointer", "pointer", "pointer"], result: "void" },
+      (self) => {
+        const window = this.delegates.get(pointerId(self));
+        this.#queue.push({ type: "blur", window });
+      },
+    );
+    this.#didMiniaturizeCallback = new Deno.UnsafeCallback(
+      { parameters: ["pointer", "pointer", "pointer"], result: "void" },
+      (self) => {
+        const window = this.delegates.get(pointerId(self));
+        this.#queue.push({ type: "visibilitychange", visible: false, window });
+      },
+    );
+    this.#didDeminiaturizeCallback = new Deno.UnsafeCallback(
+      { parameters: ["pointer", "pointer", "pointer"], result: "void" },
+      (self) => {
+        const window = this.delegates.get(pointerId(self));
+        this.#queue.push({ type: "visibilitychange", visible: true, window });
+      },
+    );
+
     this.delegateClass = allocateClassPair(getClass("NSObject"), "WindingWindowDelegate");
     addMethod(this.delegateClass, sel("windowShouldClose:"), this.#shouldCloseCallback.pointer, "c@:@");
     addMethod(this.delegateClass, sel("windowDidResize:"), this.#didResizeCallback.pointer, "v@:@");
+    // mouseEntered:/mouseExited: are NSResponder selectors, but AppKit will call them on any
+    // object registered as an NSTrackingArea's owner — the delegate instance doubles as that
+    // owner (installed per-window in the `DarwinWindow` constructor).
+    addMethod(this.delegateClass, sel("mouseEntered:"), this.#mouseEnteredCallback.pointer, "v@:@");
+    addMethod(this.delegateClass, sel("mouseExited:"), this.#mouseExitedCallback.pointer, "v@:@");
+    addMethod(this.delegateClass, sel("windowDidBecomeKey:"), this.#didBecomeKeyCallback.pointer, "v@:@");
+    addMethod(this.delegateClass, sel("windowDidResignKey:"), this.#didResignKeyCallback.pointer, "v@:@");
+    addMethod(this.delegateClass, sel("windowDidMiniaturize:"), this.#didMiniaturizeCallback.pointer, "v@:@");
+    addMethod(
+      this.delegateClass,
+      sel("windowDidDeminiaturize:"),
+      this.#didDeminiaturizeCallback.pointer,
+      "v@:@",
+    );
     registerClassPair(this.delegateClass);
   }
 
@@ -369,6 +470,12 @@ class DarwinLibrary implements Library {
   close(): void {
     this.#shouldCloseCallback.close();
     this.#didResizeCallback.close();
+    this.#mouseEnteredCallback.close();
+    this.#mouseExitedCallback.close();
+    this.#didBecomeKeyCallback.close();
+    this.#didResignKeyCallback.close();
+    this.#didMiniaturizeCallback.close();
+    this.#didDeminiaturizeCallback.close();
     this.ffi.cf.symbols.CFRelease(this.colorSpace);
     this.ffi.close();
   }
