@@ -31,11 +31,7 @@ export type QuoxResizeEvent = { type: "resize"; width: number; height: number };
 export type QuoxCloseEvent = { type: "close" };
 
 export type QuoxWindowContent = QuoxInnerHTML | QuoxRenderable;
-type CanvasLikeSurface = {
-  width: number;
-  height: number;
-  getContext(contextId: "webgpu", options?: unknown): GPUCanvasContext | null;
-};
+type SurfaceRenderTarget = Pick<Deno.UnsafeWindowSurface, "width" | "height" | "getContext">;
 
 export interface WindowOptions {
   /** Width of the window in pixels (default 800). */
@@ -122,7 +118,7 @@ export class QuoxWindow implements Disposable {
   #disposed = false;
   #rendererFreed = false;
   #surface: Deno.UnsafeWindowSurface | null = null;
-  #surfaceRenderTarget: CanvasLikeSurface | null = null;
+  #surfaceRenderTarget: SurfaceRenderTarget | null = null;
   #surfaceContext: GPUCanvasContext | null = null;
   readonly #listeners: Array<(event: QuoxInputEvent) => void> = [];
   readonly document: QuoxDocument;
@@ -262,10 +258,10 @@ export class QuoxWindow implements Disposable {
     }
   }
 
-  #surfaceTarget(): { surface: Deno.UnsafeWindowSurface; target: CanvasLikeSurface } {
+  #surfaceTarget(): { surface: Deno.UnsafeWindowSurface; target: SurfaceRenderTarget } {
     if (this.#surface === null || this.#surfaceRenderTarget === null) {
       const surface = this.#win.windowSurface();
-      const target: CanvasLikeSurface = {
+      const target: SurfaceRenderTarget = {
         width: surface.width,
         height: surface.height,
         getContext: (contextId, options) => {
@@ -281,7 +277,7 @@ export class QuoxWindow implements Disposable {
     return { surface: this.#surface, target: this.#surfaceRenderTarget };
   }
 
-  #resizeSurfaceTarget(target: CanvasLikeSurface, width: number, height: number): void {
+  #resizeSurfaceTarget(target: SurfaceRenderTarget, width: number, height: number): void {
     target.width = width;
     target.height = height;
   }
