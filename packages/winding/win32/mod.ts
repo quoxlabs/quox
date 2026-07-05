@@ -52,8 +52,10 @@ class Win32Window implements Window {
   readonly #hwnd: Deno.PointerObject;
   #bgra = new Uint8Array(0) as Uint8Array<ArrayBuffer>;
   #bmi = new ArrayBuffer(BITMAPINFOHEADER_SIZE);
+  #width: number;
+  #height: number;
 
-  constructor(readonly lib: Win32Library, classNameBuf: ArrayBuffer) {
+  constructor(readonly lib: Win32Library, classNameBuf: ArrayBuffer, width: number, height: number) {
     const window = lib.user32.symbols.CreateWindowExW(
       0,
       classNameBuf,
@@ -71,12 +73,19 @@ class Win32Window implements Window {
     if (window == null) throw new Error(lib.getLastError());
     this.#hwnd = window;
     this.id = BigInt(Deno.UnsafePointer.value(window));
+    this.#width = width;
+    this.#height = height;
     lib.windows.set(this.id, this);
   }
 
   setTitle(title: string): void {
     const ok = this.lib.user32.symbols.SetWindowTextW(this.#hwnd, wideStringBuffer(title));
     if (!ok) throw new Error(this.lib.getLastError());
+  }
+
+  setSize(width: number, height: number): void {
+    this.#width = width;
+    this.#height = height;
   }
 
   /**
@@ -183,6 +192,7 @@ class Win32Library implements Library {
           const w = Number(BigInt(lParam) & 0xFFFFn);
           const h = Number((BigInt(lParam) >> 16n) & 0xFFFFn);
           if (w > 0 && h > 0) {
+            win?.setSize(w, h);
             this.#event = { type: "resize", width: w, height: h, window: win };
           }
           break;
@@ -322,8 +332,8 @@ class Win32Library implements Library {
     if (wndClass == 0) throw new Error(this.getLastError());
   }
   readonly windows = new Map<bigint, Win32Window>();
-  openWindow(_x = 0, _y = 0, _w = 800, _h = 600): Win32Window {
-    return new Win32Window(this, this.#classNameBuffer);
+  openWindow(_x = 0, _y = 0, w = 800, h = 600): Win32Window {
+    return new Win32Window(this, this.#classNameBuffer, w, h);
   }
   #msg = new ArrayBuffer(48);
   event(): UIEvent | undefined {

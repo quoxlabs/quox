@@ -208,6 +208,7 @@ class WaylandWindow implements Window {
       { parameters: ["pointer", "pointer", "u32"], result: "void" },
       (_data, _surface, serial) => {
         this.#pendingSerial = serial;
+        this.#ackPendingConfigure();
       },
     );
     // xdg_surface has exactly 1 event (configure) -- use our built interface's count.
@@ -219,14 +220,16 @@ class WaylandWindow implements Window {
       { parameters: ["pointer", "pointer", "i32", "i32", "pointer"], result: "void" },
       (_data, _toplevel, width, height, _states) => {
         if (width > 0 && height > 0) {
-          this.lib.pushEvent({ type: "resize", width, height });
+          this.#width = width;
+          this.#height = height;
+          this.lib.pushEvent({ type: "resize", width, height, window: this });
         }
       },
     );
     this.#toplevelClose = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer"], result: "void" },
       () => {
-        this.lib.pushEvent({ type: "close" });
+        this.lib.pushEvent({ type: "close", window: this });
       },
     );
     // xdg_toplevel has 4 events but we only handle the first 2; rest get noop.

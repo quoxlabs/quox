@@ -126,6 +126,11 @@ class X11Window implements Window {
     this.lib.X11.symbols.XFlush(this.lib.display);
   }
 
+  setSize(width: number, height: number): void {
+    this.#width = width;
+    this.#height = height;
+  }
+
   /**
    * Copy an RGBA pixel buffer to the X11 window. The buffer must be
    * `width * height * 4` bytes. Internally converts to X11 TrueColor BGRX
@@ -231,7 +236,11 @@ class X11Library implements Library {
       );
       const event = importEvent(view, this.wmProtocols, this.wmDeleteWindow);
       if (event !== undefined) {
-        return { ...event, window: this.windows.get(view.getBigUint64(32, true)) };
+        const window = this.windows.get(view.getBigUint64(32, true));
+        if (event.type === "resize" && window !== undefined) {
+          window.setSize(event.width, event.height);
+        }
+        return { ...event, window };
       }
     }
     return undefined;
