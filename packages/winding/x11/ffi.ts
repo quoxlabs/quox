@@ -67,6 +67,12 @@ export enum XEventMask {
   OwnerGrabButtonMask = 1 << 24,
 }
 
+// `mode` value from X11/X.h shared by XCrossingEvent (Enter/LeaveNotify) and
+// XFocusChangeEvent (FocusIn/FocusOut). Only NotifyNormal represents a real user-facing
+// hover/focus transition; NotifyGrab/NotifyUngrab/NotifyWhileGrabbed are WM-internal (e.g.
+// alt-tab, an interactive move/resize grab) and must be filtered out.
+export const NotifyNormal = 0;
+
 // Function declarations from X11/Xlib.h
 export const x11functions = {
   XActivateScreenSaver: { parameters: ["pointer"], result: "i32" },

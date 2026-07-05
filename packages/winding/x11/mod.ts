@@ -1,7 +1,7 @@
 import type { KeyModifiers, Library, LoadLibrary, UIEvent, Window } from "../types.ts";
 import { utf8Bytes, utf8CString as cString } from "../text_encoding.ts";
 import { getDomCode } from "./dom_code.ts";
-import { x11functions, XEventMask, XEventType } from "./ffi.ts";
+import { NotifyNormal, x11functions, XEventMask, XEventType } from "./ffi.ts";
 
 // XStoreName sets the legacy WM_NAME property, which is read as Latin-1 by clients that don't
 // understand the EWMH _NET_WM_NAME/UTF8_STRING property set below. Encoding it as UTF-8 there
@@ -23,6 +23,7 @@ function latin1CString(s: string): Uint8Array<ArrayBuffer> {
 //     events report the intended (larger) dimensions.
 const ALL_X_EV_MASKS = 0x1ffffff & ~(XEventMask.PointerMotionHintMask | XEventMask.ResizeRedirectMask);
 const X_SHIFT_MASK = 1 << 0;
+const X_LOCK_MASK = 1 << 1;
 const X_CONTROL_MASK = 1 << 2;
 const X_MOD1_MASK = 1 << 3;
 const X_MOD4_MASK = 1 << 6;
@@ -35,6 +36,7 @@ function getModifiers(state: number): KeyModifiers {
     altKey: (state & X_MOD1_MASK) !== 0,
     metaKey: (state & X_MOD4_MASK) !== 0,
     accelKey: ctrlKey,
+    capsLock: (state & X_LOCK_MASK) !== 0,
   };
 }
 
@@ -166,6 +168,16 @@ class X11Window implements Window {
       buf[i + 2] = rgba[i]; // R ← B
       buf[i + 3] = 0; // padding
     }
+    this.reblit();
+  }
+
+  /**
+   * Re-issue the last blitted frame to the drawable without touching `#imageBuf`. Used to
+   * respond to an `Expose` event (the window manager/compositor asking us to repaint a
+   * region, e.g. after being uncovered) — the pixels haven't changed, only the drawable
+   * needs the same bytes reapplied.
+   */
+  reblit(): void {
     this.lib.X11.symbols.XPutImage(
       this.lib.display,
       this.id,
@@ -229,6 +241,15 @@ class X11Library implements Library {
         this.display,
         Deno.UnsafePointer.of(this.#event),
       );
+
+      // Expose is a pure repaint request (e.g. the window was uncovered) — the pixels
+      // haven't changed, so self-heal by re-blitting the last frame directly rather than
+      // surfacing a UIEvent for it.
+      if (view.getInt32(0, true) === XEventType.Expose) {
+        this.windows.get(view.getBigUint64(32, true))?.reblit();
+        continue;
+      }
+
       const event = importEvent(view, this.wmProtocols, this.wmDeleteWindow);
       if (event !== undefined) {
         return { ...event, window: this.windows.get(view.getBigUint64(32, true)) };
@@ -299,6 +320,22 @@ function importEvent(
       }
       return undefined;
     }
+    case XEventType.EnterNotify:
+      // XCrossingEvent: mode at offset 80. Only NotifyNormal is a real pointer-enter.
+      return view.getInt32(80, true) === NotifyNormal ? { type: "mouseenter" } : undefined;
+    case XEventType.LeaveNotify:
+      // XCrossingEvent: mode at offset 80. Only NotifyNormal is a real pointer-leave.
+      return view.getInt32(80, true) === NotifyNormal ? { type: "mouseleave" } : undefined;
+    case XEventType.FocusIn:
+      // XFocusChangeEvent: mode at offset 40. Only NotifyNormal is a real focus gain.
+      return view.getInt32(40, true) === NotifyNormal ? { type: "focus" } : undefined;
+    case XEventType.FocusOut:
+      // XFocusChangeEvent: mode at offset 40. Only NotifyNormal is a real focus loss.
+      return view.getInt32(40, true) === NotifyNormal ? { type: "blur" } : undefined;
+    case XEventType.UnmapNotify:
+      return { type: "visibilitychange", visible: false };
+    case XEventType.MapNotify:
+      return { type: "visibilitychange", visible: true };
     default:
       return undefined;
   }
