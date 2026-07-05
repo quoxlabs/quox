@@ -31,6 +31,11 @@ export type QuoxResizeEvent = { type: "resize"; width: number; height: number };
 export type QuoxCloseEvent = { type: "close" };
 
 export type QuoxWindowContent = QuoxInnerHTML | QuoxRenderable;
+type CanvasLikeSurface = {
+  width: number;
+  height: number;
+  getContext(contextId: "webgpu", options?: unknown): GPUCanvasContext | null;
+};
 
 export interface WindowOptions {
   /** Width of the window in pixels (default 800). */
@@ -116,6 +121,8 @@ export class QuoxWindow implements Disposable {
   #stopped = false;
   #disposed = false;
   #rendererFreed = false;
+  #surface: Deno.UnsafeWindowSurface | null = null;
+  #surfaceRenderTarget: CanvasLikeSurface | null = null;
   readonly #listeners: Array<(event: QuoxInputEvent) => void> = [];
   readonly document: QuoxDocument;
 
@@ -239,12 +246,11 @@ export class QuoxWindow implements Disposable {
     try {
       this.document.syncNativeTitle();
 
-      // Render the retained Blitz document via WebGPU in WASM.
-      const rgba = await this.#renderer.render();
-
+      const { surface, target } = this.#surfaceTarget();
+      this.#resizeSurfaceTarget(target, renderWidth, renderHeight);
+      await this.#renderer.render_to_canvas(target);
       if (!this.#stopped && !this.#disposed) {
-        // Blit RGBA buffer to the window (conversion to native pixel format is handled by winding).
-        this.#win.blit(rgba, renderWidth, renderHeight);
+        surface.present();
       }
     } catch (err) {
       console.error("Quox render failed:", err);
@@ -252,6 +258,26 @@ export class QuoxWindow implements Disposable {
       this.#rendering = false;
       if (this.#needsRender) this.#requestRender();
     }
+  }
+
+  #surfaceTarget(): { surface: Deno.UnsafeWindowSurface; target: CanvasLikeSurface } {
+    if (this.#surface === null || this.#surfaceRenderTarget === null) {
+      const surface = this.#win.windowSurface();
+      const target: CanvasLikeSurface = {
+        width: surface.width,
+        height: surface.height,
+        getContext: (contextId, options) => surface.getContext(contextId, options) as GPUCanvasContext | null,
+      };
+      this.#surface = surface;
+      this.#surfaceRenderTarget = target;
+      return { surface, target };
+    }
+    return { surface: this.#surface, target: this.#surfaceRenderTarget };
+  }
+
+  #resizeSurfaceTarget(target: CanvasLikeSurface, width: number, height: number): void {
+    target.width = width;
+    target.height = height;
   }
 
   /** Register a callback that is invoked for every input event during a tick. */
