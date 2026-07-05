@@ -4,6 +4,6 @@
   "exports": "./mod.ts",
   "license": "MIT",
   "tasks": {
-    "ok": "deno fmt --check && deno lint && deno check"
+    "ok": "deno fmt --check && deno lint && deno test && deno check"
   }
 }

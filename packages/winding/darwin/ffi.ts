@@ -6,7 +6,7 @@
 // opens `libobjc` once per distinct call shape and shares those handles.
 
 // `initWithUTF8String:` and friends require genuine UTF-8 bytes.
-import { utf8CString as cStr } from "./text_encoding.ts";
+import { utf8CString as cStr } from "../text_encoding.ts";
 export { cStr };
 
 export const LIBOBJC = "/usr/lib/libobjc.dylib";

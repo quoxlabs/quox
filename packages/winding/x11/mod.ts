@@ -1,6 +1,7 @@
-import type { Library, LoadLibrary, UIEvent, Window } from "./src/../types.ts";
-import { x11functions, XEventMask, XEventType } from "./x11_ffi.ts";
-import { utf8Bytes, utf8CString as cString } from "./text_encoding.ts";
+import type { KeyModifiers, Library, LoadLibrary, UIEvent, Window } from "../types.ts";
+import { utf8Bytes, utf8CString as cString } from "../text_encoding.ts";
+import { getDomCode } from "./dom_code.ts";
+import { x11functions, XEventMask, XEventType } from "./ffi.ts";
 
 // XStoreName sets the legacy WM_NAME property, which is read as Latin-1 by clients that don't
 // understand the EWMH _NET_WM_NAME/UTF8_STRING property set below. Encoding it as UTF-8 there
@@ -21,6 +22,21 @@ function latin1CString(s: string): Uint8Array<ArrayBuffer> {
 //     the drawable to stay at its initial size while synthetic ConfigureNotify
 //     events report the intended (larger) dimensions.
 const ALL_X_EV_MASKS = 0x1ffffff & ~(XEventMask.PointerMotionHintMask | XEventMask.ResizeRedirectMask);
+const X_SHIFT_MASK = 1 << 0;
+const X_CONTROL_MASK = 1 << 2;
+const X_MOD1_MASK = 1 << 3;
+const X_MOD4_MASK = 1 << 6;
+
+function getModifiers(state: number): KeyModifiers {
+  const ctrlKey = (state & X_CONTROL_MASK) !== 0;
+  return {
+    shiftKey: (state & X_SHIFT_MASK) !== 0,
+    ctrlKey,
+    altKey: (state & X_MOD1_MASK) !== 0,
+    metaKey: (state & X_MOD4_MASK) !== 0,
+    accelKey: ctrlKey,
+  };
+}
 
 class X11Window implements Window {
   readonly id: bigint;
@@ -236,10 +252,16 @@ function importEvent(
 ): UIEvent | undefined {
   const type = view.getInt32(0, true);
   switch (type) {
-    case XEventType.KeyPress:
-      return { type: "keydown", keycode: view.getInt32(84, true) };
-    case XEventType.KeyRelease:
-      return { type: "keyup", keycode: view.getInt32(84, true) };
+    case XEventType.KeyPress: {
+      const state = view.getUint32(80, true);
+      const keycode = view.getInt32(84, true);
+      return { type: "keydown", keycode, code: getDomCode(keycode), ...getModifiers(state) };
+    }
+    case XEventType.KeyRelease: {
+      const state = view.getUint32(80, true);
+      const keycode = view.getInt32(84, true);
+      return { type: "keyup", keycode, code: getDomCode(keycode), ...getModifiers(state) };
+    }
     case XEventType.ButtonPress: {
       const btn = view.getInt32(84, true);
       if (btn === 4) return { type: "wheel", deltaX: 0, deltaY: -1 };

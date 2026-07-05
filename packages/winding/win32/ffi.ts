@@ -29,6 +29,7 @@ export const gdi32functions = {
 
 export const user32functions = {
   GetDC: { parameters: ["pointer"], result: "pointer" },
+  GetKeyState: { parameters: ["i32"], result: "i16" },
   ReleaseDC: { parameters: ["pointer", "pointer"], result: "i32" },
   SetCapture: { parameters: ["pointer"], result: "pointer" },
   ReleaseCapture: { parameters: [], result: "bool" },

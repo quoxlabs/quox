@@ -1,4 +1,5 @@
-import type { Library, LoadLibrary, UIEvent, Window } from "./types.ts";
+import type { KeyModifiers, Library, LoadLibrary, UIEvent, Window } from "../types.ts";
+import { getDomCode } from "./dom_code.ts";
 import {
   addMethod as runtimeAddMethod,
   allocateClassPair as runtimeAllocateClassPair,
@@ -17,13 +18,17 @@ import {
   RGBA_BITMAP_INFO,
   runtimeSymbols,
   sel as runtimeSel,
-} from "./darwin_ffi.ts";
+} from "./ffi.ts";
 
 // NSWindowStyleMask: Titled | Closable | Resizable | Miniaturizable
 const NS_WINDOW_STYLE_MASK = 1 | 2 | 8 | 4;
 const NS_BACKING_STORE_BUFFERED = 2n;
 const NS_APPLICATION_ACTIVATION_POLICY_REGULAR = 0n;
 const NS_EVENT_MASK_ANY = 0xFFFFFFFFFFFFFFFFn;
+const NS_EVENT_MODIFIER_FLAG_SHIFT = 1n << 17n;
+const NS_EVENT_MODIFIER_FLAG_CONTROL = 1n << 18n;
+const NS_EVENT_MODIFIER_FLAG_OPTION = 1n << 19n;
+const NS_EVENT_MODIFIER_FLAG_COMMAND = 1n << 20n;
 
 type Closeable = { close(): void };
 
@@ -143,6 +148,19 @@ function makeNSString(ffi: DarwinFfi, s: string): Deno.PointerValue {
 
 function pointerId(p: Deno.PointerValue): bigint {
   return BigInt(Deno.UnsafePointer.value(p));
+}
+
+function getModifiers(event: Deno.PointerValue, lib: DarwinLibrary): KeyModifiers {
+  const { sel, send } = lib.ffi;
+  const flags = send.u64(event, sel("modifierFlags"));
+  const metaKey = (flags & NS_EVENT_MODIFIER_FLAG_COMMAND) !== 0n;
+  return {
+    shiftKey: (flags & NS_EVENT_MODIFIER_FLAG_SHIFT) !== 0n,
+    ctrlKey: (flags & NS_EVENT_MODIFIER_FLAG_CONTROL) !== 0n,
+    altKey: (flags & NS_EVENT_MODIFIER_FLAG_OPTION) !== 0n,
+    metaKey,
+    accelKey: metaKey,
+  };
 }
 
 class DarwinWindow implements Window {
@@ -394,10 +412,14 @@ function importEvent(event: Deno.PointerValue, lib: DarwinLibrary): UIEvent | un
       const deltaY = send.f64(event, sel("deltaY"));
       return { type: "wheel", deltaX: -deltaX, deltaY: -deltaY, window };
     }
-    case NSEventType.KeyDown:
-      return { type: "keydown", keycode: send.u16(event, sel("keyCode")), window };
-    case NSEventType.KeyUp:
-      return { type: "keyup", keycode: send.u16(event, sel("keyCode")), window };
+    case NSEventType.KeyDown: {
+      const keycode = send.u16(event, sel("keyCode"));
+      return { type: "keydown", keycode, code: getDomCode(keycode), ...getModifiers(event, lib), window };
+    }
+    case NSEventType.KeyUp: {
+      const keycode = send.u16(event, sel("keyCode"));
+      return { type: "keyup", keycode, code: getDomCode(keycode), ...getModifiers(event, lib), window };
+    }
     default:
       return undefined;
   }

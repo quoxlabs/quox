@@ -1,4 +1,6 @@
-import type { Library, LoadLibrary, UIEvent, Window } from "./types.ts";
+import type { KeyModifiers, Library, LoadLibrary, UIEvent, Window } from "../types.ts";
+import { utf8CString as cStr } from "../text_encoding.ts";
+import { getDomCode } from "./dom_code.ts";
 import {
   buildXdgIfaces,
   libdlSymbols,
@@ -7,8 +9,8 @@ import {
   WlOp,
   WlSeatCap,
   WlShmFormat,
-} from "./wayland_ffi.ts";
-import { utf8CString as cStr } from "./text_encoding.ts";
+  xkbSymbols,
+} from "./ffi.ts";
 
 // ---------------------------------------------------------------------------
 // libc helpers (memfd, mmap, poll) — needed for shared-memory pixel buffers
@@ -29,12 +31,38 @@ const libcSymbols = {
 const PROT_READ = 0x1;
 const PROT_WRITE = 0x2;
 const MAP_SHARED = 0x01;
+const MAP_PRIVATE = 0x02;
 const MAP_FAILED = 0xFFFFFFFFFFFFFFFFn;
 const MFD_CLOEXEC = 1;
 const POLLIN = 1;
 const RTLD_NOW = 0x2;
 const RTLD_NOLOAD = 0x4;
 const LIBWAYLAND_CLIENT_SO = "libwayland-client.so.0";
+const LIBXKBCOMMON_SO = "libxkbcommon.so.0";
+const WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 = 1;
+const XKB_CONTEXT_NO_FLAGS = 0;
+const XKB_KEYMAP_FORMAT_TEXT_V1 = 1;
+const XKB_KEYMAP_COMPILE_NO_FLAGS = 0;
+const XKB_STATE_MODS_EFFECTIVE = 1 << 3;
+const XKB_SHIFT_MASK = 1 << 0;
+const XKB_CONTROL_MASK = 1 << 2;
+const XKB_ALT_MASK = 1 << 3;
+const XKB_META_MASK = 1 << 6;
+const XKB_MOD_SHIFT = cStr("Shift");
+const XKB_MOD_CONTROL = cStr("Control");
+const XKB_MOD_ALT = cStr("Mod1");
+const XKB_MOD_META = cStr("Mod4");
+
+function getModifiers(mask: number): KeyModifiers {
+  const ctrlKey = (mask & XKB_CONTROL_MASK) !== 0;
+  return {
+    shiftKey: (mask & XKB_SHIFT_MASK) !== 0,
+    ctrlKey,
+    altKey: (mask & XKB_ALT_MASK) !== 0,
+    metaKey: (mask & XKB_META_MASK) !== 0,
+    accelKey: ctrlKey,
+  };
+}
 
 function dlsymRequired(
   libdl: Deno.DynamicLibrary<typeof libdlSymbols>,
@@ -375,6 +403,8 @@ class WaylandLibrary implements Library {
   readonly libdl: Deno.DynamicLibrary<typeof libdlSymbols>;
   readonly #wlHandle: Deno.PointerObject;
   readonly wl: Deno.DynamicLibrary<typeof waylandSymbols>;
+  readonly xkb: Deno.DynamicLibrary<typeof xkbSymbols>;
+  readonly #xkbContext: Deno.PointerObject;
   readonly display: Deno.PointerObject;
   // XDG interface structs -- built lazily in the constructor, mem kept alive to
   // prevent the pinned buffer from being GC'd.
@@ -405,6 +435,9 @@ class WaylandLibrary implements Library {
   #seat: Deno.PointerObject | null = null;
   #pointer: Deno.PointerObject | null = null;
   #keyboard: Deno.PointerObject | null = null;
+  #xkbKeymap: Deno.PointerObject | null = null;
+  #xkbState: Deno.PointerObject | null = null;
+  #modifiers: KeyModifiers = getModifiers(0);
   // Event queue filled by listener callbacks, drained by event()
   #events: UIEvent[] = [];
   // Shared no-op callback for unused vtable slots
@@ -419,6 +452,10 @@ class WaylandLibrary implements Library {
     this.libc = Deno.dlopen("libc.so.6", libcSymbols); // needed to perform a few syscalls
     this.libdl = Deno.dlopen("libdl.so.2", libdlSymbols);
     this.wl = Deno.dlopen(LIBWAYLAND_CLIENT_SO, waylandSymbols);
+    this.xkb = Deno.dlopen(LIBXKBCOMMON_SO, xkbSymbols);
+    const xkbContext = this.xkb.symbols.xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+    if (!xkbContext) throw new Error("winding failed to create xkb context");
+    this.#xkbContext = xkbContext;
     // Retrieve an existing loader handle for dlsym without loading a second time.
     const wlHandle = this.libdl.symbols.dlopen(cStr(LIBWAYLAND_CLIENT_SO), RTLD_NOW | RTLD_NOLOAD);
     if (!wlHandle) throw new Error(`winding failed to get existing ${LIBWAYLAND_CLIENT_SO} handle via libdl`);
@@ -688,6 +725,62 @@ class WaylandLibrary implements Library {
     sym.wl_proxy_add_listener(pointer, Deno.UnsafePointer.of(ptrVtable), null);
   }
 
+  #loadKeymap(format: number, fd: number, size: number): void {
+    try {
+      if (format !== WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 || size === 0) return;
+
+      const byteLength = BigInt(size);
+      const mapped = this.libc.symbols.mmap(null, byteLength, PROT_READ, MAP_PRIVATE, fd, 0n);
+      if (mapped === null || Deno.UnsafePointer.value(mapped) === MAP_FAILED) return;
+
+      try {
+        const keymap = this.xkb.symbols.xkb_keymap_new_from_buffer(
+          this.#xkbContext,
+          mapped,
+          byteLength,
+          XKB_KEYMAP_FORMAT_TEXT_V1,
+          XKB_KEYMAP_COMPILE_NO_FLAGS,
+        );
+        if (!keymap) return;
+
+        const state = this.xkb.symbols.xkb_state_new(keymap);
+        if (!state) {
+          this.xkb.symbols.xkb_keymap_unref(keymap);
+          return;
+        }
+
+        this.#replaceXkbState(keymap, state);
+      } finally {
+        this.libc.symbols.munmap(mapped, byteLength);
+      }
+    } finally {
+      this.libc.symbols.close(fd);
+    }
+  }
+
+  #replaceXkbState(keymap: Deno.PointerObject, state: Deno.PointerObject): void {
+    if (this.#xkbState) this.xkb.symbols.xkb_state_unref(this.#xkbState);
+    if (this.#xkbKeymap) this.xkb.symbols.xkb_keymap_unref(this.#xkbKeymap);
+    this.#xkbKeymap = keymap;
+    this.#xkbState = state;
+  }
+
+  #modifiersFromXkbState(): KeyModifiers {
+    const state = this.#xkbState;
+    if (!state) return this.#modifiers;
+
+    const active = (name: Uint8Array): boolean =>
+      this.xkb.symbols.xkb_state_mod_name_is_active(state, name, XKB_STATE_MODS_EFFECTIVE) > 0;
+    const ctrlKey = active(XKB_MOD_CONTROL);
+    return {
+      shiftKey: active(XKB_MOD_SHIFT),
+      ctrlKey,
+      altKey: active(XKB_MOD_ALT),
+      metaKey: active(XKB_MOD_META),
+      accelKey: ctrlKey,
+    };
+  }
+
   #initKeyboard(): void {
     const sym = this.wl.symbols;
     const keyboard = sym.wl_proxy_marshal_array_flags(
@@ -702,16 +795,40 @@ class WaylandLibrary implements Library {
     this.#keyboard = keyboard;
 
     // wl_keyboard events: 0=keymap, 1=enter, 2=leave, 3=key, 4=modifiers, 5=repeat_info
+    const keymapCb = new Deno.UnsafeCallback(
+      // (data, keyboard, format, fd, size)
+      { parameters: ["pointer", "pointer", "u32", "i32", "u32"], result: "void" },
+      (_data, _kb, format, fd, size) => {
+        this.#loadKeymap(format, fd, size);
+      },
+    );
     const keyCb = new Deno.UnsafeCallback(
       // (data, keyboard, serial, time, key, state)
       { parameters: ["pointer", "pointer", "u32", "u32", "u32", "u32"], result: "void" },
       (_data, _kb, _serial, _time, key, state) => {
-        this.#events.push({ type: state ? "keydown" : "keyup", keycode: key });
+        this.#events.push({
+          type: state ? "keydown" : "keyup",
+          keycode: key,
+          code: getDomCode(key),
+          ...this.#modifiers,
+        });
       },
     );
-    this.#listeners.push(keyCb);
+    const modifiersCb = new Deno.UnsafeCallback(
+      // (data, keyboard, serial, mods_depressed, mods_latched, mods_locked, group)
+      { parameters: ["pointer", "pointer", "u32", "u32", "u32", "u32", "u32"], result: "void" },
+      (_data, _kb, _serial, depressed, latched, locked, _group) => {
+        if (this.#xkbState) {
+          this.xkb.symbols.xkb_state_update_mask(this.#xkbState, depressed, latched, locked, 0, 0, _group);
+          this.#modifiers = this.#modifiersFromXkbState();
+        } else {
+          this.#modifiers = getModifiers(depressed | latched | locked);
+        }
+      },
+    );
+    this.#listeners.push(keymapCb, keyCb, modifiersCb);
     const kbEventCount = readEventCount(Deno.UnsafePointer.value(this.ifaces.keyboard));
-    const kbVtable = makeVtable([null, null, null, keyCb], kbEventCount, this.noop);
+    const kbVtable = makeVtable([keymapCb, null, null, keyCb, modifiersCb], kbEventCount, this.noop);
     this.#vtables.push(kbVtable);
     sym.wl_proxy_add_listener(keyboard, Deno.UnsafePointer.of(kbVtable), null);
   }
@@ -785,6 +902,10 @@ class WaylandLibrary implements Library {
     }
     for (const cb of this.#listeners) cb.close();
     this.noop.close();
+    if (this.#xkbState) this.xkb.symbols.xkb_state_unref(this.#xkbState);
+    if (this.#xkbKeymap) this.xkb.symbols.xkb_keymap_unref(this.#xkbKeymap);
+    this.xkb.symbols.xkb_context_unref(this.#xkbContext);
+    this.xkb.close();
     this.wl.symbols.wl_display_disconnect(this.display);
     this.wl.close();
     this.libdl.symbols.dlclose(this.#wlHandle);

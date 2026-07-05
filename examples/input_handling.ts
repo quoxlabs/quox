@@ -1,8 +1,20 @@
-import { openWindow } from "../packages/quox/mod.ts";
+import { openWindow, type QuoxKeyboardEvent } from "../packages/quox/mod.ts";
 
 const body = `
 <h1>Input Handling Demo</h1>
 <p>Move the mouse, click, scroll, or type to see events in the console.</p>`;
+
+function formatModifiers(event: QuoxKeyboardEvent): string {
+  const modifiers = [
+    event.shiftKey ? "Shift" : undefined,
+    event.ctrlKey ? "Ctrl" : undefined,
+    event.altKey ? "Alt" : undefined,
+    event.metaKey ? "Meta" : undefined,
+    event.accelKey ? "Accel" : undefined,
+  ].filter((modifier) => modifier !== undefined);
+
+  return modifiers.length ? ` [${modifiers.join("+")}]` : "";
+}
 
 if (import.meta.main) {
   const window = await openWindow({ body });
@@ -26,7 +38,9 @@ if (import.meta.main) {
       case "keydown":
       case "keyup":
         console.log(
-          `Key ${event.type === "keydown" ? "pressed" : "released"}: ${event.key} (${event.code})`,
+          `Key ${event.type === "keydown" ? "pressed" : "released"}: ${event.key} (${event.code})${
+            formatModifiers(event)
+          }`,
         );
         break;
       case "resize":
