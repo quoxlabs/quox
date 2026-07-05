@@ -76,6 +76,31 @@ struct QuoxRendererState {
 }
 
 impl QuoxRendererState {
+    fn build_scene(&mut self) -> (Scene, u32, u32) {
+        let w = self.width;
+        let h = self.height;
+
+        self.document
+            .set_viewport(Viewport::new(w, h, 1.0, ColorScheme::Light));
+        self.document.resolve(0.0);
+
+        // Clamp scroll offsets to the laid-out content size so the viewport
+        // can never scroll past the end of the document.
+        let content = self.document.root_element().final_layout.size;
+        self.scroll_x = self.scroll_x.min((content.width as u32).saturating_sub(w));
+        self.scroll_y = self.scroll_y.min((content.height as u32).saturating_sub(h));
+        self.document.set_viewport_scroll(Point {
+            x: self.scroll_x as f64,
+            y: self.scroll_y as f64,
+        });
+
+        let mut scene = Scene::new();
+        let mut painter = VelloScenePainter::new(&mut scene);
+        paint_scene(&mut painter, &self.document, 1.0, w, h, 0, 0);
+
+        (scene, w, h)
+    }
+
     fn mutate_document<T>(
         &mut self,
         op: impl FnOnce(&mut DocumentMutator<'_>) -> Result<T, JsValue>,
@@ -141,7 +166,8 @@ impl QuoxRendererState {
     /// missing `<head>` (e.g. after `document.head.remove()`) by returning `None` rather than
     /// failing, so title lookups never break unrelated DOM operations.
     fn title_element(&self) -> Result<Option<usize>, JsValue> {
-        let Some(head_id) = self.optional_child_element_by_tag(self.document.root_element().id, "head")?
+        let Some(head_id) =
+            self.optional_child_element_by_tag(self.document.root_element().id, "head")?
         else {
             return Ok(None);
         };
@@ -350,7 +376,8 @@ impl QuoxRenderer {
     /// `document.head.remove()`), this is a no-op rather than an error.
     pub fn set_title(&self, value: &str) -> Result<(), JsValue> {
         let mut state = self.state.borrow_mut();
-        let Some(head_id) = state.optional_child_element_by_tag(state.document.root_element().id, "head")?
+        let Some(head_id) =
+            state.optional_child_element_by_tag(state.document.root_element().id, "head")?
         else {
             return Ok(());
         };
@@ -390,27 +417,7 @@ impl QuoxRenderer {
     pub async fn render(&self) -> Result<Vec<u8>, JsValue> {
         let (_texture, gpu_buffer, row_bytes, padded_row_bytes, w, h) = {
             let mut state = self.state.borrow_mut();
-            let w = state.width;
-            let h = state.height;
-
-            state
-                .document
-                .set_viewport(Viewport::new(w, h, 1.0, ColorScheme::Light));
-            state.document.resolve(0.0);
-
-            // Clamp scroll offsets to the laid-out content size so the viewport
-            // can never scroll past the end of the document.
-            let content = state.document.root_element().final_layout.size;
-            state.scroll_x = state.scroll_x.min((content.width as u32).saturating_sub(w));
-            state.scroll_y = state
-                .scroll_y
-                .min((content.height as u32).saturating_sub(h));
-            let scroll_x = state.scroll_x;
-            let scroll_y = state.scroll_y;
-            state.document.set_viewport_scroll(Point {
-                x: scroll_x as f64,
-                y: scroll_y as f64,
-            });
+            let (scene, w, h) = state.build_scene();
 
             let device_handle = state.context.device_pool[state.dev_id].clone();
 
@@ -431,10 +438,6 @@ impl QuoxRenderer {
                 view_formats: &[],
             });
             let texture_view = texture.create_view(&TextureViewDescriptor::default());
-
-            let mut scene = Scene::new();
-            let mut painter = VelloScenePainter::new(&mut scene);
-            paint_scene(&mut painter, &state.document, 1.0, w, h, 0, 0);
 
             state
                 .renderer
