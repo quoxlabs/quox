@@ -76,6 +76,29 @@ struct QuoxRendererState {
 }
 
 impl QuoxRendererState {
+    fn create_renderer_for_device(&self, dev_id: usize) -> Result<Renderer, JsValue> {
+        Renderer::new(
+            &self.context.device_pool[dev_id].device,
+            RendererOptions {
+                use_cpu: false,
+                num_init_threads: None,
+                antialiasing_support: AaSupport::area_only(),
+                pipeline_cache: None,
+            },
+        )
+        .map_err(|e| JsValue::from_str(&format!("Vello renderer: {e:?}")))
+    }
+
+    fn use_device(&mut self, dev_id: usize) -> Result<(), JsValue> {
+        if self.dev_id == dev_id {
+            return Ok(());
+        }
+
+        self.renderer = self.create_renderer_for_device(dev_id)?;
+        self.dev_id = dev_id;
+        Ok(())
+    }
+
     fn build_scene(&mut self) -> (Scene, u32, u32) {
         let w = self.width;
         let h = self.height;
