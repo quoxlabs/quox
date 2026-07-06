@@ -63,11 +63,19 @@ fn viewport_point_to_page(
     if !x.is_finite() || !y.is_finite() {
         return None;
     }
-    if x < 0.0 || y < 0.0 || x >= width as f32 || y >= height as f32 {
+    #[allow(clippy::cast_precision_loss)]
+    let width = width as f32;
+    #[allow(clippy::cast_precision_loss)]
+    let height = height as f32;
+    if x < 0.0 || y < 0.0 || x >= width || y >= height {
         return None;
     }
 
-    Some((x + scroll_x as f32, y + scroll_y as f32))
+    #[allow(clippy::cast_precision_loss)]
+    let page_x = x + scroll_x as f32;
+    #[allow(clippy::cast_precision_loss)]
+    let page_y = y + scroll_y as f32;
+    Some((page_x, page_y))
 }
 
 #[cfg(test)]
@@ -223,15 +231,15 @@ impl QuoxRendererState {
         // Clamp scroll offsets to the laid-out content size so the viewport
         // can never scroll past the end of the document.
         let content = self.document.root_element().final_layout.size;
-        self.scroll_x = self
-            .scroll_x
-            .min((content.width as u32).saturating_sub(self.width));
-        self.scroll_y = self
-            .scroll_y
-            .min((content.height as u32).saturating_sub(self.height));
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let max_scroll_x = (content.width as u32).saturating_sub(self.width);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let max_scroll_y = (content.height as u32).saturating_sub(self.height);
+        self.scroll_x = self.scroll_x.min(max_scroll_x);
+        self.scroll_y = self.scroll_y.min(max_scroll_y);
         self.document.set_viewport_scroll(Point {
-            x: self.scroll_x as f64,
-            y: self.scroll_y as f64,
+            x: f64::from(self.scroll_x),
+            y: f64::from(self.scroll_y),
         });
     }
 }
@@ -273,7 +281,7 @@ impl QuoxRenderer {
             &initial_html(head, body),
             DocumentConfig {
                 base_url: Some("https://example.com".to_string()),
-                net_provider: Some(Arc::new(DummyNetProvider::default())),
+                net_provider: Some(Arc::new(DummyNetProvider)),
                 shell_provider: Some(Arc::new(DummyShellProvider)),
                 html_parser_provider: Some(Arc::new(HtmlProvider)),
                 ua_stylesheets: Some(vec![DEFAULT_CSS.to_string(), FONT_CSS.to_string()]),
@@ -360,7 +368,7 @@ impl QuoxRenderer {
         state
             .document
             .get_node(node_id)
-            .map(|node| node.text_content())
+            .map(blitz_dom::Node::text_content)
             .ok_or_else(|| invalid_node(node_id))
     }
 
@@ -371,7 +379,7 @@ impl QuoxRenderer {
             Some(node_id) => state
                 .document
                 .get_node(node_id)
-                .map(|node| node.text_content())
+                .map(blitz_dom::Node::text_content)
                 .ok_or_else(|| invalid_node(node_id)),
             None => Ok(String::new()),
         }
@@ -545,7 +553,7 @@ impl QuoxRenderer {
 
             let row_bytes = w * 4;
             let padded_row_bytes = row_bytes.next_multiple_of(256);
-            let out_size = (padded_row_bytes as u64) * (h as u64);
+            let out_size = u64::from(padded_row_bytes) * u64::from(h);
             let gpu_buffer = device_handle.device.create_buffer(&BufferDescriptor {
                 label: Some("quox-readback"),
                 size: out_size,
