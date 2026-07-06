@@ -21,6 +21,7 @@ jobs:
         with:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
+      - run: sudo apt-get update && sudo apt-get install -y libfontconfig1-dev
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: packages/quox
