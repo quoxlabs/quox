@@ -29,19 +29,21 @@ jobs:
 
       - run: cargo fmt --check
         working-directory: packages/quox
-      - run: deno fmt --check
-
-      - run: cargo clippy --locked --target wasm32-unknown-unknown --all-targets -- -D warnings
-        working-directory: packages/quox
-      - run: deno lint
-
-      - run: deno task build
-      - run: deno check
-
       - run: cargo test --locked
         working-directory: packages/quox
-      - run: deno test
+      - run: cargo check --locked --target wasm32-unknown-unknown
+        working-directory: packages/quox
+      - run: cargo clippy --locked --all-targets -- -D warnings
+        working-directory: packages/quox
+      - run: cargo clippy --locked --target wasm32-unknown-unknown --all-targets -- -D warnings
+        working-directory: packages/quox
 
+      - run: deno task build
+
+      - run: deno fmt --check
+      - run: deno lint
+      - run: deno check
+      - run: deno test
       - run: deno publish --dry-run
 
   winding-darwin:
@@ -53,6 +55,7 @@ jobs:
           - macos-15
           - macos-15-intel
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
       - uses: denoland/setup-deno@v2
@@ -92,6 +95,7 @@ jobs:
   winding-x11:
     name: Winding X11 (ubuntu-24.04)
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
       - uses: denoland/setup-deno@v2
@@ -100,7 +104,7 @@ jobs:
           cache: true
       - run: deno ci
       - run: sudo apt-get update
-      - run: sudo apt-get install -y --no-install-recommends libx11-dev xauth xvfb
+      - run: sudo apt-get install -y --no-install-recommends xauth xvfb
       - run: deno check x11/mod.ts x11/input_test.ts x11/xvfb_smoke.ts
         working-directory: packages/winding
       - run: deno test x11/input_test.ts
@@ -115,6 +119,7 @@ jobs:
   winding-wayland:
     name: Winding Wayland (ubuntu-24.04)
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
       - uses: denoland/setup-deno@v2
@@ -130,8 +135,8 @@ jobs:
         working-directory: packages/winding
       - name: Test live Wayland lifecycle
         run: >
-          wlheadless-run -c weston --renderer=pixman --
           timeout --kill-after=5s 30s
+          wlheadless-run -c weston --renderer=pixman --
           env LANG=C.UTF-8 LC_ALL=C.UTF-8
           deno test --allow-ffi --allow-env=LC_ALL,LC_CTYPE,LANG
           wayland/headless_smoke.ts
