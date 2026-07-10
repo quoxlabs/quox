@@ -1,5 +1,4 @@
-import type { KeyLocation } from "../types.ts";
-import { OBJC_BOOL_ENCODING } from "./ffi.ts";
+import { normalizeCommittedText } from "../input/mod.ts";
 
 /** Selectors implemented by WindingContentView's NSTextInputClient bridge. */
 export const REQUIRED_TEXT_INPUT_SELECTORS = [
@@ -64,14 +63,6 @@ export interface NativeLogicalKeyInput {
   producedPreedit?: boolean;
 }
 
-/** DOM KeyboardEvent.location-compatible location derived from the physical code. */
-export function keyLocationForCode(code: string): KeyLocation {
-  if (code.endsWith("Left")) return 1;
-  if (code.endsWith("Right")) return 2;
-  if (code.startsWith("Numpad")) return 3;
-  return 0;
-}
-
 /**
  * Resolve a DOM KeyboardEvent.key-style value without assuming a US layout.
  * AppKit's named/function keys are identified from the physical code because
@@ -106,14 +97,24 @@ export function logicalKeyForEvent(input: NativeLogicalKeyInput): string {
 
 /** Return printable text only; control and AppKit private-use key values are not text. */
 export function printableText(value: string): string | undefined {
-  if (value.length === 0) return undefined;
+  const normalized = normalizeCommittedText(value);
+  if (normalized === undefined) return undefined;
   for (const character of value) {
     const scalar = character.codePointAt(0)!;
-    if (scalar < 0x20 || (scalar >= 0x7f && scalar <= 0x9f) || (scalar >= 0xf700 && scalar <= 0xf8ff)) {
+    if (scalar >= 0xf700 && scalar <= 0xf8ff) {
       return undefined;
     }
   }
-  return value;
+  return normalized;
+}
+
+/** Ordinary AppKit text fallback used while native composition is not active. */
+export function uninterpretedCommitText(
+  characters: string,
+  ctrlKey: boolean,
+  metaKey: boolean,
+): string | undefined {
+  return ctrlKey || metaKey ? undefined : printableText(characters);
 }
 
 function isPotentiallyPrintableCode(code: string): boolean {
@@ -157,12 +158,3 @@ export function cocoaRectFromClient(rect: ClientRect, viewHeight: number): Clien
     height,
   };
 }
-
-export const __testing = {
-  requiredSelectors: REQUIRED_TEXT_INPUT_SELECTORS,
-  boolEncoding: OBJC_BOOL_ENCODING,
-  keyLocationForCode,
-  logicalKeyForEvent,
-  printableText,
-  cocoaRectFromClient,
-};

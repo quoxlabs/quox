@@ -1,5 +1,17 @@
-import type { AppleStandardKeybindingEvent, ImeEvent, ImeSelection, KeyEvent, Window } from "../types.ts";
+import type { AppleStandardKeybindingEvent, ImeCursorRange, ImeEvent, KeyDownEvent, Window } from "../types.ts";
+import {
+  CompositionState,
+  createImeActivationEvent,
+  createImeCommitEvent,
+  createImePreeditEvent,
+  discardTrailingPreeditClear,
+  ImeActivationState,
+  type ImeCursorArea,
+  utf16RangeToUtf8Range,
+  validateImeCursorArea,
+} from "../input/mod.ts";
 import { NS_NOT_FOUND } from "./ffi.ts";
+import { printableText } from "./text_input.ts";
 export { NS_NOT_FOUND } from "./ffi.ts";
 
 export interface Utf16Range {
@@ -7,15 +19,8 @@ export interface Utf16Range {
   length: number | bigint;
 }
 
-export interface ImeCursorArea {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-}
-
 export type DarwinTextInputEvent = ImeEvent | AppleStandardKeybindingEvent;
-export type DarwinInputEvent = KeyEvent | DarwinTextInputEvent;
+export type DarwinInputEvent = KeyDownEvent | DarwinTextInputEvent;
 
 function clampedUtf16Offset(value: number | bigint, maximum: number): number {
   if (typeof value === "bigint") {
@@ -26,50 +31,27 @@ function clampedUtf16Offset(value: number | bigint, maximum: number): number {
   return Math.min(Math.trunc(value), maximum);
 }
 
-function precedingCodePointBoundary(text: string, offset: number): number {
-  if (offset <= 0 || offset >= text.length) return offset;
-  const previous = text.charCodeAt(offset - 1);
-  const current = text.charCodeAt(offset);
-  const splitsSurrogatePair = previous >= 0xd800 && previous <= 0xdbff &&
-    current >= 0xdc00 && current <= 0xdfff;
-  return splitsSurrogatePair ? offset - 1 : offset;
-}
-
-/** Convert and clamp an AppKit UTF-16 offset to a UTF-8 byte offset. */
-export function utf16OffsetToUtf8(text: string, offset: number | bigint): number {
-  const utf16Offset = precedingCodePointBoundary(
-    text,
-    clampedUtf16Offset(offset, text.length),
-  );
-  return new TextEncoder().encode(text.slice(0, utf16Offset)).byteLength;
-}
-
-/** Convert an AppKit UTF-16 range to a clamped UTF-8 byte selection. */
+/** Convert an AppKit UTF-16 range to exact UTF-8 byte cursor offsets. */
 export function utf16RangeToUtf8(
   text: string,
   location: number | bigint,
   length: number | bigint,
-): ImeSelection | null {
+): ImeCursorRange | null {
   if (location === NS_NOT_FOUND || location === -1 || location === -1n) return null;
-
-  const start16 = clampedUtf16Offset(location, text.length);
-  const remaining = text.length - start16;
-  const length16 = clampedUtf16Offset(length, remaining);
-  return {
-    start: utf16OffsetToUtf8(text, start16),
-    end: utf16OffsetToUtf8(text, start16 + length16),
-  };
+  const rawLocation = typeof location === "bigint" ? Number(location) : location;
+  const rawLength = typeof length === "bigint" ? Number(length) : length;
+  return utf16RangeToUtf8Range(text, rawLocation, rawLength);
 }
 
 interface KeyBatch {
-  key: KeyEvent;
-  wasComposing: boolean;
+  key: KeyDownEvent;
   following: DarwinTextInputEvent[];
 }
 
 /** Pure per-view state used by the AppKit NSTextInputClient callbacks. */
 export class DarwinInputState {
-  #imeEnabled = false;
+  readonly #activation = new ImeActivationState();
+  readonly #composition = new CompositionState();
   #markedText = "";
   #markedSelection: Utf16Range | null = null;
   #cursorArea: ImeCursorArea = { x: 0, y: 0, width: 0, height: 0 };
@@ -77,11 +59,22 @@ export class DarwinInputState {
   readonly #pressedModifierCodes = new Set<string>();
   #batch: KeyBatch | null = null;
   #pending: DarwinTextInputEvent[] = [];
+  #closed = false;
 
-  constructor(readonly window?: Window) {}
+  constructor(readonly window: Window) {
+    this.#activation.setAvailable(true);
+  }
 
   get imeEnabled(): boolean {
-    return this.#imeEnabled;
+    return this.#activation.desired;
+  }
+
+  get active(): boolean {
+    return this.#activation.active;
+  }
+
+  get composing(): boolean {
+    return this.#composition.active;
   }
 
   get markedText(): string {
@@ -111,8 +104,8 @@ export class DarwinInputState {
   }
 
   setCursorArea(x: number, y: number, width: number, height: number): void {
-    if (![x, y, width, height].every(Number.isFinite)) return;
-    this.#cursorArea = { x, y, width: Math.max(0, width), height: Math.max(0, height) };
+    const area = validateImeCursorArea(x, y, width, height);
+    if (area !== undefined) this.#cursorArea = area;
   }
 
   get modifierFlags(): bigint {
@@ -148,26 +141,38 @@ export class DarwinInputState {
   }
 
   setImeEnabled(enabled: boolean): void {
-    if (enabled === this.#imeEnabled) return;
+    if (enabled === this.#activation.desired || this.#closed) return;
     if (!enabled) this.cancelComposition();
-    this.#imeEnabled = enabled;
-    this.#emit({ type: "ime", kind: enabled ? "enabled" : "disabled" });
+    this.#activation.setDesired(enabled);
+    this.#syncActivation();
   }
 
-  beginKey(key: KeyEvent): void {
+  setNativeFocused(focused: boolean): void {
+    if (focused === this.#activation.focused || this.#closed) return;
+    if (!focused) this.cancelComposition();
+    this.#activation.setFocused(focused);
+    this.#syncActivation();
+  }
+
+  setNativeAvailable(available: boolean): void {
+    if (available === this.#activation.available || this.#closed) return;
+    if (!available) this.cancelComposition();
+    this.#activation.setAvailable(available);
+    this.#syncActivation();
+  }
+
+  beginKey(key: KeyDownEvent): void {
     if (this.#batch !== null) throw new Error("winding(darwin): nested key input batch");
-    this.#batch = { key, wasComposing: this.hasMarkedText, following: [] };
+    this.#batch = { key, following: [] };
   }
 
   finishKey(): DarwinInputEvent[] {
     const batch = this.#batch;
     if (batch === null) return [];
     this.#batch = null;
-    const key: KeyEvent = {
+    const key: KeyDownEvent = {
       ...batch.key,
-      window: batch.key.window ?? this.window,
-      isComposing: batch.key.isComposing === true || batch.wasComposing || this.hasMarkedText,
-      textInputHandled: batch.following.length !== 0,
+      editDisposition: batch.following.length > 0 ? "text-input" : batch.key.editDisposition,
     };
     return [key, ...batch.following];
   }
@@ -182,41 +187,59 @@ export class DarwinInputState {
         location,
         length: clampedUtf16Offset(selectionLength, text.length - location),
       };
-    this.#emit({
-      type: "ime",
-      kind: "preedit",
+    const update = text.length === 0 ? this.#composition.cancel() : this.#composition.update(
       text,
-      selection: utf16RangeToUtf8(text, selectionLocation, selectionLength),
-    });
+      utf16RangeToUtf8(text, selectionLocation, selectionLength),
+    );
+    if (update !== undefined) {
+      this.#emit(createImePreeditEvent(this.window, update.text, update.cursorRange));
+    }
   }
 
-  insertText(text: string): void {
+  insertText(text: string): string | undefined {
+    const committed = printableText(text);
+    if (committed === undefined) return undefined;
+    this.#removeTrailingPreeditClear();
     this.#clearMarkedText();
-    this.#emit({ type: "ime", kind: "preedit", text: "", selection: null });
-    this.#emit({ type: "ime", kind: "commit", text });
+    this.#composition.commit();
+    const event = createImeCommitEvent(this.window, committed);
+    if (event !== undefined) this.#emit(event);
+    return committed;
   }
 
   performCommand(command: string): void {
-    this.#emit({ type: "apple-standard-keybinding", command });
+    this.#emit({ type: "apple-standard-keybinding", command, window: this.window });
   }
 
   /** Accept the current marked text, matching NSTextInputClient.unmarkText. */
-  unmarkText(): void {
-    if (!this.hasMarkedText) return;
+  unmarkText(): string | undefined {
+    if (!this.#composition.active) return undefined;
+    if (!this.hasMarkedText) {
+      this.#markedSelection = null;
+      this.#composition.commit();
+      return undefined;
+    }
     const text = this.#markedText;
+    const committed = printableText(text);
+    if (committed === undefined) {
+      this.cancelComposition();
+      return undefined;
+    }
+    this.#removeTrailingPreeditClear();
     this.#clearMarkedText();
-    this.#emit({ type: "ime", kind: "preedit", text: "", selection: null });
-    this.#emit({ type: "ime", kind: "commit", text });
+    this.#composition.commit();
+    const event = createImeCommitEvent(this.window, committed);
+    if (event !== undefined) this.#emit(event);
+    return committed;
   }
 
   /** Cancel marked text without accepting it (disable, blur, or close). */
   cancelComposition(): void {
-    if (!this.hasMarkedText) {
-      this.#markedSelection = null;
-      return;
-    }
+    const update = this.#composition.cancel();
     this.#clearMarkedText();
-    this.#emit({ type: "ime", kind: "preedit", text: "", selection: null });
+    if (update !== undefined) {
+      this.#emit(createImePreeditEvent(this.window, update.text, update.cursorRange));
+    }
   }
 
   drainEvents(): DarwinTextInputEvent[] {
@@ -225,16 +248,37 @@ export class DarwinInputState {
     return events;
   }
 
+  close(): void {
+    this.#closed = true;
+    this.#batch = null;
+    this.#pending = [];
+    this.#clearMarkedText();
+    this.#composition.reset();
+    this.#activation.reset();
+  }
+
   #clearMarkedText(): void {
     this.#markedText = "";
     this.#markedSelection = null;
   }
 
   #emit(event: DarwinTextInputEvent): void {
-    const withWindow = event.window !== undefined || this.window === undefined
-      ? event
-      : { ...event, window: this.window };
-    if (this.#batch !== null) this.#batch.following.push(withWindow);
-    else this.#pending.push(withWindow);
+    if (this.#closed) return;
+    if (this.#batch !== null) this.#batch.following.push(event);
+    else this.#pending.push(event);
+  }
+
+  #removeTrailingPreeditClear(): void {
+    const events = this.#batch?.following ?? this.#pending;
+    discardTrailingPreeditClear(events);
+  }
+
+  #syncActivation(): void {
+    const transition = this.#activation.reconcile({
+      activate: () => true,
+      deactivate: () => undefined,
+    });
+    if (transition === undefined) return;
+    this.#emit(createImeActivationEvent(this.window, transition));
   }
 }
