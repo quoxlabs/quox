@@ -218,8 +218,11 @@ export class XimManager implements Disposable {
     for (const context of this.#contexts) context.recreate(true);
   }
 
-  filterEvent(event: Deno.PointerObject, context: XimContext): boolean {
-    return context.shouldFilter && this.#x11.XFilterEvent(event, context.window) !== 0;
+  filterEvent(event: Deno.PointerObject): boolean {
+    // XIM filtering belongs to the display event stream, not to one active
+    // XIC.  In particular, protocol traffic and IM-owned window events often
+    // cannot be associated with a Winding window at all.
+    return this.#x11.XFilterEvent(event, 0n) !== 0;
   }
 
   lookup(context: XimContext, event: Deno.PointerObject): XimLookupResult {
@@ -527,10 +530,6 @@ export class XimContext implements Disposable {
 
   get composing(): boolean {
     return this.#composition.active;
-  }
-
-  get shouldFilter(): boolean {
-    return this.#activation.active;
   }
 
   get hasStagedEvents(): boolean {

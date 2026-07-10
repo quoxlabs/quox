@@ -396,6 +396,18 @@ class X11Library implements Library {
       const windowId = view.getBigUint64(32, true);
       const window = this.windows.get(windowId);
 
+      const routedKey =
+        (type === XEventType.KeyPress || type === XEventType.KeyRelease) && window !== undefined;
+      if (!routedKey) {
+        const filtered = this.input.filterEvent(eventPointer);
+        this.input.throwIfCallbackFailed();
+        if (filtered) {
+          const imeEvent = this.#events.shift();
+          if (imeEvent !== undefined) return imeEvent;
+          continue;
+        }
+      }
+
       if (type === XEventType.MappingNotify) {
         this.X11.symbols.XRefreshKeyboardMapping(eventPointer);
         this.#refreshAltGraphMask();
@@ -406,7 +418,7 @@ class X11Library implements Library {
         let lookupStaged = type === XEventType.KeyPress;
         if (lookupStaged) window.input.beginLookup();
         try {
-          const filtered = this.input.filterEvent(eventPointer, window.input);
+          const filtered = this.input.filterEvent(eventPointer);
           this.input.throwIfCallbackFailed();
           if (filtered) {
             const keycode = view.getUint32(84, true);
