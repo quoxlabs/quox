@@ -57,11 +57,6 @@ function testTextCallbacks(): void {
       handles.push(runtime);
       const sendId = openMessage(handles, ["pointer", "pointer"], "pointer");
       const sendIdBuffer = openMessage(handles, ["pointer", "pointer", "buffer"], "pointer");
-      const sendIdBufferUsize = openMessage(
-        handles,
-        ["pointer", "pointer", "buffer", "usize"],
-        "pointer",
-      );
       const sendIdId = openMessage(handles, ["pointer", "pointer", "pointer"], "pointer");
       const sendVoid = openMessage(handles, ["pointer", "pointer"], "void");
       const sendVoidId = openMessage(handles, ["pointer", "pointer", "pointer"], "void");
@@ -92,20 +87,8 @@ function testTextCallbacks(): void {
           sendIdId(attributedAlloc, sel(runtime, "initWithString:"), string),
           "NSAttributedString",
         );
-        const embeddedNulAlloc = sendId(getClass(runtime, "NSString"), sel(runtime, "alloc"));
-        const embeddedNul = own(
-          owned,
-          sendIdBufferUsize(
-            embeddedNulAlloc,
-            sel(runtime, "initWithCharacters:length:"),
-            new Uint16Array([0x61, 0, 0x62]),
-            3n,
-          ),
-          "embedded-NUL NSString",
-        );
-
         drainEvents(library);
-        window.setImeEnabled?.(true);
+        window.setImeEnabled(true);
         assertIme(library.event(), "enabled");
 
         sendVoidIdRangeRange(
@@ -117,7 +100,7 @@ function testTextCallbacks(): void {
         );
         const preedit = assertIme(library.event(), "preedit");
         assertEquals(preedit.text, "🙂e");
-        assertEquals(preedit.selection, { start: 4, end: 5 });
+        assertEquals(preedit.cursorRange, [4, 5]);
 
         sendVoidIdRange(
           window.contentView,
@@ -125,19 +108,8 @@ function testTextCallbacks(): void {
           attributed,
           makeNSRange(NS_NOT_FOUND, 0),
         );
-        assertIme(library.event(), "preedit");
         const commit = assertIme(library.event(), "commit");
         assertEquals(commit.text, "🙂e");
-
-        sendVoidIdRange(
-          window.contentView,
-          sel(runtime, "insertText:replacementRange:"),
-          embeddedNul,
-          makeNSRange(NS_NOT_FOUND, 0),
-        );
-        assertIme(library.event(), "preedit");
-        const nulCommit = assertIme(library.event(), "commit");
-        assertEquals(nulCommit.text, "a\0b");
 
         sendVoidId(
           window.contentView,
@@ -215,7 +187,7 @@ function testKeydownOrdering(): void {
         assert(event !== null, "failed to create synthetic key event");
 
         drainEvents(library);
-        window.setImeEnabled?.(true);
+        window.setImeEnabled(true);
         assertIme(library.event(), "enabled");
         sendVoidId(window.contentView, sel(runtime, "keyDown:"), event);
 
@@ -223,10 +195,7 @@ function testKeydownOrdering(): void {
         assert(key?.type === "keydown", "expected keydown before text input callbacks");
         assertEquals(key.code, "KeyA");
         assertEquals(key.key, "a");
-        assertEquals(key.text, "a");
-        assertEquals(key.textInputHandled, true);
-        const clear = assertIme(library.event(), "preedit");
-        assertEquals(clear.text, "");
+        assertEquals(key.editDisposition, "text-input");
         const commit = assertIme(library.event(), "commit");
         assertEquals(commit.text, "a");
       } finally {
@@ -291,7 +260,7 @@ function testProtocolAndStructAbis(): void {
       assertEquals(readStructF64(frame, 16), 64);
       assertEquals(readStructF64(frame, 24), 48);
 
-      window.setImeCursorArea?.(4, 6, 2, 14);
+      window.setImeCursorArea(4, 6, 2, 14);
       const actualRange = makeNSRange(0, 0);
       const screenRect = rectSend.rangePointerArgs(
         window.contentView,

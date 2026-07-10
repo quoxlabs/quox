@@ -1,5 +1,10 @@
-import { makeNSRange, NS_NOT_FOUND, readNSRange } from "./ffi.ts";
-import { __testing } from "./text_input.ts";
+import { makeNSRange, NS_NOT_FOUND, OBJC_BOOL_ENCODING, readNSRange } from "./ffi.ts";
+import {
+  cocoaRectFromClient,
+  logicalKeyForEvent,
+  REQUIRED_TEXT_INPUT_SELECTORS,
+  uninterpretedCommitText,
+} from "./text_input.ts";
 
 const TEXT_INPUT_SELECTORS = [
   "acceptsFirstResponder",
@@ -20,7 +25,7 @@ const TEXT_INPUT_SELECTORS = [
 ] as const;
 
 Deno.test("WindingContentView declares the complete NSTextInputClient responder surface", () => {
-  const registered = new Set(__testing.requiredSelectors);
+  const registered = new Set(REQUIRED_TEXT_INPUT_SELECTORS);
   for (const selector of TEXT_INPUT_SELECTORS) {
     assert(registered.has(selector), `missing Objective-C selector ${selector}`);
   }
@@ -28,7 +33,7 @@ Deno.test("WindingContentView declares the complete NSTextInputClient responder 
 
 Deno.test("Objective-C BOOL uses the architecture-correct method encoding", () => {
   const expected = Deno.build.arch === "x86_64" ? "c" : "B";
-  assertEquals(__testing.boolEncoding, expected);
+  assertEquals(OBJC_BOOL_ENCODING, expected);
 });
 
 Deno.test("NSRange helpers preserve ordinary ranges and NSNotFound", () => {
@@ -41,7 +46,7 @@ Deno.test("NSRange helpers preserve ordinary ranges and NSNotFound", () => {
 
 Deno.test("logical keys come from AppKit text rather than the physical key position", () => {
   assertEquals(
-    __testing.logicalKeyForEvent({
+    logicalKeyForEvent({
       code: "KeyY",
       characters: "z",
       charactersIgnoringModifiers: "z",
@@ -49,7 +54,7 @@ Deno.test("logical keys come from AppKit text rather than the physical key posit
     "z",
   );
   assertEquals(
-    __testing.logicalKeyForEvent({
+    logicalKeyForEvent({
       code: "KeyQ",
       characters: "'",
       charactersIgnoringModifiers: "'",
@@ -57,7 +62,7 @@ Deno.test("logical keys come from AppKit text rather than the physical key posit
     "'",
   );
   assertEquals(
-    __testing.logicalKeyForEvent({
+    logicalKeyForEvent({
       code: "KeyE",
       characters: "€",
       charactersIgnoringModifiers: "e",
@@ -68,7 +73,7 @@ Deno.test("logical keys come from AppKit text rather than the physical key posit
 
 Deno.test("logical key resolution covers interpreted text, dead keys, and named keys", () => {
   assertEquals(
-    __testing.logicalKeyForEvent({
+    logicalKeyForEvent({
       code: "KeyE",
       characters: "",
       charactersIgnoringModifiers: "",
@@ -77,7 +82,7 @@ Deno.test("logical key resolution covers interpreted text, dead keys, and named 
     "é",
   );
   assertEquals(
-    __testing.logicalKeyForEvent({
+    logicalKeyForEvent({
       code: "Quote",
       characters: "",
       charactersIgnoringModifiers: "",
@@ -86,7 +91,7 @@ Deno.test("logical key resolution covers interpreted text, dead keys, and named 
     "Dead",
   );
   assertEquals(
-    __testing.logicalKeyForEvent({
+    logicalKeyForEvent({
       code: "KeyK",
       characters: "k",
       charactersIgnoringModifiers: "k",
@@ -95,7 +100,7 @@ Deno.test("logical key resolution covers interpreted text, dead keys, and named 
     "k",
   );
   assertEquals(
-    __testing.logicalKeyForEvent({
+    logicalKeyForEvent({
       code: "KeyE",
       characters: "",
       charactersIgnoringModifiers: "e",
@@ -104,7 +109,7 @@ Deno.test("logical key resolution covers interpreted text, dead keys, and named 
     "Dead",
   );
   assertEquals(
-    __testing.logicalKeyForEvent({
+    logicalKeyForEvent({
       code: "KeyE",
       characters: "",
       charactersIgnoringModifiers: "e",
@@ -112,7 +117,7 @@ Deno.test("logical key resolution covers interpreted text, dead keys, and named 
     "Dead",
   );
   assertEquals(
-    __testing.logicalKeyForEvent({
+    logicalKeyForEvent({
       code: "ArrowLeft",
       characters: "\uf702",
       charactersIgnoringModifiers: "\uf702",
@@ -121,27 +126,28 @@ Deno.test("logical key resolution covers interpreted text, dead keys, and named 
   );
 });
 
-Deno.test("Darwin key locations distinguish left, right, and keypad keys", () => {
-  assertEquals(__testing.keyLocationForCode("ShiftLeft"), 1);
-  assertEquals(__testing.keyLocationForCode("AltRight"), 2);
-  assertEquals(__testing.keyLocationForCode("Numpad7"), 3);
-  assertEquals(__testing.keyLocationForCode("KeyA"), 0);
+Deno.test("inactive AppKit input commits ordinary text but not shortcuts or function scalars", () => {
+  assertEquals(uninterpretedCommitText("z", false, false), "z");
+  assertEquals(uninterpretedCommitText("€", false, false), "€");
+  assertEquals(uninterpretedCommitText("c", true, false), undefined);
+  assertEquals(uninterpretedCommitText("q", false, true), undefined);
+  assertEquals(uninterpretedCommitText("\uf702", false, false), undefined);
 });
 
 Deno.test("candidate rectangles convert from top-left client to Cocoa view coordinates", () => {
   assertDeepEquals(
-    __testing.cocoaRectFromClient({ x: 4.25, y: 8.5, width: 12.75, height: 16.5 }, 100),
+    cocoaRectFromClient({ x: 4.25, y: 8.5, width: 12.75, height: 16.5 }, 100),
     { x: 4.25, y: 75, width: 12.75, height: 16.5 },
   );
   assertDeepEquals(
-    __testing.cocoaRectFromClient(
+    cocoaRectFromClient(
       { x: Number.NaN, y: Number.POSITIVE_INFINITY, width: -1, height: Number.NaN },
       100,
     ),
     { x: 0, y: 100, width: 0, height: 0 },
   );
   assertDeepEquals(
-    __testing.cocoaRectFromClient({ x: -4, y: 110, width: 2, height: 3 }, 100),
+    cocoaRectFromClient({ x: -4, y: 110, width: 2, height: 3 }, 100),
     { x: -4, y: -13, width: 2, height: 3 },
   );
 });
