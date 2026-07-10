@@ -48,9 +48,6 @@ function runLifecycle(user32: Deno.DynamicLibrary<typeof testUser32Functions>): 
     try {
       // Keep hosted CI independent of foreground-window and desktop behavior.
       user32.symbols.ShowWindow(window.hwnd, 0);
-      if (window.setImeEnabled === undefined || window.setImeCursorArea === undefined) {
-        throw new Error("Win32 IME hooks are unavailable");
-      }
       window.setImeCursorArea(4, 8, 2, 16);
       window.setImeEnabled(true);
       window.setImeEnabled(false);
@@ -68,10 +65,6 @@ function runLifecycle(user32: Deno.DynamicLibrary<typeof testUser32Functions>): 
         throw new Error("PostMessageW rejected the synthetic Unicode character");
       }
 
-      const clear = nextImeEdit(library, window);
-      if (clear?.kind !== "preedit" || clear.text !== "") {
-        throw new Error("Expected an empty preedit before the Win32 commit");
-      }
       const commit = nextImeEdit(library, window);
       if (commit?.kind !== "commit" || commit.text !== "A") {
         throw new Error("Expected a Win32 commit containing A");

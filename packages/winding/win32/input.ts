@@ -1,26 +1,7 @@
-/** Pure Win32 keyboard and IME helpers. This module intentionally performs no FFI. */
+/** Pure Win32 keyboard, AltGr, and WM_CHAR helpers. This module performs no FFI. */
 
-const UTF8_ENCODER = new TextEncoder();
-const INT32_MIN = -0x80000000;
-const INT32_MAX = 0x7fffffff;
-const UINT32_MAX = 0xffffffff;
-
-/** Small testable FIFO used when one native message expands to several semantic events. */
-export class SemanticEventQueue<Event> {
-  readonly #events: Event[] = [];
-
-  get length(): number {
-    return this.#events.length;
-  }
-
-  push(event: Event): void {
-    this.#events.push(event);
-  }
-
-  shift(): Event | undefined {
-    return this.#events.shift();
-  }
-}
+import type { KeyEditDisposition } from "../types.ts";
+import { normalizeCommittedText } from "../input/keyboard.ts";
 
 /** Virtual-key values used by the Win32 input implementation. */
 export const VK = {
@@ -114,11 +95,6 @@ export const VK = {
 /** Windows 10 1607+ flag that makes ToUnicodeEx leave the keyboard buffer unchanged. */
 export const TO_UNICODE_NO_STATE_CHANGE = 0x04;
 
-/** Candidate window excludes the supplied rectangle. */
-export const CFS_EXCLUDE = 0x0080;
-/** Composition window uses the supplied point. */
-export const CFS_POINT = 0x0002;
-
 export interface DecodedKeyLParam {
   repeatCount: number;
   scanCode: number;
@@ -149,16 +125,6 @@ export function decodeKeyLParam(lParam: number | bigint): DecodedKeyLParam {
   };
 }
 
-export type KeyLocation = "standard" | "left" | "right" | "numpad";
-
-/** Resolve a DOM KeyboardEvent.location-style value from the physical code. */
-export function keyLocation(code: string): KeyLocation {
-  if (code.startsWith("Numpad")) return "numpad";
-  if (code.endsWith("Left")) return "left";
-  if (code.endsWith("Right")) return "right";
-  return "standard";
-}
-
 function keyIsDown(state: Uint8Array, virtualKey: number): boolean {
   return (state[virtualKey] & 0x80) !== 0;
 }
@@ -181,6 +147,24 @@ export interface Win32KeyboardModifiers {
   accelKey: boolean;
   capsLock: boolean;
   altGraphKey: boolean;
+}
+
+/** Classify one Win32 keydown using its actual native message ownership. */
+export function win32KeyEditDisposition(
+  key: string,
+  isComposing: boolean,
+  modifiers: Win32KeyboardModifiers,
+  text: string | undefined,
+  systemMessage: boolean,
+): KeyEditDisposition {
+  // AltGr may arrive through WM_SYSKEYDOWN, but winding consumes the matching
+  // WM_SYSCHAR as text instead of leaving it to DefWindowProcW.
+  if (systemMessage && !modifiers.altGraphKey) return "platform";
+  if (isComposing || key === "Dead" || key === "Process") return "text-input";
+  if (text !== undefined && (modifiers.altGraphKey || (!modifiers.ctrlKey && !modifiers.metaKey))) {
+    return "text-input";
+  }
+  return "key-default";
 }
 
 /** Read modifier and toggle bits from a 256-byte GetKeyboardState snapshot. */
@@ -244,6 +228,8 @@ export interface ToUnicodeAdapter {
 
 export interface LogicalKeyTranslation {
   key: string;
+  /** Printable layout text returned by ToUnicodeEx for this transition. */
+  text?: string;
   dead: boolean;
   modifiers: Win32KeyboardModifiers;
 }
@@ -268,8 +254,10 @@ export function translateLogicalKey(
 
   if (translation.result < 0) return { key: "Dead", dead: true, modifiers };
   const translatedText = translation.result > 0 ? translation.text.slice(0, translation.result) : undefined;
+  const text = translatedText === undefined ? undefined : normalizeCommittedText(translatedText);
   return {
     key: logicalKeyFromVirtualKey(virtualKey, translatedText),
+    ...(text === undefined ? {} : { text }),
     dead: false,
     modifiers,
   };
@@ -361,41 +349,12 @@ export function logicalKeyFromVirtualKey(virtualKey: number, translatedText?: st
 
 /** Text accepted from WM_CHAR/ToUnicodeEx. Key controls are dispatched separately. */
 export function isCommitText(text: string): boolean {
-  if (text.length === 0) return false;
-  for (const character of text) {
-    const codePoint = character.codePointAt(0)!;
-    if (codePoint < 0x20 || codePoint === 0x7f) return false;
-  }
-  return true;
+  return normalizeCommittedText(text) !== undefined;
 }
 
-function keyIdentity(virtualKey: number, lParam: number | bigint): string {
+export function win32KeyIdentity(virtualKey: number, lParam: number | bigint): string {
   const scanCode = decodeKeyLParam(lParam).extendedScanCode;
   return scanCode === 0 ? `vk:${virtualKey}` : `scan:${scanCode}:vk:${virtualKey}`;
-}
-
-/** Retains the layout-resolved key value so keyup matches its keydown across state changes. */
-export class LogicalKeyCache {
-  readonly #keys = new Map<string, string>();
-
-  remember(virtualKey: number, lParam: number | bigint, key: string): void {
-    this.#keys.set(keyIdentity(virtualKey, lParam), key);
-  }
-
-  get(virtualKey: number, lParam: number | bigint): string | undefined {
-    return this.#keys.get(keyIdentity(virtualKey, lParam));
-  }
-
-  release(virtualKey: number, lParam: number | bigint): string | undefined {
-    const identity = keyIdentity(virtualKey, lParam);
-    const key = this.#keys.get(identity);
-    this.#keys.delete(identity);
-    return key;
-  }
-
-  clear(): void {
-    this.#keys.clear();
-  }
 }
 
 export interface Win32KeyMessage {
@@ -528,211 +487,6 @@ export function repeatedWmCharText(decoded: DecodedWmChar): string {
   return decoded.text.repeat(decoded.repeatCount);
 }
 
-/** Convert a valid UTF-16 cursor boundary to the byte offset Blitz uses for preedit. */
-export function utf16IndexToUtf8Offset(text: string, utf16Index: number): number | undefined {
-  if (!Number.isSafeInteger(utf16Index) || utf16Index < 0 || utf16Index > text.length) return undefined;
-  if (
-    utf16Index > 0 && utf16Index < text.length &&
-    isHighSurrogate(text.charCodeAt(utf16Index - 1)) && isLowSurrogate(text.charCodeAt(utf16Index))
-  ) {
-    return undefined;
-  }
-  return UTF8_ENCODER.encode(text.slice(0, utf16Index)).byteLength;
-}
-
-export type PreeditCursorRange = readonly [start: number, end: number];
-
-/** Convert IMM32's collapsed UTF-16 cursor to a collapsed UTF-8 byte range. */
-export function utf16CursorRangeToUtf8(text: string, utf16Index: number): PreeditCursorRange | undefined {
-  const offset = utf16IndexToUtf8Offset(text, utf16Index);
-  return offset === undefined ? undefined : [offset, offset];
-}
-
-/** Convert a Blitz UTF-8 byte cursor boundary back to a JavaScript UTF-16 index. */
-export function utf8OffsetToUtf16Index(text: string, utf8Offset: number): number | undefined {
-  if (!Number.isSafeInteger(utf8Offset) || utf8Offset < 0) return undefined;
-
-  let offset = 0;
-  for (let index = 0; index < text.length;) {
-    if (offset === utf8Offset) return index;
-    const codePoint = text.codePointAt(index)!;
-    const scalar = String.fromCodePoint(codePoint);
-    offset += UTF8_ENCODER.encode(scalar).byteLength;
-    if (offset > utf8Offset) return undefined;
-    index += scalar.length;
-  }
-  return offset === utf8Offset ? text.length : undefined;
-}
-
-/** Apply WM_IME_COMPOSITION's CS_INSERTCHAR operation to cached preedit state. */
-export function insertCompositionCharacter(
-  text: string,
-  cursorRange: PreeditCursorRange | undefined,
-  character: string,
-  noMoveCaret: boolean,
-): { text: string; cursorRange: PreeditCursorRange } {
-  const endOffset = UTF8_ENCODER.encode(text).byteLength;
-  const requestedOffset = cursorRange?.[1] ?? endOffset;
-  const insertionIndex = utf8OffsetToUtf16Index(text, requestedOffset) ?? text.length;
-  const insertionOffset = utf16IndexToUtf8Offset(text, insertionIndex) ?? endOffset;
-  const nextText = text.slice(0, insertionIndex) + character + text.slice(insertionIndex);
-  const nextOffset = noMoveCaret ? insertionOffset : insertionOffset + UTF8_ENCODER.encode(character).byteLength;
-  return { text: nextText, cursorRange: [nextOffset, nextOffset] };
-}
-
-export interface CursorRectangle {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-}
-
-/** Normalize a logical cursor area to Win32 LONGs, rounding outward. */
-export function normalizeCursorRectangle(
-  x: number,
-  y: number,
-  width: number,
-  height: number,
-): CursorRectangle | undefined {
-  if (![x, y, width, height].every(Number.isFinite)) return undefined;
-
-  const normalizedX = clampInt32(Math.floor(x));
-  const normalizedY = clampInt32(Math.floor(y));
-  const normalizedRight = clampInt32(Math.ceil(x + Math.max(0, width)));
-  const normalizedBottom = clampInt32(Math.ceil(y + Math.max(0, height)));
-  return {
-    x: normalizedX,
-    y: normalizedY,
-    width: width <= 0 ? 0 : clampDimension(normalizedRight - normalizedX),
-    height: height <= 0 ? 0 : clampDimension(normalizedBottom - normalizedY),
-  };
-}
-
-function clampInt32(value: number): number {
-  return Math.min(INT32_MAX, Math.max(INT32_MIN, value));
-}
-
-function clampDimension(value: number): number {
-  return Math.min(INT32_MAX, Math.max(0, value));
-}
-
-function rectRight(rect: CursorRectangle): number {
-  return clampInt32(rect.x + rect.width);
-}
-
-function rectBottom(rect: CursorRectangle): number {
-  return clampInt32(rect.y + rect.height);
-}
-
-/** Encode the 32-byte, pointer-free CANDIDATEFORM structure. */
-export function encodeCandidateForm(rect: CursorRectangle, index = 0): ArrayBuffer {
-  const buffer = new ArrayBuffer(32);
-  const view = new DataView(buffer);
-  view.setUint32(0, clampUint32(index), true);
-  view.setUint32(4, CFS_EXCLUDE, true);
-  view.setInt32(8, rect.x, true);
-  view.setInt32(12, rectBottom(rect), true);
-  writeRect(view, 16, rect);
-  return buffer;
-}
-
-/** Encode the 28-byte, pointer-free COMPOSITIONFORM structure. */
-export function encodeCompositionForm(rect: CursorRectangle): ArrayBuffer {
-  const buffer = new ArrayBuffer(28);
-  const view = new DataView(buffer);
-  view.setUint32(0, CFS_POINT, true);
-  view.setInt32(4, rect.x, true);
-  view.setInt32(8, rectBottom(rect), true);
-  writeRect(view, 12, rect);
-  return buffer;
-}
-
-/** Encode the 36-byte IMECHARPOSITION response used by IMR_QUERYCHARPOSITION. */
-export function encodeImeCharPosition(
-  characterPosition: number,
-  caretRect: CursorRectangle,
-  documentRect: CursorRectangle,
-): ArrayBuffer {
-  const buffer = new ArrayBuffer(36);
-  const view = new DataView(buffer);
-  view.setUint32(0, buffer.byteLength, true);
-  view.setUint32(4, clampUint32(characterPosition), true);
-  view.setInt32(8, caretRect.x, true);
-  view.setInt32(12, caretRect.y, true);
-  view.setUint32(16, clampUint32(caretRect.height), true);
-  writeRect(view, 20, documentRect);
-  return buffer;
-}
-
-function writeRect(view: DataView, offset: number, rect: CursorRectangle): void {
-  view.setInt32(offset, rect.x, true);
-  view.setInt32(offset + 4, rect.y, true);
-  view.setInt32(offset + 8, rectRight(rect), true);
-  view.setInt32(offset + 12, rectBottom(rect), true);
-}
-
-function clampUint32(value: number): number {
-  if (!Number.isFinite(value)) return 0;
-  return Math.min(UINT32_MAX, Math.max(0, Math.trunc(value)));
-}
-
-export type ImeEdit =
-  | { type: "preedit"; text: string; cursorRange?: PreeditCursorRange }
-  | { type: "commit"; text: string };
-
-export interface ImeCompositionUpdate {
-  /** Presence means GCS_RESULTSTR was returned; the empty string is still a result. */
-  result?: string;
-  /** Undefined leaves preedit unchanged, null/empty clears it, and text replaces it. */
-  preedit?: { text: string; cursorRange?: PreeditCursorRange } | null;
-}
-
-/** Orders the semantic edits produced from IMM32 composition messages. */
-export class ImeCompositionReducer {
-  #hasVisiblePreedit = false;
-
-  get hasVisiblePreedit(): boolean {
-    return this.#hasVisiblePreedit;
-  }
-
-  update(update: ImeCompositionUpdate): ImeEdit[] {
-    const edits: ImeEdit[] = [];
-    if (typeof update.result === "string") {
-      // A commit is authoritative and always explicitly terminates the old preedit.
-      edits.push({ type: "preedit", text: "" });
-      edits.push({ type: "commit", text: update.result });
-      this.#hasVisiblePreedit = false;
-    }
-
-    if (update.preedit !== undefined) {
-      const preedit = update.preedit;
-      if (preedit === null || preedit.text.length === 0) {
-        if (this.#hasVisiblePreedit) edits.push({ type: "preedit", text: "" });
-        this.#hasVisiblePreedit = false;
-      } else {
-        edits.push({
-          type: "preedit",
-          text: preedit.text,
-          ...(preedit.cursorRange === undefined ? {} : { cursorRange: preedit.cursorRange }),
-        });
-        this.#hasVisiblePreedit = true;
-      }
-    }
-    return edits;
-  }
-
-  /** Finish or cancel a composition without disabling the IME. */
-  end(): ImeEdit[] {
-    if (!this.#hasVisiblePreedit) return [];
-    this.#hasVisiblePreedit = false;
-    return [{ type: "preedit", text: "" }];
-  }
-
-  reset(): void {
-    this.#hasVisiblePreedit = false;
-  }
-}
-
 /** Prevents IMM32 result strings from being committed again by a following WM_CHAR echo. */
 export class ResultEchoSuppressor {
   #pending = "";
@@ -775,70 +529,5 @@ export class ResultEchoSuppressor {
 
   #expire(): void {
     if (this.#pending.length > 0 && this.now() > this.#expiresAt) this.clear();
-  }
-}
-
-/** Adapter around ImmGetCompositionStringW for exact, race-tolerant UTF-16 reads. */
-export interface ImmCompositionAdapter {
-  getCompositionString(index: number, buffer?: Uint8Array): number;
-}
-
-/** Read an IMM string whose reported lengths are bytes, not UTF-16 units. */
-export function readImmUtf16(
-  adapter: ImmCompositionAdapter,
-  index: number,
-  maximumAttempts = 3,
-): string | undefined {
-  for (let attempt = 0; attempt < Math.max(1, maximumAttempts); attempt++) {
-    const byteLength = adapter.getCompositionString(index);
-    if (!Number.isSafeInteger(byteLength) || byteLength < 0 || (byteLength & 1) !== 0) return undefined;
-    if (byteLength === 0) return "";
-
-    const buffer = new Uint8Array(byteLength);
-    const bytesWritten = adapter.getCompositionString(index, buffer);
-    if (!Number.isSafeInteger(bytesWritten)) return undefined;
-    if (bytesWritten < 0) {
-      // A composition can grow between the size query and copy. Native IMM
-      // implementations may report that as an error rather than returning the
-      // new required size, so re-query before treating it as a hard failure.
-      const currentLength = adapter.getCompositionString(index);
-      if (Number.isSafeInteger(currentLength) && currentLength > buffer.byteLength && (currentLength & 1) === 0) {
-        continue;
-      }
-      return undefined;
-    }
-    if ((bytesWritten & 1) !== 0) return undefined;
-    if (bytesWritten > buffer.byteLength) continue;
-    const currentLength = adapter.getCompositionString(index);
-    if (Number.isSafeInteger(currentLength) && currentLength >= 0 && (currentLength & 1) === 0) {
-      if (currentLength !== bytesWritten) continue;
-    }
-    if (bytesWritten === 0) return currentLength === 0 ? "" : undefined;
-    return decodeUtf16Le(buffer.subarray(0, bytesWritten));
-  }
-  return undefined;
-}
-
-function decodeUtf16Le(bytes: Uint8Array): string {
-  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  let text = "";
-  for (let offset = 0; offset < bytes.byteLength; offset += 2) {
-    text += String.fromCharCode(view.getUint16(offset, true));
-  }
-  return text;
-}
-
-/** Acquire/release an input context with release guaranteed across returns and exceptions. */
-export function withImeContext<Context, Result>(
-  acquire: () => Context | null | undefined,
-  release: (context: Context) => void,
-  callback: (context: Context) => Result,
-): Result | undefined {
-  const context = acquire();
-  if (context === null || context === undefined) return undefined;
-  try {
-    return callback(context);
-  } finally {
-    release(context);
   }
 }
