@@ -1,7 +1,12 @@
 export type {
+  AppleStandardKeybindingEvent,
   ButtonEvent,
   CloseEvent,
+  ImeEvent,
+  ImeSelection,
   KeyEvent,
+  KeyLocation,
+  KeyModifiers,
   Library,
   LoadLibrary,
   MoveEvent,
