@@ -60,9 +60,13 @@ jobs:
           deno-version: v2.x
           cache: true
       - run: deno ci
-      - run: deno check darwin/mod.ts darwin/*_test.ts
+      - run: deno check darwin/mod.ts darwin/*_test.ts darwin/native_smoke.ts
         working-directory: packages/winding
-      - run: deno test --allow-ffi darwin
+      - run: deno test darwin
+        working-directory: packages/winding
+      - name: Test native AppKit input on the process main thread
+        run: deno run --allow-ffi darwin/native_smoke.ts
+        timeout-minutes: 2
         working-directory: packages/winding
 
   winding-windows:
