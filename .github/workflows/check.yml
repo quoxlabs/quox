@@ -44,6 +44,27 @@ jobs:
 
       - run: deno publish --dry-run
 
+  winding-darwin:
+    name: Winding Darwin (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - macos-15
+          - macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+          cache: true
+      - run: deno ci
+      - run: deno check darwin/mod.ts darwin/*_test.ts
+        working-directory: packages/winding
+      - run: deno test --allow-ffi darwin
+        working-directory: packages/winding
+
   winding-wayland:
     name: Winding Wayland (ubuntu-24.04)
     runs-on: ubuntu-24.04
