@@ -1,7 +1,13 @@
 import { normalizeCommittedText } from "../input/mod.ts";
 import { logicalKeyFromKeysym } from "../linux/mod.ts";
 import { XEventType } from "./ffi.ts";
-import { fallbackLookupText, isAutoRepeatPair, x11CommittedText, x11KeyEditDisposition } from "./input.ts";
+import {
+  fallbackLookupText,
+  isAutoRepeatPair,
+  isTopLevelFocusTransition,
+  x11CommittedText,
+  x11KeyEditDisposition,
+} from "./input.ts";
 import { applyPreeditChange, preeditCursorByteOffset } from "./xim_preedit.ts";
 import { packRgbaPixels } from "./native_image.ts";
 
@@ -95,6 +101,13 @@ Deno.test("X11 repeat detection requires an identical adjacent press", () => {
   assertEquals(isAutoRepeatPair(release, press), true);
   press.setBigUint64(56, 1235n, true);
   assertEquals(isAutoRepeatPair(release, press), false);
+});
+
+Deno.test("X11 focus includes grabbed moves but excludes descendants", () => {
+  assertEquals(isTopLevelFocusTransition(0, 0), true);
+  assertEquals(isTopLevelFocusTransition(3, 0), true);
+  assertEquals(isTopLevelFocusTransition(1, 0), false);
+  assertEquals(isTopLevelFocusTransition(0, 2), false);
 });
 
 Deno.test("X11 pixels follow the server visual masks and byte order", () => {

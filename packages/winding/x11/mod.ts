@@ -14,7 +14,12 @@ import {
 import { domCodeFromX11 } from "../linux/mod.ts";
 import { utf8Bytes, utf8CString as cString } from "../text_encoding.ts";
 import { libcFunctions, NotifyNormal, x11functions, XEventMask, XEventType } from "./ffi.ts";
-import { isAutoRepeatPair, x11CommittedText, x11KeyEditDisposition } from "./input.ts";
+import {
+  isAutoRepeatPair,
+  isTopLevelFocusTransition,
+  x11CommittedText,
+  x11KeyEditDisposition,
+} from "./input.ts";
 import { NativeXImage } from "./native_image.ts";
 import { XimContext, XimManager } from "./xim.ts";
 
@@ -530,12 +535,13 @@ class X11Library implements Library {
         }
       }
 
-      if (type === XEventType.FocusIn && window !== undefined && view.getInt32(40, true) === NotifyNormal) {
-        window.input.setNativeFocused(true);
-        return { type: "focus", window };
-      }
-      if (type === XEventType.FocusOut && window !== undefined && view.getInt32(40, true) === NotifyNormal) {
-        window.input.setNativeFocused(false);
+      if ((type === XEventType.FocusIn || type === XEventType.FocusOut) && window !== undefined) {
+        if (!isTopLevelFocusTransition(view.getInt32(40, true), view.getInt32(44, true))) continue;
+        if (type === XEventType.FocusIn) {
+          if (!window.input.setNativeFocused(true)) continue;
+          return { type: "focus", window };
+        }
+        if (!window.input.setNativeFocused(false)) continue;
         window.pressedKeys.clear();
         const imeEvent = this.#events.shift();
         if (imeEvent !== undefined) {

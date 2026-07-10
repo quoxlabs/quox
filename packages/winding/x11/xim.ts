@@ -602,14 +602,15 @@ export class XimContext implements Disposable {
     this.recreate();
   }
 
-  setNativeFocused(focused: boolean): void {
-    if (this.#activation.focused === focused || this.#closed) return;
+  setNativeFocused(focused: boolean): boolean {
+    if (this.#activation.focused === focused || this.#closed) return false;
     if (!focused) {
       if (this.#ic !== null && !this.#serverInvalidated) this.manager.resetIc(this.#ic);
       this.#clearPreedit(true);
     }
     this.#activation.setFocused(focused);
     this.#reconcileActivation();
+    return true;
   }
 
   setCursorArea(x: number, y: number, width: number, height: number): void {

@@ -67,11 +67,10 @@ export enum XEventMask {
   OwnerGrabButtonMask = 1 << 24,
 }
 
-// `mode` value from X11/X.h shared by XCrossingEvent (Enter/LeaveNotify) and
-// XFocusChangeEvent (FocusIn/FocusOut). Only NotifyNormal represents a real user-facing
-// hover/focus transition; NotifyGrab/NotifyUngrab/NotifyWhileGrabbed are WM-internal (e.g.
-// alt-tab, an interactive move/resize grab) and must be filtered out.
+// Focus/crossing mode and detail values from X11/X.h.
 export const NotifyNormal = 0;
+export const NotifyWhileGrabbed = 3;
+export const NotifyInferior = 2;
 
 // XIM requires the process C locale to be initialised before XOpenIM. Kept in
 // this module because it is only used by the X11 backend.

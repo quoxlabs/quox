@@ -1,6 +1,6 @@
 import type { KeyEditDisposition, KeyModifiers } from "../types.ts";
 import { normalizeCommittedText } from "../input/mod.ts";
-import { XEventType } from "./ffi.ts";
+import { NotifyInferior, NotifyNormal, NotifyWhileGrabbed, XEventType } from "./ffi.ts";
 
 /** Decode XLookupString output without turning a control byte back into printable keysym text. */
 export function fallbackLookupText(bytes: Uint8Array, keysymText: string): string | undefined {
@@ -49,4 +49,9 @@ export function isAutoRepeatPair(
     press.getBigUint64(32, true) === release.getBigUint64(32, true) &&
     press.getBigUint64(56, true) === release.getBigUint64(56, true) &&
     press.getUint32(84, true) === release.getUint32(84, true);
+}
+
+/** Whether an X focus event changes focus for the top-level window as a whole. */
+export function isTopLevelFocusTransition(mode: number, detail: number): boolean {
+  return (mode === NotifyNormal || mode === NotifyWhileGrabbed) && detail !== NotifyInferior;
 }
