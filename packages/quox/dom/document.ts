@@ -12,38 +12,6 @@ import { QuoxElement, QuoxNode, QuoxText } from "./node.ts";
 type SetNativeTitle = (title: string) => void;
 type SyncNativeImeRequests = () => void;
 
-// The checked-in generated declarations currently predate the interaction ABI.
-// Remove this augmentation after the next successful WASM regeneration.
-type RendererInputBridge = {
-  dispatch_pointer_move(x: number, y: number, buttons: number): boolean;
-  dispatch_pointer_down(x: number, y: number, button: number, buttons: number): boolean;
-  dispatch_pointer_up(x: number, y: number, button: number, buttons: number): boolean;
-  dispatch_wheel(x: number, y: number, deltaX: number, deltaY: number, buttons: number): boolean;
-  dispatch_key_event(
-    code: string,
-    key: string,
-    modifierBits: number,
-    location: number,
-    eventFlags: number,
-  ): boolean;
-  dispatch_apple_standard_keybinding(command: string): boolean;
-  dispatch_ime_enabled(): boolean;
-  dispatch_ime_disabled(): boolean;
-  dispatch_ime_preedit(text: string, start?: number, end?: number): boolean;
-  dispatch_ime_commit(text: string): boolean;
-  dispatch_ime_delete_surrounding(beforeBytes: number, afterBytes: number): boolean;
-  clear_hover(): boolean;
-  take_click_node(): number | undefined;
-  take_double_click_node(): number | undefined;
-  take_context_menu_node(): number | undefined;
-  take_input_node(): number | undefined;
-  take_focus_node(): number | undefined;
-  take_blur_node(): number | undefined;
-  take_scroll_node(): number | undefined;
-};
-
-type InputRenderer = WasmRenderer & RendererInputBridge;
-
 /**
  * Maps the DOM event kinds quox can invoke a JS handler for to their JSX prop name.
  * `dblclick`'s prop deliberately doesn't match the raw event name — it mirrors React's
@@ -60,7 +28,7 @@ const EVENT_KIND_TO_PROP = {
 } as const;
 
 export class QuoxDocument {
-  readonly #renderer: InputRenderer;
+  readonly #renderer: WasmRenderer;
   readonly #requestRender: RequestRender;
   readonly #assertActive: AssertActive;
   readonly #setNativeTitle: SetNativeTitle;
@@ -74,7 +42,7 @@ export class QuoxDocument {
     setNativeTitle: SetNativeTitle = () => undefined,
     syncNativeImeRequests: SyncNativeImeRequests = () => undefined,
   ) {
-    this.#renderer = renderer as InputRenderer;
+    this.#renderer = renderer;
     this.#requestRender = requestRender;
     this.#assertActive = assertActive;
     this.#setNativeTitle = setNativeTitle;

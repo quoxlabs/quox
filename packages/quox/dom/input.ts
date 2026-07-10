@@ -5,6 +5,7 @@ import type {
   UIEvent as WindingUIEvent,
   Window as WindingWindow,
 } from "@quoxlabs/winding";
+import { KeyEventFlag, KeyModifierMask } from "../lib/quox.js";
 
 type WithoutWindow<Event> = Event extends { window: unknown } ? Omit<Event, "window"> : never;
 
@@ -211,24 +212,6 @@ export function mapWindingEvent(event: WindingUIEvent): QuoxInputEvent {
   }
 }
 
-// These values are also exported by Rust's KeyModifierMask/KeyEventFlag enums.
-// Import the generated enums directly after WASM artifacts can be regenerated.
-export const KEY_MODIFIER = {
-  shift: 1 << 0,
-  alt: 1 << 1,
-  meta: 1 << 2,
-  capsLock: 1 << 3,
-  altGraph: 1 << 4,
-  accelerator: 1 << 5,
-} as const;
-
-export const KEY_EVENT_FLAG = {
-  pressed: 1 << 0,
-  repeat: 1 << 1,
-  composing: 1 << 2,
-  preventDefault: 1 << 3,
-} as const;
-
 export interface EncodedKeyEvent {
   code: string;
   key: string;
@@ -240,18 +223,18 @@ export interface EncodedKeyEvent {
 /** Encode exact host flags into the compact Quox→WASM key ABI. */
 export function encodeKeyEvent(event: QuoxKeyboardEvent): EncodedKeyEvent {
   let modifierBits = 0;
-  if (event.shiftKey) modifierBits |= KEY_MODIFIER.shift;
-  if (event.altKey) modifierBits |= KEY_MODIFIER.alt;
-  if (event.metaKey) modifierBits |= KEY_MODIFIER.meta;
-  if (event.capsLock) modifierBits |= KEY_MODIFIER.capsLock;
-  if (event.altGraphKey) modifierBits |= KEY_MODIFIER.altGraph;
-  if (event.accelKey) modifierBits |= KEY_MODIFIER.accelerator;
+  if (event.shiftKey) modifierBits |= KeyModifierMask.Shift;
+  if (event.altKey) modifierBits |= KeyModifierMask.Alt;
+  if (event.metaKey) modifierBits |= KeyModifierMask.Meta;
+  if (event.capsLock) modifierBits |= KeyModifierMask.CapsLock;
+  if (event.altGraphKey) modifierBits |= KeyModifierMask.AltGraph;
+  if (event.accelKey) modifierBits |= KeyModifierMask.Accelerator;
 
-  let eventFlags = event.isComposing ? KEY_EVENT_FLAG.composing : 0;
+  let eventFlags = event.isComposing ? KeyEventFlag.Composing : 0;
   if (event.type === "keydown") {
-    eventFlags |= KEY_EVENT_FLAG.pressed;
-    if (event.repeat) eventFlags |= KEY_EVENT_FLAG.repeat;
-    if (event.editDisposition !== "key-default") eventFlags |= KEY_EVENT_FLAG.preventDefault;
+    eventFlags |= KeyEventFlag.Pressed;
+    if (event.repeat) eventFlags |= KeyEventFlag.Repeat;
+    if (event.editDisposition !== "key-default") eventFlags |= KeyEventFlag.PreventDefault;
   }
 
   return {
