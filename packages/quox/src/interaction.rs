@@ -41,105 +41,126 @@ fn viewport_point_to_page(
     ))
 }
 
-/// Build a `keyboard_types::Modifiers` set from the individual flags `winding` reports.
-#[allow(clippy::fn_params_excessive_bools)]
-fn build_modifiers(shift: bool, ctrl: bool, alt: bool, meta: bool, caps_lock: bool) -> Modifiers {
+/// Stable bit values used by the generated TypeScript keyboard bridge.
+#[wasm_bindgen]
+pub enum KeyModifierMask {
+    Shift = 1,
+    Alt = 2,
+    Meta = 4,
+    CapsLock = 8,
+    AltGraph = 16,
+    Accelerator = 32,
+}
+
+/// Stable event-state bit values used by the generated TypeScript keyboard bridge.
+#[wasm_bindgen]
+pub enum KeyEventFlag {
+    Pressed = 1,
+    Repeat = 2,
+    Composing = 4,
+    PreventDefault = 8,
+}
+
+const KEY_MOD_SHIFT: u32 = KeyModifierMask::Shift as u32;
+const KEY_MOD_ALT: u32 = KeyModifierMask::Alt as u32;
+const KEY_MOD_META: u32 = KeyModifierMask::Meta as u32;
+const KEY_MOD_CAPS_LOCK: u32 = KeyModifierMask::CapsLock as u32;
+const KEY_MOD_ALT_GRAPH: u32 = KeyModifierMask::AltGraph as u32;
+const KEY_MOD_ACCEL: u32 = KeyModifierMask::Accelerator as u32;
+const KEY_MOD_KNOWN: u32 = KEY_MOD_SHIFT
+    | KEY_MOD_ALT
+    | KEY_MOD_META
+    | KEY_MOD_CAPS_LOCK
+    | KEY_MOD_ALT_GRAPH
+    | KEY_MOD_ACCEL;
+
+const KEY_EVENT_PRESSED: u32 = KeyEventFlag::Pressed as u32;
+const KEY_EVENT_REPEAT: u32 = KeyEventFlag::Repeat as u32;
+const KEY_EVENT_COMPOSING: u32 = KeyEventFlag::Composing as u32;
+const KEY_EVENT_PREVENT_DEFAULT: u32 = KeyEventFlag::PreventDefault as u32;
+const KEY_EVENT_KNOWN: u32 =
+    KEY_EVENT_PRESSED | KEY_EVENT_REPEAT | KEY_EVENT_COMPOSING | KEY_EVENT_PREVENT_DEFAULT;
+
+/// Build the modifier set used by Blitz's editor defaults. Quox itself exposes the exact
+/// physical flags to JS; this projection deliberately maps the runtime platform accelerator to
+/// `CONTROL`, because pinned Blitz chooses its action modifier at Rust compile time while this
+/// crate is compiled once for WASM. In particular, `AltGr` and macOS physical Control must not be
+/// mistaken for the platform accelerator.
+fn build_editor_modifiers(bits: u32) -> Modifiers {
     let mut mods = Modifiers::empty();
-    if shift {
+    if bits & KEY_MOD_SHIFT != 0 {
         mods |= Modifiers::SHIFT;
     }
-    if ctrl {
-        mods |= Modifiers::CONTROL;
-    }
-    if alt {
+    if bits & KEY_MOD_ALT != 0 {
         mods |= Modifiers::ALT;
     }
-    if meta {
+    if bits & KEY_MOD_META != 0 {
         mods |= Modifiers::META;
     }
-    if caps_lock {
+    if bits & KEY_MOD_CAPS_LOCK != 0 {
         mods |= Modifiers::CAPS_LOCK;
+    }
+    if bits & KEY_MOD_ALT_GRAPH != 0 {
+        mods |= Modifiers::ALT_GRAPH;
+    }
+    if bits & KEY_MOD_ACCEL != 0 {
+        mods |= Modifiers::CONTROL;
     }
     mods
 }
 
-/// Best-effort US-QWERTY character for physical-position codes that don't have a named
-/// `keyboard_types::Key` (letters, digits, punctuation, space). Digits/punctuation ignore
-/// `caps_lock` (real keyboards do too); only Shift picks their shifted symbol.
-fn us_qwerty_char(code: &str, shift: bool, caps_lock: bool) -> Option<char> {
-    if let Some(letter) = code.strip_prefix("Key") {
-        let base = letter.chars().next()?.to_ascii_lowercase();
-        let uppercase = shift ^ caps_lock;
-        return Some(if uppercase {
-            base.to_ascii_uppercase()
-        } else {
-            base
-        });
+fn validate_key_abi(modifier_bits: u32, location: u32, event_flags: u32) {
+    assert_eq!(
+        modifier_bits & !KEY_MOD_KNOWN,
+        0,
+        "unknown key modifier bits"
+    );
+    assert_eq!(event_flags & !KEY_EVENT_KNOWN, 0, "unknown key event bits");
+    assert!(location <= 3, "invalid DOM key location");
+    if event_flags & KEY_EVENT_PRESSED == 0 {
+        assert_eq!(
+            event_flags & (KEY_EVENT_REPEAT | KEY_EVENT_PREVENT_DEFAULT),
+            0,
+            "key releases cannot repeat or suppress a keydown default"
+        );
     }
-
-    let (unshifted, shifted) = match code {
-        "Digit0" => ('0', ')'),
-        "Digit1" => ('1', '!'),
-        "Digit2" => ('2', '@'),
-        "Digit3" => ('3', '#'),
-        "Digit4" => ('4', '$'),
-        "Digit5" => ('5', '%'),
-        "Digit6" => ('6', '^'),
-        "Digit7" => ('7', '&'),
-        "Digit8" => ('8', '*'),
-        "Digit9" => ('9', '('),
-        "Minus" => ('-', '_'),
-        "Equal" => ('=', '+'),
-        "BracketLeft" => ('[', '{'),
-        "BracketRight" => (']', '}'),
-        "Backslash" => ('\\', '|'),
-        "Semicolon" => (';', ':'),
-        "Quote" => ('\'', '"'),
-        "Comma" => (',', '<'),
-        "Period" => ('.', '>'),
-        "Slash" => ('/', '?'),
-        "Backquote" => ('`', '~'),
-        "Space" => (' ', ' '),
-        _ => return None,
-    };
-    Some(if shift { shifted } else { unshifted })
 }
 
-/// Derive the best `keyboard_types::Key` for a DOM physical `code` string plus modifier
-/// state. Tries `code.parse::<Key>()` first, which directly yields the correct answer for
-/// every control/named key (DOM `code` and `key` spellings coincide for those). Falls back
-/// to an explicit match for the Left/Right modifier codes and `NumpadEnter` (which don't
-/// parse that way), then a best-effort US-QWERTY table for printable physical-position
-/// codes. Anything still unmapped (e.g. `NumpadN` without `NumLock` state) is `Unidentified`.
-fn synthesize_key(code: &str, shift: bool, caps_lock: bool) -> Key {
-    if let Ok(key) = Key::from_str(code) {
-        return key;
+fn logical_key(key: &str) -> Key {
+    if key.is_empty() {
+        Key::Unidentified
+    } else {
+        Key::from_str(key).unwrap_or(Key::Unidentified)
     }
-
-    match code {
-        "ShiftLeft" | "ShiftRight" => return Key::Shift,
-        "ControlLeft" | "ControlRight" => return Key::Control,
-        "AltLeft" | "AltRight" => return Key::Alt,
-        "MetaLeft" | "MetaRight" => return Key::Meta,
-        "NumpadEnter" => return Key::Enter,
-        _ => {}
-    }
-
-    if let Some(ch) = us_qwerty_char(code, shift, caps_lock) {
-        return Key::Character(ch.to_string());
-    }
-
-    Key::Unidentified
 }
 
-/// Prefer the platform's layout-aware logical key, retaining parser-unknown strings as
-/// character keys. Fall back to legacy physical-code synthesis only when the backend cannot
-/// supply a logical key.
-fn native_key(code: &str, logical_key: Option<&str>, shift: bool, caps_lock: bool) -> Key {
-    match logical_key.filter(|key| !key.is_empty()) {
-        Some(key) => Key::from_str(key).unwrap_or_else(|_| Key::Character(key.to_owned())),
-        None => synthesize_key(code, shift, caps_lock),
+fn is_insertable_text(text: &str) -> bool {
+    !text.is_empty()
+        && !text
+            .chars()
+            .any(|character| character <= '\u{1f}' || ('\u{7f}'..='\u{9f}').contains(&character))
+}
+
+fn key_location(location: u32) -> Location {
+    match location {
+        1 => Location::Left,
+        2 => Location::Right,
+        3 => Location::Numpad,
+        _ => Location::Standard,
     }
+}
+
+fn preedit_cursor(
+    text: &str,
+    cursor_start: Option<usize>,
+    cursor_end: Option<usize>,
+) -> Option<(usize, usize)> {
+    cursor_start.zip(cursor_end).filter(|(start, end)| {
+        start <= end
+            && *end <= text.len()
+            && text.is_char_boundary(*start)
+            && text.is_char_boundary(*end)
+    })
 }
 
 /// Map a `winding` button index (`left:0, middle:1, right:2`, matching the ordinals
@@ -195,37 +216,28 @@ fn pointer_event(
     })
 }
 
-#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 fn key_event(
     code: &str,
-    shift_key: bool,
-    ctrl_key: bool,
-    alt_key: bool,
-    meta_key: bool,
-    caps_lock: bool,
-    logical_key: Option<&str>,
-    text: Option<&str>,
-    repeat: bool,
-    state: KeyState,
+    key: &str,
+    modifier_bits: u32,
+    location: u32,
+    event_flags: u32,
 ) -> BlitzKeyEvent {
     BlitzKeyEvent {
-        key: native_key(code, logical_key, shift_key, caps_lock),
+        key: logical_key(key),
         code: Code::from_str(code).unwrap_or(Code::Unidentified),
-        modifiers: build_modifiers(shift_key, ctrl_key, alt_key, meta_key, caps_lock),
-        location: Location::Standard,
-        is_auto_repeating: repeat,
-        is_composing: false,
-        state,
-        text: text.map(Into::into),
-    }
-}
-
-/// A committed text payload is inserted by the following `Ime::Commit`, not by Blitz's
-/// physical-key default action. Cancelling only this case preserves navigation, deletion,
-/// shortcuts, Tab traversal, and other key defaults.
-fn cancel_text_keydown_default(event: &DomEvent, event_state: &mut EventState) {
-    if matches!(&event.data, DomEventData::KeyDown(data) if data.text.is_some()) {
-        event_state.prevent_default();
+        modifiers: build_editor_modifiers(modifier_bits),
+        location: key_location(location),
+        is_auto_repeating: event_flags & KEY_EVENT_REPEAT != 0,
+        is_composing: event_flags & KEY_EVENT_COMPOSING != 0,
+        state: if event_flags & KEY_EVENT_PRESSED != 0 {
+            KeyState::Pressed
+        } else {
+            KeyState::Released
+        },
+        // Winding Commit is the sole text carrier. Keeping keyboard text empty prevents a
+        // backend-specific key path from becoming a second insertion source.
+        text: None,
     }
 }
 
@@ -241,6 +253,8 @@ pub(super) struct RecordedEvents {
     focus: Option<usize>,
     blur: Option<usize>,
     scroll: Option<usize>,
+    #[cfg(test)]
+    input_count: usize,
 }
 
 /// Bridges Blitz's `EventHandler` hook (normally a no-op via `NoopEventHandler`) to a
@@ -248,6 +262,7 @@ pub(super) struct RecordedEvents {
 /// fired and let it invoke the matching JSX `onXxx` prop from `handlers.ts`'s registry.
 struct RecordingEventHandler<'a> {
     recorded: &'a mut RecordedEvents,
+    cancel_keydown_default: bool,
 }
 
 impl EventHandler for RecordingEventHandler<'_> {
@@ -258,7 +273,9 @@ impl EventHandler for RecordingEventHandler<'_> {
         _doc: &mut dyn Document,
         event_state: &mut EventState,
     ) {
-        cancel_text_keydown_default(event, event_state);
+        if self.cancel_keydown_default && matches!(event.data, DomEventData::KeyDown(_)) {
+            event_state.prevent_default();
+        }
 
         let Some(target) = chain.first().copied() else {
             return;
@@ -268,7 +285,13 @@ impl EventHandler for RecordingEventHandler<'_> {
             DomEventData::Click(_) => self.recorded.click = Some(target),
             DomEventData::DoubleClick(_) => self.recorded.double_click = Some(target),
             DomEventData::ContextMenu(_) => self.recorded.context_menu = Some(target),
-            DomEventData::Input(_) => self.recorded.input = Some(target),
+            DomEventData::Input(_) => {
+                self.recorded.input = Some(target);
+                #[cfg(test)]
+                {
+                    self.recorded.input_count += 1;
+                }
+            }
             DomEventData::Focus(_) => self.recorded.focus = Some(target),
             DomEventData::Blur(_) => self.recorded.blur = Some(target),
             DomEventData::Scroll(_) => self.recorded.scroll = Some(target),
@@ -278,11 +301,14 @@ impl EventHandler for RecordingEventHandler<'_> {
 }
 
 impl QuoxRendererState {
-    /// Feed a `UiEvent` into Blitz's event pipeline via a fresh `EventDriver`, using a
-    /// `RecordingEventHandler` (rather than the `Document::handle_ui_event` default's
-    /// `NoopEventHandler`) so JS-registered handlers can be invoked afterwards. Returns
-    /// whether a redraw was requested as a result.
-    fn dispatch(&mut self, event: UiEvent) -> bool {
+    /// Run one host dispatch inside a single `EventDriver`/recording scope. Keeping the scope
+    /// reusable lets a native commit clear preedit and insert text atomically without resetting
+    /// the generated DOM-event mailbox between the two Blitz events.
+    fn with_event_driver(
+        &mut self,
+        cancel_keydown_default: bool,
+        drive: impl FnOnce(&mut EventDriver<'_, RecordingEventHandler<'_>>),
+    ) -> bool {
         self.recorded_events = RecordedEvents::default();
 
         {
@@ -295,15 +321,46 @@ impl QuoxRendererState {
                 document,
                 RecordingEventHandler {
                     recorded: recorded_events,
+                    cancel_keydown_default,
                 },
             );
-            driver.handle_ui_event(event);
+            drive(&mut driver);
         }
 
         self.refresh_ime_cursor_area();
 
         self.redraw_requested.swap(false, Ordering::Relaxed)
     }
+
+    fn dispatch(&mut self, event: UiEvent) -> bool {
+        self.dispatch_with_policy(event, false)
+    }
+
+    fn dispatch_with_policy(&mut self, event: UiEvent, cancel_keydown_default: bool) -> bool {
+        self.with_event_driver(cancel_keydown_default, |driver| {
+            driver.handle_ui_event(event);
+        })
+    }
+
+    /// Pinned Blitz's `UiEvent::AppleStandardKeybinding` path runs the default directly but
+    /// leaves the resulting DOM `input` queued inside `EventDriver`. Entering through the public
+    /// DOM-event path processes that queue and lets `RecordingEventHandler` expose the input.
+    fn dispatch_apple_standard_keybinding(&mut self, command: &str) -> bool {
+        let target = self
+            .document
+            .get_focussed_node_id()
+            .unwrap_or_else(|| self.document.root_element().id);
+        let event = DomEvent::new(
+            target,
+            DomEventData::AppleStandardKeybinding(command.into()),
+        );
+        self.with_event_driver(false, |driver| driver.handle_dom_event(event))
+    }
+}
+
+fn drive_ime_commit<Handler: EventHandler>(driver: &mut EventDriver<'_, Handler>, text: &str) {
+    driver.handle_ui_event(UiEvent::Ime(BlitzImeEvent::Preedit(String::new(), None)));
+    driver.handle_ui_event(UiEvent::Ime(BlitzImeEvent::Commit(text.to_owned())));
 }
 
 #[wasm_bindgen]
@@ -387,79 +444,27 @@ impl QuoxRenderer {
         state.dispatch(UiEvent::Wheel(event))
     }
 
-    /// Feed a keydown event into Blitz (drives text-input editing, Tab focus traversal,
-    /// clipboard copy, and Enter-triggered form submission). `code` is a DOM
-    /// `KeyboardEvent.code`-style physical key identifier. `logical_key` is the backend's
-    /// layout-aware DOM `KeyboardEvent.key` value; when absent, Quox falls back to best-effort
-    /// US-QWERTY synthesis. `text` is committed text that will be inserted by a separate
-    /// `dispatch_ime_commit`, and `repeat` marks an auto-repeat press. Returns whether a redraw
-    /// was requested.
-    #[allow(
-        clippy::fn_params_excessive_bools,
-        clippy::needless_pass_by_value,
-        clippy::too_many_arguments,
-        reason = "the exported host-event ABI is intentionally flat, and wasm-bindgen requires owned optional strings"
-    )]
-    pub fn dispatch_key_down(
+    /// Feed a canonical native key event into Blitz. `modifier_bits` carries the editor-facing
+    /// modifier projection plus its runtime accelerator; `event_flags` carries pressed/repeat/
+    /// composing/default-cancellation state. Every insertion arrives through a following
+    /// `dispatch_ime_commit`.
+    pub fn dispatch_key_event(
         &self,
         code: &str,
-        shift_key: bool,
-        ctrl_key: bool,
-        alt_key: bool,
-        meta_key: bool,
-        caps_lock: bool,
-        logical_key: Option<String>,
-        text: Option<String>,
-        repeat: bool,
+        key: &str,
+        modifier_bits: u32,
+        location: u32,
+        event_flags: u32,
     ) -> bool {
+        validate_key_abi(modifier_bits, location, event_flags);
         let mut state = self.state.borrow_mut();
-        let event = key_event(
-            code,
-            shift_key,
-            ctrl_key,
-            alt_key,
-            meta_key,
-            caps_lock,
-            logical_key.as_deref(),
-            text.as_deref(),
-            repeat,
-            KeyState::Pressed,
-        );
-        state.dispatch(UiEvent::KeyDown(event))
-    }
-
-    /// Feed a keyup event into Blitz. See `dispatch_key_down`. Returns whether a redraw was
-    /// requested.
-    #[allow(
-        clippy::fn_params_excessive_bools,
-        clippy::needless_pass_by_value,
-        clippy::too_many_arguments,
-        reason = "the exported host-event ABI is intentionally flat, and wasm-bindgen requires owned optional strings"
-    )]
-    pub fn dispatch_key_up(
-        &self,
-        code: &str,
-        shift_key: bool,
-        ctrl_key: bool,
-        alt_key: bool,
-        meta_key: bool,
-        caps_lock: bool,
-        logical_key: Option<String>,
-    ) -> bool {
-        let mut state = self.state.borrow_mut();
-        let event = key_event(
-            code,
-            shift_key,
-            ctrl_key,
-            alt_key,
-            meta_key,
-            caps_lock,
-            logical_key.as_deref(),
-            None,
-            false,
-            KeyState::Released,
-        );
-        state.dispatch(UiEvent::KeyUp(event))
+        let event = key_event(code, key, modifier_bits, location, event_flags);
+        let cancel_keydown_default = event_flags & KEY_EVENT_PREVENT_DEFAULT != 0;
+        if event.state.is_pressed() {
+            state.dispatch_with_policy(UiEvent::KeyDown(event), cancel_keydown_default)
+        } else {
+            state.dispatch(UiEvent::KeyUp(event))
+        }
     }
 
     /// Notify Blitz that the native input method has become active.
@@ -485,7 +490,7 @@ impl QuoxRenderer {
         cursor_start: Option<usize>,
         cursor_end: Option<usize>,
     ) -> bool {
-        let cursor = cursor_start.zip(cursor_end);
+        let cursor = preedit_cursor(text, cursor_start, cursor_end);
         self.state
             .borrow_mut()
             .dispatch(UiEvent::Ime(BlitzImeEvent::Preedit(
@@ -496,13 +501,30 @@ impl QuoxRenderer {
 
     /// Commit native IME text to the focused Blitz text editor.
     pub fn dispatch_ime_commit(&self, text: &str) -> bool {
+        if !is_insertable_text(text) {
+            return false;
+        }
         let mut state = self.state.borrow_mut();
-        // Blitz follows winit's contract: an empty preedit immediately precedes Commit. Clear it
-        // here as well so backends can expose the simpler commit-only entry point safely.
-        let cleared_preedit =
-            state.dispatch(UiEvent::Ime(BlitzImeEvent::Preedit(String::new(), None)));
-        let committed = state.dispatch(UiEvent::Ime(BlitzImeEvent::Commit(text.to_owned())));
-        cleared_preedit || committed
+        state.with_event_driver(false, |driver| drive_ime_commit(driver, text))
+    }
+
+    /// Forward an `AppKit` `doCommandBySelector:` edit through Blitz's existing selector map.
+    pub fn dispatch_apple_standard_keybinding(&self, command: &str) -> bool {
+        self.state
+            .borrow_mut()
+            .dispatch_apple_standard_keybinding(command)
+    }
+
+    /// Forward byte-counted surrounding-text deletion. Pinned Blitz currently accepts but does
+    /// not apply this event; keeping the ABI wired avoids another host-boundary change once its
+    /// editor implementation lands.
+    pub fn dispatch_ime_delete_surrounding(&self, before_bytes: u32, after_bytes: u32) -> bool {
+        self.state
+            .borrow_mut()
+            .dispatch(UiEvent::Ime(BlitzImeEvent::DeleteSurrounding {
+                before_bytes: before_bytes as usize,
+                after_bytes: after_bytes as usize,
+            }))
     }
 
     /// Clear Blitz's hover state (and reset the cursor), e.g. when the pointer leaves the
@@ -553,16 +575,16 @@ impl QuoxRenderer {
 #[cfg(test)]
 mod tests {
     use super::{
-        RecordedEvents, RecordingEventHandler, cancel_text_keydown_default, key_event, native_key,
-        synthesize_key, viewport_point_to_page,
+        KEY_EVENT_COMPOSING, KEY_EVENT_PRESSED, KEY_EVENT_REPEAT, KEY_MOD_ACCEL, KEY_MOD_ALT,
+        KEY_MOD_ALT_GRAPH, KEY_MOD_META, KEY_MOD_SHIFT, RecordedEvents, RecordingEventHandler,
+        build_editor_modifiers, drive_ime_commit, is_insertable_text, key_event, preedit_cursor,
+        validate_key_abi, viewport_point_to_page,
     };
     use blitz_dom::{BaseDocument, DocumentConfig, EventDriver};
     use blitz_html::HtmlDocument;
-    use blitz_traits::events::{
-        BlitzImeEvent, DomEvent, DomEventData, EventState, KeyState, UiEvent,
-    };
+    use blitz_traits::events::{BlitzImeEvent, DomEvent, DomEventData, UiEvent};
     use blitz_traits::shell::{ColorScheme, Viewport};
-    use keyboard_types::Key;
+    use keyboard_types::{Key, Location, Modifiers};
 
     fn focused_input_document() -> (BaseDocument, usize) {
         let mut document = HtmlDocument::from_html(
@@ -593,9 +615,31 @@ mod tests {
         document: &mut BaseDocument,
         recorded: &mut RecordedEvents,
         event: UiEvent,
+        cancel_keydown_default: bool,
     ) {
-        let mut driver = EventDriver::new(document, RecordingEventHandler { recorded });
+        let mut driver = EventDriver::new(
+            document,
+            RecordingEventHandler {
+                recorded,
+                cancel_keydown_default,
+            },
+        );
         driver.handle_ui_event(event);
+    }
+
+    fn dispatch_dom_to_document(
+        document: &mut BaseDocument,
+        recorded: &mut RecordedEvents,
+        event: DomEvent,
+    ) {
+        let mut driver = EventDriver::new(
+            document,
+            RecordingEventHandler {
+                recorded,
+                cancel_keydown_default: false,
+            },
+        );
+        driver.handle_dom_event(event);
     }
 
     fn input_raw_text(document: &mut BaseDocument, input_id: usize) -> String {
@@ -669,223 +713,164 @@ mod tests {
     }
 
     #[test]
-    fn synthesizes_named_keys_from_code() {
-        assert_eq!(synthesize_key("Enter", false, false), Key::Enter);
-        assert_eq!(synthesize_key("ArrowLeft", false, false), Key::ArrowLeft);
-        assert_eq!(synthesize_key("Backspace", false, false), Key::Backspace);
-        assert_eq!(synthesize_key("Tab", false, false), Key::Tab);
-    }
-
-    #[test]
-    fn synthesizes_modifier_keys_from_left_right_codes() {
-        assert_eq!(synthesize_key("ShiftLeft", false, false), Key::Shift);
-        assert_eq!(synthesize_key("ShiftRight", false, false), Key::Shift);
-        assert_eq!(synthesize_key("ControlLeft", false, false), Key::Control);
-        assert_eq!(synthesize_key("AltRight", false, false), Key::Alt);
-        assert_eq!(synthesize_key("MetaLeft", false, false), Key::Meta);
-        assert_eq!(synthesize_key("NumpadEnter", false, false), Key::Enter);
-    }
-
-    #[test]
-    fn synthesizes_letters_with_shift_and_caps_lock() {
-        assert_eq!(
-            synthesize_key("KeyA", false, false),
-            Key::Character("a".into())
-        );
-        assert_eq!(
-            synthesize_key("KeyA", true, false),
-            Key::Character("A".into())
-        );
-        assert_eq!(
-            synthesize_key("KeyA", false, true),
-            Key::Character("A".into())
-        );
-        // Shift + CapsLock cancel out, matching a real keyboard.
-        assert_eq!(
-            synthesize_key("KeyA", true, true),
-            Key::Character("a".into())
-        );
-    }
-
-    #[test]
-    fn synthesizes_digits_and_punctuation_ignoring_caps_lock() {
-        assert_eq!(
-            synthesize_key("Digit1", false, false),
-            Key::Character("1".into())
-        );
-        assert_eq!(
-            synthesize_key("Digit1", true, false),
-            Key::Character("!".into())
-        );
-        assert_eq!(
-            synthesize_key("Digit1", false, true),
-            Key::Character("1".into())
-        );
-        assert_eq!(
-            synthesize_key("Comma", true, false),
-            Key::Character("<".into())
-        );
-    }
-
-    #[test]
-    fn falls_back_to_unidentified_for_unmapped_codes() {
-        assert_eq!(synthesize_key("Numpad5", false, false), Key::Unidentified);
-    }
-
-    #[test]
-    fn prefers_layout_aware_logical_keys_and_falls_back_to_physical_synthesis() {
-        assert_eq!(
-            native_key("KeyQ", Some("ä"), false, false),
-            Key::Character("ä".into())
-        );
-        assert_eq!(
-            native_key("KeyQ", Some("ArrowDown"), false, false),
-            Key::ArrowDown
-        );
-        assert_eq!(
-            native_key("KeyQ", None, false, false),
-            Key::Character("q".into())
-        );
-        assert_eq!(
-            native_key("KeyQ", Some("ss"), false, false),
-            Key::Character("ss".into())
-        );
-        assert_eq!(
-            native_key("KeyQ", Some(""), false, false),
-            Key::Character("q".into())
-        );
-    }
-
-    #[test]
-    fn key_event_carries_committed_text_and_repeat_state() {
+    fn key_event_uses_native_logical_key_and_carries_all_metadata() {
         let event = key_event(
             "KeyQ",
-            false,
-            false,
-            true,
-            false,
-            false,
-            Some("@"),
-            Some("@"),
-            true,
-            KeyState::Pressed,
+            "@",
+            KEY_MOD_SHIFT | KEY_MOD_ALT,
+            3,
+            KEY_EVENT_PRESSED | KEY_EVENT_REPEAT | KEY_EVENT_COMPOSING,
         );
 
         assert_eq!(event.key, Key::Character("@".into()));
-        assert_eq!(event.text.as_deref(), Some("@"));
+        assert_eq!(event.text, None);
+        assert_eq!(event.location, Location::Numpad);
         assert!(event.is_auto_repeating);
+        assert!(event.is_composing);
+        assert!(event.state.is_pressed());
+
+        assert_eq!(
+            key_event("ShiftLeft", "Shift", 0, 1, 0).location,
+            Location::Left
+        );
+        assert_eq!(
+            key_event("ShiftRight", "Shift", 0, 2, 0).location,
+            Location::Right
+        );
+        assert_eq!(
+            key_event("KeyA", "a", 0, 99, 0).location,
+            Location::Standard
+        );
     }
 
     #[test]
-    fn cancels_only_text_bearing_keydown_defaults() {
-        let text_keydown = DomEvent::new(
-            1,
-            DomEventData::KeyDown(key_event(
-                "KeyZ",
-                false,
-                false,
-                false,
-                false,
-                false,
-                Some("z"),
-                Some("z"),
-                false,
-                KeyState::Pressed,
-            )),
-        );
-        let navigation_keydown = DomEvent::new(
-            1,
-            DomEventData::KeyDown(key_event(
-                "ArrowLeft",
-                false,
-                false,
-                false,
-                false,
-                false,
-                Some("ArrowLeft"),
-                None,
-                false,
-                KeyState::Pressed,
-            )),
-        );
-        let text_keyup = DomEvent::new(
-            1,
-            DomEventData::KeyUp(key_event(
-                "KeyZ",
-                false,
-                false,
-                false,
-                false,
-                false,
-                Some("z"),
-                Some("z"),
-                false,
-                KeyState::Released,
-            )),
-        );
-
-        let mut text_keydown_state = EventState::default();
-        cancel_text_keydown_default(&text_keydown, &mut text_keydown_state);
-        assert!(text_keydown_state.is_cancelled());
-
-        let mut navigation_keydown_state = EventState::default();
-        cancel_text_keydown_default(&navigation_keydown, &mut navigation_keydown_state);
-        assert!(!navigation_keydown_state.is_cancelled());
-
-        let mut text_keyup_state = EventState::default();
-        cancel_text_keydown_default(&text_keyup, &mut text_keyup_state);
-        assert!(!text_keyup_state.is_cancelled());
+    fn empty_logical_key_is_not_synthesized() {
+        let event = key_event("KeyQ", "", 0, 0, KEY_EVENT_PRESSED);
+        assert_eq!(event.key, Key::Unidentified);
+        let event = key_event("KeyQ", "NotAKey", 0, 0, KEY_EVENT_PRESSED);
+        assert_eq!(event.key, Key::Unidentified);
     }
 
     #[test]
-    fn text_keydown_then_ime_commit_inserts_exactly_once() {
+    fn committed_text_rejects_control_ranges() {
+        assert!(!is_insertable_text(""));
+        assert!(!is_insertable_text("\u{3}"));
+        assert!(!is_insertable_text("\u{85}"));
+        assert!(is_insertable_text("ß日本"));
+    }
+
+    #[test]
+    fn runtime_accelerator_maps_to_blitz_control_without_confusing_alt_graph() {
+        let darwin_command = build_editor_modifiers(KEY_MOD_META | KEY_MOD_ACCEL);
+        assert!(darwin_command.contains(Modifiers::CONTROL));
+        assert!(darwin_command.contains(Modifiers::META));
+
+        let darwin_physical_control = build_editor_modifiers(0);
+        assert!(!darwin_physical_control.contains(Modifiers::CONTROL));
+
+        let alt_graph = build_editor_modifiers(KEY_MOD_ALT | KEY_MOD_ALT_GRAPH);
+        assert!(alt_graph.contains(Modifiers::ALT));
+        assert!(alt_graph.contains(Modifiers::ALT_GRAPH));
+        assert!(!alt_graph.contains(Modifiers::CONTROL));
+    }
+
+    #[test]
+    #[should_panic(expected = "key releases cannot repeat")]
+    fn key_abi_rejects_release_only_flag_violations() {
+        validate_key_abi(0, 0, KEY_EVENT_REPEAT);
+    }
+
+    #[test]
+    #[should_panic(expected = "unknown key modifier bits")]
+    fn key_abi_rejects_values_that_would_have_wrapped_a_narrow_mask() {
+        validate_key_abi(1 << 16, 0, KEY_EVENT_PRESSED);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid DOM key location")]
+    fn key_abi_rejects_values_that_would_have_wrapped_a_narrow_location() {
+        validate_key_abi(0, 256, KEY_EVENT_PRESSED);
+    }
+
+    #[test]
+    fn preedit_cursor_accepts_only_valid_utf8_byte_ranges() {
+        assert_eq!(preedit_cursor("éx", Some(2), Some(3)), Some((2, 3)));
+        assert_eq!(preedit_cursor("éx", Some(1), Some(3)), None);
+        assert_eq!(preedit_cursor("éx", Some(3), Some(2)), None);
+        assert_eq!(preedit_cursor("éx", Some(0), Some(4)), None);
+        assert_eq!(preedit_cursor("éx", Some(0), None), None);
+    }
+
+    #[test]
+    fn cancelled_text_input_keydown_then_ime_commit_inserts_exactly_once() {
         let (mut document, input_id) = focused_input_document();
         let mut recorded = RecordedEvents::default();
-        let key = key_event(
-            "KeyS",
-            false,
-            false,
-            false,
-            false,
-            false,
-            Some("ß"),
-            Some("ß"),
-            false,
-            KeyState::Pressed,
-        );
+        let key = key_event("KeyS", "ß", 0, 0, KEY_EVENT_PRESSED);
 
-        dispatch_to_document(&mut document, &mut recorded, UiEvent::KeyDown(key));
+        dispatch_to_document(&mut document, &mut recorded, UiEvent::KeyDown(key), true);
         assert_eq!(input_raw_text(&mut document, input_id), "");
         assert_eq!(recorded.input, None);
 
         dispatch_to_document(
             &mut document,
             &mut recorded,
-            UiEvent::Ime(BlitzImeEvent::Commit("ß".to_owned())),
+            UiEvent::Ime(BlitzImeEvent::Preedit("に".to_owned(), Some((0, 3)))),
+            false,
         );
+        recorded = RecordedEvents::default();
+        let mut driver = EventDriver::new(
+            &mut document,
+            RecordingEventHandler {
+                recorded: &mut recorded,
+                cancel_keydown_default: false,
+            },
+        );
+        drive_ime_commit(&mut driver, "ß");
         assert_eq!(input_raw_text(&mut document, input_id), "ß");
+        assert_eq!(recorded.input, Some(input_id));
+        assert_eq!(recorded.input_count, 1);
+    }
+
+    #[test]
+    fn key_default_backspace_preserves_blitz_deletion() {
+        let (mut document, input_id) = focused_input_document();
+        let mut recorded = RecordedEvents::default();
+        dispatch_to_document(
+            &mut document,
+            &mut recorded,
+            UiEvent::Ime(BlitzImeEvent::Commit("a".to_owned())),
+            false,
+        );
+        recorded = RecordedEvents::default();
+        let key = key_event("Backspace", "Backspace", 0, 0, KEY_EVENT_PRESSED);
+
+        dispatch_to_document(&mut document, &mut recorded, UiEvent::KeyDown(key), false);
+        assert_eq!(input_raw_text(&mut document, input_id), "");
         assert_eq!(recorded.input, Some(input_id));
     }
 
     #[test]
-    fn textless_legacy_keydown_preserves_blitz_default_insertion() {
+    fn apple_standard_command_processes_the_generated_input_event() {
         let (mut document, input_id) = focused_input_document();
         let mut recorded = RecordedEvents::default();
-        let key = key_event(
-            "KeyA",
+        dispatch_to_document(
+            &mut document,
+            &mut recorded,
+            UiEvent::Ime(BlitzImeEvent::Commit("a".to_owned())),
             false,
-            false,
-            false,
-            false,
-            false,
-            None,
-            None,
-            false,
-            KeyState::Pressed,
+        );
+        recorded = RecordedEvents::default();
+
+        dispatch_dom_to_document(
+            &mut document,
+            &mut recorded,
+            DomEvent::new(
+                input_id,
+                DomEventData::AppleStandardKeybinding("deleteBackward:".into()),
+            ),
         );
 
-        dispatch_to_document(&mut document, &mut recorded, UiEvent::KeyDown(key));
-        assert_eq!(input_raw_text(&mut document, input_id), "a");
+        assert_eq!(input_raw_text(&mut document, input_id), "");
         assert_eq!(recorded.input, Some(input_id));
     }
 
@@ -902,6 +887,7 @@ mod tests {
                 preedit.to_owned(),
                 Some((0, preedit.len())),
             )),
+            false,
         );
         assert_eq!(input_raw_text(&mut document, input_id), preedit);
         assert_eq!(
@@ -914,6 +900,7 @@ mod tests {
             &mut document,
             &mut recorded,
             UiEvent::Ime(BlitzImeEvent::Preedit(String::new(), None)),
+            false,
         );
         assert_eq!(input_raw_text(&mut document, input_id), "");
         assert_eq!(input_compose_range(&mut document, input_id), None);

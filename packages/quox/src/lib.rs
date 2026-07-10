@@ -49,10 +49,16 @@ struct QuoxRendererState {
     recorded_events: RecordedEvents,
 }
 
+const IME_REQUEST_CURSOR_AREA: u8 = 1 << 0;
+const IME_REQUEST_ENABLED: u8 = 1 << 1;
+const IME_REQUEST_SNAPSHOT_LEN: usize = 6;
+
 #[derive(Default)]
-struct PendingImeRequests {
-    enabled: Option<bool>,
-    cursor_area: Option<[f32; 4]>,
+struct ImeRequestState {
+    desired_enabled: Option<bool>,
+    delivered_enabled: Option<bool>,
+    desired_cursor_area: Option<[f32; 4]>,
+    delivered_cursor_area: Option<[f32; 4]>,
 }
 
 /// Thread-safe hand-off for shell requests produced synchronously inside Blitz. The host
@@ -60,38 +66,65 @@ struct PendingImeRequests {
 /// the native window/IME context.
 #[derive(Default)]
 struct ImeRequestMailbox {
-    pending: Mutex<PendingImeRequests>,
+    state: Mutex<ImeRequestState>,
 }
 
 impl ImeRequestMailbox {
     fn request_enabled(&self, enabled: bool) {
-        self.pending
+        self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .enabled = Some(enabled);
+            .desired_enabled = Some(enabled);
     }
 
-    fn request_cursor_area(&self, cursor_area: [f32; 4]) {
-        self.pending
+    fn request_cursor_area(&self, mut cursor_area: [f32; 4]) {
+        if !cursor_area.iter().all(|value| value.is_finite()) {
+            return;
+        }
+        cursor_area[2] = cursor_area[2].max(0.0);
+        cursor_area[3] = cursor_area[3].max(0.0);
+        self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .cursor_area = Some(cursor_area);
+            .desired_cursor_area = Some(cursor_area);
     }
 
-    fn take_enabled(&self) -> Option<bool> {
-        self.pending
+    /// Atomically drain the changed parts of the desired native IME state.
+    ///
+    /// The compact WASM-friendly snapshot is `[flags, x, y, width, height, enabled]`.
+    /// Cursor geometry and enabled state have independent presence bits, allowing the host to
+    /// apply geometry before an accompanying enable without racing two mailbox drains.
+    fn take_snapshot(&self) -> Option<[f32; IME_REQUEST_SNAPSHOT_LEN]> {
+        let mut state = self
+            .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .enabled
-            .take()
-    }
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cursor_area_changed = state.desired_cursor_area != state.delivered_cursor_area;
+        let enabled_changed = state.desired_enabled != state.delivered_enabled;
+        if !cursor_area_changed && !enabled_changed {
+            return None;
+        }
 
-    fn take_cursor_area(&self) -> Option<[f32; 4]> {
-        self.pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .cursor_area
-            .take()
+        let mut flags = 0;
+        let mut snapshot = [0.0; IME_REQUEST_SNAPSHOT_LEN];
+        if cursor_area_changed {
+            flags |= IME_REQUEST_CURSOR_AREA;
+            if let Some(area) = state.desired_cursor_area {
+                snapshot[1..5].copy_from_slice(&area);
+            }
+            state.delivered_cursor_area = state.desired_cursor_area;
+        }
+        if enabled_changed {
+            flags |= IME_REQUEST_ENABLED;
+            snapshot[5] = if state.desired_enabled.unwrap_or(false) {
+                1.0
+            } else {
+                0.0
+            };
+            state.delivered_enabled = state.desired_enabled;
+        }
+        snapshot[0] = f32::from(flags);
+        Some(snapshot)
     }
 }
 
@@ -255,31 +288,28 @@ impl QuoxRenderer {
         state.height = height.max(1);
     }
 
-    /// Drain the latest request to enable or disable native IME handling, if Blitz issued one.
-    pub fn take_ime_enabled(&self) -> Option<bool> {
-        self.state.borrow().ime_requests.take_enabled()
-    }
-
-    /// Drain the latest native IME candidate-window area as `[x, y, width, height]` in viewport
-    /// pixels, if Blitz or the focused Parley editor issued one.
-    pub fn take_ime_cursor_area(&self) -> Option<Box<[f32]>> {
+    /// Atomically drain changed native IME requests as
+    /// `[flags, x, y, width, height, enabled]`.
+    pub fn take_ime_requests(&self) -> Option<Box<[f32]>> {
         self.state
             .borrow()
             .ime_requests
-            .take_cursor_area()
+            .take_snapshot()
             .map(Box::<[f32]>::from)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ImeRequestMailbox, focused_ime_cursor_area};
+    use super::{
+        IME_REQUEST_CURSOR_AREA, IME_REQUEST_ENABLED, ImeRequestMailbox, focused_ime_cursor_area,
+    };
     use blitz_dom::{DocumentConfig, Point};
     use blitz_html::HtmlDocument;
     use blitz_traits::shell::{ColorScheme, Viewport};
 
     #[test]
-    fn ime_request_mailbox_keeps_latest_values_and_drains_them() {
+    fn ime_request_mailbox_coalesces_and_atomically_drains_changed_values() {
         let mailbox = ImeRequestMailbox::default();
 
         mailbox.request_enabled(true);
@@ -287,10 +317,37 @@ mod tests {
         mailbox.request_cursor_area([1.0, 2.0, 3.0, 4.0]);
         mailbox.request_cursor_area([5.0, 6.0, 7.0, 8.0]);
 
-        assert_eq!(mailbox.take_enabled(), Some(false));
-        assert_eq!(mailbox.take_enabled(), None);
-        assert_eq!(mailbox.take_cursor_area(), Some([5.0, 6.0, 7.0, 8.0]));
-        assert_eq!(mailbox.take_cursor_area(), None);
+        assert_eq!(
+            mailbox.take_snapshot(),
+            Some([
+                f32::from(IME_REQUEST_CURSOR_AREA | IME_REQUEST_ENABLED),
+                5.0,
+                6.0,
+                7.0,
+                8.0,
+                0.0,
+            ])
+        );
+        assert_eq!(mailbox.take_snapshot(), None);
+
+        // Repeating the delivered values is a no-op even after the previous snapshot drained.
+        mailbox.request_enabled(false);
+        mailbox.request_cursor_area([5.0, 6.0, 7.0, 8.0]);
+        assert_eq!(mailbox.take_snapshot(), None);
+
+        mailbox.request_enabled(true);
+        assert_eq!(
+            mailbox.take_snapshot(),
+            Some([f32::from(IME_REQUEST_ENABLED), 0.0, 0.0, 0.0, 0.0, 1.0])
+        );
+
+        mailbox.request_cursor_area([f32::NAN, 1.0, 2.0, 3.0]);
+        assert_eq!(mailbox.take_snapshot(), None);
+        mailbox.request_cursor_area([5.0, 6.0, -7.0, -8.0]);
+        assert_eq!(
+            mailbox.take_snapshot(),
+            Some([f32::from(IME_REQUEST_CURSOR_AREA), 5.0, 6.0, 0.0, 0.0, 0.0])
+        );
     }
 
     #[test]
