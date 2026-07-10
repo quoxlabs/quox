@@ -331,11 +331,14 @@ class DarwinWindow implements Window, DarwinNativeResponder {
         send.void(trackingArea, sel("release"));
       }
 
+      // A window cannot reliably become key while its application is inactive.
+      // Activate first so AppKit delivers windowDidBecomeKey: synchronously when
+      // the desktop session permits foreground activation.
+      send.void_bool(lib.nsApp, sel("activateIgnoringOtherApps:"), true);
       send.void_bool(win, sel("makeKeyAndOrderFront:"), false);
       if (!send.bool_id(win, sel("makeFirstResponder:"), contentView)) {
         throw new Error("winding(darwin): failed to make content view first responder");
       }
-      send.void_bool(lib.nsApp, sel("activateIgnoringOtherApps:"), true);
       lib.registerWindow(this);
     } catch (error) {
       const errors = [error];
