@@ -15,7 +15,6 @@ import {
   callbackRecord,
   MAX_XIM_TEXT_BYTES,
   packXPoint,
-  packXRectangle,
   pointerFromAddress,
   readXimText,
 } from "./xim_abi.ts";
@@ -42,11 +41,13 @@ const X_LOOKUP_KEYSYM = 3;
 const X_LOOKUP_BOTH = 4;
 
 const XIM_PREEDIT_CALLBACKS = 0x0002n;
+const XIM_PREEDIT_POSITION = 0x0004n;
 const XIM_PREEDIT_NOTHING = 0x0008n;
 const XIM_PREEDIT_NONE = 0x0010n;
 const XIM_STATUS_NOTHING = 0x0400n;
 const XIM_STATUS_NONE = 0x0800n;
 const CALLBACK_STYLE = XIM_PREEDIT_CALLBACKS | XIM_STATUS_NOTHING;
+const POSITION_STYLE = XIM_PREEDIT_POSITION | XIM_STATUS_NOTHING;
 const NOTHING_STYLE = XIM_PREEDIT_NOTHING | XIM_STATUS_NOTHING;
 const NONE_STYLE = XIM_PREEDIT_NONE | XIM_STATUS_NONE;
 
@@ -65,7 +66,6 @@ const XN_PREEDIT_DRAW_CALLBACK = cString("preeditDrawCallback");
 const XN_PREEDIT_CARET_CALLBACK = cString("preeditCaretCallback");
 const XN_PREEDIT_ATTRIBUTES = cString("preeditAttributes");
 const XN_SPOT_LOCATION = cString("spotLocation");
-const XN_AREA = cString("area");
 
 const PREEDIT_START_DEFINITION = {
   parameters: ["pointer", "pointer", "pointer"],
@@ -104,6 +104,7 @@ export interface XimLookupResult {
 interface InputStyles {
   preedit: bigint;
   callbacks: boolean;
+  positioned: boolean;
   none: bigint;
 }
 
@@ -281,7 +282,7 @@ export class XimManager implements Disposable {
       const callbackAttributes = context.createCallbackAttributes();
       if (callbackAttributes === null) return null;
       try {
-        ic = this.#x11.XCreateICPreeditCallbacks(
+        ic = this.#x11.XCreateICWithPreeditAttributes(
           this.#im,
           XN_INPUT_STYLE,
           style,
@@ -295,6 +296,25 @@ export class XimManager implements Disposable {
         );
       } finally {
         this.#x11.XFree(callbackAttributes);
+      }
+    } else if (context.enabled && this.#styles.positioned) {
+      const positionAttributes = this.#createPositionAttributes(context.cursorArea);
+      if (positionAttributes === null) return null;
+      try {
+        ic = this.#x11.XCreateICWithPreeditAttributes(
+          this.#im,
+          XN_INPUT_STYLE,
+          style,
+          XN_CLIENT_WINDOW,
+          context.window,
+          XN_FOCUS_WINDOW,
+          context.window,
+          XN_PREEDIT_ATTRIBUTES,
+          positionAttributes,
+          null,
+        );
+      } finally {
+        this.#x11.XFree(positionAttributes);
       }
     } else {
       ic = this.#x11.XCreateICSimple(
@@ -348,15 +368,30 @@ export class XimManager implements Disposable {
   }
 
   setArea(ic: Deno.PointerObject, area: ImeCursorArea): void {
-    const rectangle = packXRectangle(area.x, area.y, area.width, area.height);
-    const spot = packXPoint(area.x + area.width, area.y + area.height);
-    const attributes = this.#x11.XVaCreateNestedListGeometry(0, XN_SPOT_LOCATION, spot, XN_AREA, rectangle, null);
+    if (!this.#styles?.positioned) return;
+    const attributes = this.#createPositionAttributes(area);
     if (attributes === null) return;
     try {
-      this.#x11.XSetICValuesPreeditAttributes(ic, XN_PREEDIT_ATTRIBUTES, attributes, null);
+      const failedAttribute = this.#x11.XSetICValuesPreeditAttributes(
+        ic,
+        XN_PREEDIT_ATTRIBUTES,
+        attributes,
+        null,
+      );
+      if (failedAttribute !== null) {
+        throw new Error(`winding(x11): failed to set XIM ${pointerString(failedAttribute) ?? "preedit geometry"}`);
+      }
     } finally {
       this.#x11.XFree(attributes);
     }
+  }
+
+  #createPositionAttributes(area: ImeCursorArea | undefined): Deno.PointerObject | null {
+    // XNSpotLocation is an insertion point whose y coordinate is the text
+    // baseline. The public rectangle's lower edge is the closest portable
+    // baseline available without font metrics.
+    const spot = packXPoint(area?.x ?? 0, (area?.y ?? 0) + (area?.height ?? 0));
+    return this.#x11.XVaCreateNestedListSpot(0, XN_SPOT_LOCATION, spot, null);
   }
 
   writeCaretPosition(pointer: Deno.PointerObject, position: number): void {
@@ -467,15 +502,20 @@ export class XimManager implements Disposable {
       for (let index = 0; index < count; index++) values.add(valuesView.getBigUint64(index * 8));
 
       const canUseCallbacks = this.localeIsUtf8 && values.has(CALLBACK_STYLE);
+      const canUsePosition = values.has(POSITION_STYLE);
       const preedit = canUseCallbacks
         ? CALLBACK_STYLE
+        : canUsePosition
+        ? POSITION_STYLE
         : values.has(NOTHING_STYLE)
         ? NOTHING_STYLE
         : values.has(NONE_STYLE)
         ? NONE_STYLE
         : undefined;
       const none = values.has(NONE_STYLE) ? NONE_STYLE : values.has(NOTHING_STYLE) ? NOTHING_STYLE : preedit;
-      return preedit === undefined || none === undefined ? undefined : { preedit, callbacks: canUseCallbacks, none };
+      return preedit === undefined || none === undefined
+        ? undefined
+        : { preedit, callbacks: canUseCallbacks, positioned: !canUseCallbacks && canUsePosition, none };
     } finally {
       this.#x11.XFree(stylesPointer);
     }
@@ -530,6 +570,10 @@ export class XimContext implements Disposable {
 
   get composing(): boolean {
     return this.#composition.active;
+  }
+
+  get cursorArea(): ImeCursorArea | undefined {
+    return this.#cursorArea;
   }
 
   get hasStagedEvents(): boolean {
