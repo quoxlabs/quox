@@ -44,10 +44,6 @@ export interface WindowOptions {
 }
 
 const DEFAULT_WINDOW_TITLE = "quox";
-// Temporary augmentation until the checked-in WASM declarations can be regenerated.
-type RendererImeRequests = {
-  take_ime_requests(): Float32Array | undefined;
-};
 
 /** Anything that isn't itself renderable content (a string, array, or vnode) is an options bag. */
 function isWindowOptions(value: QuoxWindowContent | WindowOptions | undefined): value is WindowOptions {
@@ -203,7 +199,7 @@ export class QuoxWindow implements Disposable {
   #syncNativeImeRequests(): void {
     if (this.#disposed || this.#rendererFreed) return;
 
-    const snapshot = (this.#renderer as WasmRenderer & RendererImeRequests).take_ime_requests();
+    const snapshot = this.#renderer.take_ime_requests();
     if (snapshot !== undefined) applyImeRequestSnapshot(this.#win, snapshot);
   }
 
