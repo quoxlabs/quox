@@ -76,6 +76,8 @@ export const NotifyNormal = 0;
 // XIM requires the process C locale to be initialised before XOpenIM. Kept in
 // this module because it is only used by the X11 backend.
 export const libcFunctions = {
+  free: { parameters: ["pointer"], result: "void" },
+  malloc: { parameters: ["usize"], result: "pointer" },
   memcpy: { parameters: ["pointer", "buffer", "usize"], result: "pointer" },
   setlocale: { parameters: ["i32", "buffer"], result: "pointer" },
 } as const satisfies Deno.ForeignLibraryInterface;
@@ -207,6 +209,7 @@ export const x11functions = {
   XDeleteModifiermapEntry: { parameters: ["pointer", "u32", "i32"], result: "pointer" },
   XDeleteProperty: { parameters: ["pointer", "usize", "usize"], result: "i32" },
   XDestroyIC: { parameters: ["pointer"], result: "void" },
+  XDestroyImage: { parameters: ["pointer"], result: "i32" },
   XDestroyOC: { parameters: ["pointer"], result: "void" },
   XDestroySubwindows: { parameters: ["pointer", "usize"], result: "i32" },
   XDestroyWindow: { parameters: ["pointer", "usize"], result: "i32" },
@@ -380,6 +383,7 @@ export const x11functions = {
   XKeycodeToKeysym: { parameters: ["pointer", "u32", "i32"], result: "usize" },
   XKeysymToKeycode: { parameters: ["pointer", "usize"], result: "u32" },
   XKeysymToString: { parameters: ["usize"], result: "pointer" },
+  XkbKeysymToModifiers: { parameters: ["pointer", "usize"], result: "u32" },
   XKillClient: { parameters: ["pointer", "usize"], result: "i32" },
   XListDepths: { parameters: ["pointer", "i32", "pointer"], result: "pointer" },
   XListExtensions: { parameters: ["pointer", "pointer"], result: "pointer" },
@@ -397,6 +401,10 @@ export const x11functions = {
   XLockDisplay: { parameters: ["pointer"], result: "void" },
   XLookupColor: { parameters: ["pointer", "usize", "buffer", "buffer", "buffer"], result: "i32" },
   XLookupKeysym: { parameters: ["pointer", "i32"], result: "usize" },
+  XLookupString: {
+    parameters: ["pointer", "buffer", "i32", "buffer", "pointer"],
+    result: "i32",
+  },
   XLowerWindow: { parameters: ["pointer", "usize"], result: "i32" },
   XMapRaised: { parameters: ["pointer", "usize"], result: "i32" },
   XMapSubwindows: { parameters: ["pointer", "usize"], result: "i32" },

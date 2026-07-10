@@ -1,21 +1,23 @@
-import { applyPreeditChange, keysymToDomKey, normalizeCommittedText, utf8ByteOffset } from "./keysym.ts";
+import { normalizeCommittedText } from "../input/mod.ts";
+import { logicalKeyFromKeysym } from "../linux/mod.ts";
 import { XEventType } from "./ffi.ts";
-import { isAutoRepeatPair } from "./input.ts";
+import { fallbackLookupText, isAutoRepeatPair, x11KeyEditDisposition } from "./input.ts";
+import { applyPreeditChange, preeditCursorByteOffset } from "./xim_preedit.ts";
 
 Deno.test("X11 logical keys prefer layout-aware printable text", () => {
-  assertEquals(keysymToDomKey("z", "z"), "z");
-  assertEquals(keysymToDomKey("adiaeresis", "ä"), "ä");
-  assertEquals(keysymToDomKey("EuroSign", "€"), "€");
+  assertEquals(logicalKeyFromKeysym(0x7a, "z"), "z");
+  assertEquals(logicalKeyFromKeysym(0x010000e4, "ä"), "ä");
+  assertEquals(logicalKeyFromKeysym(0x010020ac, "€"), "€");
 });
 
 Deno.test("X11 logical keys use KeySym names for controls and named keys", () => {
-  assertEquals(keysymToDomKey("c", "\u0003"), "c");
-  assertEquals(keysymToDomKey("Return", "\r"), "Enter");
-  assertEquals(keysymToDomKey("KP_Left", ""), "ArrowLeft");
-  assertEquals(keysymToDomKey("ISO_Level3_Shift", ""), "AltGraph");
-  assertEquals(keysymToDomKey("dead_acute", ""), "Dead");
-  assertEquals(keysymToDomKey("F24", ""), "F24");
-  assertEquals(keysymToDomKey("XF86AudioMute", ""), "AudioVolumeMute");
+  assertEquals(logicalKeyFromKeysym(0x63, "\u0003"), "c");
+  assertEquals(logicalKeyFromKeysym(0xff0d, "\r"), "Enter");
+  assertEquals(logicalKeyFromKeysym(0xff96), "ArrowLeft");
+  assertEquals(logicalKeyFromKeysym(0xfe03), "AltGraph");
+  assertEquals(logicalKeyFromKeysym(0xfe51), "Dead");
+  assertEquals(logicalKeyFromKeysym(0xffd5), "F24");
+  assertEquals(logicalKeyFromKeysym(0x1008ff12), "AudioVolumeMute");
 });
 
 Deno.test("X11 committed text rejects shortcut control bytes", () => {
@@ -24,6 +26,21 @@ Deno.test("X11 committed text rejects shortcut control bytes", () => {
   assertEquals(normalizeCommittedText("line\nfeed"), undefined);
   assertEquals(normalizeCommittedText("ß"), "ß");
   assertEquals(normalizeCommittedText("👩‍💻"), "👩‍💻");
+});
+
+Deno.test("X11 fallback lookup keeps controls out while retaining layout text", () => {
+  assertEquals(fallbackLookupText(new Uint8Array([3]), "c"), undefined);
+  assertEquals(fallbackLookupText(new TextEncoder().encode("€"), "e"), "€");
+  assertEquals(fallbackLookupText(new Uint8Array([0xe4]), "ä"), "ä");
+  assertEquals(fallbackLookupText(new Uint8Array(), "ß"), "ß");
+});
+
+Deno.test("X11 edit ownership includes dead keys and XIM semantic output", () => {
+  assertEquals(x11KeyEditDisposition("c", false, false, false, false), "key-default");
+  assertEquals(x11KeyEditDisposition("Dead", false, false, false, false), "text-input");
+  assertEquals(x11KeyEditDisposition("a", true, false, false, false), "text-input");
+  assertEquals(x11KeyEditDisposition("Unidentified", false, true, false, false), "text-input");
+  assertEquals(x11KeyEditDisposition("Unidentified", false, false, false, true), "text-input");
 });
 
 Deno.test("XIM preedit draw applies scalar-indexed replacements", () => {
@@ -37,10 +54,10 @@ Deno.test("XIM preedit draw applies scalar-indexed replacements", () => {
 
 Deno.test("XIM cursor scalar indices convert to UTF-8 byte offsets", () => {
   const text = [..."aé文"];
-  assertEquals(utf8ByteOffset(text, 0), 0);
-  assertEquals(utf8ByteOffset(text, 1), 1);
-  assertEquals(utf8ByteOffset(text, 2), 3);
-  assertEquals(utf8ByteOffset(text, 3), 6);
+  assertEquals(preeditCursorByteOffset(text, 0), 0);
+  assertEquals(preeditCursorByteOffset(text, 1), 1);
+  assertEquals(preeditCursorByteOffset(text, 2), 3);
+  assertEquals(preeditCursorByteOffset(text, 3), 6);
 });
 
 Deno.test("X11 repeat detection requires an identical adjacent press", () => {
