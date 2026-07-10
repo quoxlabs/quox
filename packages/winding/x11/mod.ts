@@ -1,7 +1,10 @@
-import type { KeyModifiers, Library, LoadLibrary, UIEvent, Window } from "../types.ts";
+import type { KeyEvent, KeyModifiers, Library, LoadLibrary, UIEvent, Window } from "../types.ts";
 import { utf8Bytes, utf8CString as cString } from "../text_encoding.ts";
 import { getDomCode } from "./dom_code.ts";
 import { NotifyNormal, x11functions, XEventMask, XEventType } from "./ffi.ts";
+import { isAutoRepeatPair } from "./input.ts";
+import { normalizeCommittedText } from "./keysym.ts";
+import { XimContext, XimManager } from "./xim.ts";
 
 // XStoreName sets the legacy WM_NAME property, which is read as Latin-1 by clients that don't
 // understand the EWMH _NET_WM_NAME/UTF8_STRING property set below. Encoding it as UTF-8 there
@@ -21,7 +24,9 @@ function latin1CString(s: string): Uint8Array<ArrayBuffer> {
 //   - ResizeRedirectMask (bit 18): blocks the WM from resizing the window, causing
 //     the drawable to stay at its initial size while synthetic ConfigureNotify
 //     events report the intended (larger) dimensions.
-const ALL_X_EV_MASKS = 0x1ffffff & ~(XEventMask.PointerMotionHintMask | XEventMask.ResizeRedirectMask);
+const ALL_X_EV_MASKS = BigInt(
+  0x1ffffff & ~(XEventMask.PointerMotionHintMask | XEventMask.ResizeRedirectMask),
+);
 const X_SHIFT_MASK = 1 << 0;
 const X_LOCK_MASK = 1 << 1;
 const X_CONTROL_MASK = 1 << 2;
@@ -42,6 +47,8 @@ function getModifiers(state: number): KeyModifiers {
 
 class X11Window implements Window {
   readonly id: bigint;
+  readonly input: XimContext;
+  readonly pressedKeys = new Map<number, string | undefined>();
   readonly #gc: bigint;
   #image: Deno.PointerValue;
   // imageBuf is kept as a field so XCreateImage's internal pointer remains
@@ -49,6 +56,7 @@ class X11Window implements Window {
   #imageBuf: Uint8Array;
   #width: number;
   #height: number;
+  #closed = false;
 
   constructor(readonly lib: X11Library, x = 0, y = 0, w = 800, h = 600) {
     const view = new Deno.UnsafePointerView(lib.screen);
@@ -75,7 +83,7 @@ class X11Window implements Window {
     const attrs = new BigUint64Array([0n]); // None pixmap
     lib.X11.symbols.XChangeWindowAttributes(lib.display, window, CW_BACK_PIXMAP, attrs);
 
-    lib.X11.symbols.XSelectInput(lib.display, window, BigInt(ALL_X_EV_MASKS));
+    lib.X11.symbols.XSelectInput(lib.display, window, ALL_X_EV_MASKS);
 
     // Ask the window manager to send WM_DELETE_WINDOW via ClientMessage instead
     // of forcibly killing the process when the user closes the window.
@@ -109,6 +117,15 @@ class X11Window implements Window {
     this.#image = image;
 
     lib.windows.set(this.id, this);
+    this.input = lib.input.createContext(this.id);
+  }
+
+  setImeEnabled(enabled: boolean): void {
+    this.input.setEnabled(enabled);
+  }
+
+  setImeCursorArea(x: number, y: number, width: number, height: number): void {
+    this.input.setCursorArea(x, y, width, height);
   }
 
   setTitle(title: string): void {
@@ -197,6 +214,10 @@ class X11Window implements Window {
     this.close();
   }
   close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.input.close();
+    this.pressedKeys.clear();
     this.lib.windows.delete(this.id);
   }
 }
@@ -210,6 +231,9 @@ class X11Library implements Library {
   readonly wmDeleteWindow: bigint;
   readonly netWmName: bigint;
   readonly utf8String: bigint;
+  readonly input: XimManager;
+  readonly #events: UIEvent[] = [];
+  #closed = false;
   constructor() {
     this.X11 = Deno.dlopen("libX11.so", x11functions);
     const display = this.X11.symbols.XOpenDisplay(null);
@@ -224,13 +248,29 @@ class X11Library implements Library {
     );
     this.netWmName = BigInt(this.X11.symbols.XInternAtom(display, cString("_NET_WM_NAME"), 0));
     this.utf8String = BigInt(this.X11.symbols.XInternAtom(display, cString("UTF8_STRING"), 0));
+    this.input = new XimManager(
+      this.X11,
+      display,
+      (windowId, event) => {
+        this.#events.push({ ...event, window: this.windows.get(windowId) });
+      },
+      (windowId, extraMask) => {
+        this.X11.symbols.XSelectInput(this.display, windowId, ALL_X_EV_MASKS | extraMask);
+      },
+    );
   }
   openWindow(x = 0, y = 0, w = 800, h = 600): X11Window {
     return new X11Window(this, x, y, w, h);
   }
   #event = new ArrayBuffer(192);
+  #peekEvent = new ArrayBuffer(192);
   event(): UIEvent | undefined {
+    this.input.processDeferred();
+    const queued = this.#events.shift();
+    if (queued !== undefined) return queued;
+
     const view = new DataView(this.#event);
+    const eventPointer = Deno.UnsafePointer.of(this.#event)!;
     // Keep consuming X11 events until we find one we handle or the queue is empty.
     // Returning undefined for unhandled types and immediately surfacing it to the
     // caller would stop the outer while-loop in #tick, causing subsequent handled
@@ -239,20 +279,100 @@ class X11Library implements Library {
     while (this.X11.symbols.XPending(this.display) !== 0) {
       this.X11.symbols.XNextEvent(
         this.display,
-        Deno.UnsafePointer.of(this.#event),
+        eventPointer,
       );
+
+      const type = view.getInt32(0, true);
+      const windowId = view.getBigUint64(32, true);
+      const window = this.windows.get(windowId);
+
+      if (type === XEventType.MappingNotify) {
+        this.X11.symbols.XRefreshKeyboardMapping(eventPointer);
+        continue;
+      }
+
+      if ((type === XEventType.KeyPress || type === XEventType.KeyRelease) && window !== undefined) {
+        if (this.input.filterEvent(eventPointer, window.input)) {
+          const imeEvent = this.#events.shift();
+          if (imeEvent !== undefined) return imeEvent;
+          continue;
+        }
+
+        const state = view.getUint32(80, true);
+        const keycode = view.getUint32(84, true);
+        if (type === XEventType.KeyRelease) {
+          if (this.#isAutoRepeatRelease(view)) continue;
+          const key = window.pressedKeys.get(keycode);
+          window.pressedKeys.delete(keycode);
+          const event: KeyEvent = {
+            type: "keyup",
+            keycode,
+            code: getDomCode(keycode),
+            ...getModifiers(state),
+            window,
+          };
+          if (key !== undefined) event.key = key;
+          return event;
+        }
+
+        const wasComposing = window.input.composing;
+        const lookup = this.input.lookup(window.input, eventPointer);
+        if (wasComposing || window.input.composing) {
+          if (lookup.text !== undefined) window.input.commit(lookup.text);
+          const imeEvent = this.#events.shift();
+          if (imeEvent !== undefined) return imeEvent;
+          continue;
+        }
+
+        const repeat = window.pressedKeys.has(keycode);
+        window.pressedKeys.set(keycode, lookup.key);
+        const event: KeyEvent = {
+          type: "keydown",
+          keycode,
+          code: getDomCode(keycode),
+          repeat,
+          ...getModifiers(state),
+          window,
+        };
+        if (lookup.key !== undefined) event.key = lookup.key;
+        const text = normalizeCommittedText(lookup.text ?? "");
+        if (text !== undefined) event.text = text;
+
+        // Xutf8LookupString may synchronously invoke preedit callbacks. Preserve
+        // callback-before-key ordering without losing the physical key event.
+        if (this.#events.length > 0) {
+          this.#events.push(event);
+          return this.#events.shift();
+        }
+        return event;
+      }
+
+      if (type === XEventType.FocusIn && window !== undefined && view.getInt32(40, true) === NotifyNormal) {
+        window.input.setNativeFocused(true);
+        return { type: "focus", window };
+      }
+      if (type === XEventType.FocusOut && window !== undefined && view.getInt32(40, true) === NotifyNormal) {
+        window.input.setNativeFocused(false);
+        window.pressedKeys.clear();
+        const imeEvent = this.#events.shift();
+        if (imeEvent !== undefined) {
+          this.#events.push({ type: "blur", window });
+          return imeEvent;
+        }
+        return { type: "blur", window };
+      }
 
       // Expose is a pure repaint request (e.g. the window was uncovered) — the pixels
       // haven't changed, so self-heal by re-blitting the last frame directly rather than
       // surfacing a UIEvent for it.
-      if (view.getInt32(0, true) === XEventType.Expose) {
-        this.windows.get(view.getBigUint64(32, true))?.reblit();
+      if (type === XEventType.Expose) {
+        window?.reblit();
         continue;
       }
 
       const event = importEvent(view, this.wmProtocols, this.wmDeleteWindow);
       if (event !== undefined) {
-        return { ...event, window: this.windows.get(view.getBigUint64(32, true)) };
+        return { ...event, window };
       }
     }
     return undefined;
@@ -261,7 +381,20 @@ class X11Library implements Library {
     this.close();
   }
   close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    for (const window of [...this.windows.values()]) window.close();
+    this.input.close();
+    this.X11.symbols.XCloseDisplay(this.display);
     this.X11.close();
+  }
+
+  #isAutoRepeatRelease(release: DataView<ArrayBuffer>): boolean {
+    if (this.X11.symbols.XPending(this.display) === 0) return false;
+    const peekPointer = Deno.UnsafePointer.of(this.#peekEvent)!;
+    this.X11.symbols.XPeekEvent(this.display, peekPointer);
+    const press = new DataView(this.#peekEvent);
+    return isAutoRepeatPair(release, press);
   }
 }
 
@@ -273,16 +406,6 @@ function importEvent(
 ): UIEvent | undefined {
   const type = view.getInt32(0, true);
   switch (type) {
-    case XEventType.KeyPress: {
-      const state = view.getUint32(80, true);
-      const keycode = view.getInt32(84, true);
-      return { type: "keydown", keycode, code: getDomCode(keycode), ...getModifiers(state) };
-    }
-    case XEventType.KeyRelease: {
-      const state = view.getUint32(80, true);
-      const keycode = view.getInt32(84, true);
-      return { type: "keyup", keycode, code: getDomCode(keycode), ...getModifiers(state) };
-    }
     case XEventType.ButtonPress: {
       const btn = view.getInt32(84, true);
       if (btn === 4) return { type: "wheel", deltaX: 0, deltaY: -1 };
@@ -326,12 +449,6 @@ function importEvent(
     case XEventType.LeaveNotify:
       // XCrossingEvent: mode at offset 80. Only NotifyNormal is a real pointer-leave.
       return view.getInt32(80, true) === NotifyNormal ? { type: "mouseleave" } : undefined;
-    case XEventType.FocusIn:
-      // XFocusChangeEvent: mode at offset 40. Only NotifyNormal is a real focus gain.
-      return view.getInt32(40, true) === NotifyNormal ? { type: "focus" } : undefined;
-    case XEventType.FocusOut:
-      // XFocusChangeEvent: mode at offset 40. Only NotifyNormal is a real focus loss.
-      return view.getInt32(40, true) === NotifyNormal ? { type: "blur" } : undefined;
     case XEventType.UnmapNotify:
       return { type: "visibilitychange", visible: false };
     case XEventType.MapNotify:
