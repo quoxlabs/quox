@@ -8,7 +8,12 @@ import {
   x11CommittedText,
   x11KeyEditDisposition,
 } from "./input.ts";
-import { applyPreeditChange, preeditCursorByteOffset } from "./xim_preedit.ts";
+import {
+  applyPreeditChange,
+  movePreeditCaret,
+  preeditCursorByteOffset,
+  XimCaretDirection,
+} from "./xim_preedit.ts";
 import { packRgbaPixels } from "./native_image.ts";
 
 Deno.test("X11 logical keys prefer layout-aware printable text", () => {
@@ -82,6 +87,17 @@ Deno.test("XIM cursor scalar indices convert to UTF-8 byte offsets", () => {
   assertEquals(preeditCursorByteOffset(text, 1), 1);
   assertEquals(preeditCursorByteOffset(text, 2), 3);
   assertEquals(preeditCursorByteOffset(text, 3), 6);
+});
+
+Deno.test("XIM caret directions update the one-line preedit synchronously", () => {
+  const text = [..."one two"];
+  assertEquals(movePreeditCaret(text, 0, XimCaretDirection.ForwardChar, 0), 1);
+  assertEquals(movePreeditCaret(text, 1, XimCaretDirection.BackwardChar, 0), 0);
+  assertEquals(movePreeditCaret(text, 0, XimCaretDirection.ForwardWord, 0), 4);
+  assertEquals(movePreeditCaret(text, 7, XimCaretDirection.BackwardWord, 0), 4);
+  assertEquals(movePreeditCaret(text, 4, XimCaretDirection.LineStart, 0), 0);
+  assertEquals(movePreeditCaret(text, 4, XimCaretDirection.LineEnd, 0), 7);
+  assertEquals(movePreeditCaret(text, 0, XimCaretDirection.AbsolutePosition, 99), 7);
 });
 
 Deno.test("X11 repeat detection requires an identical adjacent press", () => {

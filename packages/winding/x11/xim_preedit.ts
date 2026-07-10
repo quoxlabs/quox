@@ -1,5 +1,20 @@
 import { scalarIndexToUtf8Offset } from "../input/mod.ts";
 
+export const enum XimCaretDirection {
+  ForwardChar = 0,
+  BackwardChar = 1,
+  ForwardWord = 2,
+  BackwardWord = 3,
+  Up = 4,
+  Down = 5,
+  NextLine = 6,
+  PreviousLine = 7,
+  LineStart = 8,
+  LineEnd = 9,
+  AbsolutePosition = 10,
+  DontChange = 11,
+}
+
 /** Convert an XIM Unicode-scalar cursor index to a UTF-8 byte offset. */
 export function preeditCursorByteOffset(
   characters: readonly string[],
@@ -22,4 +37,46 @@ export function applyPreeditChange(
   ) return false;
   characters.splice(first, length, ...replacement);
   return true;
+}
+
+/** Apply XIM's synchronous caret request to the backend's one-line preedit model. */
+export function movePreeditCaret(
+  characters: readonly string[],
+  current: number,
+  direction: number,
+  absolute: number,
+): number {
+  const length = characters.length;
+  const position = Math.max(0, Math.min(length, current));
+  switch (direction) {
+    case XimCaretDirection.ForwardChar:
+      return Math.min(length, position + 1);
+    case XimCaretDirection.BackwardChar:
+      return Math.max(0, position - 1);
+    case XimCaretDirection.ForwardWord: {
+      let next = position;
+      while (next < length && !/^\s$/u.test(characters[next])) next++;
+      while (next < length && /^\s$/u.test(characters[next])) next++;
+      return next;
+    }
+    case XimCaretDirection.BackwardWord: {
+      let previous = position;
+      while (previous > 0 && /^\s$/u.test(characters[previous - 1])) previous--;
+      while (previous > 0 && !/^\s$/u.test(characters[previous - 1])) previous--;
+      return previous;
+    }
+    case XimCaretDirection.Up:
+    case XimCaretDirection.PreviousLine:
+    case XimCaretDirection.LineStart:
+      return 0;
+    case XimCaretDirection.Down:
+    case XimCaretDirection.NextLine:
+    case XimCaretDirection.LineEnd:
+      return length;
+    case XimCaretDirection.AbsolutePosition:
+      return Math.max(0, Math.min(length, absolute));
+    case XimCaretDirection.DontChange:
+    default:
+      return position;
+  }
 }

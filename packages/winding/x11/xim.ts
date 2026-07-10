@@ -18,7 +18,11 @@ import {
   pointerFromAddress,
   readXimText,
 } from "./xim_abi.ts";
-import { applyPreeditChange, preeditCursorByteOffset } from "./xim_preedit.ts";
+import {
+  applyPreeditChange,
+  movePreeditCaret,
+  preeditCursorByteOffset,
+} from "./xim_preedit.ts";
 import { fallbackLookupText } from "./input.ts";
 
 type X11Library = Deno.DynamicLibrary<typeof x11functions>;
@@ -51,7 +55,6 @@ const POSITION_STYLE = XIM_PREEDIT_POSITION | XIM_STATUS_NOTHING;
 const NOTHING_STYLE = XIM_PREEDIT_NOTHING | XIM_STATUS_NOTHING;
 const NONE_STYLE = XIM_PREEDIT_NONE | XIM_STATUS_NONE;
 
-const XIM_ABSOLUTE_POSITION = 10;
 const XIM_CARET_INVISIBLE = 0;
 
 const XN_QUERY_INPUT_STYLE = cString("queryInputStyle");
@@ -686,10 +689,8 @@ export class XimContext implements Disposable {
           const view = new Deno.UnsafePointerView(callData);
           const direction = view.getInt32(4);
           this.#cursorVisible = view.getInt32(8) !== XIM_CARET_INVISIBLE;
-          if (direction === XIM_ABSOLUTE_POSITION) {
-            this.#cursor = Math.max(0, Math.min(this.#preedit.length, view.getInt32(0)));
-            this.manager.writeCaretPosition(callData, this.#cursor);
-          }
+          this.#cursor = movePreeditCaret(this.#preedit, this.#cursor, direction, view.getInt32(0));
+          this.manager.writeCaretPosition(callData, this.#cursor);
           this.#emitPreedit();
         },
         (_ic, _clientData, _callData) => this.#resetAfterCallbackFailure(),
