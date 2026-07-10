@@ -25,6 +25,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: packages/quox
+      - run: deno ci
 
       - run: cargo fmt --check
         working-directory: packages/quox

@@ -20,5 +20,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: packages/quox
+      - run: deno ci
       - run: deno task build:prod
       - run: deno publish
