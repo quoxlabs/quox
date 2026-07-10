@@ -150,6 +150,9 @@ export class NativeXImage implements Disposable {
     let pixels: Uint8Array;
     try {
       pixels = new Uint8Array(new Deno.UnsafePointerView(data).getArrayBuffer(byteLength));
+      // Expose can arrive before the application submits its first frame.
+      // Never let recycled process heap contents become window pixels.
+      pixels.fill(0);
       // XCreateImage initializes its format before storage is supplied. Once
       // attached, XDestroyImage owns and frees this allocation.
       const dataAddress = new BigUint64Array([Deno.UnsafePointer.value(data)]);
