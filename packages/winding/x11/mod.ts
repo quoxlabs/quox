@@ -74,7 +74,6 @@ class X11Window implements Window {
   readonly id: bigint;
   readonly input: XimContext;
   readonly pressedKeys = new PressedLogicalKeyCache<number>();
-  readonly filteredKeys = new Set<number>();
   readonly #gc: bigint;
   #image: NativeXImage;
   #width: number;
@@ -259,7 +258,6 @@ class X11Window implements Window {
     };
     cleanup(() => this.input.close());
     this.pressedKeys.clear();
-    this.filteredKeys.clear();
     cleanup(() => this.#image.close());
     cleanup(() => {
       this.lib.X11.symbols.XFreeGC(this.lib.display, this.#gc);
@@ -430,36 +428,54 @@ class X11Library implements Library {
       }
 
       if ((type === XEventType.KeyPress || type === XEventType.KeyRelease) && window !== undefined) {
+        const state = view.getUint32(80, true);
+        const keycode = view.getUint32(84, true);
+        const code = domCodeFromX11(keycode);
+        const modifiers = getModifiers(state, this.#altGraphMask);
+        const wasComposing = window.input.composing;
         let lookupStaged = type === XEventType.KeyPress;
         if (lookupStaged) window.input.beginLookup();
         try {
           const filtered = this.input.filterEvent(eventPointer);
           this.input.throwIfCallbackFailed();
           if (filtered) {
-            const keycode = view.getUint32(84, true);
-            if (type === XEventType.KeyPress) window.filteredKeys.add(keycode);
-            else {
-              window.filteredKeys.delete(keycode);
-              window.pressedKeys.release(keycode);
+            let keyEvent: KeyDownEvent | KeyUpEvent;
+            if (type === XEventType.KeyPress) {
+              const repeat = window.pressedKeys.has(keycode);
+              const key = window.pressedKeys.press(keycode, "Process");
+              keyEvent = createKeyDownEvent({
+                keycode,
+                code,
+                key,
+                location: keyLocationForCode(code),
+                repeat,
+                isComposing: wasComposing,
+                editDisposition: "text-input",
+                ...modifiers,
+                window,
+              });
+            } else {
+              keyEvent = createKeyUpEvent({
+                keycode,
+                code,
+                key: window.pressedKeys.release(keycode),
+                location: keyLocationForCode(code),
+                isComposing: wasComposing,
+                ...modifiers,
+                window,
+              });
             }
             if (lookupStaged) {
               window.input.finishLookup();
               lookupStaged = false;
             }
-            const imeEvent = this.#events.shift();
-            if (imeEvent !== undefined) return imeEvent;
-            continue;
+            // Xlib owns native dispatch for a filtered event, but the browser-
+            // style wrapper still exposes the physical transition first.
+            this.#events.prepend(keyEvent);
+            return this.#events.shift();
           }
 
-          const state = view.getUint32(80, true);
-          const keycode = view.getUint32(84, true);
-          const code = domCodeFromX11(keycode);
-          const modifiers = getModifiers(state, this.#altGraphMask);
           if (type === XEventType.KeyRelease) {
-            if (window.filteredKeys.delete(keycode)) {
-              window.pressedKeys.release(keycode);
-              continue;
-            }
             if (this.#isAutoRepeatRelease(view)) continue;
             const key = window.pressedKeys.release(keycode);
             const event: KeyUpEvent = createKeyUpEvent({
@@ -474,7 +490,6 @@ class X11Library implements Library {
             return event;
           }
 
-          const wasComposing = window.input.composing;
           const lookup = this.input.lookup(window.input, eventPointer);
           this.input.throwIfCallbackFailed();
           const repeat = window.pressedKeys.has(keycode);
@@ -522,7 +537,6 @@ class X11Library implements Library {
       if (type === XEventType.FocusOut && window !== undefined && view.getInt32(40, true) === NotifyNormal) {
         window.input.setNativeFocused(false);
         window.pressedKeys.clear();
-        window.filteredKeys.clear();
         const imeEvent = this.#events.shift();
         if (imeEvent !== undefined) {
           this.#events.push({ type: "blur", window });
