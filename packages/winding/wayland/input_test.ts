@@ -2,17 +2,16 @@ import {
   type ComposeAdapter,
   ComposeFeedResult,
   ComposeStatus,
-  keyLocationForCode,
   KeyRepeatController,
-  logicalKeyFromKeysym,
-  normalizeCursorRectangle,
   resolveComposeLocale,
-  TextInputV3Batch,
   toXkbKeycode,
   translateKey,
-  validatePreeditCursorRange,
+  waylandKeyEditDisposition,
   type XkbKeyTranslator,
-} from "./input.ts";
+} from "./keyboard.ts";
+import { TextInputV3Batch } from "./text_input.ts";
+import { keyLocationForCode, normalizeImeCursorArea, validateImeCursorRange } from "../input/mod.ts";
+import { logicalKeyFromKeysym } from "../linux/mod.ts";
 
 Deno.test("Compose locale resolution follows the locale precedence and ignores empty values", () => {
   const environment = new Map([
@@ -151,6 +150,38 @@ Deno.test("xkb control strings stay named keys and are not committed as text", (
   }
 });
 
+Deno.test("Wayland edit ownership leaves delivered shortcuts to key defaults", () => {
+  const plain = {
+    shiftKey: false,
+    ctrlKey: false,
+    altKey: false,
+    metaKey: false,
+    accelKey: false,
+    capsLock: false,
+    altGraphKey: false,
+  };
+  assertEquals(waylandKeyEditDisposition("a", "a", false, plain), "text-input");
+  assertEquals(waylandKeyEditDisposition("ArrowLeft", undefined, false, plain), "key-default");
+  assertEquals(
+    waylandKeyEditDisposition("a", "a", false, { ...plain, altKey: true }),
+    "key-default",
+  );
+  assertEquals(
+    waylandKeyEditDisposition("c", undefined, false, { ...plain, ctrlKey: true, accelKey: true }),
+    "key-default",
+  );
+  assertEquals(
+    waylandKeyEditDisposition("@", "@", false, {
+      ...plain,
+      ctrlKey: true,
+      altKey: true,
+      altGraphKey: true,
+    }),
+    "text-input",
+  );
+  assertEquals(waylandKeyEditDisposition("Dead", undefined, false, plain), "text-input");
+});
+
 Deno.test("logical keysym mapping covers printable, named, dead, function, and keypad keys", () => {
   assertEquals(logicalKeyFromKeysym(0x010020ac, "€"), "€");
   assertEquals(logicalKeyFromKeysym(0x0101f642), "🙂");
@@ -164,36 +195,36 @@ Deno.test("logical keysym mapping covers printable, named, dead, function, and k
 });
 
 Deno.test("preedit cursor ranges use UTF-8 byte boundaries", () => {
-  assertEquals(validatePreeditCursorRange("plain", 1, 4), [1, 4]);
-  assertEquals(validatePreeditCursorRange("é日", 2, 5), [2, 5]);
-  assertEquals(validatePreeditCursorRange("é日", 1, 5), undefined);
-  assertEquals(validatePreeditCursorRange("é日", 2, 4), undefined);
-  assertEquals(validatePreeditCursorRange("é日", 5, 6), undefined);
-  assertEquals(validatePreeditCursorRange("text", -1, -1), undefined);
-  assertEquals(validatePreeditCursorRange("text", 3, 2), undefined);
-  assertEquals(validatePreeditCursorRange("", 0, 0), [0, 0]);
+  assertEquals(validateImeCursorRange("plain", 1, 4), [1, 4]);
+  assertEquals(validateImeCursorRange("é日", 2, 5), [2, 5]);
+  assertEquals(validateImeCursorRange("é日", 1, 5), null);
+  assertEquals(validateImeCursorRange("é日", 2, 4), null);
+  assertEquals(validateImeCursorRange("é日", 5, 6), null);
+  assertEquals(validateImeCursorRange("text", -1, -1), null);
+  assertEquals(validateImeCursorRange("text", 3, 2), null);
+  assertEquals(validateImeCursorRange("", 0, 0), [0, 0]);
 });
 
 Deno.test("cursor rectangles are outward-rounded and clamped to Wayland ints", () => {
-  assertEquals(normalizeCursorRectangle(10.25, 20.75, 3.1, 4.1), {
+  assertEquals(normalizeImeCursorArea(10.25, 20.75, 3.1, 4.1), {
     x: 10,
     y: 20,
     width: 4,
     height: 5,
   });
-  assertEquals(normalizeCursorRectangle(10.25, 20.75, -3, 0), {
+  assertEquals(normalizeImeCursorArea(10.25, 20.75, -3, 0), {
     x: 10,
     y: 20,
     width: 0,
     height: 0,
   });
-  assertEquals(normalizeCursorRectangle(-1e20, -1e20, 2e20, 2e20), {
+  assertEquals(normalizeImeCursorArea(-1e20, -1e20, 2e20, 2e20), {
     x: -0x80000000,
     y: -0x80000000,
     width: 0x7fffffff,
     height: 0x7fffffff,
   });
-  assertEquals(normalizeCursorRectangle(Number.NaN, 0, 1, 1), undefined);
+  assertEquals(normalizeImeCursorArea(Number.NaN, 0, 1, 1), undefined);
 });
 
 Deno.test("text-input done flushes edits in protocol order and reports serial matches", () => {
@@ -215,8 +246,7 @@ Deno.test("text-input done flushes edits in protocol order and reports serial ma
     serial: 0,
     serialMatches: false,
     edits: [
-      { type: "preedit", text: "" },
-      { type: "deleteSurrounding", beforeLength: 4, afterLength: 2 },
+      { type: "deleteSurrounding", beforeBytes: 4, afterBytes: 2 },
       { type: "commit", text: "好" },
       { type: "preedit", text: "next", cursorRange: [1, 3] },
     ],
@@ -230,23 +260,17 @@ Deno.test("text-input pending fields reset after every done and invalid cursors 
   batch.setPreedit("é", 1, 2);
 
   assertEquals(batch.done(0).edits, [
-    { type: "preedit", text: "" },
-    { type: "commit", text: "" },
-    { type: "preedit", text: "é" },
+    { type: "preedit", text: "é", cursorRange: null },
   ]);
-  assertEquals(batch.done(0).edits, [{ type: "preedit", text: "" }]);
   assertEquals(batch.done(0).edits, []);
-  assertEquals(batch.hasVisiblePreedit, false);
+  assertEquals(batch.hasVisiblePreedit, true);
 });
 
-Deno.test("text-input commits clear preedit even when no preedit was visible", () => {
+Deno.test("text-input commits atomically end preedit without a separate clear", () => {
   const batch = new TextInputV3Batch();
   batch.setCommit("committed");
 
-  assertEquals(batch.done(0).edits, [
-    { type: "preedit", text: "" },
-    { type: "commit", text: "committed" },
-  ]);
+  assertEquals(batch.done(0).edits, [{ type: "commit", text: "committed" }]);
 });
 
 Deno.test("resetEdits clears both visible and uncommitted text-input state", () => {
@@ -255,7 +279,7 @@ Deno.test("resetEdits clears both visible and uncommitted text-input state", () 
   batch.done(0);
   batch.setCommit("must not leak");
 
-  assertEquals(batch.resetEdits(), [{ type: "preedit", text: "" }]);
+  assertEquals(batch.resetEdits(), [{ type: "preedit", text: "", cursorRange: null }]);
   assertEquals(batch.done(0).edits, []);
 });
 
