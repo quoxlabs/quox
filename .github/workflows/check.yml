@@ -43,3 +43,28 @@ jobs:
       - run: deno test
 
       - run: deno publish --dry-run
+
+  winding-wayland:
+    name: Winding Wayland (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+          cache: true
+      - run: deno ci
+      - run: sudo apt-get update
+      - run: sudo apt-get install -y --no-install-recommends weston xwayland-run
+      - run: deno check wayland/mod.ts wayland/input_test.ts wayland/headless_smoke.ts
+        working-directory: packages/winding
+      - run: deno test wayland/input_test.ts
+        working-directory: packages/winding
+      - name: Test live Wayland lifecycle
+        run: >
+          wlheadless-run -c weston --renderer=pixman --
+          timeout --kill-after=5s 30s
+          env LANG=C.UTF-8 LC_ALL=C.UTF-8
+          deno test --allow-ffi --allow-env=LC_ALL,LC_CTYPE,LANG
+          wayland/headless_smoke.ts
+        working-directory: packages/winding

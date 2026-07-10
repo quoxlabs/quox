@@ -1,10 +1,10 @@
 // FFI bindings for libwayland-client.so
 
 // ---------------------------------------------------------------------------
-// XDG-shell interface structs built in JS memory.
-// The xdg_wm_base, xdg_surface, and xdg_toplevel interfaces are not exported
-// from libwayland-client.so, so we construct the wl_interface/wl_message C
-// structs manually in a pinned Uint8Array that is never GC'd.
+// Non-core Wayland protocol interface structs built in JS memory.
+// These interfaces are not exported from libwayland-client.so, so we
+// construct the wl_interface/wl_message C structs manually in a pinned
+// Uint8Array that is never GC'd.
 //
 // wl_interface layout (40 bytes, 64-bit):
 //   +0  const char *name   (8)
@@ -18,8 +18,14 @@
 // wl_message layout (24 bytes, 64-bit):
 //   +0  const char *name      (8)
 //   +8  const char *signature (8)
-//   +16 wl_interface **types  (8)  ← NULL; signature is sufficient
+//   +16 wl_interface **types  (8)
 // ---------------------------------------------------------------------------
+
+type MessageDef = [
+  name: string,
+  signature: string,
+  types?: (Deno.PointerObject | null)[],
+];
 
 export interface XdgIfaces {
   /** Pinned buffer — must be kept alive for the lifetime of the library. */
@@ -29,13 +35,19 @@ export interface XdgIfaces {
   xdgToplevelIface: Deno.PointerObject;
   wpCursorShapeManagerIface: Deno.PointerObject;
   wpCursorShapeDeviceIface: Deno.PointerObject;
+  zwpTextInputManagerIface: Deno.PointerObject;
+  zwpTextInputIface: Deno.PointerObject;
 }
 
-// All request/event signatures come from xdg-shell-client-protocol-code.h.
+// Request/event signatures come from the corresponding generated protocol
+// code (xdg-shell, cursor-shape-v1, and text-input-unstable-v3).
 // Called once inside WaylandLibrary's constructor so no FFI work happens at
 // module-load time.
-export function buildXdgIfaces(): XdgIfaces {
-  const mem = new Uint8Array(8192);
+export function buildXdgIfaces(
+  wlSeatIface: Deno.PointerObject,
+  wlSurfaceIface: Deno.PointerObject,
+): XdgIfaces {
+  const mem = new Uint8Array(16384);
   let off = 0;
   const base = Deno.UnsafePointer.value(Deno.UnsafePointer.of(mem));
   const dv = new DataView(mem.buffer);
@@ -43,7 +55,7 @@ export function buildXdgIfaces(): XdgIfaces {
   function alloc(n: number): number {
     const o = off;
     off += n;
-    if (off > mem.byteLength) throw new Error("winding xdg interface memory overflow");
+    if (off > mem.byteLength) throw new Error("winding Wayland interface memory overflow");
     return o;
   }
 
@@ -57,17 +69,31 @@ export function buildXdgIfaces(): XdgIfaces {
     off = (off + 7) & ~7;
   }
 
-  function buildMsgs(msgs: [string, string][]): number {
+  function buildTypes(types: (Deno.PointerObject | null)[] | undefined): number {
+    if (!types) return 0;
+    align8();
+    const o = alloc(8 * types.length);
+    for (let i = 0; i < types.length; i++) {
+      dv.setBigUint64(o + i * 8, types[i] ? Deno.UnsafePointer.value(types[i]) : 0n, true);
+    }
+    return o;
+  }
+
+  function buildMsgs(msgs: MessageDef[]): number {
     if (msgs.length === 0) return 0;
     const namePtrs = msgs.map(([n]) => base + BigInt(cstr(n)));
     const sigPtrs = msgs.map(([, s]) => base + BigInt(cstr(s)));
+    const typesPtrs = msgs.map(([, , types]) => {
+      const typesOff = buildTypes(types);
+      return typesOff > 0 ? base + BigInt(typesOff) : 0n;
+    });
     align8();
     const arr = alloc(24 * msgs.length);
     for (let i = 0; i < msgs.length; i++) {
       const o = arr + i * 24;
       dv.setBigUint64(o, namePtrs[i], true);
       dv.setBigUint64(o + 8, sigPtrs[i], true);
-      dv.setBigUint64(o + 16, 0n, true); // types = NULL
+      dv.setBigUint64(o + 16, typesPtrs[i], true);
     }
     return arr;
   }
@@ -75,8 +101,8 @@ export function buildXdgIfaces(): XdgIfaces {
   function buildIface(
     name: string,
     version: number,
-    methods: [string, string][],
-    events: [string, string][],
+    methods: MessageDef[],
+    events: MessageDef[],
   ): bigint {
     const methodsOff = buildMsgs(methods);
     const eventsOff = buildMsgs(events);
@@ -153,6 +179,33 @@ export function buildXdgIfaces(): XdgIfaces {
     ], []),
   )!;
 
+  const zwpTextInputIface = Deno.UnsafePointer.create(
+    buildIface("zwp_text_input_v3", 1, [
+      ["destroy", ""],
+      ["enable", ""],
+      ["disable", ""],
+      ["set_surrounding_text", "sii"],
+      ["set_text_change_cause", "u"],
+      ["set_content_type", "uu"],
+      ["set_cursor_rectangle", "iiii"],
+      ["commit", ""],
+    ], [
+      ["enter", "o", [wlSurfaceIface]],
+      ["leave", "o", [wlSurfaceIface]],
+      ["preedit_string", "?sii"],
+      ["commit_string", "?s"],
+      ["delete_surrounding_text", "uu"],
+      ["done", "u"],
+    ]),
+  )!;
+
+  const zwpTextInputManagerIface = Deno.UnsafePointer.create(
+    buildIface("zwp_text_input_manager_v3", 1, [
+      ["destroy", ""],
+      ["get_text_input", "no", [zwpTextInputIface, wlSeatIface]],
+    ], []),
+  )!;
+
   return {
     mem,
     xdgWmBaseIface,
@@ -160,6 +213,8 @@ export function buildXdgIfaces(): XdgIfaces {
     xdgToplevelIface,
     wpCursorShapeManagerIface,
     wpCursorShapeDeviceIface,
+    zwpTextInputManagerIface,
+    zwpTextInputIface,
   };
 }
 
@@ -214,6 +269,18 @@ export const WlOp = {
   // wp_cursor_shape_device_v1 requests
   WP_CURSOR_SHAPE_DEVICE_DESTROY: 0,
   WP_CURSOR_SHAPE_DEVICE_SET_SHAPE: 1,
+  // zwp_text_input_manager_v3 requests
+  ZWP_TEXT_INPUT_MANAGER_DESTROY: 0,
+  ZWP_TEXT_INPUT_MANAGER_GET_TEXT_INPUT: 1,
+  // zwp_text_input_v3 requests
+  ZWP_TEXT_INPUT_DESTROY: 0,
+  ZWP_TEXT_INPUT_ENABLE: 1,
+  ZWP_TEXT_INPUT_DISABLE: 2,
+  ZWP_TEXT_INPUT_SET_SURROUNDING_TEXT: 3,
+  ZWP_TEXT_INPUT_SET_TEXT_CHANGE_CAUSE: 4,
+  ZWP_TEXT_INPUT_SET_CONTENT_TYPE: 5,
+  ZWP_TEXT_INPUT_SET_CURSOR_RECTANGLE: 6,
+  ZWP_TEXT_INPUT_COMMIT: 7,
 } as const;
 
 export const WlShmFormat = {
@@ -286,15 +353,30 @@ export const libdlSymbols = {
 } as const;
 
 export const xkbSymbols = {
+  xkb_keysym_to_utf8: { parameters: ["u32", "pointer", "usize"], result: "i32" },
   xkb_context_new: { parameters: ["i32"], result: "pointer" },
   xkb_context_unref: { parameters: ["pointer"], result: "void" },
   xkb_keymap_new_from_buffer: { parameters: ["pointer", "pointer", "usize", "i32", "i32"], result: "pointer" },
   xkb_keymap_unref: { parameters: ["pointer"], result: "void" },
+  xkb_keymap_key_repeats: { parameters: ["pointer", "u32"], result: "i32" },
   xkb_state_new: { parameters: ["pointer"], result: "pointer" },
   xkb_state_unref: { parameters: ["pointer"], result: "void" },
   xkb_state_update_mask: {
     parameters: ["pointer", "u32", "u32", "u32", "u32", "u32", "u32"],
     result: "u32",
   },
+  xkb_state_key_get_utf8: { parameters: ["pointer", "u32", "pointer", "usize"], result: "i32" },
+  xkb_state_key_get_one_sym: { parameters: ["pointer", "u32"], result: "u32" },
   xkb_state_mod_name_is_active: { parameters: ["pointer", "buffer", "i32"], result: "i32" },
+  xkb_compose_table_new_from_locale: {
+    parameters: ["pointer", "buffer", "i32"],
+    result: "pointer",
+  },
+  xkb_compose_table_unref: { parameters: ["pointer"], result: "void" },
+  xkb_compose_state_new: { parameters: ["pointer", "i32"], result: "pointer" },
+  xkb_compose_state_unref: { parameters: ["pointer"], result: "void" },
+  xkb_compose_state_feed: { parameters: ["pointer", "u32"], result: "i32" },
+  xkb_compose_state_reset: { parameters: ["pointer"], result: "void" },
+  xkb_compose_state_get_status: { parameters: ["pointer"], result: "i32" },
+  xkb_compose_state_get_utf8: { parameters: ["pointer", "pointer", "usize"], result: "i32" },
 } as const;
