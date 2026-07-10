@@ -4,6 +4,67 @@ import { type AssertActive, attachDocumentInternals, type RequestRender } from "
 import { QuoxElement, QuoxNode, QuoxText } from "./node.ts";
 
 type SetNativeTitle = (title: string) => void;
+type SyncNativeImeRequests = () => void;
+
+type RendererInputBridge = {
+  dispatch_pointer_move(x: number, y: number, buttons: number): boolean;
+  dispatch_pointer_down(x: number, y: number, button: number, buttons: number): boolean;
+  dispatch_pointer_up(x: number, y: number, button: number, buttons: number): boolean;
+  dispatch_wheel(x: number, y: number, deltaX: number, deltaY: number, buttons: number): boolean;
+  dispatch_key_down(
+    code: string,
+    shiftKey: boolean,
+    ctrlKey: boolean,
+    altKey: boolean,
+    metaKey: boolean,
+    capsLock: boolean,
+    logicalKey: string | undefined,
+    text: string | undefined,
+    repeat: boolean,
+  ): boolean;
+  dispatch_key_up(
+    code: string,
+    shiftKey: boolean,
+    ctrlKey: boolean,
+    altKey: boolean,
+    metaKey: boolean,
+    capsLock: boolean,
+    logicalKey?: string,
+  ): boolean;
+  dispatch_ime_enabled(): boolean;
+  dispatch_ime_disabled(): boolean;
+  dispatch_ime_preedit(text: string, start?: number, end?: number): boolean;
+  dispatch_ime_commit(text: string): boolean;
+  clear_hover(): boolean;
+  take_click_node(): number | undefined;
+  take_double_click_node(): number | undefined;
+  take_context_menu_node(): number | undefined;
+  take_input_node(): number | undefined;
+  take_focus_node(): number | undefined;
+  take_blur_node(): number | undefined;
+  take_scroll_node(): number | undefined;
+};
+
+type InputRenderer = WasmRenderer & RendererInputBridge;
+
+export type QuoxImeEvent =
+  | { type: "ime"; kind: "enabled" | "disabled" }
+  | {
+    type: "ime";
+    kind: "preedit";
+    text: string;
+    /** UTF-8 byte offsets; omitted when the preedit cursor should be hidden. */
+    cursorRange?: readonly [number, number];
+  }
+  | { type: "ime"; kind: "commit"; text: string }
+  | {
+    type: "ime";
+    kind: "deleteSurrounding";
+    /** UTF-8 byte count before the cursor. */
+    beforeLength: number;
+    /** UTF-8 byte count after the cursor. */
+    afterLength: number;
+  };
 
 /**
  * Maps the DOM event kinds quox can invoke a JS handler for to their JSX prop name.
@@ -21,10 +82,11 @@ const EVENT_KIND_TO_PROP = {
 } as const;
 
 export class QuoxDocument {
-  readonly #renderer: WasmRenderer;
+  readonly #renderer: InputRenderer;
   readonly #requestRender: RequestRender;
   readonly #assertActive: AssertActive;
   readonly #setNativeTitle: SetNativeTitle;
+  readonly #syncNativeImeRequests: SyncNativeImeRequests;
   #lastNativeTitle: string;
 
   constructor(
@@ -32,11 +94,13 @@ export class QuoxDocument {
     requestRender: RequestRender,
     assertActive: AssertActive,
     setNativeTitle: SetNativeTitle = () => undefined,
+    syncNativeImeRequests: SyncNativeImeRequests = () => undefined,
   ) {
-    this.#renderer = renderer;
+    this.#renderer = renderer as InputRenderer;
     this.#requestRender = requestRender;
     this.#assertActive = assertActive;
     this.#setNativeTitle = setNativeTitle;
+    this.#syncNativeImeRequests = syncNativeImeRequests;
     this.#lastNativeTitle = renderer.title();
     attachDocumentInternals(this, { renderer, requestRender, assertActive });
   }
@@ -98,30 +162,22 @@ export class QuoxDocument {
 
   /** Feed a pointer-move event into Blitz. Drives hover/`:hover` and cursor resolution. */
   dispatchPointerMove(x: number, y: number, buttons: number): void {
-    this.#assertActive();
-    if (this.#renderer.dispatch_pointer_move(x, y, buttons)) this.#requestRender();
-    this.#drainFiredEvents();
+    this.#dispatchInputEvent(() => this.#renderer.dispatch_pointer_move(x, y, buttons));
   }
 
   /** Feed a pointer-down event into Blitz. Drives `:active`, click timing, and focus. */
   dispatchPointerDown(x: number, y: number, button: number, buttons: number): void {
-    this.#assertActive();
-    if (this.#renderer.dispatch_pointer_down(x, y, button, buttons)) this.#requestRender();
-    this.#drainFiredEvents();
+    this.#dispatchInputEvent(() => this.#renderer.dispatch_pointer_down(x, y, button, buttons));
   }
 
   /** Feed a pointer-up event into Blitz. Synthesizes `click`/`dblclick`/`contextmenu`. */
   dispatchPointerUp(x: number, y: number, button: number, buttons: number): void {
-    this.#assertActive();
-    if (this.#renderer.dispatch_pointer_up(x, y, button, buttons)) this.#requestRender();
-    this.#drainFiredEvents();
+    this.#dispatchInputEvent(() => this.#renderer.dispatch_pointer_up(x, y, button, buttons));
   }
 
   /** Feed a wheel event into Blitz, scrolling whatever's hovered (not just the viewport). */
   dispatchWheel(x: number, y: number, deltaX: number, deltaY: number, buttons: number): void {
-    this.#assertActive();
-    if (this.#renderer.dispatch_wheel(x, y, deltaX, deltaY, buttons)) this.#requestRender();
-    this.#drainFiredEvents();
+    this.#dispatchInputEvent(() => this.#renderer.dispatch_wheel(x, y, deltaX, deltaY, buttons));
   }
 
   /** Feed a keydown event into Blitz. Drives text-input editing and Tab focus traversal. */
@@ -132,12 +188,23 @@ export class QuoxDocument {
     altKey: boolean,
     metaKey: boolean,
     capsLock: boolean,
+    logicalKey?: string,
+    text?: string,
+    repeat = false,
   ): void {
-    this.#assertActive();
-    if (this.#renderer.dispatch_key_down(code, shiftKey, ctrlKey, altKey, metaKey, capsLock)) {
-      this.#requestRender();
-    }
-    this.#drainFiredEvents();
+    this.#dispatchInputEvent(() =>
+      this.#renderer.dispatch_key_down(
+        code,
+        shiftKey,
+        ctrlKey,
+        altKey,
+        metaKey,
+        capsLock,
+        logicalKey,
+        text,
+        repeat,
+      )
+    );
   }
 
   /** Feed a keyup event into Blitz. */
@@ -148,18 +215,52 @@ export class QuoxDocument {
     altKey: boolean,
     metaKey: boolean,
     capsLock: boolean,
+    logicalKey?: string,
   ): void {
-    this.#assertActive();
-    if (this.#renderer.dispatch_key_up(code, shiftKey, ctrlKey, altKey, metaKey, capsLock)) {
-      this.#requestRender();
+    this.#dispatchInputEvent(() =>
+      this.#renderer.dispatch_key_up(code, shiftKey, ctrlKey, altKey, metaKey, capsLock, logicalKey)
+    );
+  }
+
+  /** Feed native IME lifecycle and edit events into Blitz. */
+  dispatchIme(event: QuoxImeEvent): void {
+    switch (event.kind) {
+      case "enabled":
+        this.#dispatchInputEvent(() => this.#renderer.dispatch_ime_enabled());
+        break;
+      case "disabled":
+        this.#dispatchInputEvent(() => this.#renderer.dispatch_ime_disabled());
+        break;
+      case "preedit": {
+        const start = event.cursorRange?.[0];
+        const end = event.cursorRange?.[1];
+        this.#dispatchInputEvent(() => this.#renderer.dispatch_ime_preedit(event.text, start, end));
+        break;
+      }
+      case "commit":
+        this.#dispatchInputEvent(() => this.#renderer.dispatch_ime_commit(event.text));
+        break;
+      case "deleteSurrounding":
+        // The pinned Blitz input API does not yet expose delete-surrounding. Keep the
+        // event observable at the QuoxWindow layer without pretending it was applied.
+        this.#dispatchInputEvent(() => false);
+        break;
     }
-    this.#drainFiredEvents();
   }
 
   /** Clear Blitz's hover state, e.g. when the pointer leaves the window entirely. */
   clearHover(): void {
+    this.#dispatchInputEvent(() => this.#renderer.clear_hover(), false);
+  }
+
+  #dispatchInputEvent(dispatch: () => boolean, drainFiredEvents = true): void {
     this.#assertActive();
-    if (this.#renderer.clear_hover()) this.#requestRender();
+    try {
+      if (dispatch()) this.#requestRender();
+      if (drainFiredEvents) this.#drainFiredEvents();
+    } finally {
+      this.#syncNativeImeRequests();
+    }
   }
 
   /**

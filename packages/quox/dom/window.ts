@@ -2,7 +2,7 @@
 import { QuoxRenderer as WasmRenderer } from "../lib/quox.js";
 import { load as windingLoad } from "@quoxlabs/winding";
 import type { Library as WindingLibrary, UIEvent as WindingUIEvent, Window as WindingWindow } from "@quoxlabs/winding";
-import { QuoxDocument } from "./document.ts";
+import { QuoxDocument, type QuoxImeEvent } from "./document.ts";
 import { isVNode, mount, type QuoxRenderable } from "./mount.ts";
 import type { QuoxElement, QuoxInnerHTML } from "./node.ts";
 
@@ -11,6 +11,7 @@ export type QuoxInputEvent =
   | QuoxMouseButtonEvent
   | QuoxMouseWheelEvent
   | QuoxKeyboardEvent
+  | QuoxImeEvent
   | QuoxResizeEvent
   | QuoxCloseEvent
   | QuoxMouseEnterLeaveEvent
@@ -30,6 +31,9 @@ export type QuoxKeyboardEvent = {
   metaKey: boolean;
   accelKey: boolean;
   capsLock: boolean;
+  /** Text committed by this keydown, when the backend reports it directly. */
+  text?: string;
+  repeat: boolean;
 };
 export type QuoxResizeEvent = { type: "resize"; width: number; height: number };
 export type QuoxCloseEvent = { type: "close" };
@@ -61,6 +65,11 @@ const BUTTON_INDEX: Record<"left" | "middle" | "right", number> = { left: 0, mid
 const BUTTON_INDEX_TO_BIT = [1, 4, 2] as const;
 const WHEEL_SCROLL_SPEED = 40;
 
+type RendererImeRequests = {
+  take_ime_cursor_area(): Float32Array | undefined;
+  take_ime_enabled(): boolean | undefined;
+};
+
 /** Anything that isn't itself renderable content (a string, array, or vnode) is an options bag. */
 function isWindowOptions(value: QuoxWindowContent | WindowOptions | undefined): value is WindowOptions {
   if (value === undefined) return true;
@@ -88,9 +97,10 @@ function mapWindingEvent(ev: WindingUIEvent): QuoxInputEvent | null {
     case "wheel":
       return { type: "wheel", deltaX: ev.deltaX, deltaY: ev.deltaY };
     case "keydown":
-      return {
-        type: "keydown",
-        key: String(ev.keycode),
+    case "keyup": {
+      const mapped: QuoxKeyboardEvent = {
+        type: ev.type,
+        key: ev.key ?? String(ev.keycode),
         code: ev.code,
         shiftKey: ev.shiftKey,
         ctrlKey: ev.ctrlKey,
@@ -98,19 +108,37 @@ function mapWindingEvent(ev: WindingUIEvent): QuoxInputEvent | null {
         metaKey: ev.metaKey,
         accelKey: ev.accelKey,
         capsLock: ev.capsLock ?? false,
+        repeat: ev.repeat ?? false,
       };
-    case "keyup":
-      return {
-        type: "keyup",
-        key: String(ev.keycode),
-        code: ev.code,
-        shiftKey: ev.shiftKey,
-        ctrlKey: ev.ctrlKey,
-        altKey: ev.altKey,
-        metaKey: ev.metaKey,
-        accelKey: ev.accelKey,
-        capsLock: ev.capsLock ?? false,
-      };
+      if (ev.text !== undefined) mapped.text = ev.text;
+      return mapped;
+    }
+    case "ime": {
+      switch (ev.kind) {
+        case "enabled":
+        case "disabled":
+          return { type: "ime", kind: ev.kind };
+        case "preedit": {
+          const mapped: QuoxImeEvent = { type: "ime", kind: "preedit", text: ev.text };
+          const cursorRange = ev.cursorRange ??
+            (ev.selection === undefined || ev.selection === null
+              ? undefined
+              : [ev.selection.start, ev.selection.end] as const);
+          if (cursorRange !== undefined) mapped.cursorRange = cursorRange;
+          return mapped;
+        }
+        case "commit":
+          return { type: "ime", kind: "commit", text: ev.text };
+        case "deleteSurrounding":
+          return {
+            type: "ime",
+            kind: "deleteSurrounding",
+            beforeLength: ev.beforeLength,
+            afterLength: ev.afterLength,
+          };
+      }
+      return null;
+    }
     case "resize":
       return { type: "resize", width: ev.width, height: ev.height };
     case "close":
@@ -125,6 +153,9 @@ function mapWindingEvent(ev: WindingUIEvent): QuoxInputEvent | null {
       return { type: "blur" };
     case "visibilitychange":
       return { type: "visibilitychange", visible: ev.visible };
+    case "apple-standard-keybinding":
+      // Native AppKit editing commands do not have a QuoxWindow event equivalent.
+      return null;
   }
 }
 
@@ -165,6 +196,7 @@ export class QuoxWindow implements Disposable {
       () => this.#requestRender(),
       () => this.#assertActiveDocument(),
       (title) => this.#win.setTitle(title),
+      () => this.#syncNativeImeRequests(),
     );
   }
 
@@ -184,6 +216,7 @@ export class QuoxWindow implements Disposable {
       await mountWindowContent(quoxWindow.document.head, options.head);
       await mountWindowContent(quoxWindow.document.body, options.body);
       quoxWindow.setTitle(options.title ?? (quoxWindow.document.title || DEFAULT_WINDOW_TITLE));
+      quoxWindow.#syncNativeImeRequests();
     } catch (error) {
       quoxWindow[Symbol.dispose]();
       throw error;
@@ -210,7 +243,7 @@ export class QuoxWindow implements Disposable {
 
       if (mapped.type === "close") {
         // Notify listeners before tearing down so they can react.
-        for (const cb of this.#listeners) cb(mapped);
+        this.#notifyListeners(mapped);
         this[Symbol.dispose]();
         return;
       }
@@ -258,7 +291,34 @@ export class QuoxWindow implements Disposable {
         this.document.clearHover();
       }
 
-      if (mapped.type === "keydown") {
+      if (
+        mapped.type === "keydown" &&
+        ev.type === "keydown" &&
+        ev.text !== undefined &&
+        ev.textInputHandled !== true
+      ) {
+        try {
+          this.document.dispatchKeyDown(
+            mapped.code,
+            mapped.shiftKey,
+            mapped.ctrlKey,
+            mapped.altKey,
+            mapped.metaKey,
+            mapped.capsLock,
+            ev.key,
+            ev.text,
+            ev.repeat ?? false,
+          );
+          this.#notifyListeners(mapped);
+        } finally {
+          // Keep character insertion separate from KeyDown. This lets Blitz expose
+          // the keyboard event first while Commit remains the single DOM input source.
+          this.document.dispatchIme({ type: "ime", kind: "commit", text: ev.text });
+        }
+        continue;
+      }
+
+      if (mapped.type === "keydown" && ev.type === "keydown") {
         this.document.dispatchKeyDown(
           mapped.code,
           mapped.shiftKey,
@@ -266,10 +326,13 @@ export class QuoxWindow implements Disposable {
           mapped.altKey,
           mapped.metaKey,
           mapped.capsLock,
+          ev.key,
+          ev.text,
+          ev.repeat ?? false,
         );
       }
 
-      if (mapped.type === "keyup") {
+      if (mapped.type === "keyup" && ev.type === "keyup") {
         this.document.dispatchKeyUp(
           mapped.code,
           mapped.shiftKey,
@@ -277,16 +340,39 @@ export class QuoxWindow implements Disposable {
           mapped.altKey,
           mapped.metaKey,
           mapped.capsLock,
+          ev.key,
         );
       }
+
+      if (mapped.type === "ime") this.document.dispatchIme(mapped);
 
       if (mapped.type === "visibilitychange") {
         this.#visible = mapped.visible;
         if (mapped.visible) this.#requestRender();
       }
 
-      for (const cb of this.#listeners) cb(mapped);
+      this.#notifyListeners(mapped);
     }
+  }
+
+  #notifyListeners(event: QuoxInputEvent): void {
+    for (const cb of this.#listeners) cb(event);
+  }
+
+  #syncNativeImeRequests(): void {
+    if (this.#disposed || this.#rendererFreed) return;
+
+    const renderer = this.#renderer as WasmRenderer & RendererImeRequests;
+
+    // Cursor geometry must reach the native backend before an accompanying enable
+    // request, otherwise an IME can briefly open its candidate window at the origin.
+    const cursorArea = renderer.take_ime_cursor_area();
+    if (cursorArea !== undefined && cursorArea.length >= 4) {
+      this.#win.setImeCursorArea?.(cursorArea[0], cursorArea[1], cursorArea[2], cursorArea[3]);
+    }
+
+    const enabled = renderer.take_ime_enabled();
+    if (enabled !== undefined) this.#win.setImeEnabled?.(enabled);
   }
 
   #requestRender(): void {
@@ -323,6 +409,7 @@ export class QuoxWindow implements Disposable {
 
       // Render the retained Blitz document via WebGPU in WASM.
       const rgba = await this.#renderer.render();
+      this.#syncNativeImeRequests();
 
       if (!this.#stopped && !this.#disposed) {
         // Blit RGBA buffer to the window (conversion to native pixel format is handled by winding).
