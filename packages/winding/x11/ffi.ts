@@ -73,6 +73,13 @@ export enum XEventMask {
 // alt-tab, an interactive move/resize grab) and must be filtered out.
 export const NotifyNormal = 0;
 
+// XIM requires the process C locale to be initialised before XOpenIM. Kept in
+// this module because it is only used by the X11 backend.
+export const libcFunctions = {
+  memcpy: { parameters: ["pointer", "buffer", "usize"], result: "pointer" },
+  setlocale: { parameters: ["i32", "buffer"], result: "pointer" },
+} as const satisfies Deno.ForeignLibraryInterface;
+
 // Function declarations from X11/Xlib.h
 export const x11functions = {
   XActivateScreenSaver: { parameters: ["pointer"], result: "i32" },
@@ -145,6 +152,30 @@ export const x11functions = {
   XCreateGlyphCursor: { parameters: ["pointer", "usize", "usize", "u32", "u32", "buffer", "buffer"], result: "usize" },
   XCreateImage: {
     parameters: ["pointer", "pointer", "u32", "i32", "i32", "buffer", "u32", "u32", "i32", "i32"],
+    result: "pointer",
+  },
+  // The XIM APIs below are C varargs. Deno FFI has no variadic descriptor, so
+  // bind each all-GPR call shape used by this backend to a fixed alias. This is
+  // intentionally limited to the repository's existing LP64 Linux target.
+  XCreateICPreeditCallbacks: {
+    name: "XCreateIC",
+    parameters: [
+      "pointer",
+      "buffer",
+      "usize",
+      "buffer",
+      "usize",
+      "buffer",
+      "usize",
+      "buffer",
+      "pointer",
+      "pointer",
+    ],
+    result: "pointer",
+  },
+  XCreateICSimple: {
+    name: "XCreateIC",
+    parameters: ["pointer", "buffer", "usize", "buffer", "usize", "buffer", "usize", "pointer"],
     result: "pointer",
   },
   XCreatePixmap: { parameters: ["pointer", "usize", "u32", "u32", "u32"], result: "usize" },
@@ -238,6 +269,16 @@ export const x11functions = {
   XFreeFontInfo: { parameters: ["pointer", "pointer", "i32"], result: "i32" },
   XFreeFontNames: { parameters: ["pointer"], result: "i32" },
   XFreeFontPath: { parameters: ["pointer"], result: "i32" },
+  XGetICValuesFilterEvents: {
+    name: "XGetICValues",
+    parameters: ["pointer", "buffer", "buffer", "pointer"],
+    result: "pointer",
+  },
+  XGetIMValuesQueryInputStyle: {
+    name: "XGetIMValues",
+    parameters: ["pointer", "buffer", "buffer", "pointer"],
+    result: "pointer",
+  },
   XFreeFontSet: { parameters: ["pointer", "pointer"], result: "void" },
   XFreeGC: { parameters: ["pointer", "usize"], result: "i32" },
   XFreeModifiermap: { parameters: ["pointer"], result: "i32" },
@@ -482,6 +523,16 @@ export const x11functions = {
   XSetGraphicsExposures: { parameters: ["pointer", "usize", "i32"], result: "i32" },
   XSetICFocus: { parameters: ["pointer"], result: "void" },
   XSetIconName: { parameters: ["pointer", "usize", "buffer"], result: "i32" },
+  XSetICValuesPreeditAttributes: {
+    name: "XSetICValues",
+    parameters: ["pointer", "buffer", "pointer", "pointer"],
+    result: "pointer",
+  },
+  XSetIMValuesDestroyCallback: {
+    name: "XSetIMValues",
+    parameters: ["pointer", "buffer", "buffer", "pointer"],
+    result: "pointer",
+  },
   XSetInputFocus: { parameters: ["pointer", "usize", "i32", "u64"], result: "i32" },
   XSetIOErrorExitHandler: { parameters: ["pointer", "pointer", "pointer"], result: "void" },
   XSetIOErrorHandler: { parameters: ["pointer"], result: "pointer" },
@@ -582,7 +633,28 @@ export const x11functions = {
     result: "void",
   },
   Xutf8DrawText: { parameters: ["pointer", "usize", "usize", "i32", "i32", "buffer", "i32"], result: "void" },
-  Xutf8LookupString: { parameters: ["pointer", "pointer", "pointer", "i32", "pointer", "pointer"], result: "i32" },
+  XVaCreateNestedListGeometry: {
+    name: "XVaCreateNestedList",
+    parameters: ["i32", "buffer", "buffer", "buffer", "buffer", "pointer"],
+    result: "pointer",
+  },
+  XVaCreateNestedListPreeditCallbacks: {
+    name: "XVaCreateNestedList",
+    parameters: [
+      "i32",
+      "buffer",
+      "buffer",
+      "buffer",
+      "buffer",
+      "buffer",
+      "buffer",
+      "buffer",
+      "buffer",
+      "pointer",
+    ],
+    result: "pointer",
+  },
+  Xutf8LookupString: { parameters: ["pointer", "pointer", "buffer", "i32", "buffer", "buffer"], result: "i32" },
   Xutf8ResetIC: { parameters: ["pointer"], result: "pointer" },
   Xutf8TextEscapement: { parameters: ["pointer", "buffer", "i32"], result: "i32" },
   Xutf8TextExtents: { parameters: ["pointer", "buffer", "i32", "buffer", "buffer"], result: "i32" },

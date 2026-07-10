@@ -85,6 +85,29 @@ jobs:
         timeout-minutes: 2
         working-directory: packages/winding
 
+  winding-x11:
+    name: Winding X11 (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+          cache: true
+      - run: deno ci
+      - run: sudo apt-get update
+      - run: sudo apt-get install -y --no-install-recommends libx11-dev xauth xvfb
+      - run: deno check x11/mod.ts x11/input_test.ts x11/xvfb_smoke.ts
+        working-directory: packages/winding
+      - run: deno test x11/input_test.ts
+        working-directory: packages/winding
+      - name: Test live X11 and XIM lifecycle
+        run: >
+          timeout --kill-after=5s 30s xvfb-run -a
+          env LANG=C.UTF-8 LC_ALL=C.UTF-8 XMODIFIERS=@im=local
+          deno test --allow-ffi x11/xvfb_smoke.ts
+        working-directory: packages/winding
+
   winding-wayland:
     name: Winding Wayland (ubuntu-24.04)
     runs-on: ubuntu-24.04
