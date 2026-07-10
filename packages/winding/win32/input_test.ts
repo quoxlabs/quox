@@ -1,48 +1,38 @@
 import { assert, assertEquals, assertThrows } from "jsr:@std/assert@^1.0.19";
 import {
   AltGraphControlFilter,
-  CFS_EXCLUDE,
-  CFS_POINT,
   decodeKeyLParam,
-  encodeCandidateForm,
-  encodeCompositionForm,
-  encodeImeCharPosition,
-  ImeCompositionReducer,
-  insertCompositionCharacter,
   isCommitText,
   keyboardModifiers,
   keyboardStateForTranslation,
-  keyLocation,
-  LogicalKeyCache,
   logicalKeyFromVirtualKey,
-  normalizeCursorRectangle,
-  readImmUtf16,
   repeatedWmCharText,
   ResultEchoSuppressor,
-  SemanticEventQueue,
   TO_UNICODE_NO_STATE_CHANGE,
   translateLogicalKey,
-  utf16CursorRangeToUtf8,
-  utf16IndexToUtf8Offset,
-  utf8OffsetToUtf16Index,
   VK,
-  withImeContext,
+  win32KeyEditDisposition,
+  win32KeyIdentity,
   WmCharDecoder,
 } from "./input.ts";
-
-Deno.test("semantic events remain FIFO when one native message enqueues a batch", () => {
-  const queue = new SemanticEventQueue<string>();
-  queue.push("clear preedit");
-  queue.push("commit");
-  queue.push("new preedit");
-  assertEquals(queue.length, 3);
-  assertEquals(queue.shift(), "clear preedit");
-  queue.push("later native event");
-  assertEquals(queue.shift(), "commit");
-  assertEquals(queue.shift(), "new preedit");
-  assertEquals(queue.shift(), "later native event");
-  assertEquals(queue.shift(), undefined);
-});
+import {
+  CFS_EXCLUDE,
+  CFS_POINT,
+  encodeCandidateForm,
+  encodeCompositionForm,
+  encodeImeCharPosition,
+  insertCompositionCharacter,
+  readImmUtf16,
+  utf16CursorRangeToUtf8,
+  withImeContext,
+} from "./imm.ts";
+import {
+  keyLocationForCode,
+  normalizeImeCursorArea,
+  PressedLogicalKeyCache,
+  utf16IndexToUtf8Offset,
+  utf8OffsetToUtf16Index,
+} from "../input/mod.ts";
 
 Deno.test("Win32 key lParam decoding preserves repeat, scan, extended, context, and transition fields", () => {
   const lParam = makeKeyLParam(0x38, {
@@ -66,10 +56,10 @@ Deno.test("Win32 key lParam decoding preserves repeat, scan, extended, context, 
 });
 
 Deno.test("physical codes determine DOM key locations", () => {
-  assertEquals(keyLocation("NumpadEnter"), "numpad");
-  assertEquals(keyLocation("ShiftLeft"), "left");
-  assertEquals(keyLocation("AltRight"), "right");
-  assertEquals(keyLocation("KeyA"), "standard");
+  assertEquals(keyLocationForCode("NumpadEnter"), 3);
+  assertEquals(keyLocationForCode("ShiftLeft"), 1);
+  assertEquals(keyLocationForCode("AltRight"), 2);
+  assertEquals(keyLocationForCode("KeyA"), 0);
 });
 
 Deno.test("logical virtual-key mapping covers named, function, translated, and unknown keys", () => {
@@ -93,6 +83,7 @@ Deno.test("injected ToUnicode translation follows the active layout and uses the
   });
   assertEquals(translated, {
     key: "z",
+    text: "z",
     dead: false,
     modifiers: {
       shiftKey: false,
@@ -170,6 +161,24 @@ Deno.test("AltGr preserves Control and right Alt for layout translation without 
   assertEquals(translated.modifiers.altGraphKey, true);
 });
 
+Deno.test("Win32 edit ownership follows WM_SYSKEYDOWN rather than inferred Alt state", () => {
+  const ordinary = {
+    shiftKey: false,
+    ctrlKey: false,
+    altKey: true,
+    metaKey: false,
+    accelKey: false,
+    capsLock: false,
+    altGraphKey: false,
+  };
+  assertEquals(win32KeyEditDisposition("F10", false, ordinary, undefined, true), "platform");
+  assertEquals(win32KeyEditDisposition("ArrowLeft", false, ordinary, undefined, false), "key-default");
+  assertEquals(win32KeyEditDisposition("x", false, ordinary, "x", false), "text-input");
+
+  const altGraph = { ...ordinary, ctrlKey: true, altGraphKey: true };
+  assertEquals(win32KeyEditDisposition("@", false, altGraph, "@", true), "text-input");
+});
+
 Deno.test("AltGr's paired fake Control transitions are suppressed", () => {
   const filter = new AltGraphControlFilter();
   const controlDown = {
@@ -191,15 +200,15 @@ Deno.test("AltGr's paired fake Control transitions are suppressed", () => {
 });
 
 Deno.test("logical key cache resolves keyup using the keydown identity", () => {
-  const cache = new LogicalKeyCache();
+  const cache = new PressedLogicalKeyCache<string>();
   const down = makeKeyLParam(0x15);
   const repeat = makeKeyLParam(0x15, { previous: true, repeatCount: 5 });
   const up = makeKeyLParam(0x15, { previous: true, transition: true });
 
-  cache.remember(0x59, down, "z");
-  assertEquals(cache.get(0x59, repeat), "z");
-  assertEquals(cache.release(0x59, up), "z");
-  assertEquals(cache.get(0x59, down), undefined);
+  assertEquals(cache.press(win32KeyIdentity(0x59, down), "z"), "z");
+  assertEquals(cache.press(win32KeyIdentity(0x59, repeat), "y"), "z");
+  assertEquals(cache.release(win32KeyIdentity(0x59, up)), "z");
+  assertEquals(cache.size, 0);
 });
 
 Deno.test("WM_CHAR decoder filters controls and applies repeat after scalar decoding", () => {
@@ -211,7 +220,8 @@ Deno.test("WM_CHAR decoder filters controls and applies repeat after scalar deco
   assertEquals(decoder.push(0x1b), []);
   assertEquals(decoder.push(0x7f), []);
   assertEquals(repeatedWmCharText({ text: "é", repeatCount: 3 }), "ééé");
-  assertEquals(isCommitText("\u0085"), true);
+  assertEquals(decoder.push(0x85), []);
+  assertEquals(isCommitText("\u0085"), false);
 });
 
 Deno.test("WM_CHAR decoder assembles surrogate pairs and recovers malformed UTF-16", () => {
@@ -269,25 +279,25 @@ Deno.test("CS_INSERTCHAR splices into cached preedit and applies its caret flag"
 });
 
 Deno.test("cursor rectangles round outward, reject invalid values, and clamp to Win32 LONGs", () => {
-  assertEquals(normalizeCursorRectangle(10.25, 20.75, 3.1, 4.1), {
+  assertEquals(normalizeImeCursorArea(10.25, 20.75, 3.1, 4.1), {
     x: 10,
     y: 20,
     width: 4,
     height: 5,
   });
-  assertEquals(normalizeCursorRectangle(10.25, 20.75, -3, 0), {
+  assertEquals(normalizeImeCursorArea(10.25, 20.75, -3, 0), {
     x: 10,
     y: 20,
     width: 0,
     height: 0,
   });
-  assertEquals(normalizeCursorRectangle(-1e20, -1e20, 2e20, 2e20), {
+  assertEquals(normalizeImeCursorArea(-1e20, -1e20, 2e20, 2e20), {
     x: -0x80000000,
     y: -0x80000000,
     width: 0x7fffffff,
     height: 0x7fffffff,
   });
-  assertEquals(normalizeCursorRectangle(Number.NaN, 0, 1, 1), undefined);
+  assertEquals(normalizeImeCursorArea(Number.NaN, 0, 1, 1), undefined);
 });
 
 Deno.test("native IME structure encoders use the documented little-endian layouts", () => {
@@ -312,33 +322,6 @@ Deno.test("native IME structure encoders use the documented little-endian layout
   assertEquals(readPoint(character, 8), [10, 20]);
   assertEquals(character.getUint32(16, true), 5);
   assertEquals(readRect(character, 20), [1, 2, 31, 42]);
-});
-
-Deno.test("IME reducer orders old-preedit clear, result commit, and new preedit", () => {
-  const reducer = new ImeCompositionReducer();
-  assertEquals(reducer.update({ preedit: { text: "に", cursorRange: [3, 3] } }), [
-    { type: "preedit", text: "に", cursorRange: [3, 3] },
-  ]);
-  assertEquals(reducer.hasVisiblePreedit, true);
-
-  assertEquals(reducer.update({ result: "日", preedit: { text: "ほ", cursorRange: [3, 3] } }), [
-    { type: "preedit", text: "" },
-    { type: "commit", text: "日" },
-    { type: "preedit", text: "ほ", cursorRange: [3, 3] },
-  ]);
-  assertEquals(reducer.end(), [{ type: "preedit", text: "" }]);
-  assertEquals(reducer.end(), []);
-});
-
-Deno.test("IME commits always clear preedit, while empty composition updates avoid duplicate clears", () => {
-  const reducer = new ImeCompositionReducer();
-  assertEquals(reducer.update({ result: "committed" }), [
-    { type: "preedit", text: "" },
-    { type: "commit", text: "committed" },
-  ]);
-  assertEquals(reducer.update({ preedit: null }), []);
-  reducer.update({ preedit: { text: "visible" } });
-  assertEquals(reducer.update({ preedit: { text: "" } }), [{ type: "preedit", text: "" }]);
 });
 
 Deno.test("result echo suppression consumes matching text and expires or clears on mismatches", () => {
