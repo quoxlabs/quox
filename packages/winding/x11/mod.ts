@@ -157,14 +157,17 @@ class X11Window implements Window {
   }
 
   setImeEnabled(enabled: boolean): void {
+    this.#assertOpen();
     this.input.setEnabled(enabled);
   }
 
   setImeCursorArea(x: number, y: number, width: number, height: number): void {
+    this.#assertOpen();
     this.input.setCursorArea(x, y, width, height);
   }
 
   setTitle(title: string): void {
+    this.#assertOpen();
     const titleBytes = utf8Bytes(title);
     const titleBuffer = titleBytes.length > 0 ? titleBytes : new Uint8Array(1);
     this.lib.X11.symbols.XChangeProperty(
@@ -190,6 +193,7 @@ class X11Window implements Window {
    * match the new size.
    */
   blit(rgba: Uint8Array, width: number, height: number): void {
+    this.#assertOpen();
     if (rgba.byteLength !== width * height * 4) {
       throw new RangeError("winding(x11): RGBA buffer size does not match its dimensions");
     }
@@ -222,6 +226,7 @@ class X11Window implements Window {
    * needs the same bytes reapplied.
    */
   reblit(): void {
+    this.#assertOpen();
     this.lib.X11.symbols.XPutImage(
       this.lib.display,
       this.id,
@@ -266,6 +271,10 @@ class X11Window implements Window {
     if (errors.length > 1) {
       throw new AggregateError(errors, "winding(x11): errors while closing window");
     }
+  }
+
+  #assertOpen(): void {
+    if (this.#closed) throw new Error("winding(x11): window is closed");
   }
 }
 
