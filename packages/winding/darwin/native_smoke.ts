@@ -88,6 +88,7 @@ function testTextCallbacks(): void {
           "NSAttributedString",
         );
         drainEvents(library);
+        establishNativeFocus(library, window);
         window.setImeEnabled(true);
         assertIme(library.event(), "enabled");
 
@@ -187,6 +188,7 @@ function testKeydownOrdering(): void {
         assert(event !== null, "failed to create synthetic key event");
 
         drainEvents(library);
+        establishNativeFocus(library, window);
         window.setImeEnabled(true);
         assertIme(library.event(), "enabled");
         sendVoidId(window.contentView, sel(runtime, "keyDown:"), event);
@@ -343,6 +345,32 @@ function assertProcessMainThread(): void {
     );
   } finally {
     pthread.close();
+  }
+}
+
+/**
+ * AppKit does not reliably grant an unbundled command-line process foreground
+ * focus on hosted CI runners. Drive the registered delegate callback through
+ * Objective-C so the smoke test exercises the same native focus bridge without
+ * depending on the runner's desktop session.
+ */
+function establishNativeFocus(library: Library, window: NativeWindow): void {
+  const handles: Closeable[] = [];
+  try {
+    const runtime = Deno.dlopen(LIBOBJC, runtimeSymbols);
+    handles.push(runtime);
+    const sendId = openMessage(handles, ["pointer", "pointer"], "pointer");
+    const sendVoidId = openMessage(handles, ["pointer", "pointer", "pointer"], "void");
+    const delegate = sendId(window.nsWindow, sel(runtime, "delegate"));
+    assert(delegate !== null, "Darwin window has no native delegate");
+    sendVoidId(delegate, sel(runtime, "windowDidBecomeKey:"), null);
+    const focus = library.event();
+    assert(
+      focus?.type === "focus" && focus.window === window,
+      "expected native focus event before enabling IME",
+    );
+  } finally {
+    closeAll(handles);
   }
 }
 
