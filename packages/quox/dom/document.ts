@@ -1,40 +1,37 @@
 import type { QuoxRenderer as WasmRenderer } from "../lib/quox.js";
 import { getElementFunctionProps } from "./handlers.ts";
+import {
+  encodeKeyEvent,
+  type QuoxAppleStandardKeybindingEvent,
+  type QuoxImeEvent,
+  type QuoxKeyboardEvent,
+} from "./input.ts";
 import { type AssertActive, attachDocumentInternals, type RequestRender } from "./internals.ts";
 import { QuoxElement, QuoxNode, QuoxText } from "./node.ts";
 
 type SetNativeTitle = (title: string) => void;
 type SyncNativeImeRequests = () => void;
 
+// The checked-in generated declarations currently predate the interaction ABI.
+// Remove this augmentation after the next successful WASM regeneration.
 type RendererInputBridge = {
   dispatch_pointer_move(x: number, y: number, buttons: number): boolean;
   dispatch_pointer_down(x: number, y: number, button: number, buttons: number): boolean;
   dispatch_pointer_up(x: number, y: number, button: number, buttons: number): boolean;
   dispatch_wheel(x: number, y: number, deltaX: number, deltaY: number, buttons: number): boolean;
-  dispatch_key_down(
+  dispatch_key_event(
     code: string,
-    shiftKey: boolean,
-    ctrlKey: boolean,
-    altKey: boolean,
-    metaKey: boolean,
-    capsLock: boolean,
-    logicalKey: string | undefined,
-    text: string | undefined,
-    repeat: boolean,
+    key: string,
+    modifierBits: number,
+    location: number,
+    eventFlags: number,
   ): boolean;
-  dispatch_key_up(
-    code: string,
-    shiftKey: boolean,
-    ctrlKey: boolean,
-    altKey: boolean,
-    metaKey: boolean,
-    capsLock: boolean,
-    logicalKey?: string,
-  ): boolean;
+  dispatch_apple_standard_keybinding(command: string): boolean;
   dispatch_ime_enabled(): boolean;
   dispatch_ime_disabled(): boolean;
   dispatch_ime_preedit(text: string, start?: number, end?: number): boolean;
   dispatch_ime_commit(text: string): boolean;
+  dispatch_ime_delete_surrounding(beforeBytes: number, afterBytes: number): boolean;
   clear_hover(): boolean;
   take_click_node(): number | undefined;
   take_double_click_node(): number | undefined;
@@ -46,25 +43,6 @@ type RendererInputBridge = {
 };
 
 type InputRenderer = WasmRenderer & RendererInputBridge;
-
-export type QuoxImeEvent =
-  | { type: "ime"; kind: "enabled" | "disabled" }
-  | {
-    type: "ime";
-    kind: "preedit";
-    text: string;
-    /** UTF-8 byte offsets; omitted when the preedit cursor should be hidden. */
-    cursorRange?: readonly [number, number];
-  }
-  | { type: "ime"; kind: "commit"; text: string }
-  | {
-    type: "ime";
-    kind: "deleteSurrounding";
-    /** UTF-8 byte count before the cursor. */
-    beforeLength: number;
-    /** UTF-8 byte count after the cursor. */
-    afterLength: number;
-  };
 
 /**
  * Maps the DOM event kinds quox can invoke a JS handler for to their JSX prop name.
@@ -180,46 +158,23 @@ export class QuoxDocument {
     this.#dispatchInputEvent(() => this.#renderer.dispatch_wheel(x, y, deltaX, deltaY, buttons));
   }
 
-  /** Feed a keydown event into Blitz. Drives text-input editing and Tab focus traversal. */
-  dispatchKeyDown(
-    code: string,
-    shiftKey: boolean,
-    ctrlKey: boolean,
-    altKey: boolean,
-    metaKey: boolean,
-    capsLock: boolean,
-    logicalKey?: string,
-    text?: string,
-    repeat = false,
-  ): void {
+  /** Feed a canonical native key event into Blitz. Character insertion remains a later Commit. */
+  dispatchKey(event: QuoxKeyboardEvent): void {
+    const encoded = encodeKeyEvent(event);
     this.#dispatchInputEvent(() =>
-      this.#renderer.dispatch_key_down(
-        code,
-        shiftKey,
-        ctrlKey,
-        altKey,
-        metaKey,
-        capsLock,
-        logicalKey,
-        text,
-        repeat,
+      this.#renderer.dispatch_key_event(
+        encoded.code,
+        encoded.key,
+        encoded.modifierBits,
+        encoded.location,
+        encoded.eventFlags,
       )
     );
   }
 
-  /** Feed a keyup event into Blitz. */
-  dispatchKeyUp(
-    code: string,
-    shiftKey: boolean,
-    ctrlKey: boolean,
-    altKey: boolean,
-    metaKey: boolean,
-    capsLock: boolean,
-    logicalKey?: string,
-  ): void {
-    this.#dispatchInputEvent(() =>
-      this.#renderer.dispatch_key_up(code, shiftKey, ctrlKey, altKey, metaKey, capsLock, logicalKey)
-    );
+  /** Apply an AppKit editing selector through Blitz's platform-command adapter. */
+  dispatchAppleStandardKeybinding(event: QuoxAppleStandardKeybindingEvent): void {
+    this.#dispatchInputEvent(() => this.#renderer.dispatch_apple_standard_keybinding(event.command));
   }
 
   /** Feed native IME lifecycle and edit events into Blitz. */
@@ -232,8 +187,8 @@ export class QuoxDocument {
         this.#dispatchInputEvent(() => this.#renderer.dispatch_ime_disabled());
         break;
       case "preedit": {
-        const start = event.cursorRange?.[0];
-        const end = event.cursorRange?.[1];
+        const start = event.cursorRange?.[0] ?? undefined;
+        const end = event.cursorRange?.[1] ?? undefined;
         this.#dispatchInputEvent(() => this.#renderer.dispatch_ime_preedit(event.text, start, end));
         break;
       }
@@ -241,10 +196,12 @@ export class QuoxDocument {
         this.#dispatchInputEvent(() => this.#renderer.dispatch_ime_commit(event.text));
         break;
       case "deleteSurrounding":
-        // The pinned Blitz input API does not yet expose delete-surrounding. Keep the
-        // event observable at the QuoxWindow layer without pretending it was applied.
-        this.#dispatchInputEvent(() => false);
+        this.#dispatchInputEvent(() =>
+          this.#renderer.dispatch_ime_delete_surrounding(event.beforeBytes, event.afterBytes)
+        );
         break;
+      default:
+        return assertNever(event);
     }
   }
 
@@ -293,4 +250,8 @@ export class QuoxDocument {
     this.#assertActive();
     return new QuoxText(this, this.#renderer.create_text_node(text));
   }
+}
+
+function assertNever(_value: never): never {
+  throw new TypeError("Unsupported Quox IME event");
 }

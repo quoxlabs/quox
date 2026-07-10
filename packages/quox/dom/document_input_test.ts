@@ -21,9 +21,14 @@ class FakeInputRenderer {
     return false;
   }
 
-  dispatch_key_down(...args: unknown[]): boolean {
-    this.calls.push({ method: "keyDown", args });
+  dispatch_key_event(...args: unknown[]): boolean {
+    this.calls.push({ method: "keyEvent", args });
     return true;
+  }
+
+  dispatch_apple_standard_keybinding(command: string): boolean {
+    this.calls.push({ method: "appleCommand", args: [command] });
+    return false;
   }
 
   dispatch_ime_enabled(): boolean {
@@ -43,6 +48,11 @@ class FakeInputRenderer {
 
   dispatch_ime_commit(text: string): boolean {
     this.calls.push({ method: "imeCommit", args: [text] });
+    return false;
+  }
+
+  dispatch_ime_delete_surrounding(beforeBytes: number, afterBytes: number): boolean {
+    this.calls.push({ method: "imeDeleteSurrounding", args: [beforeBytes, afterBytes] });
     return false;
   }
 
@@ -95,14 +105,31 @@ function createDocument(renderer = new FakeInputRenderer()): {
   return { document, renderer, renders, syncs };
 }
 
-Deno.test("keyboard dispatch forwards logical key, text, and repeat without synthesis", () => {
+Deno.test("keyboard dispatch forwards logical key, policy, and repeat without synthesis", () => {
   const { document, renderer, renders, syncs } = createDocument();
 
-  document.dispatchKeyDown("KeyZ", true, false, true, false, true, "y", "y", true);
+  document.dispatchKey({
+    type: "keydown",
+    keycode: 44,
+    code: "KeyZ",
+    key: "y",
+    location: 0,
+    repeat: true,
+    isComposing: false,
+    editDisposition: "text-input",
+    shiftKey: true,
+    ctrlKey: false,
+    altKey: true,
+    metaKey: false,
+    accelKey: false,
+    capsLock: true,
+    altGraphKey: false,
+  });
 
   assertEquals(renderer.calls, [{
-    method: "keyDown",
-    args: ["KeyZ", true, false, true, false, true, "y", "y", true],
+    method: "keyEvent",
+    // modifiers = Shift | Alt | CapsLock; flags = Pressed | Repeat | PreventDefault
+    args: ["KeyZ", "y", 11, 0, 11],
   }]);
   assertEquals(renders.count, 1);
   assertEquals(syncs.count, 1);
@@ -115,14 +142,14 @@ Deno.test("IME dispatch preserves UTF-8 preedit ranges and emits DOM input for c
 
   document.dispatchIme({ type: "ime", kind: "enabled" });
   document.dispatchIme({ type: "ime", kind: "preedit", text: "éx", cursorRange: [2, 3] });
-  document.dispatchIme({ type: "ime", kind: "preedit", text: "hidden" });
+  document.dispatchIme({ type: "ime", kind: "preedit", text: "hidden", cursorRange: null });
   renderer.inputNode = 42;
   document.dispatchIme({ type: "ime", kind: "commit", text: "é" });
   document.dispatchIme({
     type: "ime",
     kind: "deleteSurrounding",
-    beforeLength: 4,
-    afterLength: 2,
+    beforeBytes: 4,
+    afterBytes: 2,
   });
   document.dispatchIme({ type: "ime", kind: "disabled" });
 
@@ -131,10 +158,23 @@ Deno.test("IME dispatch preserves UTF-8 preedit ranges and emits DOM input for c
     { method: "imePreedit", args: ["éx", 2, 3] },
     { method: "imePreedit", args: ["hidden", undefined, undefined] },
     { method: "imeCommit", args: ["é"] },
+    { method: "imeDeleteSurrounding", args: [4, 2] },
     { method: "imeDisabled", args: [] },
   ]);
   assertEquals(inputs, 1);
   assertEquals(syncs.count, 6);
+});
+
+Deno.test("AppKit selectors use the dedicated renderer entry point", () => {
+  const { document, renderer, syncs } = createDocument();
+
+  document.dispatchAppleStandardKeybinding({
+    type: "apple-standard-keybinding",
+    command: "deleteBackward:",
+  });
+
+  assertEquals(renderer.calls, [{ method: "appleCommand", args: ["deleteBackward:"] }]);
+  assertEquals(syncs.count, 1);
 });
 
 Deno.test("native IME requests are synchronized even when renderer dispatch throws", () => {
