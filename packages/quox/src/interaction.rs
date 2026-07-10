@@ -1,9 +1,9 @@
 use super::{QuoxRenderer, QuoxRendererState};
 use blitz_dom::{Document, EventDriver, EventHandler};
 use blitz_traits::events::{
-    BlitzKeyEvent, BlitzPointerEvent, BlitzPointerId, BlitzWheelDelta, BlitzWheelEvent, DomEvent,
-    DomEventData, EventState, KeyState, MouseEventButton, MouseEventButtons, Point as ElementPoint,
-    PointerCoords, PointerDetails, UiEvent,
+    BlitzImeEvent, BlitzKeyEvent, BlitzPointerEvent, BlitzPointerId, BlitzWheelDelta,
+    BlitzWheelEvent, DomEvent, DomEventData, EventState, KeyState, MouseEventButton,
+    MouseEventButtons, Point as ElementPoint, PointerCoords, PointerDetails, UiEvent,
 };
 use keyboard_types::{Code, Key, Location, Modifiers};
 use std::str::FromStr;
@@ -132,6 +132,16 @@ fn synthesize_key(code: &str, shift: bool, caps_lock: bool) -> Key {
     Key::Unidentified
 }
 
+/// Prefer the platform's layout-aware logical key, retaining parser-unknown strings as
+/// character keys. Fall back to legacy physical-code synthesis only when the backend cannot
+/// supply a logical key.
+fn native_key(code: &str, logical_key: Option<&str>, shift: bool, caps_lock: bool) -> Key {
+    match logical_key.filter(|key| !key.is_empty()) {
+        Some(key) => Key::from_str(key).unwrap_or_else(|_| Key::Character(key.to_owned())),
+        None => synthesize_key(code, shift, caps_lock),
+    }
+}
+
 /// Map a `winding` button index (`left:0, middle:1, right:2`, matching the ordinals
 /// `MouseEventButton` itself already uses for `Main`/`Auxiliary`/`Secondary`) to the
 /// corresponding `MouseEventButton`.
@@ -193,17 +203,29 @@ fn key_event(
     alt_key: bool,
     meta_key: bool,
     caps_lock: bool,
+    logical_key: Option<&str>,
+    text: Option<&str>,
+    repeat: bool,
     state: KeyState,
 ) -> BlitzKeyEvent {
     BlitzKeyEvent {
-        key: synthesize_key(code, shift_key, caps_lock),
+        key: native_key(code, logical_key, shift_key, caps_lock),
         code: Code::from_str(code).unwrap_or(Code::Unidentified),
         modifiers: build_modifiers(shift_key, ctrl_key, alt_key, meta_key, caps_lock),
         location: Location::Standard,
-        is_auto_repeating: false,
+        is_auto_repeating: repeat,
         is_composing: false,
         state,
-        text: None,
+        text: text.map(Into::into),
+    }
+}
+
+/// A committed text payload is inserted by the following `Ime::Commit`, not by Blitz's
+/// physical-key default action. Cancelling only this case preserves navigation, deletion,
+/// shortcuts, Tab traversal, and other key defaults.
+fn cancel_text_keydown_default(event: &DomEvent, event_state: &mut EventState) {
+    if matches!(&event.data, DomEventData::KeyDown(data) if data.text.is_some()) {
+        event_state.prevent_default();
     }
 }
 
@@ -234,8 +256,10 @@ impl EventHandler for RecordingEventHandler<'_> {
         chain: &[usize],
         event: &mut DomEvent,
         _doc: &mut dyn Document,
-        _event_state: &mut EventState,
+        event_state: &mut EventState,
     ) {
+        cancel_text_keydown_default(event, event_state);
+
         let Some(target) = chain.first().copied() else {
             return;
         };
@@ -261,18 +285,22 @@ impl QuoxRendererState {
     fn dispatch(&mut self, event: UiEvent) -> bool {
         self.recorded_events = RecordedEvents::default();
 
-        let QuoxRendererState {
-            document,
-            recorded_events,
-            ..
-        } = self;
-        let mut driver = EventDriver::new(
-            document,
-            RecordingEventHandler {
-                recorded: recorded_events,
-            },
-        );
-        driver.handle_ui_event(event);
+        {
+            let QuoxRendererState {
+                document,
+                recorded_events,
+                ..
+            } = self;
+            let mut driver = EventDriver::new(
+                document,
+                RecordingEventHandler {
+                    recorded: recorded_events,
+                },
+            );
+            driver.handle_ui_event(event);
+        }
+
+        self.refresh_ime_cursor_area();
 
         self.redraw_requested.swap(false, Ordering::Relaxed)
     }
@@ -361,10 +389,17 @@ impl QuoxRenderer {
 
     /// Feed a keydown event into Blitz (drives text-input editing, Tab focus traversal,
     /// clipboard copy, and Enter-triggered form submission). `code` is a DOM
-    /// `KeyboardEvent.code`-style physical key identifier; the corresponding `key`
-    /// (character/named key) is synthesized from it plus the modifier flags — see
-    /// `synthesize_key`. Returns whether a redraw was requested.
-    #[allow(clippy::fn_params_excessive_bools)]
+    /// `KeyboardEvent.code`-style physical key identifier. `logical_key` is the backend's
+    /// layout-aware DOM `KeyboardEvent.key` value; when absent, Quox falls back to best-effort
+    /// US-QWERTY synthesis. `text` is committed text that will be inserted by a separate
+    /// `dispatch_ime_commit`, and `repeat` marks an auto-repeat press. Returns whether a redraw
+    /// was requested.
+    #[allow(
+        clippy::fn_params_excessive_bools,
+        clippy::needless_pass_by_value,
+        clippy::too_many_arguments,
+        reason = "the exported host-event ABI is intentionally flat, and wasm-bindgen requires owned optional strings"
+    )]
     pub fn dispatch_key_down(
         &self,
         code: &str,
@@ -373,6 +408,9 @@ impl QuoxRenderer {
         alt_key: bool,
         meta_key: bool,
         caps_lock: bool,
+        logical_key: Option<String>,
+        text: Option<String>,
+        repeat: bool,
     ) -> bool {
         let mut state = self.state.borrow_mut();
         let event = key_event(
@@ -382,6 +420,9 @@ impl QuoxRenderer {
             alt_key,
             meta_key,
             caps_lock,
+            logical_key.as_deref(),
+            text.as_deref(),
+            repeat,
             KeyState::Pressed,
         );
         state.dispatch(UiEvent::KeyDown(event))
@@ -389,7 +430,12 @@ impl QuoxRenderer {
 
     /// Feed a keyup event into Blitz. See `dispatch_key_down`. Returns whether a redraw was
     /// requested.
-    #[allow(clippy::fn_params_excessive_bools)]
+    #[allow(
+        clippy::fn_params_excessive_bools,
+        clippy::needless_pass_by_value,
+        clippy::too_many_arguments,
+        reason = "the exported host-event ABI is intentionally flat, and wasm-bindgen requires owned optional strings"
+    )]
     pub fn dispatch_key_up(
         &self,
         code: &str,
@@ -398,6 +444,7 @@ impl QuoxRenderer {
         alt_key: bool,
         meta_key: bool,
         caps_lock: bool,
+        logical_key: Option<String>,
     ) -> bool {
         let mut state = self.state.borrow_mut();
         let event = key_event(
@@ -407,9 +454,55 @@ impl QuoxRenderer {
             alt_key,
             meta_key,
             caps_lock,
+            logical_key.as_deref(),
+            None,
+            false,
             KeyState::Released,
         );
         state.dispatch(UiEvent::KeyUp(event))
+    }
+
+    /// Notify Blitz that the native input method has become active.
+    pub fn dispatch_ime_enabled(&self) -> bool {
+        self.state
+            .borrow_mut()
+            .dispatch(UiEvent::Ime(BlitzImeEvent::Enabled))
+    }
+
+    /// Notify Blitz that the native input method has become inactive and clear any pending
+    /// preedit text.
+    pub fn dispatch_ime_disabled(&self) -> bool {
+        self.state
+            .borrow_mut()
+            .dispatch(UiEvent::Ime(BlitzImeEvent::Disabled))
+    }
+
+    /// Update the native IME's preedit text. Cursor offsets are optional UTF-8 byte offsets;
+    /// both must be present to expose a cursor/selection inside the preedit.
+    pub fn dispatch_ime_preedit(
+        &self,
+        text: &str,
+        cursor_start: Option<usize>,
+        cursor_end: Option<usize>,
+    ) -> bool {
+        let cursor = cursor_start.zip(cursor_end);
+        self.state
+            .borrow_mut()
+            .dispatch(UiEvent::Ime(BlitzImeEvent::Preedit(
+                text.to_owned(),
+                cursor,
+            )))
+    }
+
+    /// Commit native IME text to the focused Blitz text editor.
+    pub fn dispatch_ime_commit(&self, text: &str) -> bool {
+        let mut state = self.state.borrow_mut();
+        // Blitz follows winit's contract: an empty preedit immediately precedes Commit. Clear it
+        // here as well so backends can expose the simpler commit-only entry point safely.
+        let cleared_preedit =
+            state.dispatch(UiEvent::Ime(BlitzImeEvent::Preedit(String::new(), None)));
+        let committed = state.dispatch(UiEvent::Ime(BlitzImeEvent::Commit(text.to_owned())));
+        cleared_preedit || committed
     }
 
     /// Clear Blitz's hover state (and reset the cursor), e.g. when the pointer leaves the
@@ -459,8 +552,71 @@ impl QuoxRenderer {
 
 #[cfg(test)]
 mod tests {
-    use super::{synthesize_key, viewport_point_to_page};
+    use super::{
+        RecordedEvents, RecordingEventHandler, cancel_text_keydown_default, key_event, native_key,
+        synthesize_key, viewport_point_to_page,
+    };
+    use blitz_dom::{BaseDocument, DocumentConfig, EventDriver};
+    use blitz_html::HtmlDocument;
+    use blitz_traits::events::{
+        BlitzImeEvent, DomEvent, DomEventData, EventState, KeyState, UiEvent,
+    };
+    use blitz_traits::shell::{ColorScheme, Viewport};
     use keyboard_types::Key;
+
+    fn focused_input_document() -> (BaseDocument, usize) {
+        let mut document = HtmlDocument::from_html(
+            "<!doctype html><html><body><input value=\"\"></body></html>",
+            DocumentConfig {
+                viewport: Some(Viewport::new(800, 600, 1.0, ColorScheme::Light)),
+                ..Default::default()
+            },
+        )
+        .into_inner();
+        document.resolve(0.0);
+
+        let input_id = document
+            .tree()
+            .iter()
+            .find_map(|(id, node)| {
+                node.element_data()
+                    .is_some_and(|element| element.name.local.as_ref() == "input")
+                    .then_some(id)
+            })
+            .expect("test document should contain an input");
+        assert!(document.set_focus_to(input_id));
+
+        (document, input_id)
+    }
+
+    fn dispatch_to_document(
+        document: &mut BaseDocument,
+        recorded: &mut RecordedEvents,
+        event: UiEvent,
+    ) {
+        let mut driver = EventDriver::new(document, RecordingEventHandler { recorded });
+        driver.handle_ui_event(event);
+    }
+
+    fn input_raw_text(document: &mut BaseDocument, input_id: usize) -> String {
+        let mut text = None;
+        document.with_text_input(input_id, |driver| {
+            text = Some(driver.editor.raw_text().to_owned());
+        });
+        text.expect("test node should remain a text input")
+    }
+
+    fn input_compose_range(document: &mut BaseDocument, input_id: usize) -> Option<(usize, usize)> {
+        let mut range = None;
+        document.with_text_input(input_id, |driver| {
+            range = driver
+                .editor
+                .raw_compose()
+                .as_ref()
+                .map(|range| (range.start, range.end));
+        });
+        range
+    }
 
     #[test]
     fn rejects_non_finite_coordinates() {
@@ -574,5 +730,193 @@ mod tests {
     #[test]
     fn falls_back_to_unidentified_for_unmapped_codes() {
         assert_eq!(synthesize_key("Numpad5", false, false), Key::Unidentified);
+    }
+
+    #[test]
+    fn prefers_layout_aware_logical_keys_and_falls_back_to_physical_synthesis() {
+        assert_eq!(
+            native_key("KeyQ", Some("ä"), false, false),
+            Key::Character("ä".into())
+        );
+        assert_eq!(
+            native_key("KeyQ", Some("ArrowDown"), false, false),
+            Key::ArrowDown
+        );
+        assert_eq!(
+            native_key("KeyQ", None, false, false),
+            Key::Character("q".into())
+        );
+        assert_eq!(
+            native_key("KeyQ", Some("ss"), false, false),
+            Key::Character("ss".into())
+        );
+        assert_eq!(
+            native_key("KeyQ", Some(""), false, false),
+            Key::Character("q".into())
+        );
+    }
+
+    #[test]
+    fn key_event_carries_committed_text_and_repeat_state() {
+        let event = key_event(
+            "KeyQ",
+            false,
+            false,
+            true,
+            false,
+            false,
+            Some("@"),
+            Some("@"),
+            true,
+            KeyState::Pressed,
+        );
+
+        assert_eq!(event.key, Key::Character("@".into()));
+        assert_eq!(event.text.as_deref(), Some("@"));
+        assert!(event.is_auto_repeating);
+    }
+
+    #[test]
+    fn cancels_only_text_bearing_keydown_defaults() {
+        let text_keydown = DomEvent::new(
+            1,
+            DomEventData::KeyDown(key_event(
+                "KeyZ",
+                false,
+                false,
+                false,
+                false,
+                false,
+                Some("z"),
+                Some("z"),
+                false,
+                KeyState::Pressed,
+            )),
+        );
+        let navigation_keydown = DomEvent::new(
+            1,
+            DomEventData::KeyDown(key_event(
+                "ArrowLeft",
+                false,
+                false,
+                false,
+                false,
+                false,
+                Some("ArrowLeft"),
+                None,
+                false,
+                KeyState::Pressed,
+            )),
+        );
+        let text_keyup = DomEvent::new(
+            1,
+            DomEventData::KeyUp(key_event(
+                "KeyZ",
+                false,
+                false,
+                false,
+                false,
+                false,
+                Some("z"),
+                Some("z"),
+                false,
+                KeyState::Released,
+            )),
+        );
+
+        let mut text_keydown_state = EventState::default();
+        cancel_text_keydown_default(&text_keydown, &mut text_keydown_state);
+        assert!(text_keydown_state.is_cancelled());
+
+        let mut navigation_keydown_state = EventState::default();
+        cancel_text_keydown_default(&navigation_keydown, &mut navigation_keydown_state);
+        assert!(!navigation_keydown_state.is_cancelled());
+
+        let mut text_keyup_state = EventState::default();
+        cancel_text_keydown_default(&text_keyup, &mut text_keyup_state);
+        assert!(!text_keyup_state.is_cancelled());
+    }
+
+    #[test]
+    fn text_keydown_then_ime_commit_inserts_exactly_once() {
+        let (mut document, input_id) = focused_input_document();
+        let mut recorded = RecordedEvents::default();
+        let key = key_event(
+            "KeyS",
+            false,
+            false,
+            false,
+            false,
+            false,
+            Some("ß"),
+            Some("ß"),
+            false,
+            KeyState::Pressed,
+        );
+
+        dispatch_to_document(&mut document, &mut recorded, UiEvent::KeyDown(key));
+        assert_eq!(input_raw_text(&mut document, input_id), "");
+        assert_eq!(recorded.input, None);
+
+        dispatch_to_document(
+            &mut document,
+            &mut recorded,
+            UiEvent::Ime(BlitzImeEvent::Commit("ß".to_owned())),
+        );
+        assert_eq!(input_raw_text(&mut document, input_id), "ß");
+        assert_eq!(recorded.input, Some(input_id));
+    }
+
+    #[test]
+    fn textless_legacy_keydown_preserves_blitz_default_insertion() {
+        let (mut document, input_id) = focused_input_document();
+        let mut recorded = RecordedEvents::default();
+        let key = key_event(
+            "KeyA",
+            false,
+            false,
+            false,
+            false,
+            false,
+            None,
+            None,
+            false,
+            KeyState::Pressed,
+        );
+
+        dispatch_to_document(&mut document, &mut recorded, UiEvent::KeyDown(key));
+        assert_eq!(input_raw_text(&mut document, input_id), "a");
+        assert_eq!(recorded.input, Some(input_id));
+    }
+
+    #[test]
+    fn utf8_preedit_updates_and_clears_without_emitting_input() {
+        let (mut document, input_id) = focused_input_document();
+        let mut recorded = RecordedEvents::default();
+        let preedit = "に";
+
+        dispatch_to_document(
+            &mut document,
+            &mut recorded,
+            UiEvent::Ime(BlitzImeEvent::Preedit(
+                preedit.to_owned(),
+                Some((0, preedit.len())),
+            )),
+        );
+        assert_eq!(input_raw_text(&mut document, input_id), preedit);
+        assert_eq!(
+            input_compose_range(&mut document, input_id),
+            Some((0, preedit.len()))
+        );
+        assert_eq!(recorded.input, None);
+
+        dispatch_to_document(
+            &mut document,
+            &mut recorded,
+            UiEvent::Ime(BlitzImeEvent::Preedit(String::new(), None)),
+        );
+        assert_eq!(input_raw_text(&mut document, input_id), "");
+        assert_eq!(input_compose_range(&mut document, input_id), None);
+        assert_eq!(recorded.input, None);
     }
 }
