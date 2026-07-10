@@ -52,7 +52,7 @@ if (import.meta.main) {
         console.log("Window closed");
         break;
       default:
-        console.log("Other even thrown:", event);
+        console.log("Other event:", event);
         break;
     }
   });
