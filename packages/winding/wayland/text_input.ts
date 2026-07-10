@@ -1,7 +1,7 @@
 /** Double-buffered semantic state for the Wayland text-input-v3 protocol. */
 
 import type { ImeCursorRange } from "../types.ts";
-import { validateImeCursorRange } from "../input/mod.ts";
+import { normalizeCommittedText, validateImeCursorRange } from "../input/mod.ts";
 
 const UINT32_MAX = 0xffffffff;
 
@@ -50,7 +50,7 @@ export class TextInputV3Batch {
   }
 
   setCommit(text: string | null): void {
-    this.#pendingCommit = text !== null && text.length > 0 ? text : undefined;
+    this.#pendingCommit = text === null ? undefined : normalizeCommittedText(text);
   }
 
   setDeleteSurrounding(beforeBytes: number, afterBytes: number): void {

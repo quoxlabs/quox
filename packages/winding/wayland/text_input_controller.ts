@@ -319,9 +319,11 @@ export class WaylandTextInputController {
           break;
         }
         case "commit": {
-          window.composition.commit();
           const event = createImeCommitEvent(window, edit.text);
-          if (event !== undefined) this.host.pushEvent(event);
+          if (event !== undefined) {
+            window.composition.commit();
+            this.host.pushEvent(event);
+          }
           break;
         }
         default:

@@ -1,5 +1,6 @@
 export type UIEvent =
-  | KeyEvent
+  | KeyDownEvent
+  | KeyUpEvent
   | ImeEvent
   | AppleStandardKeybindingEvent
   | ButtonEvent
@@ -12,137 +13,149 @@ export type UIEvent =
   | VisibilityEvent;
 export type UIEventType = UIEvent["type"];
 
-export interface WindowEvent {
-  type: string;
-  window?: Window;
+export interface WindowEvent<Type extends string = string> {
+  type: Type;
+  /** The live Winding window that originated this event. */
+  window: Window;
 }
 export interface KeyModifiers {
   shiftKey: boolean;
   ctrlKey: boolean;
   altKey: boolean;
   metaKey: boolean;
-  /** Command on Darwin, otherwise Control. */
+  /** Command on Darwin; Control elsewhere, excluding synthetic AltGr Control. */
   accelKey: boolean;
-  /** Backends that cannot report Caps Lock state omit it. */
-  capsLock?: boolean;
+  /** Active Caps Lock state. */
+  capsLock: boolean;
+  /** Whether the active keyboard level is AltGraph/AltGr. */
+  altGraphKey: boolean;
 }
 /** DOM KeyboardEvent.location-compatible key location. */
 export type KeyLocation = 0 | 1 | 2 | 3;
-export interface KeyEvent extends WindowEvent, KeyModifiers {
-  type: "keydown" | "keyup";
+
+/**
+ * Describes which layer owns a keydown's editing behavior.
+ *
+ * `text-input` and `platform` keydowns remain observable, but consumers must
+ * suppress their editor's ordinary keyboard default. A `text-input` key may be
+ * followed by IME or AppKit command events; a `platform` key is owned entirely
+ * by the operating system and has no semantic editing follow-up.
+ */
+export type KeyEditDisposition = "key-default" | "text-input" | "platform";
+
+export interface KeyEventBase extends WindowEvent<"keydown" | "keyup">, KeyModifiers {
   /** Native, unnormalized platform key identifier. */
   keycode: number;
-  /** DOM KeyboardEvent.code-style physical key identifier. */
+  /** DOM KeyboardEvent.code-style physical key identifier, or `Unidentified`. */
   code: string;
-  /** Layout-aware logical key value, when the backend can resolve it. */
-  key?: string;
+  /** Layout-aware DOM KeyboardEvent.key-style value, or `Unidentified`. */
+  key: string;
   /** Standard, left, right, or numeric-keypad location. */
-  location?: KeyLocation;
-  /** Whether this event is an operating-system key repeat. */
-  repeat?: boolean;
-  /** Whether the key was delivered while an IME composition is active. */
-  isComposing?: boolean;
-  /** Text produced by this key, when it can be represented independently of IME events. */
-  text?: string;
+  location: KeyLocation;
   /**
-   * A following IME or native-command event owns this key's editing action.
-   * Consumers must not also apply the key's default text-editing behavior.
+   * Whether a native composition/preedit session was active immediately before
+   * this native key transition. The initiating key may therefore be false,
+   * while subsequent composition and commit keys are true.
    */
-  textInputHandled?: boolean;
+  isComposing: boolean;
 }
-export interface ImeSelection {
-  /** Inclusive UTF-8 byte offset into the preedit text. */
-  start: number;
-  /** Exclusive UTF-8 byte offset into the preedit text. */
-  end: number;
+
+export interface KeyDownEvent extends KeyEventBase {
+  type: "keydown";
+  /** False for the initial press and true for an operating-system repeat. */
+  repeat: boolean;
+  editDisposition: KeyEditDisposition;
 }
+
+export interface KeyUpEvent extends KeyEventBase {
+  type: "keyup";
+  /** Key releases are never repeat events. */
+  repeat: false;
+}
+
+export type KeyEvent = KeyDownEvent | KeyUpEvent;
+
+/** Inclusive/exclusive UTF-8 byte offsets into preedit text. */
+export type ImeCursorRange = readonly [start: number, end: number];
+
 /** Native text-input offsets and lengths are UTF-8 byte counts. */
 export type ImeEvent =
-  | (WindowEvent & { type: "ime"; kind: "enabled" | "disabled" })
-  | (WindowEvent & {
-    type: "ime";
+  | (WindowEvent<"ime"> & { kind: "enabled" | "disabled" })
+  | (WindowEvent<"ime"> & {
     kind: "preedit";
     text: string;
-    /** Omitted when the IME asks the application to hide the preedit cursor. */
-    cursorRange?: readonly [number, number];
-    /** Darwin-compatible named form; `null` also requests a hidden preedit cursor. */
-    selection?: ImeSelection | null;
+    /** `null` when the native input method hides or cannot report its cursor. */
+    cursorRange: ImeCursorRange | null;
   })
-  | (WindowEvent & { type: "ime"; kind: "commit"; text: string })
-  | (WindowEvent & {
-    type: "ime";
-    kind: "delete-surrounding";
+  | (WindowEvent<"ime"> & {
+    kind: "commit";
+    /** Non-empty committed text. A commit atomically ends the current preedit. */
+    text: string;
+  })
+  | (WindowEvent<"ime"> & {
+    kind: "deleteSurrounding";
     /** Number of UTF-8 bytes to delete before the cursor. */
     beforeBytes: number;
     /** Number of UTF-8 bytes to delete after the cursor. */
     afterBytes: number;
-  })
-  | (WindowEvent & {
-    type: "ime";
-    kind: "deleteSurrounding";
-    /** Number of UTF-8 bytes to delete before the cursor. */
-    beforeLength: number;
-    /** Number of UTF-8 bytes to delete after the cursor. */
-    afterLength: number;
   });
-export interface AppleStandardKeybindingEvent extends WindowEvent {
-  type: "apple-standard-keybinding";
+export interface AppleStandardKeybindingEvent extends WindowEvent<"apple-standard-keybinding"> {
   /** Original AppKit action selector, for example `deleteBackward:`. */
   command: string;
 }
-export interface ButtonEvent extends WindowEvent {
+export interface ButtonEvent extends WindowEvent<"mousedown" | "mouseup"> {
   type: "mousedown" | "mouseup";
   button: "left" | "middle" | "right";
 }
-export interface MoveEvent extends WindowEvent {
+export interface MoveEvent extends WindowEvent<"mousemove"> {
   type: "mousemove";
   x: number;
   y: number;
 }
-export interface WheelEvent extends WindowEvent {
+export interface WheelEvent extends WindowEvent<"wheel"> {
   type: "wheel";
   deltaX: number;
   deltaY: number;
 }
-export interface ResizeEvent extends WindowEvent {
+export interface ResizeEvent extends WindowEvent<"resize"> {
   type: "resize";
   width: number;
   height: number;
 }
-export interface CloseEvent extends WindowEvent {
+export interface CloseEvent extends WindowEvent<"close"> {
   type: "close";
 }
 /** Fired when the pointer enters/leaves the window's bounds. */
-export interface EnterLeaveEvent extends WindowEvent {
+export interface EnterLeaveEvent extends WindowEvent<"mouseenter" | "mouseleave"> {
   type: "mouseenter" | "mouseleave";
 }
 /** Fired when the window (not a DOM element) gains/loses OS-level input focus. */
-export interface FocusChangeEvent extends WindowEvent {
+export interface FocusChangeEvent extends WindowEvent<"focus" | "blur"> {
   type: "focus" | "blur";
 }
 /** Fired when the window is minimized/restored. */
-export interface VisibilityEvent extends WindowEvent {
+export interface VisibilityEvent extends WindowEvent<"visibilitychange"> {
   type: "visibilitychange";
   visible: boolean;
 }
 
 export interface Window {
-  [Symbol.dispose]: () => void;
+  [Symbol.dispose](): void;
   close(): void;
   /** Set the native window title. */
   setTitle(title: string): void;
   /** Blit (bit-block transfer) an RGBA pixel buffer to the window. Width and height must match the window dimensions. */
   blit(rgba: Uint8Array, width: number, height: number): void;
-  /** Enable or disable platform text input when supported. */
-  setImeEnabled?(enabled: boolean): void;
+  /** Set whether native composition is desired for this window. */
+  setImeEnabled(enabled: boolean): void;
   /**
    * Set the IME candidate-window anchor in top-left-origin logical client coordinates.
    */
-  setImeCursorArea?(x: number, y: number, width: number, height: number): void;
+  setImeCursorArea(x: number, y: number, width: number, height: number): void;
 }
 
 export interface Library {
-  [Symbol.dispose]: () => void;
+  [Symbol.dispose](): void;
   openWindow(): Window;
   openWindow(x: number, y: number): Window;
   openWindow(x: number, y: number, w: number, h: number): Window;
