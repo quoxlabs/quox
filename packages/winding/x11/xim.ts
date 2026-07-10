@@ -367,6 +367,13 @@ export class XimManager implements Disposable {
     this.#x11.XUnsetICFocus(ic);
   }
 
+  resetIc(ic: Deno.PointerObject): void {
+    const pendingText = this.#x11.Xutf8ResetIC(ic);
+    // Reset text represents the composition being abandoned. The public blur
+    // contract is cancellation, so discard it after releasing Xlib's storage.
+    if (pendingText !== null) this.#x11.XFree(pendingText);
+  }
+
   setArea(ic: Deno.PointerObject, area: ImeCursorArea): void {
     if (!this.#styles?.positioned) return;
     const attributes = this.#createPositionAttributes(area);
@@ -582,7 +589,10 @@ export class XimContext implements Disposable {
 
   setEnabled(enabled: boolean): void {
     if (this.#activation.desired === enabled || this.#closed) return;
-    if (!enabled) this.#clearPreedit(true);
+    if (!enabled) {
+      if (this.#ic !== null && !this.#serverInvalidated) this.manager.resetIc(this.#ic);
+      this.#clearPreedit(true);
+    }
     if (this.#activation.active) {
       this.#activation.setDesired(false);
       this.#reconcileActivation();
@@ -594,7 +604,10 @@ export class XimContext implements Disposable {
 
   setNativeFocused(focused: boolean): void {
     if (this.#activation.focused === focused || this.#closed) return;
-    if (!focused) this.#clearPreedit(true);
+    if (!focused) {
+      if (this.#ic !== null && !this.#serverInvalidated) this.manager.resetIc(this.#ic);
+      this.#clearPreedit(true);
+    }
     this.#activation.setFocused(focused);
     this.#reconcileActivation();
   }
