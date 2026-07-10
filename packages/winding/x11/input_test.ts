@@ -3,6 +3,7 @@ import { logicalKeyFromKeysym } from "../linux/mod.ts";
 import { XEventType } from "./ffi.ts";
 import { fallbackLookupText, isAutoRepeatPair, x11KeyEditDisposition } from "./input.ts";
 import { applyPreeditChange, preeditCursorByteOffset } from "./xim_preedit.ts";
+import { packRgbaPixels } from "./native_image.ts";
 
 Deno.test("X11 logical keys prefer layout-aware printable text", () => {
   assertEquals(logicalKeyFromKeysym(0x7a, "z"), "z");
@@ -79,8 +80,39 @@ Deno.test("X11 repeat detection requires an identical adjacent press", () => {
   assertEquals(isAutoRepeatPair(release, press), false);
 });
 
+Deno.test("X11 pixels follow the server visual masks and byte order", () => {
+  const rgba = new Uint8Array([255, 128, 0, 7]);
+  const bgrx = new Uint8Array(4);
+  packRgbaPixels(rgba, bgrx, 1, 1, {
+    byteOrder: 0,
+    bytesPerLine: 4,
+    bitsPerPixel: 32,
+    redMask: 0xff0000n,
+    greenMask: 0xff00n,
+    blueMask: 0xffn,
+  });
+  assertArrayEquals(bgrx, [0, 128, 255, 0]);
+
+  const rgb565 = new Uint8Array(2);
+  packRgbaPixels(rgba, rgb565, 1, 1, {
+    byteOrder: 1,
+    bytesPerLine: 2,
+    bitsPerPixel: 16,
+    redMask: 0xf800n,
+    greenMask: 0x07e0n,
+    blueMask: 0x001fn,
+  });
+  assertArrayEquals(rgb565, [0xfc, 0x00]);
+});
+
 function assertEquals<T>(actual: T, expected: T): void {
   if (!Object.is(actual, expected)) {
     throw new Error(`Expected ${String(expected)}, got ${String(actual)}`);
+  }
+}
+
+function assertArrayEquals(actual: Uint8Array, expected: readonly number[]): void {
+  if (actual.length !== expected.length || actual.some((value, index) => value !== expected[index])) {
+    throw new Error(`Expected [${expected.join(", ")}], got [${actual.join(", ")}]`);
   }
 }

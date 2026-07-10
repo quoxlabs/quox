@@ -120,13 +120,15 @@ class X11Window implements Window {
     }
     this.#gc = gc;
     try {
-      const visual = lib.X11.symbols.XDefaultVisual(lib.display, 0);
+      const visual = lib.X11.symbols.XDefaultVisualOfScreen(lib.screen);
       if (visual === null) throw new Error("winding(x11): failed to get default visual");
+      const depth = lib.X11.symbols.XDefaultDepthOfScreen(lib.screen);
       this.#image = new NativeXImage(
         lib.X11.symbols,
         lib.libc.symbols,
         lib.display,
         visual,
+        depth,
         w,
         h,
       );
@@ -173,8 +175,8 @@ class X11Window implements Window {
 
   /**
    * Copy an RGBA pixel buffer to the X11 window. The buffer must be
-   * `width * height * 4` bytes. Internally converts to X11 TrueColor BGRX
-   * (little-endian) before blitting.
+   * `width * height * 4` bytes. Internally converts to the default visual's
+   * advertised TrueColor layout before blitting.
    *
    * If the dimensions differ from the last blit, the XImage is recreated to
    * match the new size.
@@ -184,13 +186,15 @@ class X11Window implements Window {
       throw new RangeError("winding(x11): RGBA buffer size does not match its dimensions");
     }
     if (width !== this.#width || height !== this.#height) {
-      const visual = this.lib.X11.symbols.XDefaultVisual(this.lib.display, 0);
+      const visual = this.lib.X11.symbols.XDefaultVisualOfScreen(this.lib.screen);
       if (visual === null) throw new Error("winding(x11): failed to get default visual");
+      const depth = this.lib.X11.symbols.XDefaultDepthOfScreen(this.lib.screen);
       const image = new NativeXImage(
         this.lib.X11.symbols,
         this.lib.libc.symbols,
         this.lib.display,
         visual,
+        depth,
         width,
         height,
       );
@@ -199,13 +203,7 @@ class X11Window implements Window {
       this.#width = width;
       this.#height = height;
     }
-    const buf = this.#image.pixels;
-    for (let i = 0; i < rgba.length; i += 4) {
-      buf[i] = rgba[i + 2]; // B ← R
-      buf[i + 1] = rgba[i + 1]; // G
-      buf[i + 2] = rgba[i]; // R ← B
-      buf[i + 3] = 0; // padding
-    }
+    this.#image.write(rgba);
     this.reblit();
   }
 
