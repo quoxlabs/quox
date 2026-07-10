@@ -30,14 +30,22 @@ function latin1CString(s: string): Uint8Array<ArrayBuffer> {
   return buf;
 }
 
-// All event masks except:
-//   - PointerMotionHintMask (bit 7): throttles MotionNotify to one hint per entry
-//     and requires XQueryPointer acknowledgement, making cursor tracking choppy.
-//   - ResizeRedirectMask (bit 18): blocks the WM from resizing the window, causing
-//     the drawable to stay at its initial size while synthetic ConfigureNotify
-//     events report the intended (larger) dimensions.
-const ALL_X_EV_MASKS = BigInt(
-  0x1ffffff & ~(XEventMask.PointerMotionHintMask | XEventMask.ResizeRedirectMask),
+// Select only events routed by this backend. In particular, redirect and child
+// notification masks would make this window responsible for managing XIM or
+// embedded child windows even though it has no window-manager implementation.
+const APPLICATION_X_EVENT_MASKS = BigInt(
+  XEventMask.KeyPressMask |
+    XEventMask.KeyReleaseMask |
+    XEventMask.ButtonPressMask |
+    XEventMask.ButtonReleaseMask |
+    XEventMask.EnterWindowMask |
+    XEventMask.LeaveWindowMask |
+    XEventMask.PointerMotionMask |
+    XEventMask.ExposureMask |
+    XEventMask.VisibilityChangeMask |
+    XEventMask.StructureNotifyMask |
+    XEventMask.FocusChangeMask |
+    XEventMask.OwnerGrabButtonMask,
 );
 const X_SHIFT_MASK = 1 << 0;
 const X_LOCK_MASK = 1 << 1;
@@ -98,7 +106,7 @@ class X11Window implements Window {
     const attrs = new BigUint64Array([0n]); // None pixmap
     lib.X11.symbols.XChangeWindowAttributes(lib.display, window, CW_BACK_PIXMAP, attrs);
 
-    lib.X11.symbols.XSelectInput(lib.display, window, ALL_X_EV_MASKS);
+    lib.X11.symbols.XSelectInput(lib.display, window, APPLICATION_X_EVENT_MASKS);
 
     // Ask the window manager to send WM_DELETE_WINDOW via ClientMessage instead
     // of forcibly killing the process when the user closes the window.
@@ -348,7 +356,7 @@ class X11Library implements Library {
           }
         },
         (windowId, extraMask) => {
-          this.X11.symbols.XSelectInput(this.display, windowId, ALL_X_EV_MASKS | extraMask);
+          this.X11.symbols.XSelectInput(this.display, windowId, APPLICATION_X_EVENT_MASKS | extraMask);
         },
       );
     } catch (error) {
