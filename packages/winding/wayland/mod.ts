@@ -1,6 +1,18 @@
-import type { KeyModifiers, Library, LoadLibrary, UIEvent, Window } from "../types.ts";
+import type { ImeEvent, KeyEvent, KeyModifiers, Library, LoadLibrary, UIEvent, Window } from "../types.ts";
 import { utf8CString as cStr } from "../text_encoding.ts";
 import { getDomCode } from "./dom_code.ts";
+import {
+  type ComposeAdapter,
+  type CursorRectangle,
+  keyLocationForCode,
+  KeyRepeatController,
+  normalizeCursorRectangle,
+  resolveComposeLocale,
+  type TextInputEdit,
+  TextInputV3Batch,
+  translateKey,
+  type XkbKeyTranslator,
+} from "./input.ts";
 import {
   buildXdgIfaces,
   libdlSymbols,
@@ -45,6 +57,8 @@ const XKB_CONTEXT_NO_FLAGS = 0;
 const XKB_KEYMAP_FORMAT_TEXT_V1 = 1;
 const XKB_KEYMAP_COMPILE_NO_FLAGS = 0;
 const XKB_STATE_MODS_EFFECTIVE = 1 << 3;
+const XKB_COMPOSE_COMPILE_NO_FLAGS = 0;
+const XKB_COMPOSE_STATE_NO_FLAGS = 0;
 const XKB_SHIFT_MASK = 1 << 0;
 const XKB_LOCK_MASK = 1 << 1;
 const XKB_CONTROL_MASK = 1 << 2;
@@ -54,8 +68,11 @@ const XKB_MOD_SHIFT = cStr("Shift");
 const XKB_MOD_CONTROL = cStr("Control");
 const XKB_MOD_ALT = cStr("Mod1");
 const XKB_MOD_META = cStr("Mod4");
+const XKB_MOD_LEVEL_THREE = cStr("LevelThree");
+const XKB_MOD5 = cStr("Mod5");
 // "Lock" is XKB's real-modifier name for Caps Lock (the same convention X11 uses).
 const XKB_MOD_LOCK = cStr("Lock");
+const WL_MARSHAL_FLAG_DESTROY = 1;
 
 function getModifiers(mask: number): KeyModifiers {
   const ctrlKey = (mask & XKB_CONTROL_MASK) !== 0;
@@ -83,6 +100,10 @@ function dlsymRequired(
 // (8 bytes). Pass as "buffer" param so Deno hands libwayland a raw pointer.
 function args(...vals: bigint[]): BigUint64Array<ArrayBuffer> {
   return new BigUint64Array(vals.length === 0 ? [0n] : vals);
+}
+
+function nullableCString(pointer: Deno.PointerValue): string | null {
+  return pointer ? new Deno.UnsafePointerView(pointer).getCString() : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +139,14 @@ function hasXdgToplevelState(statesPtr: Deno.PointerValue, state: number): boole
 // All UnsafeCallback instances satisfy this shape regardless of their parameter
 // type arguments, letting us store callbacks of different signatures together.
 type AnyCallback = { pointer: Deno.PointerObject; close(): void };
+
+interface WaylandKeyEvent extends KeyEvent {
+  window: WaylandWindow;
+  key: string;
+  repeat: boolean;
+  isComposing: boolean;
+  altGraphKey: boolean;
+}
 
 // ---------------------------------------------------------------------------
 // Build a vtable (array of function pointers) for wl_proxy_add_listener.
@@ -164,6 +193,9 @@ class WaylandWindow implements Window {
   // Last-seen `suspended` bit from xdg_toplevel::configure's states array, used to only
   // push a `visibilitychange` event when it actually flips.
   #suspended = false;
+  #closed = false;
+  #imeEnabled = false;
+  #imeCursorRectangle: CursorRectangle | undefined;
 
   constructor(readonly lib: WaylandLibrary, w: number, h: number) {
     const sym = lib.wl.symbols;
@@ -210,21 +242,36 @@ class WaylandWindow implements Window {
     this.#setupListeners();
     this.setTitle("winding");
 
-    // Initial empty commit -- compositor will reply with configure
-    sym.wl_proxy_marshal_array_flags(
-      this.#surface,
-      WlOp.SURFACE_COMMIT,
-      null,
-      sym.wl_proxy_get_version(this.#surface),
-      0,
-      args(),
-    );
-    sym.wl_display_roundtrip(lib.display);
+    // Register before the first commit/roundtrip: keyboard and text-input
+    // enter callbacks identify their target by wl_surface pointer.
+    lib.registerWindow(this.#surface, this);
 
-    // Ack the configure we just received
-    this.#ackPendingConfigure();
+    try {
+      // Initial empty commit -- compositor will reply with configure
+      sym.wl_proxy_marshal_array_flags(
+        this.#surface,
+        WlOp.SURFACE_COMMIT,
+        null,
+        sym.wl_proxy_get_version(this.#surface),
+        0,
+        args(),
+      );
+      sym.wl_display_roundtrip(lib.display);
 
-    lib.windows.add(this);
+      // Ack the configure we just received
+      this.#ackPendingConfigure();
+    } catch (error) {
+      this.close();
+      throw error;
+    }
+  }
+
+  get imeEnabled(): boolean {
+    return this.#imeEnabled;
+  }
+
+  get imeCursorRectangle(): CursorRectangle | undefined {
+    return this.#imeCursorRectangle;
   }
 
   #setupListeners(): void {
@@ -247,20 +294,20 @@ class WaylandWindow implements Window {
       { parameters: ["pointer", "pointer", "i32", "i32", "pointer"], result: "void" },
       (_data, _toplevel, width, height, states) => {
         if (width > 0 && height > 0) {
-          this.lib.pushEvent({ type: "resize", width, height });
+          this.lib.pushEvent({ type: "resize", width, height, window: this });
         }
 
         const suspended = hasXdgToplevelState(states, XdgToplevelState.SUSPENDED);
         if (suspended !== this.#suspended) {
           this.#suspended = suspended;
-          this.lib.pushEvent({ type: "visibilitychange", visible: !suspended });
+          this.lib.pushEvent({ type: "visibilitychange", visible: !suspended, window: this });
         }
       },
     );
     this.#toplevelClose = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer"], result: "void" },
       () => {
-        this.lib.pushEvent({ type: "close" });
+        this.lib.pushEvent({ type: "close", window: this });
       },
     );
     // xdg_toplevel has 4 events but we only handle the first 2; rest get noop.
@@ -295,6 +342,18 @@ class WaylandWindow implements Window {
       args(Deno.UnsafePointer.value(Deno.UnsafePointer.of(titleBuf))),
     );
     sym.wl_display_flush(this.lib.display);
+  }
+
+  setImeEnabled(enabled: boolean): void {
+    if (this.#closed || this.#imeEnabled === enabled) return;
+    this.#imeEnabled = enabled;
+    this.lib.updateWindowImeState(this);
+  }
+
+  setImeCursorArea(x: number, y: number, width: number, height: number): void {
+    if (this.#closed) return;
+    this.#imeCursorRectangle = normalizeCursorRectangle(x, y, width, height);
+    this.lib.updateWindowImeCursorRectangle(this);
   }
 
   /**
@@ -415,10 +474,12 @@ class WaylandWindow implements Window {
   }
 
   close(): void {
-    this.lib.windows.delete(this);
+    if (this.#closed) return;
+    this.#closed = true;
+    this.lib.unregisterWindow(this.#surface, this);
     this.#destroyShmBuffer();
     const sym = this.lib.wl.symbols;
-    const f = 1; // WL_MARSHAL_FLAG_DESTROY
+    const f = WL_MARSHAL_FLAG_DESTROY;
     sym.wl_proxy_marshal_array_flags(this.#xdgToplevel, WlOp.XDG_TOPLEVEL_DESTROY, null, 1, f, args());
     sym.wl_proxy_marshal_array_flags(this.#xdgSurface, WlOp.XDG_SURFACE_DESTROY, null, 1, f, args());
     sym.wl_proxy_marshal_array_flags(this.#surface, WlOp.SURFACE_DESTROY, null, 1, f, args());
@@ -439,6 +500,8 @@ class WaylandLibrary implements Library {
   readonly wl: Deno.DynamicLibrary<typeof waylandSymbols>;
   readonly xkb: Deno.DynamicLibrary<typeof xkbSymbols>;
   readonly #xkbContext: Deno.PointerObject;
+  #xkbComposeTable: Deno.PointerObject | null = null;
+  #xkbComposeState: Deno.PointerObject | null = null;
   readonly display: Deno.PointerObject;
   // XDG interface structs -- built lazily in the constructor, mem kept alive to
   // prevent the pinned buffer from being GC'd.
@@ -448,6 +511,8 @@ class WaylandLibrary implements Library {
   readonly xdgToplevelIface: Deno.PointerObject;
   readonly wpCursorShapeManagerIface: Deno.PointerObject;
   readonly wpCursorShapeDeviceIface: Deno.PointerObject;
+  readonly zwpTextInputManagerIface: Deno.PointerObject;
+  readonly zwpTextInputIface: Deno.PointerObject;
   readonly ifaces: {
     registry: Deno.PointerObject;
     compositor: Deno.PointerObject;
@@ -460,6 +525,7 @@ class WaylandLibrary implements Library {
     keyboard: Deno.PointerObject;
   };
   readonly windows = new Set<WaylandWindow>();
+  readonly #windowsBySurface = new Map<bigint, WaylandWindow>();
   // Globals bound from registry -- set during init roundtrip
   compositor: Deno.PointerObject | null = null;
   shm: Deno.PointerObject | null = null;
@@ -469,9 +535,17 @@ class WaylandLibrary implements Library {
   #seat: Deno.PointerObject | null = null;
   #pointer: Deno.PointerObject | null = null;
   #keyboard: Deno.PointerObject | null = null;
+  #keyboardFocus: WaylandWindow | null = null;
   #xkbKeymap: Deno.PointerObject | null = null;
   #xkbState: Deno.PointerObject | null = null;
   #modifiers: KeyModifiers = getModifiers(0);
+  #altGraphKey = false;
+  #textInputManager: Deno.PointerObject | null = null;
+  #textInput: Deno.PointerObject | null = null;
+  #textInputFocus: WaylandWindow | null = null;
+  #textInputEnabledWindow: WaylandWindow | null = null;
+  readonly #textInputBatch = new TextInputV3Batch();
+  readonly #repeat = new KeyRepeatController();
   // Event queue filled by listener callbacks, drained by event()
   #events: UIEvent[] = [];
   // Shared no-op callback for unused vtable slots
@@ -481,6 +555,7 @@ class WaylandLibrary implements Library {
   #vtables: BigUint64Array<ArrayBuffer>[] = [];
   // pollfd buffer for non-blocking display read
   #pollFd = new Uint8Array(8) as Uint8Array<ArrayBuffer>; // struct pollfd {int fd; short events; short revents;}
+  #closed = false;
 
   constructor() {
     this.libc = Deno.dlopen("libc.so.6", libcSymbols); // needed to perform a few syscalls
@@ -490,25 +565,12 @@ class WaylandLibrary implements Library {
     const xkbContext = this.xkb.symbols.xkb_context_new(XKB_CONTEXT_NO_FLAGS);
     if (!xkbContext) throw new Error("winding failed to create xkb context");
     this.#xkbContext = xkbContext;
+    this.#initCompose();
     // Retrieve an existing loader handle for dlsym without loading a second time.
     const wlHandle = this.libdl.symbols.dlopen(cStr(LIBWAYLAND_CLIENT_SO), RTLD_NOW | RTLD_NOLOAD);
     if (!wlHandle) throw new Error(`winding failed to get existing ${LIBWAYLAND_CLIENT_SO} handle via libdl`);
     this.#wlHandle = wlHandle;
-    const {
-      mem,
-      xdgWmBaseIface,
-      xdgSurfaceIface,
-      xdgToplevelIface,
-      wpCursorShapeManagerIface,
-      wpCursorShapeDeviceIface,
-    } = buildXdgIfaces();
-    this.#xdgMem = mem;
-    this.xdgWmBaseIface = xdgWmBaseIface;
-    this.xdgSurfaceIface = xdgSurfaceIface;
-    this.xdgToplevelIface = xdgToplevelIface;
-    this.wpCursorShapeManagerIface = wpCursorShapeManagerIface;
-    this.wpCursorShapeDeviceIface = wpCursorShapeDeviceIface;
-    this.ifaces = {
+    const ifaces = {
       registry: dlsymRequired(this.libdl, wlHandle, "wl_registry_interface"),
       compositor: dlsymRequired(this.libdl, wlHandle, "wl_compositor_interface"),
       shm: dlsymRequired(this.libdl, wlHandle, "wl_shm_interface"),
@@ -519,6 +581,25 @@ class WaylandLibrary implements Library {
       pointer: dlsymRequired(this.libdl, wlHandle, "wl_pointer_interface"),
       keyboard: dlsymRequired(this.libdl, wlHandle, "wl_keyboard_interface"),
     };
+    const {
+      mem,
+      xdgWmBaseIface,
+      xdgSurfaceIface,
+      xdgToplevelIface,
+      wpCursorShapeManagerIface,
+      wpCursorShapeDeviceIface,
+      zwpTextInputManagerIface,
+      zwpTextInputIface,
+    } = buildXdgIfaces(ifaces.seat, ifaces.surface);
+    this.#xdgMem = mem;
+    this.xdgWmBaseIface = xdgWmBaseIface;
+    this.xdgSurfaceIface = xdgSurfaceIface;
+    this.xdgToplevelIface = xdgToplevelIface;
+    this.wpCursorShapeManagerIface = wpCursorShapeManagerIface;
+    this.wpCursorShapeDeviceIface = wpCursorShapeDeviceIface;
+    this.zwpTextInputManagerIface = zwpTextInputManagerIface;
+    this.zwpTextInputIface = zwpTextInputIface;
+    this.ifaces = ifaces;
     const sym = this.wl.symbols;
 
     // NULL asks libwayland to use the default display from the environment.
@@ -537,6 +618,28 @@ class WaylandLibrary implements Library {
 
     this.#initGlobals();
     this.#initSeat();
+  }
+
+  #initCompose(): void {
+    const create = (locale: string): boolean => {
+      const table = this.xkb.symbols.xkb_compose_table_new_from_locale(
+        this.#xkbContext,
+        cStr(locale),
+        XKB_COMPOSE_COMPILE_NO_FLAGS,
+      );
+      if (!table) return false;
+      const state = this.xkb.symbols.xkb_compose_state_new(table, XKB_COMPOSE_STATE_NO_FLAGS);
+      if (!state) {
+        this.xkb.symbols.xkb_compose_table_unref(table);
+        return false;
+      }
+      this.#xkbComposeTable = table;
+      this.#xkbComposeState = state;
+      return true;
+    };
+
+    const locale = resolveComposeLocale();
+    if (!create(locale) && locale !== "C") create("C");
   }
 
   #initGlobals(): void {
@@ -596,6 +699,9 @@ class WaylandLibrary implements Library {
     } else if (iface === "wp_cursor_shape_manager_v1") {
       ifacePtr = this.wpCursorShapeManagerIface;
       version = Math.min(offered, 1);
+    } else if (iface === "zwp_text_input_manager_v3") {
+      ifacePtr = this.zwpTextInputManagerIface;
+      version = Math.min(offered, 1);
     } else {
       return;
     }
@@ -624,6 +730,9 @@ class WaylandLibrary implements Library {
       this.#setupXdgWmBaseListener(proxy);
     } else if (iface === "wp_cursor_shape_manager_v1") {
       this.#cursorShapeManager = proxy;
+    } else if (iface === "zwp_text_input_manager_v3") {
+      this.#textInputManager = proxy;
+      this.#maybeInitTextInput();
     }
   }
 
@@ -671,6 +780,7 @@ class WaylandLibrary implements Library {
       (_data, _seat, caps) => {
         if ((caps & WlSeatCap.POINTER) && !this.#pointer) this.#initPointer();
         if ((caps & WlSeatCap.KEYBOARD) && !this.#keyboard) this.#initKeyboard();
+        if (!(caps & WlSeatCap.KEYBOARD) && this.#keyboard) this.#releaseKeyboard();
       },
     );
     const nameCb = new Deno.UnsafeCallback(
@@ -685,7 +795,193 @@ class WaylandLibrary implements Library {
     );
     this.#vtables.push(seatVtable);
     sym.wl_proxy_add_listener(this.#seat, Deno.UnsafePointer.of(seatVtable), null);
+    this.#maybeInitTextInput();
     sym.wl_display_roundtrip(this.display);
+  }
+
+  #maybeInitTextInput(): void {
+    if (this.#textInput || !this.#textInputManager || !this.#seat) return;
+    const sym = this.wl.symbols;
+    const textInput = sym.wl_proxy_marshal_array_flags(
+      this.#textInputManager,
+      WlOp.ZWP_TEXT_INPUT_MANAGER_GET_TEXT_INPUT,
+      this.zwpTextInputIface,
+      sym.wl_proxy_get_version(this.#textInputManager),
+      0,
+      args(0n, Deno.UnsafePointer.value(this.#seat)),
+    );
+    if (!textInput) return;
+    this.#textInput = textInput;
+
+    const enterCb = new Deno.UnsafeCallback(
+      { parameters: ["pointer", "pointer", "pointer"], result: "void" },
+      (_data, _textInput, surface) => {
+        const window = this.#windowForSurface(surface);
+        const previousWindow = this.#textInputEnabledWindow ?? this.#textInputFocus;
+        if (previousWindow) this.#deactivateTextInput(previousWindow, false);
+        else this.#textInputBatch.resetEdits();
+
+        this.#textInputFocus = window;
+        if (window?.imeEnabled) this.#activateTextInput(window);
+      },
+    );
+    const leaveCb = new Deno.UnsafeCallback(
+      { parameters: ["pointer", "pointer", "pointer"], result: "void" },
+      (_data, _textInput, surface) => {
+        const window = this.#windowForSurface(surface);
+        if (!window || window !== this.#textInputFocus) return;
+        this.#deactivateTextInput(window, false);
+        this.#textInputFocus = null;
+      },
+    );
+    const preeditCb = new Deno.UnsafeCallback(
+      { parameters: ["pointer", "pointer", "pointer", "i32", "i32"], result: "void" },
+      (_data, _textInput, text, cursorBegin, cursorEnd) => {
+        if (!this.#textInputFocus || this.#textInputEnabledWindow !== this.#textInputFocus) return;
+        this.#textInputBatch.setPreedit(nullableCString(text), cursorBegin, cursorEnd);
+      },
+    );
+    const commitCb = new Deno.UnsafeCallback(
+      { parameters: ["pointer", "pointer", "pointer"], result: "void" },
+      (_data, _textInput, text) => {
+        if (!this.#textInputFocus || this.#textInputEnabledWindow !== this.#textInputFocus) return;
+        this.#textInputBatch.setCommit(nullableCString(text));
+      },
+    );
+    const deleteCb = new Deno.UnsafeCallback(
+      { parameters: ["pointer", "pointer", "u32", "u32"], result: "void" },
+      (_data, _textInput, beforeLength, afterLength) => {
+        if (!this.#textInputFocus || this.#textInputEnabledWindow !== this.#textInputFocus) return;
+        this.#textInputBatch.setDeleteSurrounding(beforeLength, afterLength);
+      },
+    );
+    const doneCb = new Deno.UnsafeCallback(
+      { parameters: ["pointer", "pointer", "u32"], result: "void" },
+      (_data, _textInput, serial) => {
+        const window = this.#textInputEnabledWindow;
+        if (!window || window !== this.#textInputFocus) {
+          this.#textInputBatch.resetEdits();
+          return;
+        }
+        const result = this.#textInputBatch.done(serial);
+        // Edits are authoritative even when this serial describes an older
+        // client-state commit. With no surrounding-text output yet, a lagging
+        // serial requires no replay; a later done will acknowledge newer state.
+        this.#emitTextInputEdits(window, result.edits);
+      },
+    );
+    this.#listeners.push(enterCb, leaveCb, preeditCb, commitCb, deleteCb, doneCb);
+    const vtable = makeVtable(
+      [enterCb, leaveCb, preeditCb, commitCb, deleteCb, doneCb],
+      readEventCount(Deno.UnsafePointer.value(this.zwpTextInputIface)),
+      this.noop,
+    );
+    this.#vtables.push(vtable);
+    sym.wl_proxy_add_listener(textInput, Deno.UnsafePointer.of(vtable), null);
+  }
+
+  #activateTextInput(window: WaylandWindow): void {
+    if (!this.#textInput || this.#textInputFocus !== window || this.#textInputEnabledWindow === window) return;
+    const sym = this.wl.symbols;
+    sym.wl_proxy_marshal_array_flags(
+      this.#textInput,
+      WlOp.ZWP_TEXT_INPUT_ENABLE,
+      null,
+      1,
+      0,
+      args(),
+    );
+    const rectangle = window.imeCursorRectangle;
+    if (rectangle) this.#sendTextInputCursorRectangle(rectangle);
+    this.#commitTextInputState();
+    this.#textInputEnabledWindow = window;
+    this.#events.push({ type: "ime", kind: "enabled", window });
+    sym.wl_display_flush(this.display);
+  }
+
+  #deactivateTextInput(window: WaylandWindow, sendProtocol: boolean): void {
+    const wasEnabled = this.#textInputEnabledWindow === window;
+    this.#emitTextInputEdits(window, this.#textInputBatch.resetEdits());
+
+    if (sendProtocol && this.#textInput && this.#textInputFocus === window) {
+      const sym = this.wl.symbols;
+      sym.wl_proxy_marshal_array_flags(
+        this.#textInput,
+        WlOp.ZWP_TEXT_INPUT_DISABLE,
+        null,
+        1,
+        0,
+        args(),
+      );
+      this.#commitTextInputState();
+      sym.wl_display_flush(this.display);
+    }
+
+    if (wasEnabled) {
+      this.#textInputEnabledWindow = null;
+      this.#events.push({ type: "ime", kind: "disabled", window });
+    }
+  }
+
+  #sendTextInputCursorRectangle(rectangle: CursorRectangle): void {
+    if (!this.#textInput) return;
+    this.wl.symbols.wl_proxy_marshal_array_flags(
+      this.#textInput,
+      WlOp.ZWP_TEXT_INPUT_SET_CURSOR_RECTANGLE,
+      null,
+      1,
+      0,
+      args(
+        BigInt(rectangle.x),
+        BigInt(rectangle.y),
+        BigInt(rectangle.width),
+        BigInt(rectangle.height),
+      ),
+    );
+  }
+
+  #commitTextInputState(): void {
+    if (!this.#textInput) return;
+    this.wl.symbols.wl_proxy_marshal_array_flags(
+      this.#textInput,
+      WlOp.ZWP_TEXT_INPUT_COMMIT,
+      null,
+      1,
+      0,
+      args(),
+    );
+    this.#textInputBatch.recordClientCommit();
+  }
+
+  #emitTextInputEdits(window: WaylandWindow, edits: TextInputEdit[]): void {
+    for (const edit of edits) {
+      switch (edit.type) {
+        case "preedit": {
+          const event: ImeEvent = {
+            type: "ime",
+            kind: "preedit",
+            window,
+            text: edit.text,
+            selection: edit.cursorRange ? { start: edit.cursorRange[0], end: edit.cursorRange[1] } : null,
+          };
+          if (edit.cursorRange !== undefined) event.cursorRange = edit.cursorRange;
+          this.#events.push(event);
+          break;
+        }
+        case "deleteSurrounding":
+          this.#events.push({
+            type: "ime",
+            kind: "deleteSurrounding",
+            window,
+            beforeLength: edit.beforeLength,
+            afterLength: edit.afterLength,
+          });
+          break;
+        case "commit":
+          this.#events.push({ type: "ime", kind: "commit", window, text: edit.text });
+          break;
+      }
+    }
   }
 
   #initPointer(): void {
@@ -767,6 +1063,94 @@ class WaylandLibrary implements Library {
     sym.wl_proxy_add_listener(pointer, Deno.UnsafePointer.of(ptrVtable), null);
   }
 
+  #readSizedUtf8(read: (buffer: Deno.PointerValue, size: bigint) => number): string {
+    const required = read(null, 0n);
+    if (required <= 0) return "";
+    const buffer = new Uint8Array(required + 1) as Uint8Array<ArrayBuffer>;
+    const written = read(Deno.UnsafePointer.of(buffer), BigInt(buffer.byteLength));
+    if (written <= 0) return "";
+    return new TextDecoder().decode(buffer.subarray(0, Math.min(written, required)));
+  }
+
+  #utf8ForKeysym(keysym: number): string {
+    // xkb_keysym_to_utf8 differs from the state/Compose helpers: it requires
+    // a buffer of at least seven bytes and includes the NUL in its return.
+    const buffer = new Uint8Array(8) as Uint8Array<ArrayBuffer>;
+    const written = this.xkb.symbols.xkb_keysym_to_utf8(
+      keysym,
+      Deno.UnsafePointer.of(buffer),
+      BigInt(buffer.byteLength),
+    );
+    if (written <= 1) return "";
+    return new TextDecoder().decode(buffer.subarray(0, written - 1));
+  }
+
+  #xkbTranslator(): XkbKeyTranslator | undefined {
+    const state = this.#xkbState;
+    if (!state) return undefined;
+    return {
+      keysymForKeycode: (keycode) => this.xkb.symbols.xkb_state_key_get_one_sym(state, keycode),
+      utf8ForKeycode: (keycode) =>
+        this.#readSizedUtf8((buffer, size) => this.xkb.symbols.xkb_state_key_get_utf8(state, keycode, buffer, size)),
+      utf8ForKeysym: (keysym) => this.#utf8ForKeysym(keysym),
+    };
+  }
+
+  #composeAdapter(): ComposeAdapter | undefined {
+    const state = this.#xkbComposeState;
+    if (!state) return undefined;
+    return {
+      feed: (keysym) => this.xkb.symbols.xkb_compose_state_feed(state, keysym),
+      status: () => this.xkb.symbols.xkb_compose_state_get_status(state),
+      utf8: () =>
+        this.#readSizedUtf8((buffer, size) => this.xkb.symbols.xkb_compose_state_get_utf8(state, buffer, size)),
+      reset: () => this.xkb.symbols.xkb_compose_state_reset(state),
+    };
+  }
+
+  #resetCompose(): void {
+    if (this.#xkbComposeState) this.xkb.symbols.xkb_compose_state_reset(this.#xkbComposeState);
+  }
+
+  #emitKey(rawKeycode: number, phase: "press" | "release" | "repeat"): void {
+    const window = this.#keyboardFocus;
+    if (!window) return;
+
+    const translator = this.#xkbTranslator();
+    const translated = translator ? translateKey(rawKeycode, phase, translator, this.#composeAdapter()) : {
+      rawKeycode,
+      xkbKeycode: rawKeycode + 8,
+      keysym: 0,
+      key: "Unidentified",
+      isComposing: false,
+    };
+    const code = getDomCode(rawKeycode);
+    const event: WaylandKeyEvent = {
+      type: phase === "release" ? "keyup" : "keydown",
+      window,
+      keycode: rawKeycode,
+      code,
+      key: translated.key,
+      location: keyLocationForCode(code),
+      repeat: phase === "repeat",
+      isComposing: translated.isComposing,
+      altGraphKey: this.#altGraphKey,
+      ...this.#modifiers,
+    };
+    if (translated.text !== undefined) event.text = translated.text;
+    this.#events.push(event);
+  }
+
+  #enqueueDueKeyRepeat(): void {
+    const rawKeycode = this.#repeat.poll();
+    if (rawKeycode === undefined) return;
+    if (!this.#keyboardFocus) {
+      this.#repeat.cancel();
+      return;
+    }
+    this.#emitKey(rawKeycode, "repeat");
+  }
+
   #loadKeymap(format: number, fd: number, size: number): void {
     try {
       if (format !== WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 || size === 0) return;
@@ -801,19 +1185,27 @@ class WaylandLibrary implements Library {
   }
 
   #replaceXkbState(keymap: Deno.PointerObject, state: Deno.PointerObject): void {
+    this.#repeat.cancel();
+    this.#resetCompose();
     if (this.#xkbState) this.xkb.symbols.xkb_state_unref(this.#xkbState);
     if (this.#xkbKeymap) this.xkb.symbols.xkb_keymap_unref(this.#xkbKeymap);
     this.#xkbKeymap = keymap;
     this.#xkbState = state;
+    this.#modifiers = getModifiers(0);
+    this.#altGraphKey = false;
   }
 
   #modifiersFromXkbState(): KeyModifiers {
     const state = this.#xkbState;
-    if (!state) return this.#modifiers;
+    if (!state) {
+      this.#altGraphKey = false;
+      return this.#modifiers;
+    }
 
     const active = (name: Uint8Array): boolean =>
       this.xkb.symbols.xkb_state_mod_name_is_active(state, name, XKB_STATE_MODS_EFFECTIVE) > 0;
     const ctrlKey = active(XKB_MOD_CONTROL);
+    this.#altGraphKey = active(XKB_MOD_LEVEL_THREE) || active(XKB_MOD5);
     return {
       shiftKey: active(XKB_MOD_SHIFT),
       ctrlKey,
@@ -848,27 +1240,44 @@ class WaylandLibrary implements Library {
     const kbEnterCb = new Deno.UnsafeCallback(
       // (data, keyboard, serial, surface, keys)
       { parameters: ["pointer", "pointer", "u32", "pointer", "pointer"], result: "void" },
-      () => {
-        this.#events.push({ type: "focus" });
+      (_data, _keyboard, _serial, surface) => {
+        const window = this.#windowForSurface(surface);
+        if (!window) return;
+        if (this.#keyboardFocus === window) return;
+        if (this.#keyboardFocus) this.#events.push({ type: "blur", window: this.#keyboardFocus });
+        this.#repeat.cancel();
+        this.#resetCompose();
+        this.#keyboardFocus = window;
+        this.#events.push({ type: "focus", window });
       },
     );
     const kbLeaveCb = new Deno.UnsafeCallback(
       // (data, keyboard, serial, surface)
       { parameters: ["pointer", "pointer", "u32", "pointer"], result: "void" },
-      () => {
-        this.#events.push({ type: "blur" });
+      (_data, _keyboard, _serial, surface) => {
+        const window = this.#windowForSurface(surface);
+        if (!window || this.#keyboardFocus !== window) return;
+        this.#repeat.cancel();
+        this.#resetCompose();
+        this.#keyboardFocus = null;
+        this.#events.push({ type: "blur", window });
       },
     );
     const keyCb = new Deno.UnsafeCallback(
       // (data, keyboard, serial, time, key, state)
       { parameters: ["pointer", "pointer", "u32", "u32", "u32", "u32"], result: "void" },
       (_data, _kb, _serial, _time, key, state) => {
-        this.#events.push({
-          type: state ? "keydown" : "keyup",
-          keycode: key,
-          code: getDomCode(key),
-          ...this.#modifiers,
-        });
+        if (state) {
+          if (!this.#keyboardFocus) return;
+          this.#emitKey(key, "press");
+          const repeatable = this.#xkbKeymap
+            ? this.xkb.symbols.xkb_keymap_key_repeats(this.#xkbKeymap, key + 8) > 0
+            : false;
+          this.#repeat.press(key, repeatable);
+        } else {
+          this.#repeat.release(key);
+          this.#emitKey(key, "release");
+        }
       },
     );
     const modifiersCb = new Deno.UnsafeCallback(
@@ -880,14 +1289,98 @@ class WaylandLibrary implements Library {
           this.#modifiers = this.#modifiersFromXkbState();
         } else {
           this.#modifiers = getModifiers(depressed | latched | locked);
+          this.#altGraphKey = false;
         }
       },
     );
-    this.#listeners.push(keymapCb, kbEnterCb, kbLeaveCb, keyCb, modifiersCb);
+    const repeatInfoCb = new Deno.UnsafeCallback(
+      // (data, keyboard, rate, delay)
+      { parameters: ["pointer", "pointer", "i32", "i32"], result: "void" },
+      (_data, _keyboard, rate, delay) => {
+        this.#repeat.setRepeatInfo(rate, delay);
+      },
+    );
+    this.#listeners.push(keymapCb, kbEnterCb, kbLeaveCb, keyCb, modifiersCb, repeatInfoCb);
     const kbEventCount = readEventCount(Deno.UnsafePointer.value(this.ifaces.keyboard));
-    const kbVtable = makeVtable([keymapCb, kbEnterCb, kbLeaveCb, keyCb, modifiersCb], kbEventCount, this.noop);
+    const kbVtable = makeVtable(
+      [keymapCb, kbEnterCb, kbLeaveCb, keyCb, modifiersCb, repeatInfoCb],
+      kbEventCount,
+      this.noop,
+    );
     this.#vtables.push(kbVtable);
     sym.wl_proxy_add_listener(keyboard, Deno.UnsafePointer.of(kbVtable), null);
+  }
+
+  #releaseKeyboard(): void {
+    const keyboard = this.#keyboard;
+    if (!keyboard) return;
+    const focusedWindow = this.#keyboardFocus;
+    this.#repeat.setRepeatInfo(0, 0);
+    this.#resetCompose();
+    this.#keyboardFocus = null;
+    const version = this.wl.symbols.wl_proxy_get_version(keyboard);
+    if (version >= 3) {
+      this.wl.symbols.wl_proxy_marshal_array_flags(
+        keyboard,
+        WlOp.KEYBOARD_RELEASE,
+        null,
+        version,
+        WL_MARSHAL_FLAG_DESTROY,
+        args(),
+      );
+    } else {
+      this.wl.symbols.wl_proxy_destroy(keyboard);
+    }
+    this.#keyboard = null;
+    if (this.#xkbState) {
+      this.xkb.symbols.xkb_state_unref(this.#xkbState);
+      this.#xkbState = null;
+    }
+    if (this.#xkbKeymap) {
+      this.xkb.symbols.xkb_keymap_unref(this.#xkbKeymap);
+      this.#xkbKeymap = null;
+    }
+    this.#modifiers = getModifiers(0);
+    this.#altGraphKey = false;
+    if (focusedWindow) this.#events.push({ type: "blur", window: focusedWindow });
+  }
+
+  #windowForSurface(surface: Deno.PointerValue): WaylandWindow | null {
+    return surface ? this.#windowsBySurface.get(Deno.UnsafePointer.value(surface)) ?? null : null;
+  }
+
+  registerWindow(surface: Deno.PointerObject, window: WaylandWindow): void {
+    this.#windowsBySurface.set(Deno.UnsafePointer.value(surface), window);
+    this.windows.add(window);
+  }
+
+  unregisterWindow(surface: Deno.PointerObject, window: WaylandWindow): void {
+    if (this.#textInputFocus === window) {
+      this.#deactivateTextInput(window, true);
+      this.#textInputFocus = null;
+    }
+    if (this.#keyboardFocus === window) {
+      this.#repeat.cancel();
+      this.#resetCompose();
+      this.#keyboardFocus = null;
+    }
+    const key = Deno.UnsafePointer.value(surface);
+    if (this.#windowsBySurface.get(key) === window) this.#windowsBySurface.delete(key);
+    this.windows.delete(window);
+  }
+
+  updateWindowImeState(window: WaylandWindow): void {
+    if (this.#textInputFocus !== window) return;
+    if (window.imeEnabled) this.#activateTextInput(window);
+    else this.#deactivateTextInput(window, true);
+  }
+
+  updateWindowImeCursorRectangle(window: WaylandWindow): void {
+    const rectangle = window.imeCursorRectangle;
+    if (!rectangle || this.#textInputEnabledWindow !== window || this.#textInputFocus !== window) return;
+    this.#sendTextInputCursorRectangle(rectangle);
+    this.#commitTextInputState();
+    this.wl.symbols.wl_display_flush(this.display);
   }
 
   /** Called by WaylandWindow to push UI events into the shared queue. */
@@ -896,6 +1389,7 @@ class WaylandLibrary implements Library {
   }
 
   openWindow(_x = 0, _y = 0, w = 800, h = 600): WaylandWindow {
+    if (this.#closed) throw new Error("winding Wayland library is closed");
     if (!this.compositor || !this.shm || !this.xdgWmBase) {
       throw new Error("winding wayland globals not ready (compositor/shm/xdg_wm_base missing)");
     }
@@ -903,6 +1397,7 @@ class WaylandLibrary implements Library {
   }
 
   event(): UIEvent | undefined {
+    if (this.#closed) return undefined;
     const sym = this.wl.symbols;
     sym.wl_display_flush(this.display);
 
@@ -919,6 +1414,7 @@ class WaylandLibrary implements Library {
     }
 
     sym.wl_display_dispatch_pending(this.display);
+    this.#enqueueDueKeyRepeat();
     return this.#events.shift();
   }
 
@@ -927,14 +1423,40 @@ class WaylandLibrary implements Library {
   }
 
   close(): void {
-    for (const win of this.windows) win.close();
+    if (this.#closed) return;
+    this.#closed = true;
+    for (const win of [...this.windows]) win.close();
+    this.#repeat.cancel();
+    this.#textInputBatch.resetEdits();
+    if (this.#textInput) {
+      this.wl.symbols.wl_proxy_marshal_array_flags(
+        this.#textInput,
+        WlOp.ZWP_TEXT_INPUT_DESTROY,
+        null,
+        1,
+        WL_MARSHAL_FLAG_DESTROY,
+        args(),
+      );
+      this.#textInput = null;
+    }
+    if (this.#textInputManager) {
+      this.wl.symbols.wl_proxy_marshal_array_flags(
+        this.#textInputManager,
+        WlOp.ZWP_TEXT_INPUT_MANAGER_DESTROY,
+        null,
+        1,
+        WL_MARSHAL_FLAG_DESTROY,
+        args(),
+      );
+      this.#textInputManager = null;
+    }
     if (this.#cursorShapeDevice) {
       this.wl.symbols.wl_proxy_marshal_array_flags(
         this.#cursorShapeDevice,
         WlOp.WP_CURSOR_SHAPE_DEVICE_DESTROY,
         null,
         1,
-        1,
+        WL_MARSHAL_FLAG_DESTROY,
         args(),
       );
     }
@@ -944,21 +1466,45 @@ class WaylandLibrary implements Library {
         WlOp.WP_CURSOR_SHAPE_MANAGER_DESTROY,
         null,
         1,
-        1,
+        WL_MARSHAL_FLAG_DESTROY,
         args(),
       );
     }
     if (this.#pointer) {
-      this.wl.symbols.wl_proxy_marshal_array_flags(this.#pointer, WlOp.POINTER_RELEASE, null, 1, 1, args());
+      const version = this.wl.symbols.wl_proxy_get_version(this.#pointer);
+      if (version >= 3) {
+        this.wl.symbols.wl_proxy_marshal_array_flags(
+          this.#pointer,
+          WlOp.POINTER_RELEASE,
+          null,
+          version,
+          WL_MARSHAL_FLAG_DESTROY,
+          args(),
+        );
+      } else {
+        this.wl.symbols.wl_proxy_destroy(this.#pointer);
+      }
     }
-    if (this.#keyboard) {
-      this.wl.symbols.wl_proxy_marshal_array_flags(this.#keyboard, WlOp.KEYBOARD_RELEASE, null, 1, 1, args());
-    }
+    this.#releaseKeyboard();
     if (this.#seat) {
-      this.wl.symbols.wl_proxy_marshal_array_flags(this.#seat, WlOp.SEAT_RELEASE, null, 1, 1, args());
+      const version = this.wl.symbols.wl_proxy_get_version(this.#seat);
+      if (version >= 5) {
+        this.wl.symbols.wl_proxy_marshal_array_flags(
+          this.#seat,
+          WlOp.SEAT_RELEASE,
+          null,
+          version,
+          WL_MARSHAL_FLAG_DESTROY,
+          args(),
+        );
+      } else {
+        this.wl.symbols.wl_proxy_destroy(this.#seat);
+      }
     }
     for (const cb of this.#listeners) cb.close();
     this.noop.close();
+    if (this.#xkbComposeState) this.xkb.symbols.xkb_compose_state_unref(this.#xkbComposeState);
+    if (this.#xkbComposeTable) this.xkb.symbols.xkb_compose_table_unref(this.#xkbComposeTable);
     if (this.#xkbState) this.xkb.symbols.xkb_state_unref(this.#xkbState);
     if (this.#xkbKeymap) this.xkb.symbols.xkb_keymap_unref(this.#xkbKeymap);
     this.xkb.symbols.xkb_context_unref(this.#xkbContext);
