@@ -65,6 +65,26 @@ jobs:
       - run: deno test --allow-ffi darwin
         working-directory: packages/winding
 
+  winding-windows:
+    name: Winding Windows (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+          cache: true
+      - run: deno ci
+      - run: deno check win32/mod.ts win32/input_test.ts win32/native_smoke.ts
+        working-directory: packages/winding
+      - run: deno test win32/input_test.ts
+        working-directory: packages/winding
+      - name: Test live Win32 input and lifecycle
+        run: deno test --allow-ffi win32/native_smoke.ts
+        timeout-minutes: 2
+        working-directory: packages/winding
+
   winding-wayland:
     name: Winding Wayland (ubuntu-24.04)
     runs-on: ubuntu-24.04
