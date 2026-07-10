@@ -60,22 +60,32 @@ fn invalid_element(node_id: usize) -> JsValue {
 /// Convert viewport-pixel coordinates (the space `mousemove` events report) into Blitz's
 /// page-space coordinates (viewport coordinates plus the current scroll offset), or
 /// `None` if the point is non-finite or outside the viewport bounds.
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "Blitz stores scroll offsets as f64 but its hit-testing and pointer-event APIs require f32"
+)]
 fn viewport_point_to_page(
     x: f32,
     y: f32,
     width: u32,
     height: u32,
-    scroll_x: f32,
-    scroll_y: f32,
+    scroll_x: f64,
+    scroll_y: f64,
 ) -> Option<(f32, f32)> {
     if !x.is_finite() || !y.is_finite() {
         return None;
     }
-    if x < 0.0 || y < 0.0 || x >= width as f32 || y >= height as f32 {
+    if x < 0.0 || y < 0.0 || f64::from(x) >= f64::from(width) || f64::from(y) >= f64::from(height) {
         return None;
     }
 
-    Some((x + scroll_x, y + scroll_y))
+    // Blitz stores viewport scroll offsets as f64, while its hit-testing and pointer-event
+    // APIs require f32 coordinates. Keep the calculation at the wider precision and narrow
+    // only at that API boundary.
+    Some((
+        (f64::from(x) + scroll_x) as f32,
+        (f64::from(y) + scroll_y) as f32,
+    ))
 }
 
 /// Build a `keyboard_types::Modifiers` set from the individual flags `winding` reports.
@@ -147,7 +157,7 @@ fn us_qwerty_char(code: &str, shift: bool, caps_lock: bool) -> Option<char> {
 /// every control/named key (DOM `code` and `key` spellings coincide for those). Falls back
 /// to an explicit match for the Left/Right modifier codes and `NumpadEnter` (which don't
 /// parse that way), then a best-effort US-QWERTY table for printable physical-position
-/// codes. Anything still unmapped (e.g. `NumpadN` without NumLock state) is `Unidentified`.
+/// codes. Anything still unmapped (e.g. `NumpadN` without `NumLock` state) is `Unidentified`.
 fn synthesize_key(code: &str, shift: bool, caps_lock: bool) -> Key {
     if let Ok(key) = Key::from_str(code) {
         return key;
@@ -205,14 +215,8 @@ fn pointer_event(
     buttons: u8,
 ) -> Option<BlitzPointerEvent> {
     let scroll = state.document.viewport_scroll();
-    let (page_x, page_y) = viewport_point_to_page(
-        x,
-        y,
-        state.width,
-        state.height,
-        scroll.x as f32,
-        scroll.y as f32,
-    )?;
+    let (page_x, page_y) =
+        viewport_point_to_page(x, y, state.width, state.height, scroll.x, scroll.y)?;
 
     Some(BlitzPointerEvent {
         id: BlitzPointerId::Mouse,
@@ -278,6 +282,14 @@ mod tests {
         assert_eq!(
             viewport_point_to_page(10.0, 600.0, 800, 600, 0.0, 0.0),
             None
+        );
+    }
+
+    #[test]
+    fn preserves_large_viewport_boundary_precision() {
+        assert_eq!(
+            viewport_point_to_page(16_777_216.0, 0.0, 16_777_217, 1, 0.0, 0.0),
+            Some((16_777_216.0, 0.0))
         );
     }
 
@@ -600,7 +612,7 @@ impl QuoxRenderer {
             &initial_html(head, body),
             DocumentConfig {
                 base_url: Some("https://example.com".to_string()),
-                net_provider: Some(Arc::new(DummyNetProvider::default())),
+                net_provider: Some(Arc::new(DummyNetProvider)),
                 shell_provider: Some(Arc::new(QuoxShellProvider {
                     redraw_requested: Arc::clone(&redraw_requested),
                 })),
@@ -644,14 +656,8 @@ impl QuoxRenderer {
         state.sync_layout();
 
         let scroll = state.document.viewport_scroll();
-        let (page_x, page_y) = viewport_point_to_page(
-            x,
-            y,
-            state.width,
-            state.height,
-            scroll.x as f32,
-            scroll.y as f32,
-        )?;
+        let (page_x, page_y) =
+            viewport_point_to_page(x, y, state.width, state.height, scroll.x, scroll.y)?;
         state.document.hit(page_x, page_y).map(|hit| hit.node_id)
     }
 
@@ -703,14 +709,9 @@ impl QuoxRenderer {
     pub fn dispatch_wheel(&self, x: f32, y: f32, delta_x: f64, delta_y: f64, buttons: u8) -> bool {
         let mut state = self.state.borrow_mut();
         let scroll = state.document.viewport_scroll();
-        let Some((page_x, page_y)) = viewport_point_to_page(
-            x,
-            y,
-            state.width,
-            state.height,
-            scroll.x as f32,
-            scroll.y as f32,
-        ) else {
+        let Some((page_x, page_y)) =
+            viewport_point_to_page(x, y, state.width, state.height, scroll.x, scroll.y)
+        else {
             return false;
         };
 
@@ -847,7 +848,7 @@ impl QuoxRenderer {
         state
             .document
             .get_node(node_id)
-            .map(|node| node.text_content())
+            .map(blitz_dom::Node::text_content)
             .ok_or_else(|| invalid_node(node_id))
     }
 
@@ -858,7 +859,7 @@ impl QuoxRenderer {
             Some(node_id) => state
                 .document
                 .get_node(node_id)
-                .map(|node| node.text_content())
+                .map(blitz_dom::Node::text_content)
                 .ok_or_else(|| invalid_node(node_id)),
             None => Ok(String::new()),
         }
@@ -1032,7 +1033,7 @@ impl QuoxRenderer {
 
             let row_bytes = w * 4;
             let padded_row_bytes = row_bytes.next_multiple_of(256);
-            let out_size = (padded_row_bytes as u64) * (h as u64);
+            let out_size = u64::from(padded_row_bytes) * u64::from(h);
             let gpu_buffer = device_handle.device.create_buffer(&BufferDescriptor {
                 label: Some("quox-readback"),
                 size: out_size,

@@ -5,6 +5,7 @@ edition = "2024"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
 
 [lib]
 crate-type = ["cdylib"]
