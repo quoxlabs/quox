@@ -1,4 +1,4 @@
-import type { KeyEditDisposition } from "../types.ts";
+import type { KeyEditDisposition, KeyModifiers } from "../types.ts";
 import { normalizeCommittedText } from "../input/mod.ts";
 import { XEventType } from "./ffi.ts";
 
@@ -26,6 +26,18 @@ export function x11KeyEditDisposition(
   return key === "Dead" || hasCommittedText || wasComposing || isComposing || hasSemanticEvents
     ? "text-input"
     : "key-default";
+}
+
+/** Keep shortcut lookups from becoming edits unless AltGraph or composition owns them. */
+export function x11CommittedText(
+  text: string | undefined,
+  modifiers: KeyModifiers,
+  wasComposing: boolean,
+  isComposing: boolean,
+  hasSemanticEvents: boolean,
+): string | undefined {
+  if (text === undefined || modifiers.altGraphKey || wasComposing || isComposing || hasSemanticEvents) return text;
+  return modifiers.altKey || modifiers.metaKey || modifiers.accelKey ? undefined : text;
 }
 
 /** Core X11 represents auto-repeat as a release immediately followed by a matching press. */

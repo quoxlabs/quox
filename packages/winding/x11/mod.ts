@@ -14,7 +14,7 @@ import {
 import { domCodeFromX11 } from "../linux/mod.ts";
 import { utf8Bytes, utf8CString as cString } from "../text_encoding.ts";
 import { libcFunctions, NotifyNormal, x11functions, XEventMask, XEventType } from "./ffi.ts";
-import { isAutoRepeatPair, x11KeyEditDisposition } from "./input.ts";
+import { isAutoRepeatPair, x11CommittedText, x11KeyEditDisposition } from "./input.ts";
 import { NativeXImage } from "./native_image.ts";
 import { XimContext, XimManager } from "./xim.ts";
 
@@ -479,7 +479,13 @@ class X11Library implements Library {
           this.input.throwIfCallbackFailed();
           const repeat = window.pressedKeys.has(keycode);
           const key = window.pressedKeys.press(keycode, lookup.key);
-          const text = normalizeCommittedText(lookup.text ?? "");
+          const text = x11CommittedText(
+            normalizeCommittedText(lookup.text ?? ""),
+            modifiers,
+            wasComposing,
+            window.input.composing,
+            window.input.hasStagedEvents,
+          );
           const event: KeyDownEvent = createKeyDownEvent({
             keycode,
             code,

@@ -1,7 +1,7 @@
 import { normalizeCommittedText } from "../input/mod.ts";
 import { logicalKeyFromKeysym } from "../linux/mod.ts";
 import { XEventType } from "./ffi.ts";
-import { fallbackLookupText, isAutoRepeatPair, x11KeyEditDisposition } from "./input.ts";
+import { fallbackLookupText, isAutoRepeatPair, x11CommittedText, x11KeyEditDisposition } from "./input.ts";
 import { applyPreeditChange, preeditCursorByteOffset } from "./xim_preedit.ts";
 import { packRgbaPixels } from "./native_image.ts";
 
@@ -42,6 +42,23 @@ Deno.test("X11 edit ownership includes dead keys and XIM semantic output", () =>
   assertEquals(x11KeyEditDisposition("a", true, false, false, false), "text-input");
   assertEquals(x11KeyEditDisposition("Unidentified", false, true, false, false), "text-input");
   assertEquals(x11KeyEditDisposition("Unidentified", false, false, false, true), "text-input");
+});
+
+Deno.test("X11 shortcut modifiers do not turn lookup text into edits", () => {
+  const plain = {
+    shiftKey: false,
+    ctrlKey: false,
+    altKey: false,
+    metaKey: false,
+    accelKey: false,
+    capsLock: false,
+    altGraphKey: false,
+  };
+  assertEquals(x11CommittedText("a", plain, false, false, false), "a");
+  assertEquals(x11CommittedText("a", { ...plain, altKey: true }, false, false, false), undefined);
+  assertEquals(x11CommittedText("a", { ...plain, metaKey: true }, false, false, false), undefined);
+  assertEquals(x11CommittedText("@", { ...plain, altKey: true, altGraphKey: true }, false, false, false), "@");
+  assertEquals(x11CommittedText("a", { ...plain, altKey: true }, true, false, false), "a");
 });
 
 Deno.test("XIM preedit draw applies scalar-indexed replacements", () => {
