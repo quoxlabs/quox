@@ -40,17 +40,34 @@ Also See [this example](../../examples/winding.ts).
 
 ## Keyboard and text input
 
-Keyboard events keep the native numeric `keycode` and the layout-independent physical `code`. Backends that support
-layout-aware input also populate `key`, `location`, `repeat`, `isComposing`, and `text`. Darwin populates every extended
-field on every key event; `text` is an empty string when that event produces no text.
+Every keyboard event carries the native numeric `keycode`, a layout-independent DOM-style `code`, a layout-aware
+DOM-style `key`, location, composition state, and the complete modifier snapshot. Unknown physical or logical values are
+reported as `"Unidentified"`. Key releases reuse the logical key resolved by their matching press.
 
-On macOS, applications can opt into AppKit text input by calling `window.setImeEnabled?.(true)`. Winding then emits
-`ime` events for composition state, preedit updates, and committed text. The shared event type also represents
-surrounding-text deletion for backends that support it. Preedit selections and deletion lengths are UTF-8 byte offsets.
-Position the native candidate window with `setImeCursorArea`; its arguments use logical client coordinates with a
-top-left origin.
+Keydown events also describe who owns their editing behavior:
 
-An interpreted key is emitted before the text-input events it caused. Its `textInputHandled` field is `true`, telling
-consumers not to apply the key's default edit a second time. AppKit editing commands are emitted as
-`apple-standard-keybinding` events whose `command` is the original selector, such as `deleteBackward:`. Consumers should
-map that selector at their editor boundary rather than reproducing macOS keybinding rules in Winding.
+- `key-default` leaves navigation, deletion, Enter, Tab, and shortcuts to the application.
+- `text-input` suppresses that default because native text input or an AppKit command owns the edit.
+- `platform` suppresses it because the operating system owns the action.
+
+Committed text is never duplicated on a keyboard event. A normal character press is delivered as a `text-input` keydown
+followed by one nonempty `ime` commit. Composition updates use UTF-8 byte cursor ranges; cancellation is an empty
+preedit with a `null` cursor. A commit ends preedit atomically, so it is not preceded by a synthetic empty preedit.
+AppKit editing selectors remain observable as `apple-standard-keybinding` events.
+
+Call `window.setImeEnabled(true)` when a text editor wants native composition and
+`window.setImeCursorArea(x, y, width, height)` to position its candidate window in top-left-origin logical client
+coordinates. The setter records desired permission; `ime/enabled` and `ime/disabled` events report actual activation on
+the focused native window. Non-finite cursor geometry is ignored, while negative dimensions become zero.
+
+### Wayland environment permission
+
+The package selects Wayland only when it may read `WAYLAND_DISPLAY` and that variable is set. Applications that want
+automatic Wayland selection should therefore grant it explicitly:
+
+```sh
+deno run --allow-ffi --allow-env=WAYLAND_DISPLAY app.ts
+```
+
+Without that environment permission, the top-level loader falls back to X11. Code importing the Wayland backend directly
+may additionally need locale-variable access for XKB/compose initialization.

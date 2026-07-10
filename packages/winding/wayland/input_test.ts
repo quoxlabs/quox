@@ -257,6 +257,7 @@ Deno.test("text-input pending fields reset after every done and invalid cursors 
   const batch = new TextInputV3Batch();
   batch.setDeleteSurrounding(-10, Number.POSITIVE_INFINITY);
   batch.setCommit(null);
+  batch.setCommit("\u0003");
   batch.setPreedit("é", 1, 2);
 
   assertEquals(batch.done(0).edits, [
