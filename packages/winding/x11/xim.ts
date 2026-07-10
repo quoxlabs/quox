@@ -37,8 +37,6 @@ interface OwnedCallback {
 }
 
 const LC_CTYPE = 0;
-const MAX_STYLES = 64;
-
 const X_BUFFER_OVERFLOW = -1;
 const X_LOOKUP_CHARS = 2;
 const X_LOOKUP_KEYSYM = 3;
@@ -50,10 +48,8 @@ const XIM_PREEDIT_NOTHING = 0x0008n;
 const XIM_PREEDIT_NONE = 0x0010n;
 const XIM_STATUS_NOTHING = 0x0400n;
 const XIM_STATUS_NONE = 0x0800n;
-const CALLBACK_STYLE = XIM_PREEDIT_CALLBACKS | XIM_STATUS_NOTHING;
-const POSITION_STYLE = XIM_PREEDIT_POSITION | XIM_STATUS_NOTHING;
-const NOTHING_STYLE = XIM_PREEDIT_NOTHING | XIM_STATUS_NOTHING;
-const NONE_STYLE = XIM_PREEDIT_NONE | XIM_STATUS_NONE;
+const XIM_PREEDIT_MASK = 0x001fn;
+const XIM_STATUS_MASK = 0x0f00n;
 
 const XIM_CARET_INVISIBLE = 0;
 
@@ -104,11 +100,32 @@ export interface XimLookupResult {
   keysym: bigint;
 }
 
-interface InputStyles {
+export interface InputStyles {
   preedit: bigint;
   callbacks: boolean;
   positioned: boolean;
-  none: bigint;
+  none?: bigint;
+}
+
+/** Select styles by independently supported preedit and status capabilities. */
+export function selectXimStyles(values: readonly bigint[], localeIsUtf8: boolean): InputStyles | undefined {
+  const find = (preedit: bigint): bigint | undefined =>
+    values.find((style) => {
+      const status = style & XIM_STATUS_MASK;
+      return (style & XIM_PREEDIT_MASK) === preedit &&
+        (status === XIM_STATUS_NOTHING || status === XIM_STATUS_NONE);
+    });
+
+  const callback = localeIsUtf8 ? find(XIM_PREEDIT_CALLBACKS) : undefined;
+  const position = find(XIM_PREEDIT_POSITION);
+  const preedit = callback ?? position ?? find(XIM_PREEDIT_NOTHING) ?? find(XIM_PREEDIT_NONE);
+  if (preedit === undefined) return undefined;
+  return {
+    preedit,
+    callbacks: callback !== undefined && preedit === callback,
+    positioned: position !== undefined && preedit === position,
+    none: find(XIM_PREEDIT_NONE) ?? find(XIM_PREEDIT_NOTHING),
+  };
 }
 
 /** Process-wide XIM owner. All calls are deliberately made on Deno's main thread. */
@@ -279,6 +296,7 @@ export class XimManager implements Disposable {
   createIc(context: XimContext): Deno.PointerObject | null {
     if (this.#im === null || this.#styles === undefined) return null;
     const style = context.enabled ? this.#styles.preedit : this.#styles.none;
+    if (style === undefined) return null;
     let ic: Deno.PointerObject | null;
 
     if (context.enabled && this.#styles.callbacks) {
@@ -504,28 +522,13 @@ export class XimManager implements Disposable {
     if (stylesPointer === null) return undefined;
     try {
       const stylesView = new Deno.UnsafePointerView(stylesPointer);
-      const count = Math.min(stylesView.getUint16(0), MAX_STYLES);
+      const count = stylesView.getUint16(0);
       const valuesPointer = pointerFromAddress(stylesView.getBigUint64(8));
       if (valuesPointer === null) return undefined;
       const valuesView = new Deno.UnsafePointerView(valuesPointer);
-      const values = new Set<bigint>();
-      for (let index = 0; index < count; index++) values.add(valuesView.getBigUint64(index * 8));
-
-      const canUseCallbacks = this.localeIsUtf8 && values.has(CALLBACK_STYLE);
-      const canUsePosition = values.has(POSITION_STYLE);
-      const preedit = canUseCallbacks
-        ? CALLBACK_STYLE
-        : canUsePosition
-        ? POSITION_STYLE
-        : values.has(NOTHING_STYLE)
-        ? NOTHING_STYLE
-        : values.has(NONE_STYLE)
-        ? NONE_STYLE
-        : undefined;
-      const none = values.has(NONE_STYLE) ? NONE_STYLE : values.has(NOTHING_STYLE) ? NOTHING_STYLE : preedit;
-      return preedit === undefined || none === undefined
-        ? undefined
-        : { preedit, callbacks: canUseCallbacks, positioned: !canUseCallbacks && canUsePosition, none };
+      const values: bigint[] = [];
+      for (let index = 0; index < count; index++) values.push(valuesView.getBigUint64(index * 8));
+      return selectXimStyles(values, this.localeIsUtf8);
     } finally {
       this.#x11.XFree(stylesPointer);
     }

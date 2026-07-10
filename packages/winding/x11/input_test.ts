@@ -15,6 +15,7 @@ import {
   XimCaretDirection,
 } from "./xim_preedit.ts";
 import { packRgbaPixels } from "./native_image.ts";
+import { selectXimStyles } from "./xim.ts";
 
 Deno.test("X11 logical keys prefer layout-aware printable text", () => {
   assertEquals(logicalKeyFromKeysym(0x7a, "z"), "z");
@@ -98,6 +99,20 @@ Deno.test("XIM caret directions update the one-line preedit synchronously", () =
   assertEquals(movePreeditCaret(text, 4, XimCaretDirection.LineStart, 0), 0);
   assertEquals(movePreeditCaret(text, 4, XimCaretDirection.LineEnd, 0), 7);
   assertEquals(movePreeditCaret(text, 0, XimCaretDirection.AbsolutePosition, 99), 7);
+});
+
+Deno.test("XIM style selection accepts independent status choices", () => {
+  const callbackWithStatusNone = 0x0002n | 0x0800n;
+  const noneWithStatusNothing = 0x0010n | 0x0400n;
+  assertEquals(
+    selectXimStyles([callbackWithStatusNone, noneWithStatusNothing], true)?.preedit,
+    callbackWithStatusNone,
+  );
+  assertEquals(
+    selectXimStyles([callbackWithStatusNone, noneWithStatusNothing], true)?.none,
+    noneWithStatusNothing,
+  );
+  assertEquals(selectXimStyles([callbackWithStatusNone], true)?.none, undefined);
 });
 
 Deno.test("X11 repeat detection requires an identical adjacent press", () => {
