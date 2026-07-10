@@ -566,14 +566,18 @@ class DarwinWindow implements Window, DarwinNativeResponder {
   handleFlagsChanged(event: Deno.PointerValue): void {
     if (this.#closed || event === null) return;
     this.lib.markNativeEventHandled(event);
-    const native = this.#nativeKeyData(event);
-    const code = native.base.code;
+    // AppKit only defines `characters` and `charactersIgnoringModifiers` for
+    // key-down/up events. In particular, querying either property on a
+    // FlagsChanged event raises NSInternalInconsistencyException, which cannot
+    // safely unwind through the FFI boundary.
+    const base = this.#nativeKeyBase(event);
+    const code = base.code;
     const flags = this.lib.ffi.send.u64(event, this.lib.ffi.sel("modifierFlags"));
     const flag = modifierFlagForCode(code);
     const type = this.inputState.modifierTransition(code, flags, flag);
     if (type === "keydown") {
       const key: KeyDownEvent = createKeyDownEvent({
-        ...native.base,
+        ...base,
         repeat: false,
         editDisposition: "key-default",
       });
@@ -581,8 +585,8 @@ class DarwinWindow implements Window, DarwinNativeResponder {
       this.lib.pushEvent(key);
     } else {
       const key: KeyUpEvent = createKeyUpEvent({
-        ...native.base,
-        key: this.#pressedKeys.release(native.base.keycode, native.base.key),
+        ...base,
+        key: this.#pressedKeys.release(base.keycode, base.key),
       });
       this.lib.pushEvent(key);
     }
@@ -689,24 +693,44 @@ class DarwinWindow implements Window, DarwinNativeResponder {
     charactersIgnoringModifiers: string;
   } {
     const { sel, send } = this.lib.ffi;
-    const keycode = send.u16(event, sel("keyCode"));
-    const code = getDomCode(keycode);
     const charactersPointer = send.id(event, sel("characters"));
     const charactersIgnoringModifiersPointer = send.id(event, sel("charactersIgnoringModifiers"));
     const characters = charactersPointer === null ? "" : readCFString(this.lib.ffi.cf, charactersPointer);
     const charactersIgnoringModifiers = charactersIgnoringModifiersPointer === null
       ? ""
       : readCFString(this.lib.ffi.cf, charactersIgnoringModifiersPointer);
-    const base: Omit<KeyEventBase, "type"> = {
+    const base = this.#nativeKeyBase(
+      event,
+      logicalKeyForEvent({
+        code: getDomCode(send.u16(event, sel("keyCode"))),
+        characters,
+        charactersIgnoringModifiers,
+      }),
+    );
+    return { base, characters, charactersIgnoringModifiers };
+  }
+
+  /** Read the NSEvent fields that are valid for every keyboard event type. */
+  #nativeKeyBase(
+    event: Deno.PointerValue,
+    logicalKey?: string,
+  ): Omit<KeyEventBase, "type"> {
+    const { sel, send } = this.lib.ffi;
+    const keycode = send.u16(event, sel("keyCode"));
+    const code = getDomCode(keycode);
+    return {
       keycode,
       code,
-      key: logicalKeyForEvent({ code, characters, charactersIgnoringModifiers }),
+      key: logicalKey ?? logicalKeyForEvent({
+        code,
+        characters: "",
+        charactersIgnoringModifiers: "",
+      }),
       location: keyLocationForCode(code),
       isComposing: this.inputState.composing,
       ...getModifiers(event, this.lib.ffi),
       window: this,
     };
-    return { base, characters, charactersIgnoringModifiers };
   }
 
   setTitle(title: string): void {

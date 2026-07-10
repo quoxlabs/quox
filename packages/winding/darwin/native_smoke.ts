@@ -41,12 +41,13 @@ withAutoreleasePool(() => {
     "keydown is ordered before its synchronous preedit and commit callbacks",
     testKeydownOrdering,
   );
+  runCase("modifier transitions never query key-only character properties", testModifierTransitions);
   runCase(
     "NSTextInputClient protocol and struct-return ABIs work through Objective-C dispatch",
     testProtocolAndStructAbis,
   );
   runCase("text input survives repeated library and window lifecycles", testRepeatedLifecycles);
-  console.log("Darwin native smoke: 4 passed");
+  console.log("Darwin native smoke: 5 passed");
 });
 
 function testTextCallbacks(): void {
@@ -200,6 +201,90 @@ function testKeydownOrdering(): void {
         assertEquals(key.editDisposition, "text-input");
         const commit = assertIme(library.event(), "commit");
         assertEquals(commit.text, "a");
+      } finally {
+        for (let i = owned.length - 1; i >= 0; i--) {
+          sendVoid(owned[i], sel(runtime, "release"));
+        }
+      }
+    } finally {
+      closeAll(handles);
+    }
+  });
+}
+
+function testModifierTransitions(): void {
+  withNativeWindow(64, 48, (library, window) => {
+    const handles: Closeable[] = [];
+    try {
+      const runtime = Deno.dlopen(LIBOBJC, runtimeSymbols);
+      handles.push(runtime);
+      const sendId = openMessage(handles, ["pointer", "pointer"], "pointer");
+      const sendIdBuffer = openMessage(handles, ["pointer", "pointer", "buffer"], "pointer");
+      const sendI64 = openMessage(handles, ["pointer", "pointer"], "i64");
+      const sendVoid = openMessage(handles, ["pointer", "pointer"], "void");
+      const sendVoidId = openMessage(handles, ["pointer", "pointer", "pointer"], "void");
+      const makeKeyEvent = openMessage(
+        handles,
+        [
+          "pointer",
+          "pointer",
+          "u64",
+          NSPOINT,
+          "u64",
+          "f64",
+          "i64",
+          "pointer",
+          "pointer",
+          "pointer",
+          "bool",
+          "u16",
+        ],
+        "pointer",
+      );
+      const owned: Deno.PointerObject[] = [];
+      try {
+        const stringAlloc = sendId(getClass(runtime, "NSString"), sel(runtime, "alloc"));
+        const empty = own(
+          owned,
+          sendIdBuffer(stringAlloc, sel(runtime, "initWithUTF8String:"), cStr("")),
+          "empty key event characters",
+        );
+        const makeModifierEvent = (flags: bigint) => {
+          const event = makeKeyEvent(
+            getClass(runtime, "NSEvent"),
+            sel(
+              runtime,
+              "keyEventWithType:location:modifierFlags:timestamp:windowNumber:context:characters:charactersIgnoringModifiers:isARepeat:keyCode:",
+            ),
+            12n,
+            new Float64Array([0, 0]),
+            flags,
+            0,
+            sendI64(window.nsWindow, sel(runtime, "windowNumber")),
+            null,
+            empty,
+            empty,
+            false,
+            0x38,
+          );
+          assert(event !== null, "failed to create synthetic flags-changed event");
+          return event;
+        };
+
+        drainEvents(library);
+        sendVoidId(window.contentView, sel(runtime, "flagsChanged:"), makeModifierEvent(1n << 17n));
+        const down = library.event();
+        assert(down?.type === "keydown", "expected Shift keydown");
+        assertEquals(down.code, "ShiftLeft");
+        assertEquals(down.key, "Shift");
+        assertEquals(down.shiftKey, true);
+
+        sendVoidId(window.contentView, sel(runtime, "flagsChanged:"), makeModifierEvent(0n));
+        const up = library.event();
+        assert(up?.type === "keyup", "expected Shift keyup");
+        assertEquals(up.code, "ShiftLeft");
+        assertEquals(up.key, "Shift");
+        assertEquals(up.shiftKey, false);
       } finally {
         for (let i = owned.length - 1; i >= 0; i--) {
           sendVoid(owned[i], sel(runtime, "release"));
