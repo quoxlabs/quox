@@ -21,6 +21,11 @@ Deno.test("X11 opens a window, configures XIM, and translates a basic keypress",
 
     window.setImeCursorArea(8, 12, 2, 18);
     window.setImeEnabled(true);
+    focusWindow(window);
+    const focus = nextEvent(library, (event) => event.type === "focus");
+    if (focus?.type !== "focus" || focus.window !== window) {
+      throw new Error("Expected the X11 window to receive keyboard focus");
+    }
     assertImeKind(nextEvent(library, (event) => event.type === "ime"), "enabled");
 
     window.setImeEnabled(false);
@@ -42,6 +47,22 @@ Deno.test("X11 opens a window, configures XIM, and translates a basic keypress",
     library.close();
   }
 });
+
+function focusWindow(window: NativeX11Window): void {
+  // Xvfb runs without a window manager, so mapping a window does not give it
+  // keyboard focus. IME activation is intentionally conditional on native
+  // focus; establish it explicitly and let the resulting FocusIn event drive
+  // the public `focus → enabled` lifecycle.
+  const REVERT_TO_PARENT = 2;
+  const CURRENT_TIME = 0n;
+  window.lib.X11.symbols.XSetInputFocus(
+    window.lib.display,
+    window.id,
+    REVERT_TO_PARENT,
+    CURRENT_TIME,
+  );
+  window.lib.X11.symbols.XSync(window.lib.display, 0);
+}
 
 function drainEvents(library: Library): void {
   for (let count = 0; count < 64 && library.event() !== undefined; count++);
