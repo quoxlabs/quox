@@ -1,4 +1,4 @@
-import type { KeyEvent, Library, UIEvent, Window } from "../types.ts";
+import type { KeyDownEvent, Library, UIEvent, Window } from "../types.ts";
 import { utf8CString as cString } from "../text_encoding.ts";
 import { x11functions, XEventMask, XEventType } from "./ffi.ts";
 import { load } from "./mod.ts";
@@ -17,9 +17,6 @@ Deno.test("X11 opens a window, configures XIM, and translates a basic keypress",
   const library = load();
   try {
     const window = library.openWindow(0, 0, 64, 64) as NativeX11Window;
-    if (window.setImeCursorArea === undefined || window.setImeEnabled === undefined) {
-      throw new Error("X11 IME hooks are unavailable");
-    }
     drainEvents(library);
 
     window.setImeCursorArea(8, 12, 2, 18);
@@ -32,8 +29,15 @@ Deno.test("X11 opens a window, configures XIM, and translates a basic keypress",
     sendKeyPress(window, "a");
     const event = nextEvent(library, (candidate) => candidate.type === "keydown");
     if (event?.type !== "keydown") throw new Error("Expected an X11 keydown event");
-    assertKey(event, { code: "KeyA", key: "a", text: "a" });
+    assertKey(event, { code: "KeyA", key: "a", editDisposition: "text-input" });
     if (event.window !== window) throw new Error("X11 keydown was routed to the wrong window");
+    const commit = nextEvent(
+      library,
+      (candidate) => candidate.type === "ime" && candidate.kind === "commit",
+    );
+    if (commit?.type !== "ime" || commit.kind !== "commit" || commit.text !== "a") {
+      throw new Error("Expected an X11 IME commit for the basic keypress");
+    }
   } finally {
     library.close();
   }
@@ -90,10 +94,10 @@ function assertImeKind(event: UIEvent | undefined, expected: "enabled" | "disabl
 }
 
 function assertKey(
-  event: KeyEvent,
-  expected: Pick<KeyEvent, "code" | "key" | "text">,
+  event: KeyDownEvent,
+  expected: Pick<KeyDownEvent, "code" | "key" | "editDisposition">,
 ): void {
-  for (const field of ["code", "key", "text"] as const) {
+  for (const field of ["code", "key", "editDisposition"] as const) {
     if (event[field] !== expected[field]) {
       throw new Error(`Expected ${field} ${expected[field]}, got ${event[field]}`);
     }
