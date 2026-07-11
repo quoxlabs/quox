@@ -1089,12 +1089,16 @@ class DarwinLibrary implements Library {
       cleanupErrors.push(error);
     }
 
+    if (activeLibrary === this) activeLibrary = undefined;
+
     if (cleanupErrors.length === 1) throw cleanupErrors[0];
     if (cleanupErrors.length > 1) {
       throw new AggregateError(cleanupErrors, "winding(darwin): errors during native shutdown");
     }
   }
 }
+
+let activeLibrary: DarwinLibrary | undefined;
 
 function importPointerEvent(event: Deno.PointerValue, window: DarwinWindow): UIEvent | undefined {
   const { sel, send } = window.lib.ffi;
@@ -1137,4 +1141,11 @@ function importPointerEvent(event: Deno.PointerValue, window: DarwinWindow): UIE
   }
 }
 
-export const load: LoadLibrary = () => new DarwinLibrary();
+export const load: LoadLibrary = () => {
+  if (activeLibrary !== undefined) {
+    throw new Error("winding(darwin): only one Darwin library may be open at a time");
+  }
+  const library = new DarwinLibrary();
+  activeLibrary = library;
+  return library;
+};

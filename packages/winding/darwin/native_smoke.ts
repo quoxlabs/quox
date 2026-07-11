@@ -50,12 +50,13 @@ withAutoreleasePool(() => {
   runCase("blit copies pixels into storage retained by Core Graphics", testBlitStorageLifetime);
   runCase("windows opt into ordinary mouse-move delivery", testMouseMoveDeliveryEnabled);
   runCase("closed windows and libraries reject every native operation", testClosedMethodGuards);
+  runCase("only one library owns the process-wide AppKit queue", testSingleLibraryOwnership);
   runCase(
     "NSTextInputClient protocol and struct-return ABIs work through Objective-C dispatch",
     testProtocolAndStructAbis,
   );
   runCase("text input survives repeated library and window lifecycles", testRepeatedLifecycles);
-  console.log("Darwin native smoke: 8 passed");
+  console.log("Darwin native smoke: 9 passed");
 });
 
 function testTextCallbacks(): void {
@@ -430,6 +431,18 @@ function testClosedMethodGuards(): void {
   assertThrowsMessage(() => library.event(), "library is closed");
   assertThrowsMessage(() => window.setTitle("library closed"), "window is closed");
   library.close();
+}
+
+function testSingleLibraryOwnership(): void {
+  const first = load();
+  try {
+    assertThrowsMessage(() => load(), "only one Darwin library");
+  } finally {
+    first.close();
+  }
+
+  const replacement = load();
+  replacement.close();
 }
 
 function testProtocolAndStructAbis(): void {
