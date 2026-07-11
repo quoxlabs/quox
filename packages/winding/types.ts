@@ -194,8 +194,10 @@ export interface Window {
   /**
    * Blit tightly packed, row-major sRGB RGBA8 pixels whose dimensions match a
    * resize event's framebuffer dimensions. The first pixel is the top-left
-   * pixel and alpha is straight (unpremultiplied). Pass the event's frame token
-   * when rendering asynchronously so stale frames can be dropped.
+   * pixel and alpha is straight (unpremultiplied). The source space remains
+   * sRGB across display-profile changes, so a profile change alone does not
+   * invalidate the pixels. Pass the event's frame token when rendering
+   * asynchronously so stale frames can be dropped.
    */
   blit(rgba: Uint8Array, width: number, height: number, frameToken?: number): void;
   /** Set whether native composition is desired for this window. */

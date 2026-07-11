@@ -18,7 +18,9 @@ import {
   openNSRectMsgSend,
   readCFString,
   readNSRange,
+  readPointerStatic,
   readStructF64,
+  RGBA_BITMAP_INFO,
   runtimeSymbols,
   sel,
 } from "./ffi.ts";
@@ -57,7 +59,10 @@ runCase(
   testKeydownOrdering,
 );
 runCase("modifier transitions never query key-only character properties", testModifierTransitions);
-runCase("blit uses exact backing pixels retained by Core Graphics", testBlitStorageLifetime);
+runCase(
+  "blit preserves RGBA8 sRGB pixels across profile redisplay",
+  testBlitStorageLifetime,
+);
 runCase("validated outer-frame geometries accept their first framebuffer", testWindowGeometryValidation);
 runCase("windows opt into ordinary mouse-move delivery", testMouseMoveDeliveryEnabled);
 runCase("closed windows and libraries reject every native operation", testClosedMethodGuards);
@@ -495,11 +500,15 @@ function testBlitStorageLifetime(): void {
       handles.push(runtime);
       const rectSend = openNSRectMsgSend(handles);
       const sendId = openMessage(handles, ["pointer", "pointer"], "pointer");
+      const sendBool = openMessage(handles, ["pointer", "pointer"], "bool");
       const sendF64 = openMessage(handles, ["pointer", "pointer"], "f64");
       const sendVoid = openMessage(handles, ["pointer", "pointer"], "void");
+      const sendVoidId = openMessage(handles, ["pointer", "pointer", "pointer"], "void");
       const cg = Deno.dlopen(
         CORE_GRAPHICS,
         {
+          kCGColorSpaceSRGB: { type: "pointer" },
+          CGImageGetBitmapInfo: { parameters: ["pointer"], result: "u32" },
           CGImageGetColorSpace: { parameters: ["pointer"], result: "pointer" },
           CGImageGetDataProvider: { parameters: ["pointer"], result: "pointer" },
           CGImageGetWidth: { parameters: ["pointer"], result: "usize" },
@@ -518,6 +527,24 @@ function testBlitStorageLifetime(): void {
         } as const,
       );
       handles.push(cf);
+
+      const srgbNameStatic = cg.symbols.kCGColorSpaceSRGB;
+      assert(srgbNameStatic !== null, "kCGColorSpaceSRGB static is unavailable");
+      const srgbName = readPointerStatic(srgbNameStatic);
+      assert(srgbName !== null, "kCGColorSpaceSRGB contains a null CFStringRef");
+      assert(
+        Deno.UnsafePointer.value(srgbName) !== Deno.UnsafePointer.value(srgbNameStatic),
+        "kCGColorSpaceSRGB was not dereferenced",
+      );
+      assertEquals(readCFString(cf, srgbName), "kCGColorSpaceSRGB");
+      assert(
+        sendBool(window.nsWindow, sel(runtime, "displaysWhenScreenProfileChanges")),
+        "window did not opt into screen-profile redisplay",
+      );
+      assert(
+        sendBool(window.contentView, sel(runtime, "wantsUpdateLayer")),
+        "content view does not use the profile-redisplay update path",
+      );
 
       const resize = takeResizeEvent(library, window);
       const contentBounds = rectSend.noArgs(window.contentView, sel(runtime, "bounds"));
@@ -564,6 +591,7 @@ function testBlitStorageLifetime(): void {
       assert(image !== null, "content layer has no image after blit");
       assertEquals(cg.symbols.CGImageGetWidth(image), BigInt(width));
       assertEquals(cg.symbols.CGImageGetHeight(image), BigInt(height));
+      assertEquals(cg.symbols.CGImageGetBitmapInfo(image), RGBA_BITMAP_INFO);
       const imageColorSpace = cg.symbols.CGImageGetColorSpace(image);
       assert(imageColorSpace !== null, "installed image has no color space");
       const colorSpaceName = cg.symbols.CGColorSpaceCopyName(imageColorSpace);
@@ -573,6 +601,13 @@ function testBlitStorageLifetime(): void {
       } finally {
         cf.symbols.CFRelease(colorSpaceName);
       }
+      const imagePointer = Deno.UnsafePointer.value(image);
+      sendVoidId(layer, sel(runtime, "setContents:"), null);
+      assertEquals(sendId(layer, sel(runtime, "contents")), null);
+      sendVoid(window.contentView, sel(runtime, "updateLayer"));
+      const redisplayedImage = sendId(layer, sel(runtime, "contents"));
+      assert(redisplayedImage !== null, "profile redisplay did not restore the retained image");
+      assertEquals(Deno.UnsafePointer.value(redisplayedImage), imagePointer);
       const provider = cg.symbols.CGImageGetDataProvider(image);
       assert(provider !== null, "installed image has no data provider");
       const data = cg.symbols.CGDataProviderCopyData(provider);

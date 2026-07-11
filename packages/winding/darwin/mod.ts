@@ -51,6 +51,7 @@ import {
   type ObjcRuntime,
   openNSRectMsgSend,
   readCFString,
+  readPointerStatic,
   readStructF64,
   RGBA_BITMAP_INFO,
   runtimeSymbols,
@@ -441,6 +442,12 @@ class DarwinWindow implements Window, DarwinNativeResponder {
       // NSWindow defaults this to false, which suppresses ordinary unpressed
       // mouse motion even though drag events continue to arrive.
       send.void_bool(win, sel("setAcceptsMouseMovedEvents:"), true);
+      // AppKit defaults this to false. Enabling it updates the window context
+      // and redisplays the view when ColorSync changes the current screen's
+      // profile or the window moves to a differently profiled screen. Our
+      // updateLayer callback reapplies the retained sRGB image; only a separate
+      // backing-metrics change asks the producer for different pixels.
+      send.void_bool(win, sel("setDisplaysWhenScreenProfileChanges:"), true);
       send.void_bool(contentView, sel("setWantsLayer:"), true);
       const layer = send.id(contentView, sel("layer"));
       if (layer === null) throw new Error("winding(darwin): failed to create content layer");
@@ -588,6 +595,9 @@ class DarwinWindow implements Window, DarwinNativeResponder {
   handleNativeUpdateLayer(): void {
     if (this.#closed) return;
     const { sel, send } = this.lib.ffi;
+    // The image remains tagged with its source sRGB space. Reapplying it after
+    // AppKit updates the window context lets ColorSync target the new display
+    // without asking the producer to render identical source pixels again.
     send.void_id(this.#layer, sel("setContents:"), this.#viewImage);
   }
 
@@ -1281,8 +1291,14 @@ class DarwinLibrary implements Library {
         distantPast = send.id(send.id(getClass("NSDate"), sel("distantPast")), sel("retain"));
         if (distantPast === null) throw new Error("winding(darwin): failed to retain NSDate.distantPast");
         runLoopMode = makeNSString(this.ffi, "kCFRunLoopDefaultMode");
-        const srgbName = cg.symbols.kCGColorSpaceSRGB;
-        if (srgbName === null) throw new Error("winding(darwin): kCGColorSpaceSRGB is unavailable");
+        const srgbNameStatic = cg.symbols.kCGColorSpaceSRGB;
+        if (srgbNameStatic === null) {
+          throw new Error("winding(darwin): kCGColorSpaceSRGB static is unavailable");
+        }
+        const srgbName = readPointerStatic(srgbNameStatic);
+        if (srgbName === null) {
+          throw new Error("winding(darwin): kCGColorSpaceSRGB contains a null CFStringRef");
+        }
         colorSpace = cg.symbols.CGColorSpaceCreateWithName(srgbName);
         if (colorSpace === null) {
           throw new Error("winding(darwin): failed to create the named sRGB color space");

@@ -32,6 +32,15 @@ export const appKitSymbols = {
   NSApp: { type: "pointer" },
 } as const satisfies Deno.ForeignLibraryInterface;
 
+/** Read the pointer value stored in a pointer-valued foreign static. */
+export function readPointerStatic(
+  staticAddress: Deno.PointerValue,
+  read: (address: Deno.PointerObject) => Deno.PointerValue = (address) =>
+    new Deno.UnsafePointerView(address).getPointer(),
+): Deno.PointerValue {
+  return staticAddress === null ? null : read(staticAddress);
+}
+
 export type DarwinSystem = Deno.DynamicLibrary<typeof systemSymbols>;
 
 /** AppKit objects and event dispatch are confined to the process main thread. */
@@ -375,6 +384,8 @@ export function openNSRectMsgSend(libraries: Closeable[]): NSRectMsgSend {
 
 // CoreGraphics / CoreFoundation plain C functions (not Objective-C messages).
 export const cgSymbols = {
+  // Deno exposes this pointer-valued static's storage address. Dereference it
+  // with readPointerStatic before passing the CFStringRef to Core Graphics.
   kCGColorSpaceSRGB: { type: "pointer" },
   CGColorSpaceCreateWithName: { parameters: ["pointer"], result: "pointer" },
   CGDataProviderCreateWithCFData: {
