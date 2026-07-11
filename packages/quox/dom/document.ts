@@ -14,6 +14,7 @@ import {
   assertUint32,
   assertUtf8ByteRange,
 } from "./ffi_numbers.ts";
+import { runWithImeSynchronization } from "./ime_requests.ts";
 import { type AssertActive, attachDocumentInternals, type RequestRender } from "./internals.ts";
 import { ELEMENT_NODE, QuoxNodeCache, TEXT_NODE } from "./node_cache.ts";
 import type { QuoxElement, QuoxNode, QuoxText } from "./node.ts";
@@ -249,12 +250,10 @@ export class QuoxDocument {
 
   #dispatchInputEvent(dispatch: () => boolean, drainFiredEvents = true): void {
     this.#assertActive();
-    try {
+    runWithImeSynchronization(() => {
       if (dispatch()) this.#requestRender();
       if (drainFiredEvents) this.#drainFiredEvents();
-    } finally {
-      this.#syncNativeImeRequests();
-    }
+    }, () => this.#syncNativeImeRequests());
   }
 
   /**

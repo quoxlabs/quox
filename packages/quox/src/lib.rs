@@ -63,15 +63,80 @@ struct QuoxRendererState {
 const IME_REQUEST_CURSOR_AREA: u8 = 1 << 0;
 const IME_REQUEST_ENABLED: u8 = 1 << 1;
 const IME_REQUEST_CONTEXT_RESTART: u8 = 1 << 2;
-const IME_REQUEST_SNAPSHOT_LEN: usize = 6;
+const IME_REQUEST_SNAPSHOT_LEN: usize = 7;
 
-#[derive(Default)]
 struct ImeRequestState {
     desired_enabled: Option<bool>,
-    delivered_enabled: Option<bool>,
+    acknowledged_enabled: Option<bool>,
     desired_cursor_area: Option<[f32; 4]>,
-    delivered_cursor_area: Option<[f32; 4]>,
-    context_restart_pending: bool,
+    acknowledged_cursor_area: Option<[f32; 4]>,
+    desired_restart_generation: u64,
+    acknowledged_restart_generation: u64,
+    in_flight: Option<ImeRequestSnapshot>,
+    next_snapshot_revision: Option<u32>,
+}
+
+impl Default for ImeRequestState {
+    fn default() -> Self {
+        Self {
+            desired_enabled: None,
+            acknowledged_enabled: None,
+            desired_cursor_area: None,
+            acknowledged_cursor_area: None,
+            desired_restart_generation: 0,
+            acknowledged_restart_generation: 0,
+            in_flight: None,
+            next_snapshot_revision: Some(1),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ImeRequestSnapshot {
+    revision: u32,
+    flags: u8,
+    cursor_area: Option<[f32; 4]>,
+    enabled: Option<bool>,
+    restart_generation: u64,
+}
+
+impl ImeRequestSnapshot {
+    fn wire_values(&self) -> [f64; IME_REQUEST_SNAPSHOT_LEN] {
+        let mut values = [0.0; IME_REQUEST_SNAPSHOT_LEN];
+        values[0] = f64::from(self.revision);
+        values[1] = f64::from(self.flags);
+        if let Some(area) = self.cursor_area {
+            for (destination, source) in values[2..6].iter_mut().zip(area) {
+                *destination = f64::from(source);
+            }
+        }
+        values[6] = self.enabled.map_or(0.0, f64::from);
+        values
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ImeRequestMailboxError {
+    RevisionExhausted,
+    NothingToAcknowledge,
+    RevisionMismatch { expected: u32, actual: u32 },
+}
+
+impl std::fmt::Display for ImeRequestMailboxError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RevisionExhausted => {
+                formatter.write_str("quox: IME request revision space exhausted")
+            }
+            Self::NothingToAcknowledge => {
+                formatter.write_str("quox: no IME request is awaiting acknowledgment")
+            }
+            Self::RevisionMismatch { expected, actual } => write!(
+                formatter,
+                "quox: IME request acknowledgment revision {actual} does not match {expected}"
+            ),
+        }
+    }
 }
 
 /// Thread-safe hand-off for shell requests produced synchronously inside Blitz. The host
@@ -88,15 +153,17 @@ impl ImeRequestMailbox {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if enabled {
-            // Blitz identifies a new logical editor by disabling the old editor before enabling
-            // the new one. Preserve that edge even when both requests arrive before the host can
-            // drain the mailbox and the final boolean is unchanged.
-            if state.desired_enabled == Some(false) && state.delivered_enabled == Some(true) {
-                state.context_restart_pending = true;
-            }
-        } else {
-            state.context_restart_pending = false;
+        if state.desired_enabled == Some(enabled) {
+            return;
+        }
+        if enabled && state.desired_enabled == Some(false) {
+            // Every disable/enable edge identifies a new logical editor. Multiple edges before
+            // one peek coalesce, while the generation prevents an edge arriving during an
+            // in-flight native transaction from being cleared by that transaction's ack.
+            state.desired_restart_generation = state
+                .desired_restart_generation
+                .checked_add(1)
+                .expect("IME restart generation exhausted");
         }
         state.desired_enabled = Some(enabled);
     }
@@ -107,57 +174,114 @@ impl ImeRequestMailbox {
         }
         cursor_area[2] = cursor_area[2].max(0.0);
         cursor_area[3] = cursor_area[3].max(0.0);
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .desired_cursor_area = Some(cursor_area);
-    }
-
-    /// Atomically drain the changed parts of the desired native IME state.
-    ///
-    /// The compact WASM-friendly snapshot is `[flags, x, y, width, height, enabled]`.
-    /// Cursor geometry and enabled state have independent presence bits, allowing the host to
-    /// apply geometry before an accompanying enable without racing two mailbox drains. A restart
-    /// bit preserves a coalesced disable/enable handoff while the final enabled value stays true.
-    fn take_snapshot(&self) -> Option<[f32; IME_REQUEST_SNAPSHOT_LEN]> {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let cursor_area_changed = state.desired_cursor_area != state.delivered_cursor_area;
-        let enabled_changed = state.desired_enabled != state.delivered_enabled;
-        let context_restart = state.context_restart_pending
+        if state.desired_cursor_area != Some(cursor_area) {
+            state.desired_cursor_area = Some(cursor_area);
+        }
+    }
+
+    /// Peek one immutable native transaction without acknowledging it. Repeated peeks return the
+    /// same revision until the host confirms every operation succeeded.
+    fn peek_snapshot(
+        &self,
+    ) -> Result<Option<[f64; IME_REQUEST_SNAPSHOT_LEN]>, ImeRequestMailboxError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        if let Some(snapshot) = &state.in_flight {
+            return Ok(Some(snapshot.wire_values()));
+        }
+
+        // When native state is already disabled, any accumulated logical-editor restart edge is
+        // satisfied without another disable/enable cycle.
+        if state.acknowledged_enabled == Some(false) && state.desired_enabled == Some(false) {
+            state.acknowledged_restart_generation = state.desired_restart_generation;
+        }
+
+        let cursor_area_changed = state.desired_cursor_area != state.acknowledged_cursor_area;
+        let enabled_changed = state.desired_enabled != state.acknowledged_enabled;
+        let restart_pending =
+            state.desired_restart_generation > state.acknowledged_restart_generation;
+        let context_restart = restart_pending
             && state.desired_enabled == Some(true)
-            && state.delivered_enabled == Some(true);
+            && state.acknowledged_enabled == Some(true);
         if !cursor_area_changed && !enabled_changed && !context_restart {
-            return None;
+            return Ok(None);
         }
 
         let mut flags = 0;
-        let mut snapshot = [0.0; IME_REQUEST_SNAPSHOT_LEN];
         if cursor_area_changed {
             flags |= IME_REQUEST_CURSOR_AREA;
-            if let Some(area) = state.desired_cursor_area {
-                snapshot[1..5].copy_from_slice(&area);
-            }
-            state.delivered_cursor_area = state.desired_cursor_area;
         }
         if enabled_changed {
             flags |= IME_REQUEST_ENABLED;
-            snapshot[5] = if state.desired_enabled.unwrap_or(false) {
-                1.0
-            } else {
-                0.0
-            };
-            state.delivered_enabled = state.desired_enabled;
         }
         if context_restart {
             flags |= IME_REQUEST_CONTEXT_RESTART;
-            snapshot[5] = 1.0;
         }
-        state.context_restart_pending = false;
-        snapshot[0] = f32::from(flags);
-        Some(snapshot)
+
+        let revision = state
+            .next_snapshot_revision
+            .ok_or(ImeRequestMailboxError::RevisionExhausted)?;
+        state.next_snapshot_revision = revision.checked_add(1);
+        let snapshot = ImeRequestSnapshot {
+            revision,
+            flags,
+            cursor_area: cursor_area_changed
+                .then_some(state.desired_cursor_area)
+                .flatten(),
+            enabled: (enabled_changed || context_restart)
+                .then_some(state.desired_enabled)
+                .flatten(),
+            restart_generation: state.desired_restart_generation,
+        };
+        let wire_values = snapshot.wire_values();
+        state.in_flight = Some(snapshot);
+        Ok(Some(wire_values))
+    }
+
+    /// Acknowledge only the currently peeked revision after all native setters succeeded.
+    fn acknowledge_snapshot(&self, revision: u32) -> Result<(), ImeRequestMailboxError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let snapshot = state
+            .in_flight
+            .as_ref()
+            .ok_or(ImeRequestMailboxError::NothingToAcknowledge)?;
+        if snapshot.revision != revision {
+            return Err(ImeRequestMailboxError::RevisionMismatch {
+                expected: snapshot.revision,
+                actual: revision,
+            });
+        }
+        let snapshot = state
+            .in_flight
+            .take()
+            .expect("the checked in-flight snapshot remains present");
+
+        if snapshot.flags & IME_REQUEST_CURSOR_AREA != 0 {
+            state.acknowledged_cursor_area = snapshot.cursor_area;
+        }
+        if let Some(enabled) = snapshot.enabled {
+            state.acknowledged_enabled = Some(enabled);
+            if enabled {
+                state.acknowledged_restart_generation = state
+                    .acknowledged_restart_generation
+                    .max(snapshot.restart_generation);
+            } else {
+                // A successfully applied disable satisfies even restart edges requested while
+                // this transaction was in flight; the following enable can be ordinary.
+                state.acknowledged_restart_generation = state.desired_restart_generation;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -346,18 +470,42 @@ impl QuoxRenderer {
         Ok(())
     }
 
-    /// Atomically drain changed native IME requests as
-    /// `[flags, x, y, width, height, enabled]`.
-    pub fn take_ime_requests(&self) -> Option<Box<[f32]>> {
+    /// Peek the current native IME transaction as
+    /// `[revision, flags, x, y, width, height, enabled]` without acknowledging it.
+    pub fn peek_ime_requests(&self) -> Result<Option<Box<[f64]>>, JsValue> {
         self.state
             .borrow()
             .ime_requests
-            .take_snapshot()
-            .map(Box::<[f32]>::from)
+            .peek_snapshot()
+            .map(|snapshot| snapshot.map(Box::<[f64]>::from))
+            .map_err(|error| js_sys::Error::new(&error.to_string()).into())
+    }
+
+    /// Confirm that every native operation in the peeked IME transaction succeeded.
+    pub fn ack_ime_requests(&self, revision: f64) -> Result<(), JsValue> {
+        let revision = uint32(revision, "revision").map_err(NumericArgumentError::into_js)?;
+        if revision == 0 {
+            return Err(NumericArgumentError::new(
+                "revision",
+                "be a positive unsigned 32-bit integer",
+            )
+            .into_js());
+        }
+        self.state
+            .borrow()
+            .ime_requests
+            .acknowledge_snapshot(revision)
+            .map_err(|error| js_sys::Error::new(&error.to_string()).into())
     }
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::float_cmp,
+    reason = "IME wire snapshots contain exactly representable u32 revisions and f32-derived values"
+)]
 mod tests {
     use super::{
         IME_REQUEST_CONTEXT_RESTART, IME_REQUEST_CURSOR_AREA, IME_REQUEST_ENABLED,
@@ -367,102 +515,123 @@ mod tests {
     use blitz_html::HtmlDocument;
     use blitz_traits::shell::{ColorScheme, Viewport};
 
-    #[test]
-    fn ime_request_mailbox_coalesces_and_atomically_drains_changed_values() {
-        let mailbox = ImeRequestMailbox::default();
+    fn peek(mailbox: &ImeRequestMailbox) -> [f64; 7] {
+        mailbox
+            .peek_snapshot()
+            .expect("peek should succeed")
+            .expect("a snapshot should be pending")
+    }
 
-        mailbox.request_enabled(true);
-        mailbox.request_enabled(false);
-        mailbox.request_cursor_area([1.0, 2.0, 3.0, 4.0]);
-        mailbox.request_cursor_area([5.0, 6.0, 7.0, 8.0]);
-
-        assert_eq!(
-            mailbox.take_snapshot(),
-            Some([
-                f32::from(IME_REQUEST_CURSOR_AREA | IME_REQUEST_ENABLED),
-                5.0,
-                6.0,
-                7.0,
-                8.0,
-                0.0,
-            ])
-        );
-        assert_eq!(mailbox.take_snapshot(), None);
-
-        // Repeating the delivered values is a no-op even after the previous snapshot drained.
-        mailbox.request_enabled(false);
-        mailbox.request_cursor_area([5.0, 6.0, 7.0, 8.0]);
-        assert_eq!(mailbox.take_snapshot(), None);
-
-        mailbox.request_enabled(true);
-        assert_eq!(
-            mailbox.take_snapshot(),
-            Some([f32::from(IME_REQUEST_ENABLED), 0.0, 0.0, 0.0, 0.0, 1.0])
-        );
-
-        mailbox.request_cursor_area([f32::NAN, 1.0, 2.0, 3.0]);
-        assert_eq!(mailbox.take_snapshot(), None);
-        mailbox.request_cursor_area([5.0, 6.0, -7.0, -8.0]);
-        assert_eq!(
-            mailbox.take_snapshot(),
-            Some([f32::from(IME_REQUEST_CURSOR_AREA), 5.0, 6.0, 0.0, 0.0, 0.0])
-        );
+    fn acknowledge(mailbox: &ImeRequestMailbox, snapshot: [f64; 7]) {
+        mailbox
+            .acknowledge_snapshot(snapshot[0] as u32)
+            .expect("acknowledgment should succeed");
     }
 
     #[test]
-    fn ime_request_mailbox_preserves_same_surface_editor_restarts() {
+    fn ime_request_peek_retries_until_the_matching_revision_is_acknowledged() {
         let mailbox = ImeRequestMailbox::default();
+        mailbox.request_enabled(true);
+        mailbox.request_cursor_area([1.0, 2.0, 3.0, 4.0]);
 
-        mailbox.request_enabled(true);
-        assert_eq!(
-            mailbox.take_snapshot(),
-            Some([f32::from(IME_REQUEST_ENABLED), 0.0, 0.0, 0.0, 0.0, 1.0])
-        );
+        let snapshot = peek(&mailbox);
+        assert_eq!(snapshot, [1.0, 3.0, 1.0, 2.0, 3.0, 4.0, 1.0]);
+        assert_eq!(peek(&mailbox), snapshot);
+        assert!(mailbox.acknowledge_snapshot(2).is_err());
+        assert_eq!(peek(&mailbox), snapshot);
 
-        // A blur/focus handoff can happen synchronously inside one Blitz event dispatch. The
-        // final boolean remains true, but the host still needs to restart the native context.
-        mailbox.request_enabled(false);
-        mailbox.request_cursor_area([10.0, 20.0, 3.0, 4.0]);
-        mailbox.request_enabled(true);
-        assert_eq!(
-            mailbox.take_snapshot(),
-            Some([
-                f32::from(IME_REQUEST_CURSOR_AREA | IME_REQUEST_CONTEXT_RESTART),
-                10.0,
-                20.0,
-                3.0,
-                4.0,
-                1.0,
-            ])
-        );
-        assert_eq!(mailbox.take_snapshot(), None);
+        acknowledge(&mailbox, snapshot);
+        assert_eq!(mailbox.peek_snapshot(), Ok(None));
+    }
 
-        // Multiple handoffs before a drain only need one restart for the final editor.
+    #[test]
+    fn requests_arriving_before_ack_survive_as_a_new_revision() {
+        let mailbox = ImeRequestMailbox::default();
+        mailbox.request_enabled(true);
+        mailbox.request_cursor_area([1.0, 2.0, 3.0, 4.0]);
+        let first = peek(&mailbox);
+
+        mailbox.request_enabled(false);
+        mailbox.request_cursor_area([5.0, 6.0, 7.0, 8.0]);
+        assert_eq!(peek(&mailbox), first);
+        acknowledge(&mailbox, first);
+
+        let second = peek(&mailbox);
+        assert_eq!(second, [2.0, 3.0, 5.0, 6.0, 7.0, 8.0, 0.0]);
+        acknowledge(&mailbox, second);
+        assert_eq!(mailbox.peek_snapshot(), Ok(None));
+    }
+
+    #[test]
+    fn editor_handoffs_coalesce_but_newer_generations_survive_ack() {
+        let mailbox = ImeRequestMailbox::default();
+        mailbox.request_enabled(true);
+        let initial = peek(&mailbox);
+        acknowledge(&mailbox, initial);
+
         mailbox.request_enabled(false);
         mailbox.request_enabled(true);
         mailbox.request_enabled(false);
         mailbox.request_enabled(true);
+        let first_restart = peek(&mailbox);
+        assert_eq!(first_restart[1], f64::from(IME_REQUEST_CONTEXT_RESTART));
+
+        mailbox.request_enabled(false);
+        mailbox.request_enabled(true);
+        acknowledge(&mailbox, first_restart);
+        let second_restart = peek(&mailbox);
+        assert_eq!(second_restart[1], f64::from(IME_REQUEST_CONTEXT_RESTART));
+        assert_ne!(second_restart[0], first_restart[0]);
+        acknowledge(&mailbox, second_restart);
+        assert_eq!(mailbox.peek_snapshot(), Ok(None));
+    }
+
+    #[test]
+    fn acknowledged_disable_satisfies_a_newer_restart_edge() {
+        let mailbox = ImeRequestMailbox::default();
+        mailbox.request_enabled(true);
+        let initial = peek(&mailbox);
+        acknowledge(&mailbox, initial);
+
+        mailbox.request_enabled(false);
+        let disable = peek(&mailbox);
+        mailbox.request_enabled(true);
+        acknowledge(&mailbox, disable);
+
+        let enable = peek(&mailbox);
+        assert_eq!(enable[1], f64::from(IME_REQUEST_ENABLED));
+        assert_eq!(enable[6], 1.0);
+        acknowledge(&mailbox, enable);
+        assert_eq!(mailbox.peek_snapshot(), Ok(None));
+    }
+
+    #[test]
+    fn final_disabled_state_supersedes_restart_and_cursor_values_are_sanitized() {
+        let mailbox = ImeRequestMailbox::default();
+        mailbox.request_enabled(true);
+        let initial = peek(&mailbox);
+        acknowledge(&mailbox, initial);
+
+        mailbox.request_enabled(false);
+        mailbox.request_enabled(true);
+        mailbox.request_enabled(false);
+        mailbox.request_cursor_area([f32::NAN, 1.0, 2.0, 3.0]);
+        mailbox.request_cursor_area([5.0, 6.0, -7.0, -8.0]);
+        let snapshot = peek(&mailbox);
         assert_eq!(
-            mailbox.take_snapshot(),
-            Some([
-                f32::from(IME_REQUEST_CONTEXT_RESTART),
+            snapshot,
+            [
+                2.0,
+                f64::from(IME_REQUEST_CURSOR_AREA | IME_REQUEST_ENABLED),
+                5.0,
+                6.0,
                 0.0,
                 0.0,
                 0.0,
-                0.0,
-                1.0,
-            ])
+            ]
         );
-
-        // If the final editor is disabled, the ordinary disable supersedes a pending restart.
-        mailbox.request_enabled(false);
-        mailbox.request_enabled(true);
-        mailbox.request_enabled(false);
-        assert_eq!(
-            mailbox.take_snapshot(),
-            Some([f32::from(IME_REQUEST_ENABLED), 0.0, 0.0, 0.0, 0.0, 0.0])
-        );
-        assert_eq!(mailbox.take_snapshot(), None);
+        acknowledge(&mailbox, snapshot);
+        assert_eq!(mailbox.peek_snapshot(), Ok(None));
     }
 
     #[test]

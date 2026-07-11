@@ -1,4 +1,4 @@
-import { assertEquals, assertThrows } from "@std/assert";
+import { assertEquals, assertStrictEquals, assertThrows } from "@std/assert";
 import type { QuoxRenderer as WasmRenderer } from "../lib/quox.js";
 import { QuoxDocument } from "./document.ts";
 import { setElementFunctionProp } from "./handlers.ts";
@@ -9,6 +9,7 @@ class FakeInputRenderer {
   readonly calls: Call[] = [];
   inputNode: number | undefined;
   throwOnPointerMove = false;
+  pointerMoveError: unknown;
 
   title(): string {
     return "";
@@ -20,7 +21,7 @@ class FakeInputRenderer {
 
   dispatch_pointer_move(x: number, y: number, buttons: number, modifierBits: number): boolean {
     this.calls.push({ method: "pointerMove", args: [x, y, buttons, modifierBits] });
-    if (this.throwOnPointerMove) throw new Error("pointer dispatch failed");
+    if (this.throwOnPointerMove) throw this.pointerMoveError ?? new Error("pointer dispatch failed");
     return false;
   }
 
@@ -210,10 +211,36 @@ Deno.test("AppKit selectors use the dedicated renderer entry point", () => {
 Deno.test("native IME requests are synchronized even when renderer dispatch throws", () => {
   const renderer = new FakeInputRenderer();
   renderer.throwOnPointerMove = true;
+  const dispatchError = new Error("pointer dispatch failed");
+  renderer.pointerMoveError = dispatchError;
   const { document, syncs } = createDocument(renderer);
 
   assertThrows(() => document.dispatchPointerMove(10, 20, 0, 0), Error, "pointer dispatch failed");
   assertEquals(syncs.count, 1);
+});
+
+Deno.test("dispatch and native IME synchronization failures are both preserved", () => {
+  const renderer = new FakeInputRenderer();
+  renderer.throwOnPointerMove = true;
+  const dispatchError = new Error("pointer dispatch failed");
+  renderer.pointerMoveError = dispatchError;
+  const synchronizationError = new Error("IME synchronization failed");
+  const document = new QuoxDocument(
+    renderer as unknown as WasmRenderer,
+    () => undefined,
+    () => undefined,
+    undefined,
+    () => {
+      throw synchronizationError;
+    },
+  );
+
+  const error = assertThrows(
+    () => document.dispatchPointerMove(10, 20, 0, 0),
+    AggregateError,
+  );
+  assertStrictEquals(error.errors[0], dispatchError);
+  assertStrictEquals(error.errors[1], synchronizationError);
 });
 
 Deno.test("invalid numeric input is rejected before renderer or IME synchronization side effects", () => {

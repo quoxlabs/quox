@@ -4,12 +4,14 @@ import { load as windingLoad } from "@quoxlabs/winding";
 import type { Library as WindingLibrary, UIEvent as WindingUIEvent, Window as WindingWindow } from "@quoxlabs/winding";
 import { QuoxDocument } from "./document.ts";
 import {
-  applyImeRequestSnapshot,
   mapWindingEvent,
   notifyInputListeners,
   type QuoxInputEvent,
   QuoxInputRouter,
+  runWithImeSynchronization,
+  synchronizeImeRequests,
 } from "./input.ts";
+import type { ImeRequestSource } from "./ime_requests.ts";
 import { isVNode, mount, type QuoxRenderable } from "./mount.ts";
 import type { QuoxElement, QuoxInnerHTML } from "./node.ts";
 import { fitRgbaToFramebuffer, FramebufferState } from "./framebuffer.ts";
@@ -265,9 +267,7 @@ export class QuoxWindow implements Disposable {
 
   #syncNativeImeRequests(): void {
     if (this.#disposed || this.#rendererFreed) return;
-
-    const snapshot = this.#renderer.take_ime_requests();
-    if (snapshot !== undefined) applyImeRequestSnapshot(this.#win, snapshot);
+    synchronizeImeRequests(this.#renderer as unknown as ImeRequestSource, this.#win);
   }
 
   #requestRender(): void {
@@ -302,6 +302,8 @@ export class QuoxWindow implements Disposable {
     const renderHeight = this.#height;
     const framebuffer = this.#framebuffer.snapshot();
     const renderFrameToken = this.#frameToken;
+    let renderFailed = false;
+    let renderError: unknown;
     try {
       this.document.syncNativeTitle();
 
@@ -323,10 +325,21 @@ export class QuoxWindow implements Disposable {
           renderFrameToken,
         );
       }
-    } catch (err) {
-      console.error("Quox render failed:", err);
+    } catch (error) {
+      renderFailed = true;
+      renderError = error;
+    }
+
+    try {
+      runWithImeSynchronization(
+        () => {
+          if (renderFailed) throw renderError;
+        },
+        () => this.#syncNativeImeRequests(),
+      );
+    } catch (error) {
+      console.error("Quox render failed:", error);
     } finally {
-      this.#syncNativeImeRequests();
       this.#rendering = false;
       if (this.#needsRender) this.#requestRender();
     }

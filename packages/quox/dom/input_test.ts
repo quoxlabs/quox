@@ -275,7 +275,7 @@ Deno.test("listener errors are reported without preventing later observers", () 
 
 Deno.test("atomic IME snapshot applies cursor geometry before enable", () => {
   const target = new FakeWindow();
-  applyImeRequestSnapshot(target, new Float32Array([3, 1, 2, 3, 4, 1]));
+  applyImeRequestSnapshot(target, new Float64Array([1, 3, 1, 2, 3, 4, 1]));
   assertEquals(target.calls, [
     ["area", 1, 2, 3, 4],
     ["enabled", 1],

@@ -13,7 +13,12 @@ import type {
 import { KeyEventFlag, KeyModifierMask, PointerModifierMask } from "../lib/quox.js";
 import { wheelPixelsForBlitz } from "./wheel.ts";
 
-export { applyImeRequestSnapshot, IME_REQUEST_FLAG } from "./ime_requests.ts";
+export {
+  applyImeRequestSnapshot,
+  IME_REQUEST_FLAG,
+  runWithImeSynchronization,
+  synchronizeImeRequests,
+} from "./ime_requests.ts";
 
 type WithoutWindow<Event> = Event extends { window: unknown } ? Omit<Event, "window"> : never;
 
