@@ -10,6 +10,7 @@ import {
   ResultEchoSuppressor,
   TO_UNICODE_NO_STATE_CHANGE,
   translateLogicalKey,
+  validateWin32Geometry,
   VK,
   win32KeyEditDisposition,
   win32KeyIdentity,
@@ -53,6 +54,17 @@ Deno.test("Win32 key lParam decoding preserves repeat, scan, extended, context, 
     isRepeat: true,
   });
   assertEquals(decodeKeyLParam(makeKeyLParam(0x1e)).isRepeat, false);
+});
+
+Deno.test("Win32 validates signed outer-window geometry before native creation", () => {
+  validateWin32Geometry(-100, 20, 800, 600);
+  validateWin32Geometry(-0x80000000, 0x7fffffff, 1, 0x7fffffff);
+  assertThrows(() => validateWin32Geometry(Number.NaN, 0, 1, 1));
+  assertThrows(() => validateWin32Geometry(0, 0.5, 1, 1));
+  assertThrows(() => validateWin32Geometry(-0x80000001, 0, 1, 1));
+  assertThrows(() => validateWin32Geometry(0, 0, 0, 1));
+  assertThrows(() => validateWin32Geometry(0, 0, 1.5, 1));
+  assertThrows(() => validateWin32Geometry(0, 0, 0x80000000, 1));
 });
 
 Deno.test("physical codes determine DOM key locations", () => {

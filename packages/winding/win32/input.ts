@@ -3,6 +3,25 @@
 import type { KeyEditDisposition } from "../types.ts";
 import { normalizeCommittedText } from "../input/keyboard.ts";
 
+const INT32_MIN = -0x80000000;
+const INT32_MAX = 0x7fffffff;
+
+/** Validate top-left logical outer-window geometry accepted by CreateWindowExW. */
+export function validateWin32Geometry(x: number, y: number, width: number, height: number): void {
+  if (
+    !Number.isInteger(x) || !Number.isInteger(y) ||
+    x < INT32_MIN || x > INT32_MAX || y < INT32_MIN || y > INT32_MAX
+  ) {
+    throw new RangeError("winding(win32): window position must fit signed 32-bit logical coordinates");
+  }
+  if (
+    !Number.isInteger(width) || !Number.isInteger(height) ||
+    width <= 0 || height <= 0 || width > INT32_MAX || height > INT32_MAX
+  ) {
+    throw new RangeError("winding(win32): outer window dimensions must be positive signed 32-bit integers");
+  }
+}
+
 /** Virtual-key values used by the Win32 input implementation. */
 export const VK = {
   BACK: 0x08,

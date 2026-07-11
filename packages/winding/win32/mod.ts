@@ -11,6 +11,7 @@ import {
   WHEEL_DELTA,
   WM,
 } from "./ffi.ts";
+import { validateWin32Geometry } from "./input.ts";
 import { Win32InputController } from "./input_controller.ts";
 
 // BITMAPINFOHEADER is 40 bytes; for 32bpp BI_RGB no color table follows, so
@@ -74,16 +75,23 @@ class Win32Window implements Window {
   #closing = false;
   #destroyed = false;
 
-  constructor(readonly lib: Win32Library, classNameBuf: ArrayBuffer) {
+  constructor(
+    readonly lib: Win32Library,
+    classNameBuf: ArrayBuffer,
+    x: number,
+    y: number,
+    width: number,
+    height: number,
+  ) {
     const window = lib.user32.symbols.CreateWindowExW(
       0,
       classNameBuf,
       null,
       WS_OVERLAPPEDWINDOW,
-      0x80000000,
-      0x80000000,
-      0x80000000,
-      0x80000000,
+      x,
+      y,
+      width,
+      height,
       null,
       null,
       lib.instance,
@@ -468,9 +476,10 @@ class Win32Library implements Library {
   }
 
   readonly windows = new Map<bigint, Win32Window>();
-  openWindow(_x = 0, _y = 0, _w = 800, _h = 600): Win32Window {
+  openWindow(x = 0, y = 0, w = 800, h = 600): Win32Window {
     if (this.#closed || this.#closing) throw new Error("winding(win32): library is closed");
-    const window = new Win32Window(this, this.#classNameBuffer);
+    validateWin32Geometry(x, y, w, h);
+    const window = new Win32Window(this, this.#classNameBuffer, x, y, w, h);
     try {
       this.#callbackErrors.throwIfPending();
       return window;

@@ -21,6 +21,10 @@ const testUser32Functions = {
     parameters: ["pointer"],
     result: "i32",
   },
+  GetWindowRect: {
+    parameters: ["pointer", "buffer"],
+    result: "i32",
+  },
 } as const satisfies Deno.ForeignLibraryInterface;
 
 interface NativeWin32Window extends Window {
@@ -50,6 +54,7 @@ function runLifecycle(user32: Deno.DynamicLibrary<typeof testUser32Functions>, d
   try {
     const window = library.openWindow(0, 0, 64, 48) as NativeWin32Window;
     try {
+      assertWindowGeometry(user32, window, 0, 0, 64, 48);
       assertSingleInitialResize(library, window);
       // Keep hosted CI independent of foreground-window and desktop behavior.
       user32.symbols.ShowWindow(window.hwnd, 0);
@@ -89,6 +94,31 @@ function runLifecycle(user32: Deno.DynamicLibrary<typeof testUser32Functions>, d
 
 function drainEvents(library: Library): void {
   for (let count = 0; count < 64 && library.event() !== undefined; count++);
+}
+
+function assertWindowGeometry(
+  user32: Deno.DynamicLibrary<typeof testUser32Functions>,
+  window: NativeWin32Window,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+): void {
+  const rectangle = new ArrayBuffer(16);
+  if (user32.symbols.GetWindowRect(window.hwnd, rectangle) === 0) {
+    throw new Error("GetWindowRect rejected the Win32 geometry test");
+  }
+  const view = new DataView(rectangle);
+  const actual = [
+    view.getInt32(0, true),
+    view.getInt32(4, true),
+    view.getInt32(8, true) - view.getInt32(0, true),
+    view.getInt32(12, true) - view.getInt32(4, true),
+  ];
+  const expected = [x, y, width, height];
+  if (actual.some((value, index) => value !== expected[index])) {
+    throw new Error(`Expected Win32 outer geometry ${expected.join(",")}, received ${actual.join(",")}`);
+  }
 }
 
 function assertSingleInitialResize(library: Library, window: Window): void {
