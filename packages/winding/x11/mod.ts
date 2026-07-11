@@ -250,6 +250,17 @@ class X11Window implements Window {
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
+    this.#releaseNativeResources(true);
+  }
+
+  handleNativeDestroy(): boolean {
+    if (this.#closed) return false;
+    this.#closed = true;
+    this.#releaseNativeResources(false);
+    return true;
+  }
+
+  #releaseNativeResources(destroyWindow: boolean): void {
     this.lib.unregisterWindow(this);
     const errors: unknown[] = [];
     const cleanup = (operation: () => void): void => {
@@ -265,10 +276,12 @@ class X11Window implements Window {
     cleanup(() => {
       this.lib.X11.symbols.XFreeGC(this.lib.display, this.#gc);
     });
-    cleanup(() => {
-      this.lib.X11.symbols.XDestroyWindow(this.lib.display, this.id);
-      this.lib.X11.symbols.XFlush(this.lib.display);
-    });
+    if (destroyWindow) {
+      cleanup(() => {
+        this.lib.X11.symbols.XDestroyWindow(this.lib.display, this.id);
+        this.lib.X11.symbols.XFlush(this.lib.display);
+      });
+    } else cleanup(() => this.lib.X11.symbols.XFlush(this.lib.display));
     if (errors.length === 1) throw errors[0];
     if (errors.length > 1) {
       throw new AggregateError(errors, "winding(x11): errors while closing window");
@@ -438,7 +451,7 @@ class X11Library implements Library {
       const type = view.getInt32(0, true);
       // XConfigureEvent distinguishes the event recipient from the drawable
       // whose geometry changed; all other routed events use XAnyEvent.window.
-      const windowId = type === XEventType.ConfigureNotify
+      const windowId = type === XEventType.ConfigureNotify || type === XEventType.DestroyNotify
         ? view.getBigUint64(40, true)
         : view.getBigUint64(32, true);
       const window = this.windows.get(windowId);
@@ -626,6 +639,10 @@ class X11Library implements Library {
         const height = view.getInt32(60, true);
         if (!window.updateSize(width, height)) continue;
         return { type: "resize", width, height, window };
+      }
+      if (type === XEventType.DestroyNotify && window !== undefined) {
+        if (!window.handleNativeDestroy()) continue;
+        return { type: "close", window };
       }
 
       const event = importEvent(view, window, this.wmProtocols, this.wmDeleteWindow);
