@@ -199,6 +199,7 @@ function openDarwinFfi() {
         runtimeAddProtocol(runtime, cls, protocol),
       selectorName: (selector: Deno.PointerValue) => runtimeSelectorName(runtime, selector),
       registerClassPair: runtime.symbols.objc_registerClassPair,
+      disposeClassPair: runtime.symbols.objc_disposeClassPair,
       addMethod: (
         cls: Deno.PointerObject,
         selector: Deno.PointerValue,
@@ -1281,6 +1282,7 @@ class DarwinLibrary implements Library {
     cleanup(() => this.ffi.close());
 
     if (activeLibrary === this) activeLibrary = undefined;
+    if (darwinGlobals[ACTIVE_LIBRARY_SLOT] === this) delete darwinGlobals[ACTIVE_LIBRARY_SLOT];
 
     if (cleanupErrors.length === 1) throw cleanupErrors[0];
     if (cleanupErrors.length > 1) {
@@ -1290,6 +1292,8 @@ class DarwinLibrary implements Library {
 }
 
 let activeLibrary: DarwinLibrary | undefined;
+const ACTIVE_LIBRARY_SLOT = "__quox_winding_darwin_active_library__";
+const darwinGlobals = globalThis as unknown as Record<string, unknown>;
 
 function importPointerEvent(event: Deno.PointerValue, window: DarwinWindow): UIEvent | undefined {
   const { sel, send } = window.lib.ffi;
@@ -1333,10 +1337,11 @@ function importPointerEvent(event: Deno.PointerValue, window: DarwinWindow): UIE
 }
 
 export const load: LoadLibrary = () => {
-  if (activeLibrary !== undefined) {
+  if (activeLibrary !== undefined || darwinGlobals[ACTIVE_LIBRARY_SLOT] !== undefined) {
     throw new Error("winding(darwin): only one Darwin library may be open at a time");
   }
   const library = new DarwinLibrary();
   activeLibrary = library;
+  darwinGlobals[ACTIVE_LIBRARY_SLOT] = library;
   return library;
 };

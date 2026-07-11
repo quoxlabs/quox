@@ -31,6 +31,12 @@ type NativeWindow = Window & {
   contentView: Deno.PointerValue;
   nsWindow: Deno.PointerValue;
   inputState: DarwinInputState;
+  lib: {
+    nativeClasses: {
+      contentView: Deno.PointerObject;
+      delegate: Deno.PointerObject;
+    };
+  };
 };
 
 if (Deno.build.os !== "darwin") {
@@ -57,7 +63,8 @@ runCase(
   testProtocolAndStructAbis,
 );
 runCase("text input survives repeated library and window lifecycles", testRepeatedLifecycles);
-console.log("Darwin native smoke: 10 passed");
+await runAsyncCase("duplicate module copies share one AppKit owner", testDuplicateModuleOwnership);
+console.log("Darwin native smoke: 11 passed");
 
 function testTextCallbacks(): void {
   withNativeWindow(64, 48, (library, window) => {
@@ -508,6 +515,16 @@ function testSingleLibraryOwnership(): void {
   replacement.close();
 }
 
+async function testDuplicateModuleOwnership(): Promise<void> {
+  const first = load();
+  try {
+    const duplicate = await import("./mod.ts?duplicate-native-smoke");
+    assertThrowsMessage(() => duplicate.load(), "only one Darwin library");
+  } finally {
+    first.close();
+  }
+}
+
 function testActivationCallShapes(): void {
   withNativeWindow(64, 48, (library, window) => {
     const handles: Closeable[] = [];
@@ -543,7 +560,7 @@ function testProtocolAndStructAbis(): void {
       handles.push(runtime);
       const cf = Deno.dlopen(CORE_FOUNDATION, cfSymbols);
       handles.push(cf);
-      const viewClass = getClass(runtime, "WindingContentView");
+      const viewClass = window.lib.nativeClasses.contentView;
       assert(
         classConformsToProtocol(runtime, viewClass, getProtocol(runtime, "NSTextInputClient")),
         "WindingContentView does not conform to NSTextInputClient",
@@ -583,7 +600,7 @@ function testProtocolAndStructAbis(): void {
           `WindingContentView does not respond to ${selector}`,
         );
       }
-      const delegateClass = getClass(runtime, "WindingWindowDelegate");
+      const delegateClass = window.lib.nativeClasses.delegate;
       for (const selector of WINDOW_GEOMETRY_SELECTORS) {
         assert(
           respondsToSelector(
@@ -787,6 +804,11 @@ function enableTextInputForSmoke(library: Library, window: NativeWindow): void {
 
 function runCase(name: string, fn: () => void): void {
   fn();
+  console.log(`ok - ${name}`);
+}
+
+async function runAsyncCase(name: string, fn: () => Promise<void>): Promise<void> {
+  await fn();
   console.log(`ok - ${name}`);
 }
 

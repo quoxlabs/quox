@@ -40,6 +40,7 @@ export const runtimeSymbols = {
   sel_registerName: { parameters: ["buffer"], result: "pointer" },
   sel_getName: { parameters: ["pointer"], result: "pointer" },
   objc_allocateClassPair: { parameters: ["pointer", "buffer", "usize"], result: "pointer" },
+  objc_disposeClassPair: { parameters: ["pointer"], result: "void" },
   objc_registerClassPair: { parameters: ["pointer"], result: "void" },
   class_addMethod: { parameters: ["pointer", "pointer", "pointer", "buffer"], result: "bool" },
   class_addProtocol: { parameters: ["pointer", "pointer"], result: "bool" },

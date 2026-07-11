@@ -15,6 +15,7 @@ const NS_POINT_ENCODING = "{CGPoint=dd}";
 const NS_RECT_ENCODING = "{CGRect={CGPoint=dd}{CGSize=dd}}";
 
 type AnyCallback = { pointer: Deno.PointerObject; close(): void };
+const PROCESS_LIFETIME_CALLBACKS: AnyCallback[] = [];
 
 export interface NativeRange {
   location: number | bigint;
@@ -81,6 +82,7 @@ export interface NativeClassRuntime {
   getProtocol(name: string): Deno.PointerObject;
   addProtocol(cls: Deno.PointerObject, protocol: Deno.PointerObject): void;
   registerClassPair(cls: Deno.PointerObject): void;
+  disposeClassPair(cls: Deno.PointerObject): void;
   addMethod(
     cls: Deno.PointerObject,
     selector: Deno.PointerValue,
@@ -118,398 +120,438 @@ export class DarwinNativeClasses {
   readonly #callbacks: AnyCallback[] = [];
 
   constructor(runtime: NativeClassRuntime) {
-    const { addMethod, addProtocol, allocateClassPair, getClass, getProtocol, registerClassPair, sel } = runtime;
+    const {
+      addMethod,
+      addProtocol,
+      allocateClassPair,
+      disposeClassPair,
+      getClass,
+      getProtocol,
+      registerClassPair,
+      sel,
+    } = runtime;
+    const suffix = crypto.randomUUID().replaceAll("-", "");
+    let allocatedDelegate: Deno.PointerObject | null = null;
+    let allocatedContentView: Deno.PointerObject | null = null;
+    let delegateRegistered = false;
+    let contentViewRegistered = false;
+    try {
+      const shouldClose = new Deno.UnsafeCallback(
+        { parameters: ["pointer", "pointer", "pointer"], result: "bool" },
+        guardNativeCallback(
+          this.#errors,
+          (self: Deno.PointerValue) => {
+            this.#delegate(self)?.handleNativeWindowEvent("close");
+            return false;
+          },
+          () => false,
+        ),
+      );
+      this.#callbacks.push(shouldClose);
+      const didResize = new Deno.UnsafeCallback(
+        { parameters: ["pointer", "pointer", "pointer"], result: "void" },
+        guardNativeCallback(
+          this.#errors,
+          (self: Deno.PointerValue) => this.#delegate(self)?.handleNativeWindowEvent("resize"),
+          () => undefined,
+        ),
+      );
+      this.#callbacks.push(didResize);
+      const geometryChanged = new Deno.UnsafeCallback(
+        { parameters: ["pointer", "pointer", "pointer"], result: "void" },
+        guardNativeCallback(
+          this.#errors,
+          (self: Deno.PointerValue) => this.#delegate(self)?.handleNativeWindowEvent("geometrychange"),
+          () => undefined,
+        ),
+      );
+      this.#callbacks.push(geometryChanged);
+      const mouseEntered = new Deno.UnsafeCallback(
+        { parameters: ["pointer", "pointer", "pointer"], result: "void" },
+        guardNativeCallback(
+          this.#errors,
+          (self: Deno.PointerValue) => this.#delegate(self)?.handleNativeWindowEvent("mouseenter"),
+          () => undefined,
+        ),
+      );
+      this.#callbacks.push(mouseEntered);
+      const mouseExited = new Deno.UnsafeCallback(
+        { parameters: ["pointer", "pointer", "pointer"], result: "void" },
+        guardNativeCallback(
+          this.#errors,
+          (self: Deno.PointerValue) => this.#delegate(self)?.handleNativeWindowEvent("mouseleave"),
+          () => undefined,
+        ),
+      );
+      this.#callbacks.push(mouseExited);
+      const didBecomeKey = new Deno.UnsafeCallback(
+        { parameters: ["pointer", "pointer", "pointer"], result: "void" },
+        guardNativeCallback(
+          this.#errors,
+          (self: Deno.PointerValue) => this.#delegate(self)?.handleNativeWindowEvent("focus"),
+          () => undefined,
+        ),
+      );
+      this.#callbacks.push(didBecomeKey);
+      const didResignKey = new Deno.UnsafeCallback(
+        { parameters: ["pointer", "pointer", "pointer"], result: "void" },
+        guardNativeCallback(
+          this.#errors,
+          (self: Deno.PointerValue) => this.#delegate(self)?.handleNativeWindowEvent("blur"),
+          () => undefined,
+        ),
+      );
+      this.#callbacks.push(didResignKey);
+      const didMiniaturize = new Deno.UnsafeCallback(
+        { parameters: ["pointer", "pointer", "pointer"], result: "void" },
+        guardNativeCallback(
+          this.#errors,
+          (self: Deno.PointerValue) => this.#delegate(self)?.handleNativeWindowEvent("hidden"),
+          () => undefined,
+        ),
+      );
+      this.#callbacks.push(didMiniaturize);
+      const didDeminiaturize = new Deno.UnsafeCallback(
+        { parameters: ["pointer", "pointer", "pointer"], result: "void" },
+        guardNativeCallback(
+          this.#errors,
+          (self: Deno.PointerValue) => this.#delegate(self)?.handleNativeWindowEvent("visible"),
+          () => undefined,
+        ),
+      );
+      this.#callbacks.push(didDeminiaturize);
 
-    const shouldClose = new Deno.UnsafeCallback(
-      { parameters: ["pointer", "pointer", "pointer"], result: "bool" },
-      guardNativeCallback(
-        this.#errors,
-        (self: Deno.PointerValue) => {
-          this.#delegate(self)?.handleNativeWindowEvent("close");
-          return false;
+      const delegate = allocateClassPair(getClass("NSObject"), `WindingWindowDelegate_${suffix}`);
+      allocatedDelegate = delegate;
+      addMethod(delegate, sel("windowShouldClose:"), shouldClose.pointer, `${OBJC_BOOL_ENCODING}@:@`);
+      addMethod(delegate, sel("windowDidResize:"), didResize.pointer, "v@:@");
+      for (const selector of WINDOW_GEOMETRY_SELECTORS) {
+        addMethod(delegate, sel(selector), geometryChanged.pointer, "v@:@");
+      }
+      addMethod(delegate, sel("mouseEntered:"), mouseEntered.pointer, "v@:@");
+      addMethod(delegate, sel("mouseExited:"), mouseExited.pointer, "v@:@");
+      addMethod(delegate, sel("windowDidBecomeKey:"), didBecomeKey.pointer, "v@:@");
+      addMethod(delegate, sel("windowDidResignKey:"), didResignKey.pointer, "v@:@");
+      addMethod(delegate, sel("windowDidMiniaturize:"), didMiniaturize.pointer, "v@:@");
+      addMethod(delegate, sel("windowDidDeminiaturize:"), didDeminiaturize.pointer, "v@:@");
+      const acceptsFirstResponder = new Deno.UnsafeCallback(
+        { parameters: ["pointer", "pointer"], result: "bool" },
+        guardNativeCallback(this.#errors, () => true, () => false),
+      );
+      this.#callbacks.push(acceptsFirstResponder);
+      const wantsUpdateLayer = new Deno.UnsafeCallback(
+        { parameters: ["pointer", "pointer"], result: "bool" },
+        guardNativeCallback(this.#errors, () => true, () => false),
+      );
+      this.#callbacks.push(wantsUpdateLayer);
+      const updateLayer = new Deno.UnsafeCallback(
+        { parameters: ["pointer", "pointer"], result: "void" },
+        guardNativeCallback(
+          this.#errors,
+          (self: Deno.PointerValue) => this.#view(self)?.handleNativeUpdateLayer(),
+          () => undefined,
+        ),
+      );
+      this.#callbacks.push(updateLayer);
+      const keyDown = new Deno.UnsafeCallback(
+        { parameters: ["pointer", "pointer", "pointer"], result: "void" },
+        guardNativeCallback(
+          this.#errors,
+          (self: Deno.PointerValue, _cmd: Deno.PointerValue, event: Deno.PointerValue) =>
+            this.#view(self)?.handleNativeKeyEvent("keydown", event),
+          () => undefined,
+        ),
+      );
+      this.#callbacks.push(keyDown);
+      const keyUp = new Deno.UnsafeCallback(
+        { parameters: ["pointer", "pointer", "pointer"], result: "void" },
+        guardNativeCallback(
+          this.#errors,
+          (self: Deno.PointerValue, _cmd: Deno.PointerValue, event: Deno.PointerValue) =>
+            this.#view(self)?.handleNativeKeyEvent("keyup", event),
+          () => undefined,
+        ),
+      );
+      this.#callbacks.push(keyUp);
+      const flagsChanged = new Deno.UnsafeCallback(
+        { parameters: ["pointer", "pointer", "pointer"], result: "void" },
+        guardNativeCallback(
+          this.#errors,
+          (self: Deno.PointerValue, _cmd: Deno.PointerValue, event: Deno.PointerValue) =>
+            this.#view(self)?.handleNativeKeyEvent("flagschanged", event),
+          () => undefined,
+        ),
+      );
+      this.#callbacks.push(flagsChanged);
+      const pointerEvent = new Deno.UnsafeCallback(
+        { parameters: ["pointer", "pointer", "pointer"], result: "void" },
+        guardNativeCallback(
+          this.#errors,
+          (self: Deno.PointerValue, _cmd: Deno.PointerValue, event: Deno.PointerValue) =>
+            this.#view(self)?.handleNativePointerEvent(event),
+          () => undefined,
+        ),
+      );
+      this.#callbacks.push(pointerEvent);
+      const insertText = new Deno.UnsafeCallback(
+        { parameters: ["pointer", "pointer", "pointer", NSRANGE], result: "void" },
+        guardNativeCallback(
+          this.#errors,
+          (
+            self: Deno.PointerValue,
+            _cmd: Deno.PointerValue,
+            text: Deno.PointerValue,
+            replacement: Uint8Array,
+          ) => {
+            const range = readNSRange(replacement);
+            this.#view(self)?.handleNativeInsertText(text, range.location, range.length);
+          },
+          () => undefined,
+        ),
+      );
+      this.#callbacks.push(insertText);
+      const setMarkedText = new Deno.UnsafeCallback(
+        {
+          parameters: ["pointer", "pointer", "pointer", NSRANGE, NSRANGE],
+          result: "void",
         },
-        () => false,
-      ),
-    );
-    const didResize = new Deno.UnsafeCallback(
-      { parameters: ["pointer", "pointer", "pointer"], result: "void" },
-      guardNativeCallback(
-        this.#errors,
-        (self: Deno.PointerValue) => this.#delegate(self)?.handleNativeWindowEvent("resize"),
-        () => undefined,
-      ),
-    );
-    const geometryChanged = new Deno.UnsafeCallback(
-      { parameters: ["pointer", "pointer", "pointer"], result: "void" },
-      guardNativeCallback(
-        this.#errors,
-        (self: Deno.PointerValue) => this.#delegate(self)?.handleNativeWindowEvent("geometrychange"),
-        () => undefined,
-      ),
-    );
-    const mouseEntered = new Deno.UnsafeCallback(
-      { parameters: ["pointer", "pointer", "pointer"], result: "void" },
-      guardNativeCallback(
-        this.#errors,
-        (self: Deno.PointerValue) => this.#delegate(self)?.handleNativeWindowEvent("mouseenter"),
-        () => undefined,
-      ),
-    );
-    const mouseExited = new Deno.UnsafeCallback(
-      { parameters: ["pointer", "pointer", "pointer"], result: "void" },
-      guardNativeCallback(
-        this.#errors,
-        (self: Deno.PointerValue) => this.#delegate(self)?.handleNativeWindowEvent("mouseleave"),
-        () => undefined,
-      ),
-    );
-    const didBecomeKey = new Deno.UnsafeCallback(
-      { parameters: ["pointer", "pointer", "pointer"], result: "void" },
-      guardNativeCallback(
-        this.#errors,
-        (self: Deno.PointerValue) => this.#delegate(self)?.handleNativeWindowEvent("focus"),
-        () => undefined,
-      ),
-    );
-    const didResignKey = new Deno.UnsafeCallback(
-      { parameters: ["pointer", "pointer", "pointer"], result: "void" },
-      guardNativeCallback(
-        this.#errors,
-        (self: Deno.PointerValue) => this.#delegate(self)?.handleNativeWindowEvent("blur"),
-        () => undefined,
-      ),
-    );
-    const didMiniaturize = new Deno.UnsafeCallback(
-      { parameters: ["pointer", "pointer", "pointer"], result: "void" },
-      guardNativeCallback(
-        this.#errors,
-        (self: Deno.PointerValue) => this.#delegate(self)?.handleNativeWindowEvent("hidden"),
-        () => undefined,
-      ),
-    );
-    const didDeminiaturize = new Deno.UnsafeCallback(
-      { parameters: ["pointer", "pointer", "pointer"], result: "void" },
-      guardNativeCallback(
-        this.#errors,
-        (self: Deno.PointerValue) => this.#delegate(self)?.handleNativeWindowEvent("visible"),
-        () => undefined,
-      ),
-    );
-    this.#callbacks.push(
-      shouldClose,
-      didResize,
-      geometryChanged,
-      mouseEntered,
-      mouseExited,
-      didBecomeKey,
-      didResignKey,
-      didMiniaturize,
-      didDeminiaturize,
-    );
+        guardNativeCallback(
+          this.#errors,
+          (
+            self: Deno.PointerValue,
+            _cmd: Deno.PointerValue,
+            text: Deno.PointerValue,
+            selection: Uint8Array,
+            replacement: Uint8Array,
+          ) => {
+            const selectedRange = readNSRange(selection);
+            const replacementRange = readNSRange(replacement);
+            this.#view(self)?.handleNativeSetMarkedText(
+              text,
+              selectedRange.location,
+              selectedRange.length,
+              replacementRange.location,
+              replacementRange.length,
+            );
+          },
+          () => undefined,
+        ),
+      );
+      this.#callbacks.push(setMarkedText);
+      const unmarkText = new Deno.UnsafeCallback(
+        { parameters: ["pointer", "pointer"], result: "void" },
+        guardNativeCallback(
+          this.#errors,
+          (self: Deno.PointerValue) => this.#view(self)?.handleNativeUnmarkText(),
+          () => undefined,
+        ),
+      );
+      this.#callbacks.push(unmarkText);
+      const hasMarkedText = new Deno.UnsafeCallback(
+        { parameters: ["pointer", "pointer"], result: "bool" },
+        guardNativeCallback(
+          this.#errors,
+          (self: Deno.PointerValue) => this.#view(self)?.nativeHasMarkedText ?? false,
+          () => false,
+        ),
+      );
+      this.#callbacks.push(hasMarkedText);
+      const markedRange = new Deno.UnsafeCallback(
+        { parameters: ["pointer", "pointer"], result: NSRANGE },
+        guardNativeCallback(
+          this.#errors,
+          (self: Deno.PointerValue) => {
+            const range = this.#view(self)?.nativeMarkedRange ?? {
+              location: NS_NOT_FOUND,
+              length: 0n,
+            };
+            return makeNSRange(range.location, range.length);
+          },
+          () => makeNSRange(NS_NOT_FOUND, 0n),
+        ),
+      );
+      this.#callbacks.push(markedRange);
+      const selectedRange = new Deno.UnsafeCallback(
+        { parameters: ["pointer", "pointer"], result: NSRANGE },
+        guardNativeCallback(
+          this.#errors,
+          (self: Deno.PointerValue) => {
+            const range = this.#view(self)?.nativeSelectedRange ?? {
+              location: NS_NOT_FOUND,
+              length: 0n,
+            };
+            return makeNSRange(range.location, range.length);
+          },
+          () => makeNSRange(NS_NOT_FOUND, 0n),
+        ),
+      );
+      this.#callbacks.push(selectedRange);
+      const validAttributes = new Deno.UnsafeCallback(
+        { parameters: ["pointer", "pointer"], result: "pointer" },
+        guardNativeCallback(
+          this.#errors,
+          (self: Deno.PointerValue) => this.#view(self)?.nativeValidAttributes() ?? null,
+          () => null,
+        ),
+      );
+      this.#callbacks.push(validAttributes);
+      const attributedSubstring = new Deno.UnsafeCallback(
+        { parameters: ["pointer", "pointer", NSRANGE, "pointer"], result: "pointer" },
+        guardNativeCallback(
+          this.#errors,
+          (
+            self: Deno.PointerValue,
+            _cmd: Deno.PointerValue,
+            proposedRange: Uint8Array,
+            actualRange: Deno.PointerValue,
+          ) => {
+            const proposed = readNSRange(proposedRange);
+            const result = this.#view(self)?.nativeAttributedSubstring(
+              proposed.location,
+              proposed.length,
+            ) ?? null;
+            writeRangePointer(
+              actualRange,
+              BigInt(result?.actualRange.location ?? NS_NOT_FOUND),
+              BigInt(result?.actualRange.length ?? 0),
+            );
+            return result?.value ?? null;
+          },
+          () => null,
+        ),
+      );
+      this.#callbacks.push(attributedSubstring);
+      const characterIndexForPoint = new Deno.UnsafeCallback(
+        { parameters: ["pointer", "pointer", NSPOINT], result: "usize" },
+        guardNativeCallback(this.#errors, () => NS_NOT_FOUND, () => NS_NOT_FOUND),
+      );
+      this.#callbacks.push(characterIndexForPoint);
+      const firstRect = new Deno.UnsafeCallback(
+        { parameters: ["pointer", "pointer", NSRANGE, "pointer"], result: NSRECT },
+        guardNativeCallback(
+          this.#errors,
+          (
+            self: Deno.PointerValue,
+            _cmd: Deno.PointerValue,
+            requestedRange: Uint8Array,
+            actualRange: Deno.PointerValue,
+          ) => {
+            const requested = readNSRange(requestedRange);
+            const result = this.#view(self)?.nativeFirstRectForCharacterRange(
+              requested.location,
+              requested.length,
+            ) ?? {
+              rect: new Uint8Array(32),
+              actualRange: { location: NS_NOT_FOUND, length: 0n },
+            };
+            writeRangePointer(
+              actualRange,
+              BigInt(result.actualRange.location),
+              BigInt(result.actualRange.length),
+            );
+            return result.rect;
+          },
+          () => new Uint8Array(32),
+        ),
+      );
+      this.#callbacks.push(firstRect);
+      const doCommand = new Deno.UnsafeCallback(
+        { parameters: ["pointer", "pointer", "pointer"], result: "void" },
+        guardNativeCallback(
+          this.#errors,
+          (self: Deno.PointerValue, _cmd: Deno.PointerValue, command: Deno.PointerValue) =>
+            this.#view(self)?.handleNativeCommand(command),
+          () => undefined,
+        ),
+      );
+      this.#callbacks.push(doCommand);
 
-    const delegate = allocateClassPair(getClass("NSObject"), "WindingWindowDelegate");
-    addMethod(delegate, sel("windowShouldClose:"), shouldClose.pointer, `${OBJC_BOOL_ENCODING}@:@`);
-    addMethod(delegate, sel("windowDidResize:"), didResize.pointer, "v@:@");
-    for (const selector of WINDOW_GEOMETRY_SELECTORS) {
-      addMethod(delegate, sel(selector), geometryChanged.pointer, "v@:@");
+      const contentView = allocateClassPair(getClass("NSView"), `WindingContentView_${suffix}`);
+      allocatedContentView = contentView;
+      addProtocol(contentView, getProtocol("NSTextInputClient"));
+      addMethod(
+        contentView,
+        sel("acceptsFirstResponder"),
+        acceptsFirstResponder.pointer,
+        `${OBJC_BOOL_ENCODING}@:`,
+      );
+      addMethod(contentView, sel("wantsUpdateLayer"), wantsUpdateLayer.pointer, `${OBJC_BOOL_ENCODING}@:`);
+      addMethod(contentView, sel("updateLayer"), updateLayer.pointer, "v@:");
+      addMethod(contentView, sel("keyDown:"), keyDown.pointer, "v@:@");
+      addMethod(contentView, sel("keyUp:"), keyUp.pointer, "v@:@");
+      addMethod(contentView, sel("flagsChanged:"), flagsChanged.pointer, "v@:@");
+      for (const selector of POINTER_INPUT_SELECTORS) {
+        addMethod(contentView, sel(selector), pointerEvent.pointer, "v@:@");
+      }
+      addMethod(
+        contentView,
+        sel("insertText:replacementRange:"),
+        insertText.pointer,
+        `v@:@${NS_RANGE_ENCODING}`,
+      );
+      addMethod(
+        contentView,
+        sel("setMarkedText:selectedRange:replacementRange:"),
+        setMarkedText.pointer,
+        `v@:@${NS_RANGE_ENCODING}${NS_RANGE_ENCODING}`,
+      );
+      addMethod(contentView, sel("unmarkText"), unmarkText.pointer, "v@:");
+      addMethod(contentView, sel("hasMarkedText"), hasMarkedText.pointer, `${OBJC_BOOL_ENCODING}@:`);
+      addMethod(contentView, sel("markedRange"), markedRange.pointer, `${NS_RANGE_ENCODING}@:`);
+      addMethod(contentView, sel("selectedRange"), selectedRange.pointer, `${NS_RANGE_ENCODING}@:`);
+      addMethod(contentView, sel("validAttributesForMarkedText"), validAttributes.pointer, "@@:");
+      addMethod(
+        contentView,
+        sel("attributedSubstringForProposedRange:actualRange:"),
+        attributedSubstring.pointer,
+        `@@:${NS_RANGE_ENCODING}^${NS_RANGE_ENCODING}`,
+      );
+      addMethod(
+        contentView,
+        sel("characterIndexForPoint:"),
+        characterIndexForPoint.pointer,
+        `Q@:${NS_POINT_ENCODING}`,
+      );
+      addMethod(
+        contentView,
+        sel("firstRectForCharacterRange:actualRange:"),
+        firstRect.pointer,
+        `${NS_RECT_ENCODING}@:${NS_RANGE_ENCODING}^${NS_RANGE_ENCODING}`,
+      );
+      addMethod(contentView, sel("doCommandBySelector:"), doCommand.pointer, "v@::");
+      registerClassPair(delegate);
+      delegateRegistered = true;
+      registerClassPair(contentView);
+      contentViewRegistered = true;
+      PROCESS_LIFETIME_CALLBACKS.push(...this.#callbacks);
+      this.delegate = delegate;
+      this.contentView = contentView;
+    } catch (error) {
+      const errors = [error];
+      const cleanup = (operation: () => void): void => {
+        try {
+          operation();
+        } catch (cleanupError) {
+          errors.push(cleanupError);
+        }
+      };
+      const contentViewToDispose = allocatedContentView;
+      if (contentViewToDispose !== null && !contentViewRegistered) {
+        cleanup(() => disposeClassPair(contentViewToDispose));
+      }
+      const delegateToDispose = allocatedDelegate;
+      if (delegateToDispose !== null && !delegateRegistered) {
+        cleanup(() => disposeClassPair(delegateToDispose));
+      }
+      if (delegateRegistered || contentViewRegistered) {
+        PROCESS_LIFETIME_CALLBACKS.push(...this.#callbacks);
+      } else {
+        for (const callback of this.#callbacks) cleanup(() => callback.close());
+      }
+      throw errors.length === 1
+        ? errors[0]
+        : new AggregateError(errors, "winding(darwin): errors while unwinding native class registration");
     }
-    addMethod(delegate, sel("mouseEntered:"), mouseEntered.pointer, "v@:@");
-    addMethod(delegate, sel("mouseExited:"), mouseExited.pointer, "v@:@");
-    addMethod(delegate, sel("windowDidBecomeKey:"), didBecomeKey.pointer, "v@:@");
-    addMethod(delegate, sel("windowDidResignKey:"), didResignKey.pointer, "v@:@");
-    addMethod(delegate, sel("windowDidMiniaturize:"), didMiniaturize.pointer, "v@:@");
-    addMethod(delegate, sel("windowDidDeminiaturize:"), didDeminiaturize.pointer, "v@:@");
-    registerClassPair(delegate);
-    this.delegate = delegate;
-
-    const acceptsFirstResponder = new Deno.UnsafeCallback(
-      { parameters: ["pointer", "pointer"], result: "bool" },
-      guardNativeCallback(this.#errors, () => true, () => false),
-    );
-    const wantsUpdateLayer = new Deno.UnsafeCallback(
-      { parameters: ["pointer", "pointer"], result: "bool" },
-      guardNativeCallback(this.#errors, () => true, () => false),
-    );
-    const updateLayer = new Deno.UnsafeCallback(
-      { parameters: ["pointer", "pointer"], result: "void" },
-      guardNativeCallback(
-        this.#errors,
-        (self: Deno.PointerValue) => this.#view(self)?.handleNativeUpdateLayer(),
-        () => undefined,
-      ),
-    );
-    const keyDown = new Deno.UnsafeCallback(
-      { parameters: ["pointer", "pointer", "pointer"], result: "void" },
-      guardNativeCallback(
-        this.#errors,
-        (self: Deno.PointerValue, _cmd: Deno.PointerValue, event: Deno.PointerValue) =>
-          this.#view(self)?.handleNativeKeyEvent("keydown", event),
-        () => undefined,
-      ),
-    );
-    const keyUp = new Deno.UnsafeCallback(
-      { parameters: ["pointer", "pointer", "pointer"], result: "void" },
-      guardNativeCallback(
-        this.#errors,
-        (self: Deno.PointerValue, _cmd: Deno.PointerValue, event: Deno.PointerValue) =>
-          this.#view(self)?.handleNativeKeyEvent("keyup", event),
-        () => undefined,
-      ),
-    );
-    const flagsChanged = new Deno.UnsafeCallback(
-      { parameters: ["pointer", "pointer", "pointer"], result: "void" },
-      guardNativeCallback(
-        this.#errors,
-        (self: Deno.PointerValue, _cmd: Deno.PointerValue, event: Deno.PointerValue) =>
-          this.#view(self)?.handleNativeKeyEvent("flagschanged", event),
-        () => undefined,
-      ),
-    );
-    const pointerEvent = new Deno.UnsafeCallback(
-      { parameters: ["pointer", "pointer", "pointer"], result: "void" },
-      guardNativeCallback(
-        this.#errors,
-        (self: Deno.PointerValue, _cmd: Deno.PointerValue, event: Deno.PointerValue) =>
-          this.#view(self)?.handleNativePointerEvent(event),
-        () => undefined,
-      ),
-    );
-    const insertText = new Deno.UnsafeCallback(
-      { parameters: ["pointer", "pointer", "pointer", NSRANGE], result: "void" },
-      guardNativeCallback(
-        this.#errors,
-        (
-          self: Deno.PointerValue,
-          _cmd: Deno.PointerValue,
-          text: Deno.PointerValue,
-          replacement: Uint8Array,
-        ) => {
-          const range = readNSRange(replacement);
-          this.#view(self)?.handleNativeInsertText(text, range.location, range.length);
-        },
-        () => undefined,
-      ),
-    );
-    const setMarkedText = new Deno.UnsafeCallback(
-      {
-        parameters: ["pointer", "pointer", "pointer", NSRANGE, NSRANGE],
-        result: "void",
-      },
-      guardNativeCallback(
-        this.#errors,
-        (
-          self: Deno.PointerValue,
-          _cmd: Deno.PointerValue,
-          text: Deno.PointerValue,
-          selection: Uint8Array,
-          replacement: Uint8Array,
-        ) => {
-          const selectedRange = readNSRange(selection);
-          const replacementRange = readNSRange(replacement);
-          this.#view(self)?.handleNativeSetMarkedText(
-            text,
-            selectedRange.location,
-            selectedRange.length,
-            replacementRange.location,
-            replacementRange.length,
-          );
-        },
-        () => undefined,
-      ),
-    );
-    const unmarkText = new Deno.UnsafeCallback(
-      { parameters: ["pointer", "pointer"], result: "void" },
-      guardNativeCallback(
-        this.#errors,
-        (self: Deno.PointerValue) => this.#view(self)?.handleNativeUnmarkText(),
-        () => undefined,
-      ),
-    );
-    const hasMarkedText = new Deno.UnsafeCallback(
-      { parameters: ["pointer", "pointer"], result: "bool" },
-      guardNativeCallback(
-        this.#errors,
-        (self: Deno.PointerValue) => this.#view(self)?.nativeHasMarkedText ?? false,
-        () => false,
-      ),
-    );
-    const markedRange = new Deno.UnsafeCallback(
-      { parameters: ["pointer", "pointer"], result: NSRANGE },
-      guardNativeCallback(
-        this.#errors,
-        (self: Deno.PointerValue) => {
-          const range = this.#view(self)?.nativeMarkedRange ?? {
-            location: NS_NOT_FOUND,
-            length: 0n,
-          };
-          return makeNSRange(range.location, range.length);
-        },
-        () => makeNSRange(NS_NOT_FOUND, 0n),
-      ),
-    );
-    const selectedRange = new Deno.UnsafeCallback(
-      { parameters: ["pointer", "pointer"], result: NSRANGE },
-      guardNativeCallback(
-        this.#errors,
-        (self: Deno.PointerValue) => {
-          const range = this.#view(self)?.nativeSelectedRange ?? {
-            location: NS_NOT_FOUND,
-            length: 0n,
-          };
-          return makeNSRange(range.location, range.length);
-        },
-        () => makeNSRange(NS_NOT_FOUND, 0n),
-      ),
-    );
-    const validAttributes = new Deno.UnsafeCallback(
-      { parameters: ["pointer", "pointer"], result: "pointer" },
-      guardNativeCallback(
-        this.#errors,
-        (self: Deno.PointerValue) => this.#view(self)?.nativeValidAttributes() ?? null,
-        () => null,
-      ),
-    );
-    const attributedSubstring = new Deno.UnsafeCallback(
-      { parameters: ["pointer", "pointer", NSRANGE, "pointer"], result: "pointer" },
-      guardNativeCallback(
-        this.#errors,
-        (
-          self: Deno.PointerValue,
-          _cmd: Deno.PointerValue,
-          proposedRange: Uint8Array,
-          actualRange: Deno.PointerValue,
-        ) => {
-          const proposed = readNSRange(proposedRange);
-          const result = this.#view(self)?.nativeAttributedSubstring(
-            proposed.location,
-            proposed.length,
-          ) ?? null;
-          writeRangePointer(
-            actualRange,
-            BigInt(result?.actualRange.location ?? NS_NOT_FOUND),
-            BigInt(result?.actualRange.length ?? 0),
-          );
-          return result?.value ?? null;
-        },
-        () => null,
-      ),
-    );
-    const characterIndexForPoint = new Deno.UnsafeCallback(
-      { parameters: ["pointer", "pointer", NSPOINT], result: "usize" },
-      guardNativeCallback(this.#errors, () => NS_NOT_FOUND, () => NS_NOT_FOUND),
-    );
-    const firstRect = new Deno.UnsafeCallback(
-      { parameters: ["pointer", "pointer", NSRANGE, "pointer"], result: NSRECT },
-      guardNativeCallback(
-        this.#errors,
-        (
-          self: Deno.PointerValue,
-          _cmd: Deno.PointerValue,
-          requestedRange: Uint8Array,
-          actualRange: Deno.PointerValue,
-        ) => {
-          const requested = readNSRange(requestedRange);
-          const result = this.#view(self)?.nativeFirstRectForCharacterRange(
-            requested.location,
-            requested.length,
-          ) ?? {
-            rect: new Uint8Array(32),
-            actualRange: { location: NS_NOT_FOUND, length: 0n },
-          };
-          writeRangePointer(
-            actualRange,
-            BigInt(result.actualRange.location),
-            BigInt(result.actualRange.length),
-          );
-          return result.rect;
-        },
-        () => new Uint8Array(32),
-      ),
-    );
-    const doCommand = new Deno.UnsafeCallback(
-      { parameters: ["pointer", "pointer", "pointer"], result: "void" },
-      guardNativeCallback(
-        this.#errors,
-        (self: Deno.PointerValue, _cmd: Deno.PointerValue, command: Deno.PointerValue) =>
-          this.#view(self)?.handleNativeCommand(command),
-        () => undefined,
-      ),
-    );
-    this.#callbacks.push(
-      acceptsFirstResponder,
-      wantsUpdateLayer,
-      updateLayer,
-      keyDown,
-      keyUp,
-      flagsChanged,
-      pointerEvent,
-      insertText,
-      setMarkedText,
-      unmarkText,
-      hasMarkedText,
-      markedRange,
-      selectedRange,
-      validAttributes,
-      attributedSubstring,
-      characterIndexForPoint,
-      firstRect,
-      doCommand,
-    );
-
-    const contentView = allocateClassPair(getClass("NSView"), "WindingContentView");
-    addProtocol(contentView, getProtocol("NSTextInputClient"));
-    addMethod(
-      contentView,
-      sel("acceptsFirstResponder"),
-      acceptsFirstResponder.pointer,
-      `${OBJC_BOOL_ENCODING}@:`,
-    );
-    addMethod(contentView, sel("wantsUpdateLayer"), wantsUpdateLayer.pointer, `${OBJC_BOOL_ENCODING}@:`);
-    addMethod(contentView, sel("updateLayer"), updateLayer.pointer, "v@:");
-    addMethod(contentView, sel("keyDown:"), keyDown.pointer, "v@:@");
-    addMethod(contentView, sel("keyUp:"), keyUp.pointer, "v@:@");
-    addMethod(contentView, sel("flagsChanged:"), flagsChanged.pointer, "v@:@");
-    for (const selector of POINTER_INPUT_SELECTORS) {
-      addMethod(contentView, sel(selector), pointerEvent.pointer, "v@:@");
-    }
-    addMethod(
-      contentView,
-      sel("insertText:replacementRange:"),
-      insertText.pointer,
-      `v@:@${NS_RANGE_ENCODING}`,
-    );
-    addMethod(
-      contentView,
-      sel("setMarkedText:selectedRange:replacementRange:"),
-      setMarkedText.pointer,
-      `v@:@${NS_RANGE_ENCODING}${NS_RANGE_ENCODING}`,
-    );
-    addMethod(contentView, sel("unmarkText"), unmarkText.pointer, "v@:");
-    addMethod(contentView, sel("hasMarkedText"), hasMarkedText.pointer, `${OBJC_BOOL_ENCODING}@:`);
-    addMethod(contentView, sel("markedRange"), markedRange.pointer, `${NS_RANGE_ENCODING}@:`);
-    addMethod(contentView, sel("selectedRange"), selectedRange.pointer, `${NS_RANGE_ENCODING}@:`);
-    addMethod(contentView, sel("validAttributesForMarkedText"), validAttributes.pointer, "@@:");
-    addMethod(
-      contentView,
-      sel("attributedSubstringForProposedRange:actualRange:"),
-      attributedSubstring.pointer,
-      `@@:${NS_RANGE_ENCODING}^${NS_RANGE_ENCODING}`,
-    );
-    addMethod(
-      contentView,
-      sel("characterIndexForPoint:"),
-      characterIndexForPoint.pointer,
-      `Q@:${NS_POINT_ENCODING}`,
-    );
-    addMethod(
-      contentView,
-      sel("firstRectForCharacterRange:actualRange:"),
-      firstRect.pointer,
-      `${NS_RECT_ENCODING}@:${NS_RANGE_ENCODING}^${NS_RANGE_ENCODING}`,
-    );
-    addMethod(contentView, sel("doCommandBySelector:"), doCommand.pointer, "v@::");
-    registerClassPair(contentView);
-    this.contentView = contentView;
   }
 
   registerDelegate(pointer: Deno.PointerValue, responder: DarwinNativeResponder): void {
