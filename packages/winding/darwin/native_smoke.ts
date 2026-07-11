@@ -453,10 +453,19 @@ function testMouseMoveDeliveryEnabled(): void {
       const runtime = Deno.dlopen(LIBOBJC, runtimeSymbols);
       handles.push(runtime);
       const sendBool = openMessage(handles, ["pointer", "pointer"], "bool");
+      const sendId = openMessage(handles, ["pointer", "pointer"], "pointer");
+      const sendU64 = openMessage(handles, ["pointer", "pointer"], "u64");
       assert(
         sendBool(window.nsWindow, sel(runtime, "acceptsMouseMovedEvents")),
         "NSWindow did not enable ordinary mouse-move delivery",
       );
+      const trackingAreas = sendId(window.contentView, sel(runtime, "trackingAreas"));
+      assert(trackingAreas !== null, "content view has no tracking-area collection");
+      const trackingArea = sendId(trackingAreas, sel(runtime, "firstObject"));
+      assert(trackingArea !== null, "content view has no pointer tracking area");
+      const options = sendU64(trackingArea, sel(runtime, "options"));
+      assert((options & 0x80n) !== 0n, "tracking area is not active for non-key windows");
+      assert((options & 0x400n) !== 0n, "tracking area is not enabled during drags");
     } finally {
       closeAll(handles);
     }

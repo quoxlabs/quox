@@ -66,10 +66,11 @@ const NS_EVENT_MODIFIER_FLAG_CONTROL = 1n << 18n;
 const NS_EVENT_MODIFIER_FLAG_OPTION = 1n << 19n;
 const NS_EVENT_MODIFIER_FLAG_COMMAND = 1n << 20n;
 const NS_EVENT_MODIFIER_FLAG_FUNCTION = 1n << 23n;
-// NSTrackingAreaOptions: MouseEnteredAndExited | ActiveInKeyWindow | InVisibleRect. The rect
-// passed to `initWithRect:` is ignored when InVisibleRect is set — AppKit tracks the owning
-// view's visible rect automatically, so the area stays correct across resizes for free.
-const NS_TRACKING_AREA_OPTIONS = 0x01 | 0x20 | 0x200;
+// NSTrackingAreaOptions: MouseEnteredAndExited | ActiveAlways | InVisibleRect |
+// EnabledDuringMouseDrag. The visible-rect option keeps bounds current across
+// resizes, while ActiveAlways matches Winding's focus-independent boundary
+// events and drag tracking avoids delayed hover transitions during capture.
+const NS_TRACKING_AREA_OPTIONS = 0x01 | 0x80 | 0x200 | 0x400;
 
 function modifierFlagForCode(code: string): bigint | undefined {
   switch (code) {
