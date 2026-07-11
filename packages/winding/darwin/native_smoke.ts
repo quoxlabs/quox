@@ -1,7 +1,6 @@
 import { load } from "./mod.ts";
 import type { ImeEvent, Library, Window } from "../types.ts";
 import {
-  APPKIT,
   cfSymbols,
   classConformsToProtocol,
   CORE_FOUNDATION,
@@ -39,28 +38,26 @@ if (Deno.build.os !== "darwin") {
 }
 
 assertProcessMainThread();
-withAutoreleasePool(() => {
-  runCase(
-    "NSString, attributed text, preedit, commit, and command callbacks preserve order",
-    testTextCallbacks,
-  );
-  runCase(
-    "keydown is ordered before its synchronous preedit and commit callbacks",
-    testKeydownOrdering,
-  );
-  runCase("modifier transitions never query key-only character properties", testModifierTransitions);
-  runCase("blit copies pixels into storage retained by Core Graphics", testBlitStorageLifetime);
-  runCase("windows opt into ordinary mouse-move delivery", testMouseMoveDeliveryEnabled);
-  runCase("closed windows and libraries reject every native operation", testClosedMethodGuards);
-  runCase("only one library owns the process-wide AppKit queue", testSingleLibraryOwnership);
-  runCase("activation messages use their declared BOOL and object call shapes", testActivationCallShapes);
-  runCase(
-    "NSTextInputClient protocol and struct-return ABIs work through Objective-C dispatch",
-    testProtocolAndStructAbis,
-  );
-  runCase("text input survives repeated library and window lifecycles", testRepeatedLifecycles);
-  console.log("Darwin native smoke: 10 passed");
-});
+runCase(
+  "NSString, attributed text, preedit, commit, and command callbacks preserve order",
+  testTextCallbacks,
+);
+runCase(
+  "keydown is ordered before its synchronous preedit and commit callbacks",
+  testKeydownOrdering,
+);
+runCase("modifier transitions never query key-only character properties", testModifierTransitions);
+runCase("blit copies pixels into storage retained by Core Graphics", testBlitStorageLifetime);
+runCase("windows opt into ordinary mouse-move delivery", testMouseMoveDeliveryEnabled);
+runCase("closed windows and libraries reject every native operation", testClosedMethodGuards);
+runCase("only one library owns the process-wide AppKit queue", testSingleLibraryOwnership);
+runCase("activation messages use their declared BOOL and object call shapes", testActivationCallShapes);
+runCase(
+  "NSTextInputClient protocol and struct-return ABIs work through Objective-C dispatch",
+  testProtocolAndStructAbis,
+);
+runCase("text input survives repeated library and window lifecycles", testRepeatedLifecycles);
+console.log("Darwin native smoke: 10 passed");
 
 function testTextCallbacks(): void {
   withNativeWindow(64, 48, (library, window) => {
@@ -695,6 +692,7 @@ function testRepeatedLifecycles(): void {
         );
         window.setImeEnabled(true);
         window.setImeCursorArea(4.25, 8.5, 12.75, 16.5);
+        for (let update = 0; update < 32; update++) window.setTitle(`autorelease-${iteration}-${update}`);
         window.setImeEnabled(false);
       } finally {
         window.close();
@@ -773,28 +771,6 @@ function enableTextInputForSmoke(library: Library, window: NativeWindow): void {
   window.inputState.setNativeAvailable(true);
   window.inputState.observeNativeActive(true);
   assertIme(library.event(), "enabled");
-}
-
-function withAutoreleasePool(fn: () => void): void {
-  const handles: Closeable[] = [];
-  try {
-    const appKit = Deno.dlopen(APPKIT, {});
-    handles.push(appKit);
-    const runtime = Deno.dlopen(LIBOBJC, runtimeSymbols);
-    handles.push(runtime);
-    const sendId = openMessage(handles, ["pointer", "pointer"], "pointer");
-    const sendVoid = openMessage(handles, ["pointer", "pointer"], "void");
-    const poolAlloc = sendId(getClass(runtime, "NSAutoreleasePool"), sel(runtime, "alloc"));
-    const pool = sendId(poolAlloc, sel(runtime, "init"));
-    assert(pool !== null, "failed to create NSAutoreleasePool");
-    try {
-      fn();
-    } finally {
-      sendVoid(pool, sel(runtime, "drain"));
-    }
-  } finally {
-    closeAll(handles);
-  }
 }
 
 function runCase(name: string, fn: () => void): void {

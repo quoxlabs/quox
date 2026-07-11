@@ -60,6 +60,7 @@ const NS_WINDOW_STYLE_MASK = 1 | 2 | 8 | 4;
 const NS_BACKING_STORE_BUFFERED = 2n;
 const NS_APPLICATION_ACTIVATION_POLICY_REGULAR = 0n;
 const NS_EVENT_MASK_ANY = 0xFFFFFFFFFFFFFFFFn;
+const MAX_NATIVE_EVENTS_PER_POLL = 64;
 const NS_EVENT_MODIFIER_FLAG_CAPS_LOCK = 1n << 16n;
 const NS_EVENT_MODIFIER_FLAG_SHIFT = 1n << 17n;
 const NS_EVENT_MODIFIER_FLAG_CONTROL = 1n << 18n;
@@ -215,6 +216,18 @@ function openDarwinFfi() {
 }
 
 type DarwinFfi = ReturnType<typeof openDarwinFfi>;
+
+function withAutoreleasePool<T>(ffi: DarwinFfi, operation: () => T): T {
+  const { getClass, sel, send } = ffi;
+  const alloc = send.id(getClass("NSAutoreleasePool"), sel("alloc"));
+  const pool = send.id(alloc, sel("init"));
+  if (pool === null) throw new Error("winding(darwin): failed to create autorelease pool");
+  try {
+    return operation();
+  } finally {
+    send.void(pool, sel("drain"));
+  }
+}
 
 // NSEventType values (AppKit/NSEvent.h)
 const NSEventType = {
@@ -789,17 +802,21 @@ class DarwinWindow implements Window, DarwinNativeResponder {
 
   setImeEnabled(enabled: boolean): void {
     this.#assertOpen();
-    if (enabled === this.inputState.imeEnabled) return;
-    this.inputState.setImeEnabled(enabled);
-    this.observeNativeInputContext();
-    this.#flushInputState();
-    if (!enabled) this.#discardNativeMarkedText();
+    this.lib.withAutoreleasePool(() => {
+      if (enabled === this.inputState.imeEnabled) return;
+      this.inputState.setImeEnabled(enabled);
+      this.observeNativeInputContext();
+      this.#flushInputState();
+      if (!enabled) this.#discardNativeMarkedText();
+    });
   }
 
   setImeCursorArea(x: number, y: number, width: number, height: number): void {
     this.#assertOpen();
-    this.inputState.setCursorArea(x, y, width, height);
-    this.invalidateCharacterCoordinates();
+    this.lib.withAutoreleasePool(() => {
+      this.inputState.setCursorArea(x, y, width, height);
+      this.invalidateCharacterCoordinates();
+    });
   }
 
   invalidateCharacterCoordinates(): void {
@@ -816,9 +833,11 @@ class DarwinWindow implements Window, DarwinNativeResponder {
 
   cancelComposition(): void {
     this.#assertOpen();
-    this.inputState.cancelComposition();
-    this.#flushInputState();
-    this.#discardNativeMarkedText();
+    this.lib.withAutoreleasePool(() => {
+      this.inputState.cancelComposition();
+      this.#flushInputState();
+      this.#discardNativeMarkedText();
+    });
   }
 
   observeNativeInputContext(): void {
@@ -914,14 +933,20 @@ class DarwinWindow implements Window, DarwinNativeResponder {
 
   setTitle(title: string): void {
     this.#assertOpen();
-    const { sel, send } = this.lib.ffi;
-    const titleString = makeNSString(this.lib.ffi, title);
-    send.void_id(this.nsWindow, sel("setTitle:"), titleString);
-    send.void(titleString, sel("release"));
+    this.lib.withAutoreleasePool(() => {
+      const { sel, send } = this.lib.ffi;
+      const titleString = makeNSString(this.lib.ffi, title);
+      send.void_id(this.nsWindow, sel("setTitle:"), titleString);
+      send.void(titleString, sel("release"));
+    });
   }
 
   blit(rgba: Uint8Array, width: number, height: number): void {
     this.#assertOpen();
+    this.lib.withAutoreleasePool(() => this.#blit(rgba, width, height));
+  }
+
+  #blit(rgba: Uint8Array, width: number, height: number): void {
     const { cf, cg, sel, send } = this.lib.ffi;
     const { rowBytes } = validatedBlitGeometry(rgba, width, height, this.#width, this.#height);
     // CFDataCreate copies the bytes into immutable native-owned storage. The
@@ -969,6 +994,10 @@ class DarwinWindow implements Window, DarwinNativeResponder {
   close(): void {
     if (this.#closed) return;
     this.lib.assertMainThread();
+    this.lib.withAutoreleasePool(() => this.#closeNative());
+  }
+
+  #closeNative(): void {
     this.#closed = true;
     const errors: unknown[] = [];
     const cleanup = (operation: () => void): void => {
@@ -1033,18 +1062,28 @@ class DarwinLibrary implements Library {
 
   constructor() {
     this.ffi = openDarwinFfi();
-    const { cg, getClass, sel, send } = this.ffi;
-    this.nativeClasses = ensureNativeClasses(this.ffi);
-    this.nsApp = send.id(getClass("NSApplication"), sel("sharedApplication"));
-    if (!send.bool_i64(this.nsApp, sel("setActivationPolicy:"), NS_APPLICATION_ACTIVATION_POLICY_REGULAR)) {
-      throw new Error("winding(darwin): NSApplication rejected the regular activation policy");
-    }
-    send.void(this.nsApp, sel("finishLaunching"));
-    this.#distantPast = send.id(getClass("NSDate"), sel("distantPast"));
-    this.#runLoopMode = makeNSString(this.ffi, "kCFRunLoopDefaultMode");
-    const colorSpace = cg.symbols.CGColorSpaceCreateDeviceRGB();
-    if (colorSpace === null) throw new Error("winding(darwin): CGColorSpaceCreateDeviceRGB failed");
-    this.colorSpace = colorSpace;
+    const initialized = withAutoreleasePool(this.ffi, () => {
+      const { cg, getClass, sel, send } = this.ffi;
+      const nativeClasses = ensureNativeClasses(this.ffi);
+      const nsApp = send.id(getClass("NSApplication"), sel("sharedApplication"));
+      if (nsApp === null) throw new Error("winding(darwin): NSApplication.sharedApplication returned nil");
+      if (!send.bool_i64(nsApp, sel("setActivationPolicy:"), NS_APPLICATION_ACTIVATION_POLICY_REGULAR)) {
+        throw new Error("winding(darwin): NSApplication rejected the regular activation policy");
+      }
+      send.void(nsApp, sel("finishLaunching"));
+      const distantPast = send.id(send.id(getClass("NSDate"), sel("distantPast")), sel("retain"));
+      if (distantPast === null) throw new Error("winding(darwin): failed to retain NSDate.distantPast");
+      const runLoopMode = makeNSString(this.ffi, "kCFRunLoopDefaultMode");
+      if (runLoopMode === null) throw new Error("winding(darwin): failed to create run-loop mode");
+      const colorSpace = cg.symbols.CGColorSpaceCreateDeviceRGB();
+      if (colorSpace === null) throw new Error("winding(darwin): CGColorSpaceCreateDeviceRGB failed");
+      return { nativeClasses, nsApp, distantPast, runLoopMode, colorSpace };
+    });
+    this.nativeClasses = initialized.nativeClasses;
+    this.nsApp = initialized.nsApp;
+    this.#distantPast = initialized.distantPast;
+    this.#runLoopMode = initialized.runLoopMode;
+    this.colorSpace = initialized.colorSpace;
   }
 
   assertMainThread(): void {
@@ -1054,6 +1093,10 @@ class DarwinLibrary implements Library {
   assertOpen(): void {
     if (this.#closed) throw new Error("winding(darwin): library is closed");
     this.assertMainThread();
+  }
+
+  withAutoreleasePool<T>(operation: () => T): T {
+    return withAutoreleasePool(this.ffi, operation);
   }
 
   registerWindow(window: DarwinWindow): void {
@@ -1079,7 +1122,7 @@ class DarwinLibrary implements Library {
 
   openWindow(x = 0, y = 0, w = 800, h = 600): DarwinWindow {
     this.assertOpen();
-    return new DarwinWindow(this, x, y, w, h);
+    return this.withAutoreleasePool(() => new DarwinWindow(this, x, y, w, h));
   }
 
   event(): UIEvent | undefined {
@@ -1087,12 +1130,15 @@ class DarwinLibrary implements Library {
     this.nativeClasses.throwIfCallbackFailed();
     const { getClass, sel, send } = this.ffi;
     if (this.#queue.length) return this.#queue.shift();
-    for (const window of this.windows.values()) window.observeNativeInputContext();
+    this.withAutoreleasePool(() => {
+      for (const window of this.windows.values()) window.observeNativeInputContext();
+    });
     this.nativeClasses.throwIfCallbackFailed();
     if (this.#queue.length) return this.#queue.shift();
-    while (true) {
+    for (let dispatched = 0; dispatched < MAX_NATIVE_EVENTS_PER_POLL; dispatched++) {
       const poolAlloc = send.id(getClass("NSAutoreleasePool"), sel("alloc"));
       const pool = send.id(poolAlloc, sel("init"));
+      if (pool === null) throw new Error("winding(darwin): failed to create event autorelease pool");
       try {
         const event = send.id_u64PtrPtrBool(
           this.nsApp,
@@ -1103,11 +1149,15 @@ class DarwinLibrary implements Library {
           true,
         );
         this.nativeClasses.throwIfCallbackFailed();
-        if (event === null) break;
+        if (event === null) {
+          send.void(this.nsApp, sel("updateWindows"));
+          break;
+        }
 
         this.#handledNativeEvent = undefined;
         const nativeType = send.u64(event, sel("type"));
         send.void_id(this.nsApp, sel("sendEvent:"), event);
+        send.void(this.nsApp, sel("updateWindows"));
         this.nativeClasses.throwIfCallbackFailed();
 
         if (
@@ -1122,7 +1172,7 @@ class DarwinLibrary implements Library {
 
         if (this.#queue.length) return this.#queue.shift();
       } finally {
-        if (pool !== null) send.void(pool, sel("drain"));
+        send.void(pool, sel("drain"));
         this.nativeClasses.throwIfCallbackFailed();
       }
     }
@@ -1153,33 +1203,23 @@ class DarwinLibrary implements Library {
     this.#queue.close();
 
     const cleanupErrors: unknown[] = [];
-    for (const window of [...this.windows.values()]) {
+    const cleanup = (operation: () => void): void => {
       try {
-        window.close();
+        operation();
       } catch (error) {
         cleanupErrors.push(error);
       }
-    }
-    try {
-      this.ffi.send.void(this.#runLoopMode, this.ffi.sel("release"));
-    } catch (error) {
-      cleanupErrors.push(error);
-    }
-    try {
-      this.ffi.cf.symbols.CFRelease(this.colorSpace);
-    } catch (error) {
-      cleanupErrors.push(error);
-    }
-    try {
-      this.ffi.close();
-    } catch (error) {
-      cleanupErrors.push(error);
-    }
-    try {
-      this.nativeClasses.throwIfCallbackFailed();
-    } catch (error) {
-      cleanupErrors.push(error);
-    }
+    };
+    cleanup(() =>
+      this.withAutoreleasePool(() => {
+        for (const window of [...this.windows.values()]) cleanup(() => window.close());
+        cleanup(() => this.ffi.send.void(this.#runLoopMode, this.ffi.sel("release")));
+        cleanup(() => this.ffi.send.void(this.#distantPast, this.ffi.sel("release")));
+        cleanup(() => this.ffi.cf.symbols.CFRelease(this.colorSpace));
+      })
+    );
+    cleanup(() => this.nativeClasses.throwIfCallbackFailed());
+    cleanup(() => this.ffi.close());
 
     if (activeLibrary === this) activeLibrary = undefined;
 
