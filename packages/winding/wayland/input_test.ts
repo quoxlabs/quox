@@ -10,7 +10,7 @@ import {
   type XkbKeyTranslator,
 } from "./keyboard.ts";
 import { WlOp } from "./ffi.ts";
-import { TextInputV3Batch } from "./text_input.ts";
+import { createWaylandSurroundingTextState, TextInputV3Batch } from "./text_input.ts";
 import { keyLocationForCode, normalizeImeCursorArea, validateImeCursorRange } from "../input/mod.ts";
 import { logicalKeyFromKeysym } from "../linux/mod.ts";
 import {
@@ -418,6 +418,45 @@ Deno.test("bare, delete-only, null, and empty batches all clear old preedit", ()
   assertEquals(batch.hasVisiblePreedit, false);
 });
 
+Deno.test("Wayland surrounding text validates UTF-8 ranges and preserves selection direction", () => {
+  assertEquals(createWaylandSurroundingTextState("A🙂BC", 1, 5), {
+    text: "A🙂BC",
+    selectionStartBytes: 1,
+    selectionEndBytes: 5,
+    wireText: "A🙂BC",
+    cursorBytes: 5,
+    anchorBytes: 1,
+  });
+  assertThrowsMessage(
+    () => createWaylandSurroundingTextState("é", 1, 2),
+    "invalid UTF-8 surrounding-text selection",
+  );
+  assertThrowsMessage(
+    () => createWaylandSurroundingTextState("text", 3, 2),
+    "invalid UTF-8 surrounding-text selection",
+  );
+  assertThrowsMessage(
+    () => createWaylandSurroundingTextState("before\0after", 6, 6),
+    "surrounding text cannot contain NUL",
+  );
+});
+
+Deno.test("Wayland surrounding text slices long context on UTF-8 boundaries", () => {
+  const text = `${"a".repeat(3000)}é${"b".repeat(3000)}`;
+  const state = createWaylandSurroundingTextState(text, 3000, 3002);
+  const wireBytes = new TextEncoder().encode(state.wireText);
+  assert(wireBytes.byteLength <= 4000);
+  assertEquals(state.cursorBytes - state.anchorBytes, 2);
+  assertEquals(
+    new TextDecoder().decode(wireBytes.slice(state.anchorBytes, state.cursorBytes)),
+    "é",
+  );
+  assertThrowsMessage(
+    () => createWaylandSurroundingTextState("a".repeat(4001), 0, 4001),
+    "selection exceeds the 4000-byte protocol limit",
+  );
+});
+
 Deno.test("resetEdits clears both visible and uncommitted text-input state", () => {
   const batch = new TextInputV3Batch();
   batch.setPreedit("visible", 0, 0);
@@ -553,6 +592,16 @@ class FakeCompose implements ComposeAdapter {
 
 function assert(value: unknown, message = "Expected value to be truthy"): asserts value {
   if (!value) throw new Error(message);
+}
+
+function assertThrowsMessage(action: () => unknown, expected: string): void {
+  try {
+    action();
+  } catch (error) {
+    if (error instanceof Error && error.message.includes(expected)) return;
+    throw error;
+  }
+  throw new Error(`Expected an error containing ${JSON.stringify(expected)}`);
 }
 
 function assertEquals<T>(actual: T, expected: T): void {

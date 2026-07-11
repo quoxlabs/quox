@@ -627,6 +627,10 @@ class WaylandLibrary implements Library {
     this.#textInputController.updateCursorArea(window);
   }
 
+  updateWindowImeSurroundingText(window: WaylandWindow): void {
+    this.#textInputController.updateSurroundingText(window);
+  }
+
   /** Called by WaylandWindow to push UI events into the shared queue. */
   pushEvent(event: UIEvent): void {
     this.#events.push(event);

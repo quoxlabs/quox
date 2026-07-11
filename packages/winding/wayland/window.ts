@@ -2,6 +2,7 @@ import type { Window } from "../types.ts";
 import { CompositionState, ImeActivationState, type ImeCursorArea, normalizeImeCursorArea } from "../input/mod.ts";
 import { utf8CString as cStr } from "../text_encoding.ts";
 import { WlOp } from "./ffi.ts";
+import { createWaylandSurroundingTextState, type WaylandSurroundingTextState } from "./text_input.ts";
 import {
   type AnyCallback,
   args,
@@ -104,6 +105,7 @@ export interface WaylandWindowHost extends NativeCallbackHost, WaylandShmHost {
   unregisterWindow(surface: Deno.PointerObject, window: WaylandWindow): void;
   updateWindowImeState(window: WaylandWindow): void;
   updateWindowImeCursorArea(window: WaylandWindow): void;
+  updateWindowImeSurroundingText(window: WaylandWindow): void;
   throwCallbackError(): void;
   roundtripDisplay(context: string): void;
   flushDisplay(context: string): void;
@@ -127,6 +129,7 @@ export class WaylandWindow implements Window {
   readonly imeActivation = new ImeActivationState();
   readonly composition = new CompositionState();
   #imeCursorArea: ImeCursorArea | undefined;
+  #imeSurroundingText: WaylandSurroundingTextState | undefined;
 
   constructor(readonly lib: WaylandWindowHost, width: number, height: number) {
     this.#shmBuffer = new WaylandShmBuffer(lib);
@@ -194,6 +197,10 @@ export class WaylandWindow implements Window {
 
   get imeCursorArea(): ImeCursorArea | undefined {
     return this.#imeCursorArea;
+  }
+
+  get imeSurroundingText(): WaylandSurroundingTextState | undefined {
+    return this.#imeSurroundingText;
   }
 
   #setupListeners(): void {
@@ -293,6 +300,17 @@ export class WaylandWindow implements Window {
     if (area === undefined) return;
     this.#imeCursorArea = area;
     this.lib.updateWindowImeCursorArea(this);
+  }
+
+  setImeSurroundingText(text: string, selectionStartBytes: number, selectionEndBytes: number): void {
+    this.lib.throwIfConnectionFailed();
+    if (this.#closed) return;
+    this.#imeSurroundingText = createWaylandSurroundingTextState(
+      text,
+      selectionStartBytes,
+      selectionEndBytes,
+    );
+    this.lib.updateWindowImeSurroundingText(this);
   }
 
   blit(rgba: Uint8Array, width: number, height: number, frameToken?: number): void {

@@ -1,6 +1,7 @@
 /** Native text-input-v3 focus, activation, batching, and proxy ownership. */
 
 import type { UIEvent } from "../types.ts";
+import { utf8CString as cStr } from "../text_encoding.ts";
 import {
   createImeActivationEvent,
   createImeCommitEvent,
@@ -19,7 +20,7 @@ import {
   type WaylandNativeLibrary,
   WL_MARSHAL_FLAG_DESTROY,
 } from "./protocol.ts";
-import { type TextInputEdit, TextInputV3Batch } from "./text_input.ts";
+import { type TextInputEdit, TextInputV3Batch, type WaylandSurroundingTextState } from "./text_input.ts";
 import type { WaylandWindow } from "./window.ts";
 
 export interface WaylandTextInputHost {
@@ -102,6 +103,14 @@ export class WaylandTextInputController {
     this.#sendCursorArea(area);
     this.#commitState();
     this.host.flushDisplay("updating the text-input cursor rectangle");
+  }
+
+  updateSurroundingText(window: WaylandWindow): void {
+    const surrounding = window.imeSurroundingText;
+    if (!surrounding || this.#enabledWindow !== window || this.#focus !== window || !this.#input) return;
+    this.#sendSurroundingText(surrounding);
+    this.#commitState();
+    this.host.flushDisplay("updating text-input surrounding text");
   }
 
   close(): void {
@@ -244,6 +253,7 @@ export class WaylandTextInputController {
           0,
           args(),
         );
+        if (window.imeSurroundingText) this.#sendSurroundingText(window.imeSurroundingText);
         if (window.imeCursorArea) this.#sendCursorArea(window.imeCursorArea);
         this.#commitState();
         this.#enabledWindow = window;
@@ -285,6 +295,23 @@ export class WaylandTextInputController {
       1,
       0,
       args(BigInt(area.x), BigInt(area.y), BigInt(area.width), BigInt(area.height)),
+    );
+  }
+
+  #sendSurroundingText(surrounding: WaylandSurroundingTextState): void {
+    if (!this.#input) return;
+    const text = cStr(surrounding.wireText);
+    this.host.wl.symbols.wl_proxy_marshal_array_flags(
+      this.#input,
+      WlOp.ZWP_TEXT_INPUT_SET_SURROUNDING_TEXT,
+      null,
+      1,
+      0,
+      args(
+        Deno.UnsafePointer.value(Deno.UnsafePointer.of(text)),
+        BigInt(surrounding.cursorBytes),
+        BigInt(surrounding.anchorBytes),
+      ),
     );
   }
 
