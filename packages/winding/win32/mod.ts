@@ -40,6 +40,7 @@ import {
   win32QuitExitCode,
 } from "./input.ts";
 import { Win32InputController } from "./input_controller.ts";
+import { Win32WindowLifecycleGate } from "./window_lifecycle.ts";
 
 const PAINTSTRUCT_SIZE = 72;
 const BLACKNESS = 0x00000042;
@@ -112,8 +113,7 @@ class Win32Window implements Window {
   pointerSnapshot: Win32PointerSnapshot | undefined;
   readonly clientState = new Win32ClientState();
   readonly dpiState: Win32DpiState;
-  #closing = false;
-  #destroyed = false;
+  readonly #lifecycle = new Win32WindowLifecycleGate();
 
   constructor(
     readonly lib: Win32Library,
@@ -180,7 +180,7 @@ class Win32Window implements Window {
     } catch (error) {
       const errors = [error];
       try {
-        if (lib.user32.symbols.DestroyWindow(window) === 0 && !this.#destroyed) {
+        if (lib.user32.symbols.DestroyWindow(window) === 0 && !this.#lifecycle.destroyed) {
           errors.push(new Error(lib.getLastError()));
         }
       } catch (cleanupError) {
@@ -207,23 +207,24 @@ class Win32Window implements Window {
   }
 
   setTitle(title: string): void {
-    const ok = this.lib.user32.symbols.SetWindowTextW(this.#hwnd, wideStringBuffer(title));
-    if (ok === 0) throw new Error(this.lib.getLastError());
+    this.#lifecycle.mutate(() => {
+      const ok = this.lib.user32.symbols.SetWindowTextW(this.#hwnd, wideStringBuffer(title));
+      if (ok === 0) throw new Error(this.lib.getLastError());
+    });
   }
 
   setImeEnabled(enabled: boolean): void {
-    if (this.#destroyed) return;
-    this.lib.input.setImeEnabled(this, enabled);
+    this.#lifecycle.mutate(() => this.lib.input.setImeEnabled(this, enabled));
   }
 
   setImeCursorArea(x: number, y: number, width: number, height: number): void {
-    if (this.#destroyed) return;
-    this.lib.input.setImeCursorArea(this, x, y, width, height);
+    this.#lifecycle.mutate(() => this.lib.input.setImeCursorArea(this, x, y, width, height));
   }
 
   setImeSurroundingText(text: string, selectionStartBytes: number, selectionEndBytes: number): void {
-    if (this.#destroyed) return;
-    this.lib.input.setImeSurroundingText(this, text, selectionStartBytes, selectionEndBytes);
+    this.#lifecycle.mutate(() =>
+      this.lib.input.setImeSurroundingText(this, text, selectionStartBytes, selectionEndBytes)
+    );
   }
 
   /**
@@ -232,15 +233,17 @@ class Win32Window implements Window {
    * X11 backend) and blits it with `SetDIBitsToDevice`.
    */
   blit(rgba: Uint8Array, width: number, height: number): void {
-    const candidate = prepareWin32Frame(rgba, width, height, this.clientState.framebufferSize);
+    this.#lifecycle.mutate(() => {
+      const candidate = prepareWin32Frame(rgba, width, height, this.clientState.framebufferSize);
 
-    const hdc = this.lib.user32.symbols.GetDC(this.#hwnd);
-    if (hdc == null) throw new Error("winding(win32): GetDC failed");
-    try {
-      this.#retainedFrame.drawAndRetain(candidate, (frame) => this.#drawFrame(hdc, frame));
-    } finally {
-      this.lib.user32.symbols.ReleaseDC(this.#hwnd, hdc);
-    }
+      const hdc = this.lib.user32.symbols.GetDC(this.#hwnd);
+      if (hdc == null) throw new Error("winding(win32): GetDC failed");
+      try {
+        this.#retainedFrame.drawAndRetain(candidate, (frame) => this.#drawFrame(hdc, frame));
+      } finally {
+        this.lib.user32.symbols.ReleaseDC(this.#hwnd, hdc);
+      }
+    });
   }
 
   paint(hdc: Deno.PointerObject, left: number, top: number, right: number, bottom: number): void {
@@ -272,28 +275,24 @@ class Win32Window implements Window {
     this.close();
   }
   close(): void {
-    if (this.#destroyed || this.#closing) return;
-    this.#closing = true;
+    if (!this.#lifecycle.beginClose()) return;
     try {
-      if (this.lib.user32.symbols.DestroyWindow(this.#hwnd) === 0 && !this.#destroyed) {
-        this.#closing = false;
+      if (this.lib.user32.symbols.DestroyWindow(this.#hwnd) === 0 && !this.#lifecycle.destroyed) {
         throw new Error(this.lib.getLastError());
       }
     } catch (error) {
-      if (!this.#destroyed) this.#closing = false;
+      this.#lifecycle.recoverFailedClose();
       throw error;
     }
-    if (!this.#destroyed) {
-      this.#closing = false;
+    if (!this.#lifecycle.destroyed) {
+      this.#lifecycle.recoverFailedClose();
       throw new Error("winding(win32): DestroyWindow returned before WM_NCDESTROY");
     }
   }
 
   /** Complete JavaScript teardown only at Win32's definitive HWND lifetime boundary. */
   nativeDestroyed(): void {
-    if (this.#destroyed) return;
-    this.#destroyed = true;
-    this.#closing = false;
+    if (!this.#lifecycle.markDestroyed()) return;
     this.mouseTracking.reset();
     const errors: unknown[] = [];
     try {

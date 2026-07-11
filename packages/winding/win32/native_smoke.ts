@@ -2,6 +2,7 @@ import type { ImeEvent, Library, ResizeEvent, UIEvent, VisibilityEvent, Window }
 import { IMECHARPOSITION_SIZE, IMR_QUERYCHARPOSITION, PM_REMOVE, SIZE_MINIMIZED, UNICODE_NOCHAR, WM } from "./ffi.ts";
 import { decodeWin32ClientRect, decodeWin32QueuedMessage, win32QuitExitCode } from "./input.ts";
 import { load } from "./mod.ts";
+import { WIN32_WINDOW_CLOSED_MESSAGE } from "./window_lifecycle.ts";
 
 const SW_HIDE = 0;
 const SW_MAXIMIZE = 3;
@@ -41,6 +42,10 @@ const testUser32Functions = {
   },
   GetWindowRect: {
     parameters: ["pointer", "buffer"],
+    result: "i32",
+  },
+  GetWindowTextW: {
+    parameters: ["pointer", "buffer", "i32"],
     result: "i32",
   },
   GetClientRect: {
@@ -99,6 +104,14 @@ interface NativeWin32Window extends Window {
   };
 }
 
+type WindowMutationName = Exclude<keyof Window, "close" | typeof Symbol.dispose>;
+
+interface ClosedWindowFrame {
+  readonly rgba: Uint8Array;
+  readonly width: number;
+  readonly height: number;
+}
+
 Deno.test({
   name: "Win32 loads native libraries and survives basic input lifecycles",
   ignore: Deno.build.os !== "windows",
@@ -110,9 +123,11 @@ Deno.test({
     try {
       const gdi32 = Deno.dlopen("gdi32", testGdi32Functions);
       try {
-        // A second pass verifies that close destroys the HWND and unregisters
-        // the class before its callback and DLL handles are released.
-        for (let iteration = 0; iteration < 2; iteration++) runLifecycle(user32, gdi32, iteration === 1);
+        // Exercise each owner of the native lifetime boundary independently.
+        for (const closeOwner of ["window", "external", "library"] as const) {
+          runLifecycle(user32, gdi32, closeOwner);
+        }
+        assertStaleWindowChurn(user32, gdi32);
       } finally {
         gdi32.close();
       }
@@ -125,65 +140,219 @@ Deno.test({
 function runLifecycle(
   user32: Deno.DynamicLibrary<typeof testUser32Functions>,
   gdi32: Deno.DynamicLibrary<typeof testGdi32Functions>,
-  destroyExternally: boolean,
+  closeOwner: "window" | "external" | "library",
 ): void {
   const library = load();
-  try {
+  let retainedWindow: NativeWin32Window | undefined;
+  const errors: unknown[] = [];
+  captureSmokeError(errors, () => {
     assertConcurrentLibraryRejected();
     const window = library.openWindow(0, 0, 320, 240) as NativeWin32Window;
-    try {
-      assertWindowGeometry(user32, window, 0, 0, 320, 240);
-      const size = assertSingleInitialResize(library, window);
-      assertRepaintPixel(user32, gdi32, window, 0x000000);
-      const rgba = new Uint8Array(size.framebufferWidth * size.framebufferHeight * 4);
-      for (let offset = 0; offset < rgba.length; offset += 4) {
-        rgba[offset] = 0x12;
-        rgba[offset + 1] = 0x34;
-        rgba[offset + 2] = 0x56;
-        rgba[offset + 3] = 0xff;
-      }
-      window.blit(rgba, size.framebufferWidth, size.framebufferHeight);
-      assertRepaintPixel(user32, gdi32, window, 0x563412);
-      // Keep hosted CI independent of foreground-window and desktop behavior.
-      user32.symbols.ShowWindow(window.hwnd, SW_HIDE);
-      window.setImeCursorArea(4, 8, 2, 16);
-      window.setImeEnabled(true);
-      window.setImeEnabled(false);
-      drainEvents(library);
-      assertImeCharacterPositionDelegated(window);
+    retainedWindow = window;
+    assertWindowGeometry(user32, window, 0, 0, 320, 240);
+    const size = assertSingleInitialResize(library, window);
+    assertRepaintPixel(user32, gdi32, window, 0x000000);
+    const rgba = createSolidFrame(size.framebufferWidth, size.framebufferHeight, 0x12, 0x34, 0x56);
+    window.blit(rgba, size.framebufferWidth, size.framebufferHeight);
+    assertRepaintPixel(user32, gdi32, window, 0x563412);
+    // Keep hosted CI independent of foreground-window and desktop behavior.
+    user32.symbols.ShowWindow(window.hwnd, SW_HIDE);
+    window.setImeCursorArea(4, 8, 2, 16);
+    window.setImeEnabled(true);
+    window.setImeEnabled(false);
+    drainEvents(library);
+    assertImeCharacterPositionDelegated(window);
 
-      const probe = user32.symbols.SendMessageW(
-        window.hwnd,
-        WM.UNICHAR,
-        BigInt(UNICODE_NOCHAR),
-        0n,
-      );
-      if (probe !== 1n) throw new Error(`WM_UNICHAR capability probe returned ${probe}`);
+    const probe = user32.symbols.SendMessageW(
+      window.hwnd,
+      WM.UNICHAR,
+      BigInt(UNICODE_NOCHAR),
+      0n,
+    );
+    if (probe !== 1n) throw new Error(`WM_UNICHAR capability probe returned ${probe}`);
 
-      if (user32.symbols.PostMessageW(window.hwnd, WM.UNICHAR, 0x41n, 1n) === 0) {
-        throw new Error("PostMessageW rejected the synthetic Unicode character");
-      }
-
-      const commit = nextImeEdit(library, window);
-      if (commit?.kind !== "commit" || commit.text !== "A") {
-        throw new Error("Expected a Win32 commit containing A");
-      }
-
-      assertAuthoritativeResizeEvents(user32, library, window, {
-        width: size.framebufferWidth,
-        height: size.framebufferHeight,
-      });
-      assertThreadQueuePreservation(user32, library, window);
-    } finally {
-      if (destroyExternally && user32.symbols.DestroyWindow(window.hwnd) === 0) {
-        throw new Error("DestroyWindow rejected the externally driven lifetime test");
-      }
-      // An external destroy reaches WM_NCDESTROY first; close must then be a
-      // harmless no-op, and library teardown must still unregister the class.
-      window.close();
+    if (user32.symbols.PostMessageW(window.hwnd, WM.UNICHAR, 0x41n, 1n) === 0) {
+      throw new Error("PostMessageW rejected the synthetic Unicode character");
     }
+
+    const commit = nextImeEdit(library, window);
+    if (commit?.kind !== "commit" || commit.text !== "A") {
+      throw new Error("Expected a Win32 commit containing A");
+    }
+
+    assertAuthoritativeResizeEvents(user32, library, window, {
+      width: size.framebufferWidth,
+      height: size.framebufferHeight,
+    });
+    assertThreadQueuePreservation(user32, library, window);
+  });
+
+  const window = retainedWindow;
+  if (window !== undefined && closeOwner !== "library") {
+    if (closeOwner === "external") {
+      captureSmokeError(errors, () => {
+        if (user32.symbols.DestroyWindow(window.hwnd) === 0) {
+          throw new Error("DestroyWindow rejected the externally driven lifetime test");
+        }
+      });
+    }
+    // An external destroy reaches WM_NCDESTROY first; close must then be a
+    // harmless no-op, and library teardown must still unregister the class.
+    captureSmokeError(errors, () => window.close());
+    captureSmokeError(errors, () => assertClosedWindowMutations(window));
+  }
+
+  captureSmokeError(errors, () => library.close());
+  if (window !== undefined) captureSmokeError(errors, () => assertClosedWindowMutations(window));
+  if (window === undefined && errors.length === 0) errors.push(new Error("Win32 lifecycle created no window"));
+
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) throw new AggregateError(errors, "Win32 lifecycle and cleanup both failed");
+}
+
+function captureSmokeError(errors: unknown[], operation: () => void): void {
+  try {
+    operation();
+  } catch (error) {
+    errors.push(error);
+  }
+}
+
+function assertClosedWindowMutations(
+  window: NativeWin32Window,
+  frame: ClosedWindowFrame = { rgba: new Uint8Array(), width: 0, height: 0 },
+  afterEach: () => void = () => {},
+): void {
+  const operations = {
+    setTitle: () => window.setTitle("closed"),
+    blit: () => window.blit(frame.rgba, frame.width, frame.height),
+    setImeEnabled: () => window.setImeEnabled(true),
+    setImeCursorArea: () => window.setImeCursorArea(Number.NaN, 0, 0, 0),
+    setImeSurroundingText: () => window.setImeSurroundingText("", 1, 0),
+  } satisfies Record<WindowMutationName, () => void>;
+  for (const [name, operation] of Object.entries(operations)) {
+    try {
+      operation();
+    } catch (error) {
+      if (error instanceof Error && error.message === WIN32_WINDOW_CLOSED_MESSAGE) {
+        afterEach();
+        continue;
+      }
+      throw new Error(`${name} produced the wrong closed-window error`, { cause: error });
+    }
+    throw new Error(`${name} accepted a closed Win32 window`);
+  }
+}
+
+/** CI runs this smoke in its own process; keep handle-reuse pressure bounded and deterministic. */
+function assertStaleWindowChurn(
+  user32: Deno.DynamicLibrary<typeof testUser32Functions>,
+  gdi32: Deno.DynamicLibrary<typeof testGdi32Functions>,
+): void {
+  const library = load();
+  let current: NativeWin32Window | undefined;
+  let reusedHandles = 0;
+  const errors: unknown[] = [];
+  captureSmokeError(errors, () => {
+    current = library.openWindow(0, 0, 320, 240) as NativeWin32Window;
+    let currentSize = assertSingleInitialResize(library, current);
+    for (let iteration = 0; iteration < 64; iteration++) {
+      const stale = current;
+      const staleSize = currentSize;
+      stale.close();
+
+      const replacement = library.openWindow(0, 0, 320, 240) as NativeWin32Window;
+      current = replacement;
+      currentSize = assertSingleInitialResize(library, replacement);
+      if (stale.id === replacement.id) reusedHandles++;
+      const expectedTitle = `Winding churn ${iteration}`;
+      replacement.setTitle(expectedTitle);
+      const sentinelFrame = createSolidFrame(
+        currentSize.framebufferWidth,
+        currentSize.framebufferHeight,
+        0x12,
+        0x34,
+        0x56,
+      );
+      replacement.blit(sentinelFrame, currentSize.framebufferWidth, currentSize.framebufferHeight);
+
+      const assertReplacementIntegrity = () => {
+        const actualTitle = readNativeWindowTitle(user32, replacement);
+        if (actualTitle !== expectedTitle) {
+          throw new Error(`A stale Win32 window changed its replacement title to ${actualTitle}`);
+        }
+        const actualPixel = readNativePixel(user32, gdi32, replacement);
+        if (actualPixel !== 0x563412) {
+          throw new Error(`A stale Win32 window changed its replacement pixel to ${actualPixel.toString(16)}`);
+        }
+      };
+      assertReplacementIntegrity();
+
+      // A valid attack frame proves stale blits do not merely stop at argument
+      // validation. If Windows recycles this HWND, it would overwrite `current`.
+      const attackFrame = createSolidFrame(
+        staleSize.framebufferWidth,
+        staleSize.framebufferHeight,
+        0xaa,
+        0xbb,
+        0xcc,
+      );
+      assertClosedWindowMutations(
+        stale,
+        {
+          rgba: attackFrame,
+          width: staleSize.framebufferWidth,
+          height: staleSize.framebufferHeight,
+        },
+        assertReplacementIntegrity,
+      );
+    }
+  });
+  captureSmokeError(errors, () => library.close());
+  const finalWindow = current;
+  if (finalWindow !== undefined) {
+    captureSmokeError(errors, () => assertClosedWindowMutations(finalWindow));
+  } else if (errors.length === 0) {
+    errors.push(new Error("Win32 churn created no window"));
+  }
+
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) throw new AggregateError(errors, "Win32 stale-window churn and cleanup both failed");
+  console.log(`Win32 stale-window churn observed ${reusedHandles} recycled HWND values`);
+}
+
+function readNativeWindowTitle(
+  user32: Deno.DynamicLibrary<typeof testUser32Functions>,
+  window: NativeWin32Window,
+): string {
+  const buffer = new Uint16Array(64);
+  const length = user32.symbols.GetWindowTextW(window.hwnd, buffer, buffer.length);
+  if (length === 0) throw new Error("GetWindowTextW returned an empty title");
+  return String.fromCharCode(...buffer.subarray(0, length));
+}
+
+function createSolidFrame(width: number, height: number, red: number, green: number, blue: number): Uint8Array {
+  const rgba = new Uint8Array(width * height * 4);
+  for (let offset = 0; offset < rgba.length; offset += 4) {
+    rgba[offset] = red;
+    rgba[offset + 1] = green;
+    rgba[offset + 2] = blue;
+    rgba[offset + 3] = 0xff;
+  }
+  return rgba;
+}
+
+function readNativePixel(
+  user32: Deno.DynamicLibrary<typeof testUser32Functions>,
+  gdi32: Deno.DynamicLibrary<typeof testGdi32Functions>,
+  window: NativeWin32Window,
+): number {
+  const hdc = user32.symbols.GetDC(window.hwnd);
+  if (hdc === null) throw new Error("GetDC rejected the Win32 pixel read");
+  try {
+    return gdi32.symbols.GetPixel(hdc, 0, 0);
   } finally {
-    library.close();
+    user32.symbols.ReleaseDC(window.hwnd, hdc);
   }
 }
 
