@@ -1,6 +1,9 @@
 use super::{QuoxRenderer, QuoxRendererState};
-use blitz_dom::{DocumentMutator, LocalName, NodeData, QualName, ns};
+use blitz_dom::{BaseDocument, DocumentMutator, LocalName, NodeData, QualName, ns};
 use wasm_bindgen::prelude::*;
+
+const ELEMENT_NODE: u8 = 1;
+const TEXT_NODE: u8 = 3;
 
 fn html_name(local_name: &str) -> QualName {
     QualName {
@@ -18,12 +21,37 @@ fn attr_name(local_name: &str) -> QualName {
     }
 }
 
-fn invalid_node(node_id: usize) -> JsValue {
-    JsValue::from_str(&format!("Invalid DOM node id: {node_id}"))
+fn invalid_node_handle(node_handle: u32) -> JsValue {
+    JsValue::from_str(&format!("Invalid or stale DOM node handle: {node_handle}"))
 }
 
-fn invalid_element(node_id: usize) -> JsValue {
-    JsValue::from_str(&format!("DOM node id is not an element: {node_id}"))
+fn invalid_element(node_handle: u32) -> JsValue {
+    JsValue::from_str(&format!("DOM node handle is not an element: {node_handle}"))
+}
+
+fn invalid_internal_node(node_id: usize) -> JsValue {
+    JsValue::from_str(&format!("Invalid internal DOM node id: {node_id}"))
+}
+
+/// Return exactly the node ids Blitz's `remove_and_drop_all_children` will destroy.
+fn dropped_descendant_ids(document: &BaseDocument, parent_id: usize) -> Vec<usize> {
+    let Some(parent) = document.get_node(parent_id) else {
+        return Vec::new();
+    };
+    let mut pending = parent.children.clone();
+    let mut dropped = Vec::new();
+
+    while let Some(node_id) = pending.pop() {
+        let Some(node) = document.get_node(node_id) else {
+            continue;
+        };
+        dropped.push(node_id);
+        pending.extend(node.children.iter().copied());
+        pending.extend(node.before);
+        pending.extend(node.after);
+    }
+
+    dropped
 }
 
 impl QuoxRendererState {
@@ -38,27 +66,91 @@ impl QuoxRendererState {
         result
     }
 
-    fn ensure_node(&self, node_id: usize) -> Result<(), JsValue> {
-        self.document
-            .get_node(node_id)
-            .map(|_| ())
-            .ok_or_else(|| invalid_node(node_id))
+    /// Resolve an opaque public handle and verify that its Blitz node is still live. A mapping
+    /// whose node disappeared unexpectedly is invalidated defensively, preventing a later slab
+    /// occupant from inheriting the stale public handle.
+    fn resolve_node(&mut self, node_handle: u32) -> Result<usize, JsValue> {
+        let node_id = self
+            .node_handles
+            .resolve(node_handle)
+            .ok_or_else(|| invalid_node_handle(node_handle))?;
+        if self.document.get_node(node_id).is_none() {
+            let _ = self.node_handles.invalidate_node(node_id);
+            return Err(invalid_node_handle(node_handle));
+        }
+
+        Ok(node_id)
     }
 
-    fn ensure_element(&self, node_id: usize) -> Result<(), JsValue> {
+    fn resolve_element(&mut self, node_handle: u32) -> Result<usize, JsValue> {
+        let node_id = self.resolve_node(node_handle)?;
         self.document
             .get_node(node_id)
-            .ok_or_else(|| invalid_node(node_id))?
+            .expect("resolve_node verified the node")
             .element_data()
             .map(|_| ())
-            .ok_or_else(|| invalid_element(node_id))
+            .ok_or_else(|| invalid_element(node_handle))?;
+        Ok(node_id)
+    }
+
+    fn expose_node(&mut self, node_id: usize) -> Result<u32, JsValue> {
+        if self.document.get_node(node_id).is_none() {
+            return Err(invalid_internal_node(node_id));
+        }
+
+        self.node_handles
+            .expose(node_id)
+            .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    /// Layout-only anonymous nodes are not DOM nodes and can be rebuilt by Blitz without going
+    /// through a Quox mutation. Map hits on them back to their nearest real DOM ancestor so an
+    /// ephemeral layout slab entry never receives a public handle.
+    fn public_dom_node_id(&self, mut node_id: usize) -> Option<usize> {
+        loop {
+            let node = self.document.get_node(node_id)?;
+            if !matches!(&node.data, NodeData::AnonymousBlock(_)) {
+                return Some(node_id);
+            }
+            node_id = node.parent.or_else(|| node.layout_parent.get())?;
+        }
+    }
+
+    pub(super) fn expose_public_dom_node(
+        &mut self,
+        node_id: usize,
+    ) -> Result<Option<u32>, JsValue> {
+        let Some(node_id) = self.public_dom_node_id(node_id) else {
+            return Ok(None);
+        };
+        self.expose_node(node_id).map(Some)
+    }
+
+    fn node_kind(&self, node_id: usize) -> u8 {
+        match &self
+            .document
+            .get_node(node_id)
+            .expect("callers resolve or expose live nodes")
+            .data
+        {
+            NodeData::Element(_) => ELEMENT_NODE,
+            NodeData::Text(_) => TEXT_NODE,
+            _ => 0,
+        }
+    }
+
+    fn invalidate_dropped_descendants(&mut self, parent_id: usize) -> Vec<u32> {
+        // Collect and invalidate before mutation so the HTML parser cannot reuse a freed slab
+        // index while its old public mapping still exists.
+        let dropped = dropped_descendant_ids(&self.document, parent_id);
+        self.node_handles.invalidate_nodes(dropped)
     }
 
     fn child_element_by_tag(&self, parent_id: usize, tag_name: &str) -> Result<usize, JsValue> {
         let parent = self
             .document
             .get_node(parent_id)
-            .ok_or_else(|| invalid_node(parent_id))?;
+            .ok_or_else(|| invalid_internal_node(parent_id))?;
 
         parent
             .children
@@ -79,7 +171,7 @@ impl QuoxRendererState {
         let parent = self
             .document
             .get_node(parent_id)
-            .ok_or_else(|| invalid_node(parent_id))?;
+            .ok_or_else(|| invalid_internal_node(parent_id))?;
 
         Ok(parent.children.iter().find_map(|child_id| {
             let child = self.document.get_node(*child_id)?;
@@ -103,21 +195,22 @@ impl QuoxRendererState {
 
 #[wasm_bindgen]
 impl QuoxRenderer {
-    /// Remove a node from the retained document.
-    pub fn remove_node(&self, node_id: usize) -> Result<(), JsValue> {
+    /// Detach a node from the retained document without destroying it or changing its public
+    /// handle. This preserves browser-style identity if the caller later reattaches it.
+    pub fn remove_node(&self, node_handle: u32) -> Result<(), JsValue> {
         let mut state = self.state.borrow_mut();
-        state.ensure_node(node_id)?;
+        let node_id = state.resolve_node(node_handle)?;
         state.mutate_document(|mutator| {
             mutator.remove_node(node_id);
             Ok(())
         })
     }
 
-    // Append `child_id` to `parent_id`.
-    pub fn append_child(&self, parent_id: usize, child_id: usize) -> Result<(), JsValue> {
+    // Append `child_handle` to `parent_handle`.
+    pub fn append_child(&self, parent_handle: u32, child_handle: u32) -> Result<(), JsValue> {
         let mut state = self.state.borrow_mut();
-        state.ensure_node(parent_id)?;
-        state.ensure_node(child_id)?;
+        let parent_id = state.resolve_node(parent_handle)?;
+        let child_id = state.resolve_node(child_handle)?;
         state.mutate_document(|mutator| {
             mutator.append_children(parent_id, &[child_id]);
             Ok(())
@@ -125,13 +218,14 @@ impl QuoxRenderer {
     }
 
     /// Return a node's text content.
-    pub fn text_content(&self, node_id: usize) -> Result<String, JsValue> {
-        let state = self.state.borrow();
+    pub fn text_content(&self, node_handle: u32) -> Result<String, JsValue> {
+        let mut state = self.state.borrow_mut();
+        let node_id = state.resolve_node(node_handle)?;
         state
             .document
             .get_node(node_id)
             .map(blitz_dom::Node::text_content)
-            .ok_or_else(|| invalid_node(node_id))
+            .ok_or_else(|| invalid_node_handle(node_handle))
     }
 
     /// Return the document title.
@@ -142,55 +236,60 @@ impl QuoxRenderer {
                 .document
                 .get_node(node_id)
                 .map(blitz_dom::Node::text_content)
-                .ok_or_else(|| invalid_node(node_id)),
+                .ok_or_else(|| invalid_internal_node(node_id)),
             None => Ok(String::new()),
         }
     }
 
     /// Set an element attribute.
-    pub fn set_attribute(&self, node_id: usize, name: &str, value: &str) -> Result<(), JsValue> {
+    pub fn set_attribute(&self, node_handle: u32, name: &str, value: &str) -> Result<(), JsValue> {
         let mut state = self.state.borrow_mut();
-        state.ensure_element(node_id)?;
+        let node_id = state.resolve_element(node_handle)?;
         state.mutate_document(|mutator| {
             mutator.set_attribute(node_id, attr_name(name), value);
             Ok(())
         })
     }
 
-    /// Create an element node in the retained document.
-    pub fn create_element(&self, tag_name: &str) -> Result<usize, JsValue> {
+    /// Create an element node and return its opaque, non-reused public handle.
+    pub fn create_element(&self, tag_name: &str) -> Result<u32, JsValue> {
         let mut state = self.state.borrow_mut();
-        state.mutate_document(|mutator| {
+        let node_id = state.mutate_document(|mutator| {
             Ok(mutator.create_element(html_name(&tag_name.to_ascii_lowercase()), Vec::new()))
-        })
+        })?;
+        state.expose_node(node_id)
     }
 
     /// Replace an element's children by parsing an HTML fragment through Blitz's mutator.
-    pub fn set_inner_html(&self, node_id: usize, html: &str) -> Result<(), JsValue> {
+    pub fn set_inner_html(&self, node_handle: u32, html: &str) -> Result<Box<[u32]>, JsValue> {
         let mut state = self.state.borrow_mut();
-        state.ensure_element(node_id)?;
+        let node_id = state.resolve_element(node_handle)?;
+        let invalidated_handles = state.invalidate_dropped_descendants(node_id);
         state.mutate_document(|mutator| {
             mutator.set_inner_html(node_id, html);
             Ok(())
-        })
+        })?;
+        Ok(invalidated_handles.into_boxed_slice())
     }
 
-    /// Create a text node in the retained document.
-    pub fn create_text_node(&self, text: &str) -> Result<usize, JsValue> {
+    /// Create a text node and return its opaque, non-reused public handle.
+    pub fn create_text_node(&self, text: &str) -> Result<u32, JsValue> {
         let mut state = self.state.borrow_mut();
-        state.mutate_document(|mutator| Ok(mutator.create_text_node(text)))
+        let node_id = state.mutate_document(|mutator| Ok(mutator.create_text_node(text)))?;
+        state.expose_node(node_id)
     }
 
-    /// Return the root `<html>` element node id.
-    pub fn document_element(&self) -> Result<usize, JsValue> {
-        let state = self.state.borrow();
-        Ok(state.document.root_element().id)
+    /// Return the root `<html>` element's opaque public handle.
+    pub fn document_element(&self) -> Result<u32, JsValue> {
+        let mut state = self.state.borrow_mut();
+        let node_id = state.document.root_element().id;
+        state.expose_node(node_id)
     }
 
     /// Remove an element attribute.
-    pub fn remove_attribute(&self, node_id: usize, name: &str) -> Result<(), JsValue> {
+    pub fn remove_attribute(&self, node_handle: u32, name: &str) -> Result<(), JsValue> {
         let mut state = self.state.borrow_mut();
-        state.ensure_element(node_id)?;
+        let node_id = state.resolve_element(node_handle)?;
         state.mutate_document(|mutator| {
             mutator.clear_attribute(node_id, attr_name(name));
             Ok(())
@@ -198,14 +297,21 @@ impl QuoxRenderer {
     }
 
     /// Replace a node's text content.
-    pub fn set_text_content(&self, node_id: usize, value: &str) -> Result<(), JsValue> {
+    pub fn set_text_content(&self, node_handle: u32, value: &str) -> Result<Box<[u32]>, JsValue> {
         let mut state = self.state.borrow_mut();
+        let node_id = state.resolve_node(node_handle)?;
         let is_text_node = {
             let node = state
                 .document
                 .get_node(node_id)
-                .ok_or_else(|| invalid_node(node_id))?;
+                .ok_or_else(|| invalid_node_handle(node_handle))?;
             matches!(&node.data, NodeData::Text(_))
+        };
+
+        let invalidated_handles = if is_text_node {
+            Vec::new()
+        } else {
+            state.invalidate_dropped_descendants(node_id)
         };
 
         state.mutate_document(|mutator| {
@@ -220,20 +326,25 @@ impl QuoxRenderer {
             }
 
             Ok(())
-        })
+        })?;
+        Ok(invalidated_handles.into_boxed_slice())
     }
 
     /// Replace the first document `<title>` text, creating the element in `<head>` if needed.
     /// Mirrors the HTML spec's `document.title` setter: if there is no `<head>` (e.g. after
     /// `document.head.remove()`), this is a no-op rather than an error.
-    pub fn set_title(&self, value: &str) -> Result<(), JsValue> {
+    pub fn set_title(&self, value: &str) -> Result<Box<[u32]>, JsValue> {
         let mut state = self.state.borrow_mut();
         let Some(head_id) =
             state.optional_child_element_by_tag(state.document.root_element().id, "head")?
         else {
-            return Ok(());
+            return Ok(Vec::new().into_boxed_slice());
         };
         let existing_title_id = state.optional_child_element_by_tag(head_id, "title")?;
+
+        let invalidated_handles = existing_title_id
+            .map(|title_id| state.invalidate_dropped_descendants(title_id))
+            .unwrap_or_default();
 
         state.mutate_document(|mutator| {
             let title_id = existing_title_id.unwrap_or_else(|| {
@@ -249,18 +360,127 @@ impl QuoxRenderer {
             }
 
             Ok(())
-        })
+        })?;
+        Ok(invalidated_handles.into_boxed_slice())
     }
 
-    /// Return the document `<body>` node id.
-    pub fn body(&self) -> Result<usize, JsValue> {
-        let state = self.state.borrow();
-        state.child_element_by_tag(state.document.root_element().id, "body")
+    /// Return the document `<body>` element's opaque public handle.
+    pub fn body(&self) -> Result<u32, JsValue> {
+        let mut state = self.state.borrow_mut();
+        let node_id = state.child_element_by_tag(state.document.root_element().id, "body")?;
+        state.expose_node(node_id)
     }
 
-    /// Return the document `<head>` node id.
-    pub fn head(&self) -> Result<usize, JsValue> {
-        let state = self.state.borrow();
-        state.child_element_by_tag(state.document.root_element().id, "head")
+    /// Return the document `<head>` element's opaque public handle.
+    pub fn head(&self) -> Result<u32, JsValue> {
+        let mut state = self.state.borrow_mut();
+        let node_id = state.child_element_by_tag(state.document.root_element().id, "head")?;
+        state.expose_node(node_id)
+    }
+
+    /// Return the browser `nodeType` value for a public handle. The TypeScript facade uses this
+    /// to select the correct cached wrapper class for hit-test and event targets.
+    pub fn node_kind(&self, node_handle: u32) -> Result<u8, JsValue> {
+        let mut state = self.state.borrow_mut();
+        let node_id = state.resolve_node(node_handle)?;
+        Ok(state.node_kind(node_id))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dropped_descendant_ids;
+    use crate::node_handles::NodeHandles;
+    use blitz_dom::{DocumentConfig, NodeData};
+    use blitz_html::{HtmlDocument, HtmlProvider};
+    use std::sync::Arc;
+
+    fn element_by_tag(document: &blitz_dom::BaseDocument, tag_name: &str) -> usize {
+        document
+            .tree()
+            .iter()
+            .find_map(|(node_id, node)| {
+                node.element_data()
+                    .is_some_and(|element| element.name.local.as_ref() == tag_name)
+                    .then_some(node_id)
+            })
+            .unwrap_or_else(|| panic!("test document should contain <{tag_name}>"))
+    }
+
+    #[test]
+    fn invalidates_dropped_descendants_before_blitz_reuses_their_raw_ids() {
+        let mut document = HtmlDocument::from_html(
+            "<!doctype html><html><body><section><span>old</span></section></body></html>",
+            DocumentConfig {
+                html_parser_provider: Some(Arc::new(HtmlProvider)),
+                ..DocumentConfig::default()
+            },
+        )
+        .into_inner();
+        let body_id = element_by_tag(&document, "body");
+        let old_section_id = element_by_tag(&document, "section");
+        let old_span_id = element_by_tag(&document, "span");
+        let mut handles = NodeHandles::default();
+
+        let dropped = dropped_descendant_ids(&document, body_id);
+        assert!(dropped.contains(&old_section_id));
+        assert!(dropped.contains(&old_span_id));
+        let old_handles = dropped
+            .iter()
+            .map(|node_id| {
+                (
+                    *node_id,
+                    handles.expose(*node_id).expect("old handle should fit"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let invalidated_handles = handles.invalidate_nodes(dropped.iter().copied());
+        assert_eq!(invalidated_handles.len(), dropped.len());
+        document
+            .mutate()
+            .set_inner_html(body_id, "<section>replacement</section>");
+
+        let replacement_id = element_by_tag(&document, "section");
+        assert!(
+            dropped.contains(&replacement_id),
+            "Blitz should reuse one of the freed descendant slab ids"
+        );
+        let stale_handle_for_reused_id = old_handles
+            .iter()
+            .find_map(|(node_id, handle)| (*node_id == replacement_id).then_some(*handle))
+            .expect("the reused id should have had an old public handle");
+        let replacement_handle = handles
+            .expose(replacement_id)
+            .expect("replacement handle should fit");
+
+        assert_ne!(replacement_handle, stale_handle_for_reused_id);
+        for (_, old_handle) in old_handles {
+            assert_eq!(handles.resolve(old_handle), None);
+        }
+        assert_eq!(handles.resolve(replacement_handle), Some(replacement_id));
+    }
+
+    #[test]
+    fn detaching_and_reattaching_a_node_preserves_its_handle() {
+        let mut document = HtmlDocument::from_html(
+            "<!doctype html><html><body><p>retained</p></body></html>",
+            DocumentConfig::default(),
+        )
+        .into_inner();
+        let body_id = element_by_tag(&document, "body");
+        let paragraph_id = element_by_tag(&document, "p");
+        assert!(matches!(
+            document.get_node(paragraph_id).map(|node| &node.data),
+            Some(NodeData::Element(_))
+        ));
+        let mut handles = NodeHandles::default();
+        let handle = handles.expose(paragraph_id).expect("handle should fit");
+
+        document.mutate().remove_node(paragraph_id);
+        assert!(document.get_node(paragraph_id).is_some());
+        assert_eq!(handles.expose(paragraph_id), Ok(handle));
+
+        document.mutate().append_children(body_id, &[paragraph_id]);
+        assert_eq!(handles.expose(paragraph_id), Ok(handle));
     }
 }

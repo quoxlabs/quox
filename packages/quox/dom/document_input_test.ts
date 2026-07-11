@@ -2,7 +2,6 @@ import { assertEquals, assertThrows } from "@std/assert";
 import type { QuoxRenderer as WasmRenderer } from "../lib/quox.js";
 import { QuoxDocument } from "./document.ts";
 import { setElementFunctionProp } from "./handlers.ts";
-import { QuoxElement } from "./node.ts";
 
 type Call = { method: string; args: unknown[] };
 
@@ -13,6 +12,10 @@ class FakeInputRenderer {
 
   title(): string {
     return "";
+  }
+
+  create_element(_tagName: string): number {
+    return 42;
   }
 
   dispatch_pointer_move(x: number, y: number, buttons: number, modifierBits: number): boolean {
@@ -85,6 +88,10 @@ class FakeInputRenderer {
   take_scroll_node(): number | undefined {
     return undefined;
   }
+
+  node_kind(_nodeHandle: number): number {
+    return 1;
+  }
 }
 
 function createDocument(renderer = new FakeInputRenderer()): {
@@ -138,7 +145,7 @@ Deno.test("keyboard dispatch forwards logical key, policy, and repeat without sy
 Deno.test("IME dispatch preserves UTF-8 preedit ranges and emits DOM input for commit", () => {
   const { document, renderer, syncs } = createDocument();
   let inputs = 0;
-  setElementFunctionProp(new QuoxElement(document, 42), "onInput", () => inputs++);
+  setElementFunctionProp(document.createElement("input"), "onInput", () => inputs++);
 
   document.dispatchIme({ type: "ime", kind: "enabled" });
   document.dispatchIme({ type: "ime", kind: "preedit", text: "éx", cursorRange: [2, 3] });
@@ -168,7 +175,7 @@ Deno.test("IME dispatch preserves UTF-8 preedit ranges and emits DOM input for c
 Deno.test("IME replacement dispatches surrounding deletion before commit and drains both inputs", () => {
   const { document, renderer, syncs } = createDocument();
   let inputs = 0;
-  setElementFunctionProp(new QuoxElement(document, 42), "onInput", () => inputs++);
+  setElementFunctionProp(document.createElement("input"), "onInput", () => inputs++);
 
   renderer.inputNode = 42;
   document.dispatchIme({

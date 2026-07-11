@@ -1,5 +1,6 @@
 mod dom;
 mod interaction;
+mod node_handles;
 mod render;
 
 use blitz_dom::{BaseDocument, DEFAULT_CSS, DocumentConfig, FontContext};
@@ -8,6 +9,7 @@ use blitz_traits::net::DummyNetProvider;
 use blitz_traits::shell::{ColorScheme, ShellProvider, Viewport};
 use interaction::RecordedEvents;
 use linebender_resource_handle::Blob;
+use node_handles::NodeHandles;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -52,6 +54,8 @@ struct QuoxRendererState {
     redraw_requested: Arc<AtomicBool>,
     ime_requests: Arc<ImeRequestMailbox>,
     recorded_events: RecordedEvents,
+    /// Stable public handles for Blitz's internally reusable slab node ids.
+    node_handles: NodeHandles,
 }
 
 const IME_REQUEST_CURSOR_AREA: u8 = 1 << 0;
@@ -307,6 +311,7 @@ impl QuoxRenderer {
                 redraw_requested,
                 ime_requests,
                 recorded_events: RecordedEvents::default(),
+                node_handles: NodeHandles::default(),
             }),
         })
     }

@@ -451,20 +451,26 @@ fn apply_ime_delete_surrounding(
 
 #[wasm_bindgen]
 impl QuoxRenderer {
-    /// Return the id of the topmost DOM node at the given logical viewport coordinates
+    /// Return the opaque public handle of the topmost DOM node at the given logical viewport coordinates
     /// (top-left origin — the same space `mousemove` events report), or `None`
     /// if nothing is hit (e.g. the point is outside the viewport, or nothing is there).
     /// Forces a layout resolve first, then delegates to Blitz's own hit-testing — which
     /// still has a known TODO for z-index disambiguation among plain overlapping siblings
     /// (see Blitz's `Node::hit`), so overlapping-sibling ordering isn't fully guaranteed.
-    pub fn node_from_point(&self, x: f32, y: f32) -> Option<usize> {
+    pub fn node_from_point(&self, x: f32, y: f32) -> Result<Option<u32>, JsValue> {
         let mut state = self.state.borrow_mut();
         state.sync_layout();
 
         let scroll = state.document.viewport_scroll();
-        let (page_x, page_y) =
-            viewport_point_to_page(x, y, state.width, state.height, scroll.x, scroll.y)?;
-        state.document.hit(page_x, page_y).map(|hit| hit.node_id)
+        let Some((page_x, page_y)) =
+            viewport_point_to_page(x, y, state.width, state.height, scroll.x, scroll.y)
+        else {
+            return Ok(None);
+        };
+        let Some(hit) = state.document.hit(page_x, page_y) else {
+            return Ok(None);
+        };
+        state.expose_public_dom_node(hit.node_id)
     }
 
     /// Feed a pointer-move event into Blitz (drives hover/`:hover`, cursor resolution, and
@@ -653,39 +659,67 @@ impl QuoxRenderer {
         state.redraw_requested.swap(false, Ordering::Relaxed)
     }
 
-    /// Drain the node id a `click` fired on since the last dispatch, if any.
-    pub fn take_click_node(&self) -> Option<usize> {
-        self.state.borrow_mut().recorded_events.click.take()
+    /// Drain the public node handle a `click` fired on since the last dispatch, if any.
+    pub fn take_click_node(&self) -> Result<Option<u32>, JsValue> {
+        let mut state = self.state.borrow_mut();
+        let Some(node_id) = state.recorded_events.click.take() else {
+            return Ok(None);
+        };
+        state.expose_public_dom_node(node_id)
     }
 
-    /// Drain the node id a `dblclick` fired on since the last dispatch, if any.
-    pub fn take_double_click_node(&self) -> Option<usize> {
-        self.state.borrow_mut().recorded_events.double_click.take()
+    /// Drain the public node handle a `dblclick` fired on since the last dispatch, if any.
+    pub fn take_double_click_node(&self) -> Result<Option<u32>, JsValue> {
+        let mut state = self.state.borrow_mut();
+        let Some(node_id) = state.recorded_events.double_click.take() else {
+            return Ok(None);
+        };
+        state.expose_public_dom_node(node_id)
     }
 
-    /// Drain the node id a `contextmenu` fired on since the last dispatch, if any.
-    pub fn take_context_menu_node(&self) -> Option<usize> {
-        self.state.borrow_mut().recorded_events.context_menu.take()
+    /// Drain the public node handle a `contextmenu` fired on since the last dispatch, if any.
+    pub fn take_context_menu_node(&self) -> Result<Option<u32>, JsValue> {
+        let mut state = self.state.borrow_mut();
+        let Some(node_id) = state.recorded_events.context_menu.take() else {
+            return Ok(None);
+        };
+        state.expose_public_dom_node(node_id)
     }
 
-    /// Drain the node id an `input` fired on since the last dispatch, if any.
-    pub fn take_input_node(&self) -> Option<usize> {
-        self.state.borrow_mut().recorded_events.input.take()
+    /// Drain the public node handle an `input` fired on since the last dispatch, if any.
+    pub fn take_input_node(&self) -> Result<Option<u32>, JsValue> {
+        let mut state = self.state.borrow_mut();
+        let Some(node_id) = state.recorded_events.input.take() else {
+            return Ok(None);
+        };
+        state.expose_public_dom_node(node_id)
     }
 
-    /// Drain the node id a `focus` fired on since the last dispatch, if any.
-    pub fn take_focus_node(&self) -> Option<usize> {
-        self.state.borrow_mut().recorded_events.focus.take()
+    /// Drain the public node handle a `focus` fired on since the last dispatch, if any.
+    pub fn take_focus_node(&self) -> Result<Option<u32>, JsValue> {
+        let mut state = self.state.borrow_mut();
+        let Some(node_id) = state.recorded_events.focus.take() else {
+            return Ok(None);
+        };
+        state.expose_public_dom_node(node_id)
     }
 
-    /// Drain the node id a `blur` fired on since the last dispatch, if any.
-    pub fn take_blur_node(&self) -> Option<usize> {
-        self.state.borrow_mut().recorded_events.blur.take()
+    /// Drain the public node handle a `blur` fired on since the last dispatch, if any.
+    pub fn take_blur_node(&self) -> Result<Option<u32>, JsValue> {
+        let mut state = self.state.borrow_mut();
+        let Some(node_id) = state.recorded_events.blur.take() else {
+            return Ok(None);
+        };
+        state.expose_public_dom_node(node_id)
     }
 
-    /// Drain the node id a `scroll` fired on since the last dispatch, if any.
-    pub fn take_scroll_node(&self) -> Option<usize> {
-        self.state.borrow_mut().recorded_events.scroll.take()
+    /// Drain the public node handle a `scroll` fired on since the last dispatch, if any.
+    pub fn take_scroll_node(&self) -> Result<Option<u32>, JsValue> {
+        let mut state = self.state.borrow_mut();
+        let Some(node_id) = state.recorded_events.scroll.take() else {
+            return Ok(None);
+        };
+        state.expose_public_dom_node(node_id)
     }
 }
 

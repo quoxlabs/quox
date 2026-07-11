@@ -1,5 +1,5 @@
 import { createVNode, Fragment, type QuoxRenderable, type QuoxVNodeType } from "@quoxlabs/jsx";
-import { assert, assertEquals, assertRejects } from "@std/assert";
+import { assert, assertEquals, assertRejects, assertStrictEquals } from "@std/assert";
 import type { QuoxRenderer as WasmRenderer } from "../lib/quox.js";
 import { QuoxDocument } from "./document.ts";
 import { getElementFunctionProps } from "./handlers.ts";
@@ -47,21 +47,24 @@ class FakeRenderer {
     return this.#title;
   }
 
-  set_title(value: string): void {
+  set_title(value: string): Uint32Array {
     this.#title = value;
+    return new Uint32Array();
   }
 
-  set_text_content(nodeId: number, value: string): void {
+  set_text_content(nodeId: number, value: string): Uint32Array {
     this.#text.set(nodeId, value);
+    return new Uint32Array();
   }
 
   remove_node(nodeId: number): void {
     void nodeId;
   }
 
-  set_inner_html(nodeId: number, html: string): void {
+  set_inner_html(nodeId: number, html: string): Uint32Array {
     void nodeId;
     void html;
+    return new Uint32Array();
   }
 
   document_element(): number {
@@ -87,6 +90,10 @@ class FakeRenderer {
   node_from_point(x: number, y: number): number | undefined {
     this.#lastHitPoint = { x, y };
     return this.#hitNodeId;
+  }
+
+  node_kind(nodeHandle: number): number {
+    return this.#text.has(nodeHandle) ? 3 : 1;
   }
 
   setHitNodeId(id: number | undefined): void {
@@ -115,7 +122,7 @@ function createTestDocument(setNativeTitle?: (title: string) => void): {
   return {
     document,
     renderer,
-    root: new QuoxElement(document, 0),
+    root: document.documentElement,
   };
 }
 
@@ -414,6 +421,14 @@ Deno.test("document.nodeFromPoint wraps the hit node id", () => {
 
   assert(hit instanceof QuoxNode);
   assertEquals(hit?.nodeId, 5);
+});
+
+Deno.test("document returns the cached wrapper for a hit node", () => {
+  const { document, renderer } = createTestDocument();
+  const element = document.createElement("button");
+  renderer.setHitNodeId(element.nodeId);
+
+  assertStrictEquals(document.nodeFromPoint(10, 20), element);
 });
 
 Deno.test("document.nodeFromPoint forwards coordinates unchanged", () => {

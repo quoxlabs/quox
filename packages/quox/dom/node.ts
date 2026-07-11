@@ -3,7 +3,13 @@ import { documentInternals } from "./internals.ts";
 
 export type QuoxInnerHTML = string;
 
+type InvalidatingNodeRenderer = {
+  set_text_content(nodeHandle: number, value: string): Uint32Array;
+  set_inner_html(nodeHandle: number, html: string): Uint32Array;
+};
+
 export class QuoxNode {
+  /** Opaque document-local handle. Its numeric value has no relationship to Blitz's slab id. */
   constructor(
     readonly ownerDocument: QuoxDocument,
     readonly nodeId: number,
@@ -14,8 +20,9 @@ export class QuoxNode {
   }
 
   set textContent(value: string | null) {
-    const { renderer, requestRender } = documentInternals(this.ownerDocument);
-    renderer.set_text_content(this.nodeId, value ?? "");
+    const { invalidateNodeHandles, renderer, requestRender } = documentInternals(this.ownerDocument);
+    const invalidated = (renderer as unknown as InvalidatingNodeRenderer).set_text_content(this.nodeId, value ?? "");
+    invalidateNodeHandles(invalidated);
     requestRender();
   }
 
@@ -39,9 +46,10 @@ export class QuoxNode {
 
 export class QuoxElement extends QuoxNode {
   set innerHTML(value: QuoxInnerHTML) {
-    const { renderer, requestRender } = documentInternals(this.ownerDocument);
+    const { invalidateNodeHandles, renderer, requestRender } = documentInternals(this.ownerDocument);
     const html = value;
-    renderer.set_inner_html(this.nodeId, html);
+    const invalidated = (renderer as unknown as InvalidatingNodeRenderer).set_inner_html(this.nodeId, html);
+    invalidateNodeHandles(invalidated);
     requestRender();
   }
 

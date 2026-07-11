@@ -7,10 +7,13 @@ import {
   type QuoxKeyboardEvent,
 } from "./input.ts";
 import { type AssertActive, attachDocumentInternals, type RequestRender } from "./internals.ts";
-import { QuoxElement, QuoxNode, QuoxText } from "./node.ts";
+import { ELEMENT_NODE, QuoxNodeCache, TEXT_NODE } from "./node_cache.ts";
+import type { QuoxElement, QuoxNode, QuoxText } from "./node.ts";
 
 type SetNativeTitle = (title: string) => void;
 type SyncNativeImeRequests = () => void;
+type NodeKindRenderer = WasmRenderer & { node_kind(nodeHandle: number): number };
+type InvalidatingTitleRenderer = WasmRenderer & { set_title(title: string): Uint32Array };
 
 /**
  * Maps the DOM event kinds quox can invoke a JS handler for to their JSX prop name.
@@ -33,6 +36,7 @@ export class QuoxDocument {
   readonly #assertActive: AssertActive;
   readonly #setNativeTitle: SetNativeTitle;
   readonly #syncNativeImeRequests: SyncNativeImeRequests;
+  readonly #nodes: QuoxNodeCache;
   #lastNativeTitle: string;
 
   constructor(
@@ -47,8 +51,14 @@ export class QuoxDocument {
     this.#assertActive = assertActive;
     this.#setNativeTitle = setNativeTitle;
     this.#syncNativeImeRequests = syncNativeImeRequests;
+    this.#nodes = new QuoxNodeCache(this);
     this.#lastNativeTitle = renderer.title();
-    attachDocumentInternals(this, { renderer, requestRender, assertActive });
+    attachDocumentInternals(this, {
+      renderer,
+      requestRender,
+      assertActive,
+      invalidateNodeHandles: (nodeHandles) => this.#nodes.invalidate(nodeHandles),
+    });
   }
 
   get title(): string {
@@ -59,7 +69,8 @@ export class QuoxDocument {
   set title(value: string) {
     this.#assertActive();
     const title = String(value);
-    this.#renderer.set_title(title);
+    const invalidated = (this.#renderer as unknown as InvalidatingTitleRenderer).set_title(title);
+    this.#nodes.invalidate(invalidated);
     this.#lastNativeTitle = title;
     this.#setNativeTitle(title);
     this.#requestRender();
@@ -82,17 +93,17 @@ export class QuoxDocument {
 
   get documentElement(): QuoxElement {
     this.#assertActive();
-    return new QuoxElement(this, this.#renderer.document_element());
+    return this.#nodes.get(this.#renderer.document_element(), ELEMENT_NODE);
   }
 
   get head(): QuoxElement {
     this.#assertActive();
-    return new QuoxElement(this, this.#renderer.head());
+    return this.#nodes.get(this.#renderer.head(), ELEMENT_NODE);
   }
 
   get body(): QuoxElement {
     this.#assertActive();
-    return new QuoxElement(this, this.#renderer.body());
+    return this.#nodes.get(this.#renderer.body(), ELEMENT_NODE);
   }
 
   /**
@@ -102,8 +113,8 @@ export class QuoxDocument {
    */
   nodeFromPoint(x: number, y: number): QuoxNode | null {
     this.#assertActive();
-    const nodeId = this.#renderer.node_from_point(x, y);
-    return nodeId === undefined ? null : new QuoxNode(this, nodeId);
+    const nodeHandle = this.#renderer.node_from_point(x, y);
+    return nodeHandle === undefined ? null : this.#nodeForHandle(nodeHandle);
   }
 
   /** Feed a pointer-move event into Blitz. Drives hover/`:hover` and cursor resolution. */
@@ -205,20 +216,25 @@ export class QuoxDocument {
     this.#invokeHandler(this.#renderer.take_scroll_node(), "scroll");
   }
 
-  #invokeHandler(nodeId: number | undefined, kind: keyof typeof EVENT_KIND_TO_PROP): void {
-    if (nodeId === undefined) return;
-    const handlers = getElementFunctionProps(new QuoxNode(this, nodeId));
+  #invokeHandler(nodeHandle: number | undefined, kind: keyof typeof EVENT_KIND_TO_PROP): void {
+    if (nodeHandle === undefined) return;
+    const handlers = getElementFunctionProps(this.#nodeForHandle(nodeHandle));
     handlers?.get(EVENT_KIND_TO_PROP[kind])?.();
+  }
+
+  #nodeForHandle(nodeHandle: number): QuoxNode {
+    const nodeKind = (this.#renderer as NodeKindRenderer).node_kind(nodeHandle);
+    return this.#nodes.get(nodeHandle, nodeKind);
   }
 
   createElement(tagName: string): QuoxElement {
     this.#assertActive();
-    return new QuoxElement(this, this.#renderer.create_element(tagName));
+    return this.#nodes.get(this.#renderer.create_element(tagName), ELEMENT_NODE);
   }
 
   createTextNode(text: string): QuoxText {
     this.#assertActive();
-    return new QuoxText(this, this.#renderer.create_text_node(text));
+    return this.#nodes.get(this.#renderer.create_text_node(text), TEXT_NODE);
   }
 }
 
