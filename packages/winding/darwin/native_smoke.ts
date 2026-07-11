@@ -359,6 +359,10 @@ function testBlitStorageLifetime(): void {
       handles.push(cf);
 
       const pixels = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+      assertThrowsMessage(() => window.blit(pixels, 0, 1), "positive safe integers");
+      assertThrowsMessage(() => window.blit(pixels, 1.5, 1), "positive safe integers");
+      assertThrowsMessage(() => window.blit(pixels, 1, 2), "do not match client size");
+      assertThrowsMessage(() => window.blit(pixels.subarray(0, 7), 2, 1), "expected 8");
       window.blit(pixels, 2, 1);
       pixels.fill(0);
 

@@ -256,6 +256,34 @@ function readInputString(value: Deno.PointerValue, ffi: DarwinFfi): string {
   return string === null ? "" : readCFString(cf, string);
 }
 
+function validatedBlitGeometry(
+  rgba: Uint8Array,
+  width: number,
+  height: number,
+  expectedWidth: number,
+  expectedHeight: number,
+): { rowBytes: bigint; totalBytes: number } {
+  if (!Number.isSafeInteger(width) || width <= 0 || !Number.isSafeInteger(height) || height <= 0) {
+    throw new RangeError("winding(darwin): blit dimensions must be positive safe integers");
+  }
+  if (width !== expectedWidth || height !== expectedHeight) {
+    throw new RangeError(
+      `winding(darwin): blit dimensions ${width}x${height} do not match client size ${expectedWidth}x${expectedHeight}`,
+    );
+  }
+  const rowBytes = width * 4;
+  const totalBytes = rowBytes * height;
+  if (!Number.isSafeInteger(rowBytes) || !Number.isSafeInteger(totalBytes)) {
+    throw new RangeError("winding(darwin): blit byte size exceeds exact JavaScript/size_t range");
+  }
+  if (rgba.byteLength !== totalBytes) {
+    throw new RangeError(
+      `winding(darwin): RGBA buffer has ${rgba.byteLength} bytes; expected ${totalBytes}`,
+    );
+  }
+  return { rowBytes: BigInt(rowBytes), totalBytes };
+}
+
 class DarwinWindow implements Window, DarwinNativeResponder {
   readonly id: bigint;
   readonly nsWindow: Deno.PointerValue;
@@ -822,34 +850,44 @@ class DarwinWindow implements Window, DarwinNativeResponder {
   blit(rgba: Uint8Array, width: number, height: number): void {
     this.#assertOpen();
     const { cf, cg, sel, send } = this.lib.ffi;
+    const { rowBytes } = validatedBlitGeometry(rgba, width, height, this.#width, this.#height);
     // CFDataCreate copies the bytes into immutable native-owned storage. The
     // provider retains that storage until the last CGImage/CALayer reference
     // is gone, so no JavaScript buffer needs an approximate lifetime root.
-    const data = cf.symbols.CFDataCreate(null, rgba, BigInt(rgba.byteLength));
-    if (data === null) throw new Error("winding(darwin): CFDataCreate failed");
-    const provider = cg.symbols.CGDataProviderCreateWithCFData(data);
-    cf.symbols.CFRelease(data);
-    if (provider === null) throw new Error("winding(darwin): CGDataProviderCreateWithCFData failed");
-    const image = cg.symbols.CGImageCreate(
-      BigInt(width),
-      BigInt(height),
-      8n,
-      32n,
-      BigInt(width * 4),
-      this.lib.colorSpace,
-      RGBA_BITMAP_INFO,
-      provider,
-      null,
-      false,
-      0,
-    );
-    cf.symbols.CFRelease(provider);
-    if (image === null) throw new Error("winding(darwin): CGImageCreate failed");
-    send.void_id(this.#layer, sel("setContents:"), image);
-    cf.symbols.CFRelease(image);
-
-    this.#width = width;
-    this.#height = height;
+    let data: Deno.PointerValue = null;
+    let provider: Deno.PointerValue = null;
+    let image: Deno.PointerValue = null;
+    try {
+      data = cf.symbols.CFDataCreate(null, rgba, BigInt(rgba.byteLength));
+      if (data === null) throw new Error("winding(darwin): CFDataCreate failed");
+      provider = cg.symbols.CGDataProviderCreateWithCFData(data);
+      if (provider === null) throw new Error("winding(darwin): CGDataProviderCreateWithCFData failed");
+      image = cg.symbols.CGImageCreate(
+        BigInt(width),
+        BigInt(height),
+        8n,
+        32n,
+        rowBytes,
+        this.lib.colorSpace,
+        RGBA_BITMAP_INFO,
+        provider,
+        null,
+        false,
+        0,
+      );
+      if (image === null) throw new Error("winding(darwin): CGImageCreate failed");
+      send.void_id(this.#layer, sel("setContents:"), image);
+    } finally {
+      try {
+        if (image !== null) cf.symbols.CFRelease(image);
+      } finally {
+        try {
+          if (provider !== null) cf.symbols.CFRelease(provider);
+        } finally {
+          if (data !== null) cf.symbols.CFRelease(data);
+        }
+      }
+    }
   }
 
   [Symbol.dispose](): void {
