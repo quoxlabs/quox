@@ -504,7 +504,7 @@ function testBlitStorageLifetime(): void {
       assertThrowsMessage(() => window.blit(pixels, 1.5, height), "positive safe integers");
       assertThrowsMessage(
         () => window.blit(pixels, width + 1, height),
-        "do not match client size",
+        "do not match framebuffer size",
       );
       assertThrowsMessage(
         () => window.blit(pixels.subarray(0, byteLength - 1), width, height),
