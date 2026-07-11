@@ -36,6 +36,8 @@ type InterfaceKey =
   | "cursorShapeManager"
   | "cursorShapeDevice"
   | "tabletToolV2"
+  | "decorationManager"
+  | "toplevelDecoration"
   | "textInputManager"
   | "textInput";
 
@@ -52,6 +54,34 @@ export const CURSOR_SHAPE_MANAGER_V1_REQUESTS = [
   { name: "get_pointer", signature: "no", objectTypes: ["cursorShapeDevice", "wlPointer"] },
   { name: "get_tablet_tool_v2", signature: "no", objectTypes: ["cursorShapeDevice", "tabletToolV2"] },
 ] as const;
+
+export const XDG_DECORATION_PROTOCOL_METADATA = {
+  manager: {
+    name: "zxdg_decoration_manager_v1",
+    version: 2,
+    requests: [
+      { name: "destroy", signature: "", objectTypes: [] },
+      {
+        name: "get_toplevel_decoration",
+        signature: "no",
+        objectTypes: ["toplevelDecoration", "xdgToplevel"],
+      },
+    ],
+    events: [],
+  },
+  toplevelDecoration: {
+    name: "zxdg_toplevel_decoration_v1",
+    version: 2,
+    requests: [
+      { name: "destroy", signature: "", objectTypes: [] },
+      { name: "set_mode", signature: "u", objectTypes: [] },
+      { name: "unset_mode", signature: "", objectTypes: [] },
+    ],
+    events: [
+      { name: "configure", signature: "u", objectTypes: [] },
+    ],
+  },
+} as const;
 
 function validateTypes(
   messageName: string,
@@ -80,6 +110,8 @@ export interface XdgIfaces {
   xdgToplevelIface: Deno.PointerObject;
   wpCursorShapeManagerIface: Deno.PointerObject;
   wpCursorShapeDeviceIface: Deno.PointerObject;
+  zxdgDecorationManagerIface: Deno.PointerObject;
+  zxdgToplevelDecorationIface: Deno.PointerObject;
   zwpTextInputManagerIface: Deno.PointerObject;
   zwpTextInputIface: Deno.PointerObject;
 }
@@ -170,6 +202,20 @@ export function buildXdgIfaces(
       request.objectTypes.length === 0
         ? undefined
         : request.objectTypes.map((type) => type === "wlPointer" ? wlPointerIface : type),
+    ]);
+  }
+
+  function localProtocolMessages(
+    messages: readonly {
+      readonly name: string;
+      readonly signature: string;
+      readonly objectTypes: readonly InterfaceKey[];
+    }[],
+  ): MessageDef[] {
+    return messages.map((message) => [
+      message.name,
+      message.signature,
+      message.objectTypes.length === 0 ? undefined : [...message.objectTypes],
     ]);
   }
 
@@ -287,6 +333,20 @@ export function buildXdgIfaces(
       events: [],
     },
     {
+      key: "decorationManager",
+      name: XDG_DECORATION_PROTOCOL_METADATA.manager.name,
+      version: XDG_DECORATION_PROTOCOL_METADATA.manager.version,
+      methods: localProtocolMessages(XDG_DECORATION_PROTOCOL_METADATA.manager.requests),
+      events: localProtocolMessages(XDG_DECORATION_PROTOCOL_METADATA.manager.events),
+    },
+    {
+      key: "toplevelDecoration",
+      name: XDG_DECORATION_PROTOCOL_METADATA.toplevelDecoration.name,
+      version: XDG_DECORATION_PROTOCOL_METADATA.toplevelDecoration.version,
+      methods: localProtocolMessages(XDG_DECORATION_PROTOCOL_METADATA.toplevelDecoration.requests),
+      events: localProtocolMessages(XDG_DECORATION_PROTOCOL_METADATA.toplevelDecoration.events),
+    },
+    {
       key: "textInput",
       name: "zwp_text_input_v3",
       version: 1,
@@ -343,6 +403,8 @@ export function buildXdgIfaces(
   const xdgToplevelIface = interfacePointer("xdgToplevel");
   const wpCursorShapeManagerIface = interfacePointer("cursorShapeManager");
   const wpCursorShapeDeviceIface = interfacePointer("cursorShapeDevice");
+  const zxdgDecorationManagerIface = interfacePointer("decorationManager");
+  const zxdgToplevelDecorationIface = interfacePointer("toplevelDecoration");
   const zwpTextInputManagerIface = interfacePointer("textInputManager");
   const zwpTextInputIface = interfacePointer("textInput");
 
@@ -353,6 +415,8 @@ export function buildXdgIfaces(
     xdgToplevelIface,
     wpCursorShapeManagerIface,
     wpCursorShapeDeviceIface,
+    zxdgDecorationManagerIface,
+    zxdgToplevelDecorationIface,
     zwpTextInputManagerIface,
     zwpTextInputIface,
   };
@@ -404,6 +468,13 @@ export const WlOp = {
   XDG_TOPLEVEL_DESTROY: 0,
   XDG_TOPLEVEL_SET_TITLE: 2,
   XDG_TOPLEVEL_SET_APP_ID: 3,
+  // zxdg_decoration_manager_v1 requests
+  ZXDG_DECORATION_MANAGER_DESTROY: 0,
+  ZXDG_DECORATION_MANAGER_GET_TOPLEVEL_DECORATION: 1,
+  // zxdg_toplevel_decoration_v1 requests
+  ZXDG_TOPLEVEL_DECORATION_DESTROY: 0,
+  ZXDG_TOPLEVEL_DECORATION_SET_MODE: 1,
+  ZXDG_TOPLEVEL_DECORATION_UNSET_MODE: 2,
   // wp_cursor_shape_manager_v1 requests
   WP_CURSOR_SHAPE_MANAGER_DESTROY: 0,
   WP_CURSOR_SHAPE_MANAGER_GET_POINTER: 1,

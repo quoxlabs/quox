@@ -5,6 +5,7 @@ export const WAYLAND_GLOBAL_INTERFACES = [
   "wl_shm",
   "wl_seat",
   "xdg_wm_base",
+  "zxdg_decoration_manager_v1",
   "wp_cursor_shape_manager_v1",
   "zwp_text_input_manager_v3",
 ] as const;

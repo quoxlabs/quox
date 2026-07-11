@@ -45,6 +45,7 @@ import {
   WaylandGlobalRegistry,
 } from "./global_registry.ts";
 import { WaylandPointerFrameAccumulator, WaylandPointerPosition } from "./pointer.ts";
+import { type WaylandDecorationManagerBinding, WaylandDecorationManagerState } from "./decoration.ts";
 
 const LIBC_SO = "libc.so.6";
 const LIBDL_SO = "libdl.so.2";
@@ -88,6 +89,8 @@ class WaylandLibrary implements Library {
   readonly xdgToplevelIface!: Deno.PointerObject;
   readonly wpCursorShapeManagerIface!: Deno.PointerObject;
   readonly wpCursorShapeDeviceIface!: Deno.PointerObject;
+  readonly zxdgDecorationManagerIface!: Deno.PointerObject;
+  readonly zxdgToplevelDecorationIface!: Deno.PointerObject;
   readonly zwpTextInputManagerIface!: Deno.PointerObject;
   readonly zwpTextInputIface!: Deno.PointerObject;
   readonly ifaces!: {
@@ -113,6 +116,7 @@ class WaylandLibrary implements Library {
   #shmFormatListener: AnyCallback | null = null;
   #shmFormatVtable: BigUint64Array<ArrayBuffer> | undefined;
   xdgWmBase: Deno.PointerObject | null = null;
+  readonly #decorationManagers = new WaylandDecorationManagerState<Deno.PointerObject>();
   #cursorShapeManager: Deno.PointerObject | null = null;
   #cursorShapeDevice: Deno.PointerObject | null = null;
   #coreCursorSurface: Deno.PointerObject | null = null;
@@ -143,6 +147,8 @@ class WaylandLibrary implements Library {
   // All listeners kept alive to prevent GC
   #listeners: AnyCallback[] = [];
   #vtables: BigUint64Array<ArrayBuffer>[] = [];
+  readonly #retainedCallbackRoots = new Set<AnyCallback>();
+  readonly #retainedNativeResourceRoots = new Set<object>();
   // pollfd buffer for non-blocking display read
   #pollFd = new Uint8Array(8) as Uint8Array<ArrayBuffer>; // struct pollfd {int fd; short events; short revents;}
   #initialized = false;
@@ -195,6 +201,8 @@ class WaylandLibrary implements Library {
         xdgToplevelIface,
         wpCursorShapeManagerIface,
         wpCursorShapeDeviceIface,
+        zxdgDecorationManagerIface,
+        zxdgToplevelDecorationIface,
         zwpTextInputManagerIface,
         zwpTextInputIface,
       } = buildXdgIfaces(ifaces.seat, ifaces.surface, ifaces.pointer, ifaces.output);
@@ -204,6 +212,8 @@ class WaylandLibrary implements Library {
       this.xdgToplevelIface = xdgToplevelIface;
       this.wpCursorShapeManagerIface = wpCursorShapeManagerIface;
       this.wpCursorShapeDeviceIface = wpCursorShapeDeviceIface;
+      this.zxdgDecorationManagerIface = zxdgDecorationManagerIface;
+      this.zxdgToplevelDecorationIface = zxdgToplevelDecorationIface;
       this.zwpTextInputManagerIface = zwpTextInputManagerIface;
       this.zwpTextInputIface = zwpTextInputIface;
       this.ifaces = ifaces;
@@ -267,6 +277,10 @@ class WaylandLibrary implements Library {
       this.#events.close();
       cleanup.fail(error, "winding failed to initialize Wayland library");
     }
+  }
+
+  get decorationManager(): WaylandDecorationManagerBinding<Deno.PointerObject> | undefined {
+    return this.#decorationManagers.current;
   }
 
   #initGlobals(): void {
@@ -335,6 +349,9 @@ class WaylandLibrary implements Library {
     } else if (offer.interface === "xdg_wm_base") {
       ifacePtr = this.xdgWmBaseIface;
       version = Math.min(offer.offeredVersion, 7);
+    } else if (offer.interface === "zxdg_decoration_manager_v1") {
+      ifacePtr = this.zxdgDecorationManagerIface;
+      version = Math.min(offer.offeredVersion, 2);
     } else if (offer.interface === "wp_cursor_shape_manager_v1") {
       ifacePtr = this.wpCursorShapeManagerIface;
       version = Math.min(offer.offeredVersion, 1);
@@ -373,6 +390,9 @@ class WaylandLibrary implements Library {
       } else if (offer.interface === "xdg_wm_base") {
         this.xdgWmBase = proxy;
         this.#setupXdgWmBaseListener(proxy);
+      } else if (offer.interface === "zxdg_decoration_manager_v1") {
+        this.#decorationManagers.bind(proxy, version);
+        for (const window of this.windows) window.tryCreateDecoration();
       } else if (offer.interface === "wp_cursor_shape_manager_v1") {
         this.#cursorShapeManager = proxy;
         this.#ensureCursorShapeDevice();
@@ -385,6 +405,7 @@ class WaylandLibrary implements Library {
         throw new AggregateError([error, cleanupError], `failed to bind and unwind ${offer.interface}`);
       }
       if (
+        offer.interface === "zxdg_decoration_manager_v1" ||
         offer.interface === "wp_cursor_shape_manager_v1" ||
         offer.interface === "zwp_text_input_manager_v3"
       ) return null;
@@ -438,6 +459,18 @@ class WaylandLibrary implements Library {
       });
       if (listener) collectCleanupError(errors, () => listener.close());
       throwCleanupErrors("winding failed to release the Wayland window factory", errors);
+      return;
+    }
+    if (global.interface === "zxdg_decoration_manager_v1") {
+      this.#decorationManagers.unbind(proxy);
+      this.wl.symbols.wl_proxy_marshal_array_flags(
+        proxy,
+        WlOp.ZXDG_DECORATION_MANAGER_DESTROY,
+        null,
+        this.wl.symbols.wl_proxy_get_version(proxy),
+        WL_MARSHAL_FLAG_DESTROY,
+        args(),
+      );
       return;
     }
     if (global.interface === "wp_cursor_shape_manager_v1") {
@@ -1040,6 +1073,22 @@ class WaylandLibrary implements Library {
     return guardNativeCallback(this.#callbackErrors, callback, () => {});
   }
 
+  retainNativeCallbackRoot(callback: AnyCallback): void {
+    this.#retainedCallbackRoots.add(callback);
+  }
+
+  releaseNativeCallbackRoot(callback: AnyCallback): void {
+    this.#retainedCallbackRoots.delete(callback);
+  }
+
+  retainNativeResourceRoot(resource: object): void {
+    this.#retainedNativeResourceRoots.add(resource);
+  }
+
+  releaseNativeResourceRoot(resource: object): void {
+    this.#retainedNativeResourceRoots.delete(resource);
+  }
+
   throwCallbackError(): void {
     this.#callbackErrors.throwIfPending();
   }
@@ -1222,9 +1271,21 @@ class WaylandLibrary implements Library {
     collectCleanupError(errors, () => this.#closeProtocolInitialization());
     collectCleanupError(errors, () => this.#textInputController.close());
     collectCleanupError(errors, () => this.#keyboardController.close());
-    collectCleanupError(errors, () => this.noops.close());
     collectCleanupError(errors, () => this.xkb.close());
-    collectCleanupError(errors, () => this.wl.symbols.wl_display_disconnect(this.display));
+    let disconnected = false;
+    collectCleanupError(errors, () => {
+      this.wl.symbols.wl_display_disconnect(this.display);
+      disconnected = true;
+    });
+    if (disconnected) {
+      const retainedCallbackRoots = [...this.#retainedCallbackRoots];
+      this.#retainedCallbackRoots.clear();
+      for (const callback of retainedCallbackRoots) collectCleanupError(errors, () => callback.close());
+      this.#retainedNativeResourceRoots.clear();
+      collectCleanupError(errors, () => this.noops.close());
+    } else if (this.#retainedNativeResourceRoots.size === 0) {
+      collectCleanupError(errors, () => this.noops.close());
+    }
     collectCleanupError(errors, () => this.wl.close());
     collectCleanupError(errors, () => {
       if (this.libdl.symbols.dlclose(this.#wlHandle) !== 0) {

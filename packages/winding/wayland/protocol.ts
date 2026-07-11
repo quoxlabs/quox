@@ -87,6 +87,9 @@ export const XDG_TOPLEVEL_EVENT_SIGNATURES = [
   ["pointer", "pointer", "i32", "i32"],
   ["pointer", "pointer", "pointer"],
 ] as const satisfies readonly WaylandEventSignature[];
+export const XDG_TOPLEVEL_DECORATION_EVENT_SIGNATURES = [
+  ["pointer", "pointer", "u32"],
+] as const satisfies readonly WaylandEventSignature[];
 export const TEXT_INPUT_V3_EVENT_SIGNATURES = [
   ["pointer", "pointer", "pointer"],
   ["pointer", "pointer", "pointer"],

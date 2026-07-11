@@ -14,9 +14,18 @@ import {
   throwCleanupErrors,
   WL_MARSHAL_FLAG_DESTROY,
   XDG_SURFACE_EVENT_SIGNATURES,
+  XDG_TOPLEVEL_DECORATION_EVENT_SIGNATURES,
   XDG_TOPLEVEL_EVENT_SIGNATURES,
 } from "./protocol.ts";
 import { createOpaqueBlackFrame, WaylandShmBuffer, type WaylandShmHost } from "./shm_buffer.ts";
+import {
+  setupServerSideDecorationBeforeInitialCommit,
+  tryDestroyWaylandDecoration,
+  type WaylandDecorationGeneration,
+  WaylandDecorationLifecycle,
+  type WaylandDecorationManagerBinding,
+  WaylandDecorationMode,
+} from "./decoration.ts";
 
 export const DEFAULT_WAYLAND_APP_ID = "winding";
 
@@ -107,6 +116,8 @@ export interface WaylandWindowHost extends NativeCallbackHost, WaylandShmHost {
   readonly xdgWmBase: Deno.PointerObject | null;
   readonly xdgSurfaceIface: Deno.PointerObject;
   readonly xdgToplevelIface: Deno.PointerObject;
+  readonly zxdgToplevelDecorationIface: Deno.PointerObject;
+  readonly decorationManager: WaylandDecorationManagerBinding<Deno.PointerObject> | undefined;
   readonly ifaces: {
     readonly surface: Deno.PointerObject;
     readonly shmPool: Deno.PointerObject;
@@ -120,6 +131,10 @@ export interface WaylandWindowHost extends NativeCallbackHost, WaylandShmHost {
   throwCallbackError(): void;
   roundtripDisplay(context: string): void;
   flushDisplay(context: string): void;
+  retainNativeCallbackRoot(callback: AnyCallback): void;
+  releaseNativeCallbackRoot(callback: AnyCallback): void;
+  retainNativeResourceRoot(resource: object): void;
+  releaseNativeResourceRoot(resource: object): void;
 }
 
 export class WaylandWindow implements Window {
@@ -131,6 +146,11 @@ export class WaylandWindow implements Window {
   #xdgSurfaceConfigure: AnyCallback | null = null;
   #toplevelConfigure: AnyCallback | null = null;
   #toplevelClose: AnyCallback | null = null;
+  #decoration: Deno.PointerObject | null = null;
+  #decorationGeneration: WaylandDecorationGeneration | undefined;
+  #decorationConfigure: AnyCallback | null = null;
+  #decorationVtable: BigUint64Array<ArrayBuffer> | undefined;
+  readonly #decorationLifecycle = new WaylandDecorationLifecycle();
   readonly #shmBuffer: WaylandShmBuffer;
   readonly #configureState: WaylandConfigureState;
   #configuration: WaylandConfiguration | undefined;
@@ -182,22 +202,32 @@ export class WaylandWindow implements Window {
       this.setTitle("winding");
       lib.registerWindow(this.#surface, this);
       this.#registered = true;
-      setDefaultWaylandAppIdBeforeInitialCommit(
-        (appId) => this.#setAppId(appId),
+      setupServerSideDecorationBeforeInitialCommit(
+        (preferredMode) => this.tryCreateDecoration(preferredMode),
         () =>
-          symbols.wl_proxy_marshal_array_flags(
-            this.#surface!,
-            WlOp.SURFACE_COMMIT,
-            null,
-            symbols.wl_proxy_get_version(this.#surface!),
-            0,
-            args(),
+          setDefaultWaylandAppIdBeforeInitialCommit(
+            (appId) => this.#setAppId(appId),
+            () => {
+              symbols.wl_proxy_marshal_array_flags(
+                this.#surface!,
+                WlOp.SURFACE_COMMIT,
+                null,
+                symbols.wl_proxy_get_version(this.#surface!),
+                0,
+                args(),
+              );
+              this.#decorationLifecycle.markInitialSurfaceCommit();
+            },
           ),
       );
       lib.roundtripDisplay("initial window configure");
+      if (this.#decorationLifecycle.awaitingInitialConfigure) {
+        lib.roundtripDisplay("late initial window decoration configure");
+      }
       lib.throwCallbackError();
       const configuration = this.#configuration;
       if (!configuration) throw new Error("winding Wayland compositor did not send an initial configure");
+      this.#abandonUnconfiguredInitialDecoration();
       this.#present(
         createOpaqueBlackFrame(configuration.width, configuration.height),
         configuration.width,
@@ -223,6 +253,56 @@ export class WaylandWindow implements Window {
 
   get imeSurroundingText(): WaylandSurroundingTextState | undefined {
     return this.#imeSurroundingText;
+  }
+
+  tryCreateDecoration(preferredMode: WaylandDecorationMode = WaylandDecorationMode.serverSide): void {
+    if (this.#closed || !this.#xdgToplevel || this.#decoration) return;
+    const binding = this.lib.decorationManager;
+    if (binding === undefined) return;
+    const generation = this.#decorationLifecycle.begin(binding.generation, binding.version);
+    if (generation === undefined) return;
+    this.#decorationGeneration = generation;
+
+    try {
+      const symbols = this.lib.wl.symbols;
+      const decoration = symbols.wl_proxy_marshal_array_flags(
+        binding.manager,
+        WlOp.ZXDG_DECORATION_MANAGER_GET_TOPLEVEL_DECORATION,
+        this.lib.zxdgToplevelDecorationIface,
+        binding.version,
+        0,
+        args(0n, Deno.UnsafePointer.value(this.#xdgToplevel)),
+      );
+      if (!decoration) throw new Error("winding could not create an optional Wayland toplevel decoration");
+      this.#decoration = decoration;
+
+      const configure = new Deno.UnsafeCallback(
+        { parameters: ["pointer", "pointer", "u32"], result: "void" },
+        this.lib.guardCallback((_data, _decoration, mode) => {
+          this.#decorationLifecycle.configure(generation, mode);
+        }),
+      );
+      this.#decorationConfigure = configure;
+      const vtable = makeVtable(
+        [configure],
+        XDG_TOPLEVEL_DECORATION_EVENT_SIGNATURES,
+        this.lib.noops,
+      );
+      this.#decorationVtable = vtable;
+      if (symbols.wl_proxy_add_listener(decoration, Deno.UnsafePointer.of(vtable), null) !== 0) {
+        throw new Error("winding could not listen to an optional Wayland toplevel decoration");
+      }
+      symbols.wl_proxy_marshal_array_flags(
+        decoration,
+        WlOp.ZXDG_TOPLEVEL_DECORATION_SET_MODE,
+        null,
+        symbols.wl_proxy_get_version(decoration),
+        0,
+        args(BigInt(preferredMode)),
+      );
+    } catch {
+      this.#cleanupDecoration([]);
+    }
   }
 
   #setupListeners(): void {
@@ -369,6 +449,10 @@ export class WaylandWindow implements Window {
 
   #present(rgba: Uint8Array, width: number, height: number, configuration: WaylandConfiguration): void {
     if (!this.#surface) return;
+    if (!this.#decorationLifecycle.canAttachInitialBuffer) {
+      this.#abandonUnconfiguredInitialDecoration();
+      if (!this.#decorationLifecycle.canAttachInitialBuffer) return;
+    }
     const attachment = this.#shmBuffer.write(rgba, width, height);
     if (!attachment) return;
     this.#ackConfiguration(configuration);
@@ -398,6 +482,7 @@ export class WaylandWindow implements Window {
       0,
       args(),
     );
+    this.#decorationLifecycle.markBufferCommit();
     this.lib.flushDisplay("presenting a window frame");
   }
 
@@ -413,7 +498,50 @@ export class WaylandWindow implements Window {
     throwCleanupErrors("winding failed to close Wayland window", errors);
   }
 
+  #abandonUnconfiguredInitialDecoration(): void {
+    if (this.#decorationLifecycle.canAttachInitialBuffer) return;
+    this.#cleanupDecoration([]);
+  }
+
+  #cleanupDecoration(errors: unknown[]): boolean {
+    const decoration = this.#decoration;
+    const configure = this.#decorationConfigure;
+    if (decoration) {
+      const destroyed = tryDestroyWaylandDecoration(
+        () => {
+          this.lib.wl.symbols.wl_proxy_marshal_array_flags(
+            decoration,
+            WlOp.ZXDG_TOPLEVEL_DECORATION_DESTROY,
+            null,
+            this.lib.wl.symbols.wl_proxy_get_version(decoration),
+            WL_MARSHAL_FLAG_DESTROY,
+            args(),
+          );
+        },
+        () => {
+          if (configure) this.lib.retainNativeCallbackRoot(configure);
+          this.lib.retainNativeResourceRoot(this);
+        },
+        (error) => errors.push(error),
+      );
+      if (!destroyed) return false;
+    }
+    this.#decoration = null;
+    const generation = this.#decorationGeneration;
+    this.#decorationGeneration = undefined;
+    if (generation !== undefined) this.#decorationLifecycle.finish(generation);
+    this.#decorationConfigure = null;
+    this.#decorationVtable = undefined;
+    if (configure) {
+      this.lib.releaseNativeCallbackRoot(configure);
+      collectCleanupError(errors, () => configure.close());
+    }
+    this.lib.releaseNativeResourceRoot(this);
+    return true;
+  }
+
   #cleanup(errors: unknown[]): void {
+    if (!this.#cleanupDecoration(errors)) return;
     const surface = this.#surface;
     if (surface && this.#registered) {
       this.#registered = false;

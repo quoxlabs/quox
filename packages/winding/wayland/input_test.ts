@@ -12,7 +12,7 @@ import {
   WaylandKeyTransitionState,
   type XkbKeyTranslator,
 } from "./keyboard.ts";
-import { CURSOR_SHAPE_MANAGER_V1_REQUESTS, WlOp, WlShmFormat } from "./ffi.ts";
+import { CURSOR_SHAPE_MANAGER_V1_REQUESTS, WlOp, WlShmFormat, XDG_DECORATION_PROTOCOL_METADATA } from "./ffi.ts";
 import { createWaylandSurroundingTextState, TextInputV3Batch, TextInputV3SerialGate } from "./text_input.ts";
 import { CompositionState, keyLocationForCode, normalizeImeCursorArea, validateImeCursorRange } from "../input/mod.ts";
 import { logicalKeyFromKeysym } from "../linux/mod.ts";
@@ -45,6 +45,7 @@ import {
   waylandConnectionError,
   WaylandNoopCallbacks,
   XDG_SURFACE_EVENT_SIGNATURES,
+  XDG_TOPLEVEL_DECORATION_EVENT_SIGNATURES,
   XDG_TOPLEVEL_EVENT_SIGNATURES,
   XDG_WM_BASE_EVENT_SIGNATURES,
 } from "./protocol.ts";
@@ -57,7 +58,7 @@ import {
   setDefaultWaylandAppIdBeforeInitialCommit,
   WaylandConfigureState,
 } from "./window.ts";
-import { type WaylandGlobalInterface, WaylandGlobalRegistry } from "./global_registry.ts";
+import { isWaylandGlobalInterface, type WaylandGlobalInterface, WaylandGlobalRegistry } from "./global_registry.ts";
 import {
   WaylandPointerAxis,
   WaylandPointerAxisSource,
@@ -65,6 +66,13 @@ import {
   WaylandPointerPosition,
 } from "./pointer.ts";
 import { openRequiredWaylandDependency, type RequiredWaylandDependency, validateWaylandNativeLayout } from "./mod.ts";
+import {
+  setupServerSideDecorationBeforeInitialCommit,
+  tryDestroyWaylandDecoration,
+  WaylandDecorationLifecycle,
+  WaylandDecorationManagerState,
+  WaylandDecorationMode,
+} from "./decoration.ts";
 import type { KeyModifiers } from "../types.ts";
 
 Deno.test("required Wayland dependency failures identify the support boundary", () => {
@@ -115,6 +123,175 @@ Deno.test("Wayland rejects native layouts its hand-packed bindings cannot repres
       "winding Wayland bindings require 64-bit little-endian Linux on x86-64 or AArch64",
     );
   }
+});
+
+Deno.test("xdg-decoration metadata is complete through protocol version 2", () => {
+  assertEquals(XDG_DECORATION_PROTOCOL_METADATA, {
+    manager: {
+      name: "zxdg_decoration_manager_v1",
+      version: 2,
+      requests: [
+        { name: "destroy", signature: "", objectTypes: [] },
+        {
+          name: "get_toplevel_decoration",
+          signature: "no",
+          objectTypes: ["toplevelDecoration", "xdgToplevel"],
+        },
+      ],
+      events: [],
+    },
+    toplevelDecoration: {
+      name: "zxdg_toplevel_decoration_v1",
+      version: 2,
+      requests: [
+        { name: "destroy", signature: "", objectTypes: [] },
+        { name: "set_mode", signature: "u", objectTypes: [] },
+        { name: "unset_mode", signature: "", objectTypes: [] },
+      ],
+      events: [{ name: "configure", signature: "u", objectTypes: [] }],
+    },
+  });
+  assertEquals({
+    managerDestroy: WlOp.ZXDG_DECORATION_MANAGER_DESTROY,
+    getToplevelDecoration: WlOp.ZXDG_DECORATION_MANAGER_GET_TOPLEVEL_DECORATION,
+    decorationDestroy: WlOp.ZXDG_TOPLEVEL_DECORATION_DESTROY,
+    setMode: WlOp.ZXDG_TOPLEVEL_DECORATION_SET_MODE,
+    unsetMode: WlOp.ZXDG_TOPLEVEL_DECORATION_UNSET_MODE,
+  }, {
+    managerDestroy: 0,
+    getToplevelDecoration: 1,
+    decorationDestroy: 0,
+    setMode: 1,
+    unsetMode: 2,
+  });
+  assertEquals(XDG_TOPLEVEL_DECORATION_EVENT_SIGNATURES, [["pointer", "pointer", "u32"]]);
+  assertEquals(isWaylandGlobalInterface("zxdg_decoration_manager_v1"), true);
+});
+
+Deno.test("Wayland decoration generations outlive managers and reject stale configure", () => {
+  const firstManager = {};
+  const replacementManager = {};
+  const managers = new WaylandDecorationManagerState<object>();
+  const firstBinding = managers.bind(firstManager, 1);
+  const decoration = new WaylandDecorationLifecycle();
+  const firstDecoration = decoration.begin(firstBinding.generation, firstBinding.version);
+  assert(firstDecoration !== undefined);
+
+  assertEquals(managers.unbind(replacementManager), undefined);
+  assert(managers.current === firstBinding);
+  assert(managers.unbind(firstManager) === firstBinding);
+  assertEquals(managers.current, undefined);
+  const replacementBinding = managers.bind(replacementManager, 2);
+  assert(replacementBinding.generation !== firstBinding.generation);
+
+  assertEquals(decoration.managerGeneration, firstBinding.generation);
+  assertEquals(decoration.begin(replacementBinding.generation, replacementBinding.version), undefined);
+  assertEquals(decoration.finish(firstDecoration), true);
+  const replacementDecoration = decoration.begin(replacementBinding.generation, replacementBinding.version);
+  assert(replacementDecoration !== undefined);
+  assertEquals(decoration.configure(firstDecoration, WaylandDecorationMode.serverSide), false);
+  assertEquals(decoration.effectiveMode, undefined);
+  assertEquals(decoration.configure(replacementDecoration, WaylandDecorationMode.serverSide), true);
+  assertEquals(decoration.effectiveMode, WaylandDecorationMode.serverSide);
+});
+
+Deno.test("Wayland waits for decoration configure before its initial buffer", () => {
+  const requests: string[] = [];
+  const lifecycle = new WaylandDecorationLifecycle();
+  const managerGeneration = Symbol("manager");
+  let decorationGeneration: symbol | undefined;
+
+  setupServerSideDecorationBeforeInitialCommit(
+    (preferredMode) => {
+      requests.push("create-decoration");
+      decorationGeneration = lifecycle.begin(managerGeneration, 1);
+      requests.push(`set-mode:${preferredMode}`);
+    },
+    () => {
+      requests.push("surface-commit");
+      lifecycle.markInitialSurfaceCommit();
+    },
+  );
+
+  assert(decorationGeneration !== undefined);
+  assertEquals(requests, ["create-decoration", "set-mode:2", "surface-commit"]);
+  assertEquals(lifecycle.initialSurfaceCommitSent, true);
+  assertEquals(lifecycle.bufferCommitSent, false);
+  assertEquals(lifecycle.effectiveMode, undefined);
+  assertEquals(lifecycle.canAttachInitialBuffer, false);
+  assertEquals(lifecycle.configure(decorationGeneration, 99), false);
+  assertEquals(lifecycle.canAttachInitialBuffer, false);
+  assertEquals(lifecycle.configure(decorationGeneration, WaylandDecorationMode.clientSide), true);
+  assertEquals(lifecycle.effectiveMode, WaylandDecorationMode.clientSide);
+  assertEquals(lifecycle.canAttachInitialBuffer, true);
+  requests.push("attach-buffer");
+  lifecycle.markBufferCommit();
+  assertEquals(lifecycle.bufferCommitSent, true);
+  assertEquals(requests, ["create-decoration", "set-mode:2", "surface-commit", "attach-buffer"]);
+});
+
+Deno.test("Wayland decoration creation distinguishes a null commit from the first buffer", () => {
+  const afterNullCommit = new WaylandDecorationLifecycle();
+  afterNullCommit.markInitialSurfaceCommit();
+  assertEquals(afterNullCommit.canAttachInitialBuffer, true);
+  const duringInitialRoundtrip = afterNullCommit.begin(Symbol("late pre-buffer v1"), 1);
+  assert(duringInitialRoundtrip !== undefined);
+  assertEquals(afterNullCommit.awaitingInitialConfigure, true);
+  assertEquals(afterNullCommit.finish(duringInitialRoundtrip), true);
+
+  afterNullCommit.markBufferCommit();
+  assertEquals(afterNullCommit.begin(Symbol("late post-buffer v1"), 1), undefined);
+  const lateV2 = afterNullCommit.begin(Symbol("late post-buffer v2"), 2);
+  assert(lateV2 !== undefined);
+  assertEquals(afterNullCommit.canAttachInitialBuffer, true);
+
+  const failed = new WaylandDecorationLifecycle();
+  const failedGeneration = failed.begin(Symbol("failed manager"), 1);
+  assert(failedGeneration !== undefined);
+  assertEquals(failed.canAttachInitialBuffer, false);
+  assertEquals(failed.finish(failedGeneration), true);
+  failed.markInitialSurfaceCommit();
+  assertEquals(failed.canAttachInitialBuffer, true);
+});
+
+Deno.test("Wayland decoration destruction retains callbacks and gates dependent objects", () => {
+  const destructionError = new Error("decoration destroy failed");
+  const failedOrder: string[] = [];
+  const failedErrors: unknown[] = [];
+  assertEquals(
+    tryDestroyWaylandDecoration(
+      () => {
+        failedOrder.push("destroy-decoration");
+        throw destructionError;
+      },
+      () => failedOrder.push("retain-callback"),
+      (error) => failedErrors.push(error),
+    ),
+    false,
+  );
+  assertEquals(failedOrder, ["destroy-decoration", "retain-callback"]);
+  assertEquals(failedErrors, [destructionError]);
+
+  const abandonOrder: string[] = [];
+  assertEquals(
+    tryDestroyWaylandDecoration(
+      () => abandonOrder.push("destroy-decoration"),
+      () => abandonOrder.push("unexpected-retain"),
+      () => abandonOrder.push("unexpected-error"),
+    ),
+    true,
+  );
+  abandonOrder.push("attach-initial-buffer");
+  assertEquals(abandonOrder, ["destroy-decoration", "attach-initial-buffer"]);
+
+  const closeOrder: string[] = [];
+  const decorationDestroyed = tryDestroyWaylandDecoration(
+    () => closeOrder.push("destroy-decoration"),
+    () => closeOrder.push("unexpected-retain"),
+    () => closeOrder.push("unexpected-error"),
+  );
+  if (decorationDestroyed) closeOrder.push("destroy-xdg-toplevel");
+  assertEquals(closeOrder, ["destroy-decoration", "destroy-xdg-toplevel"]);
 });
 
 Deno.test("Wayland globals keep one owner and promote a deterministic replacement", () => {
@@ -288,6 +465,7 @@ Deno.test("Wayland listener metadata preserves every protocol callback shape", (
     xdgWmBase: XDG_WM_BASE_EVENT_SIGNATURES,
     xdgSurface: XDG_SURFACE_EVENT_SIGNATURES,
     xdgToplevel: XDG_TOPLEVEL_EVENT_SIGNATURES,
+    xdgToplevelDecoration: XDG_TOPLEVEL_DECORATION_EVENT_SIGNATURES,
     textInputV3: TEXT_INPUT_V3_EVENT_SIGNATURES,
   }, {
     registry: [
@@ -329,6 +507,7 @@ Deno.test("Wayland listener metadata preserves every protocol callback shape", (
       ["pointer", "pointer", "i32", "i32"],
       ["pointer", "pointer", "pointer"],
     ],
+    xdgToplevelDecoration: [["pointer", "pointer", "u32"]],
     textInputV3: [
       ["pointer", "pointer", "pointer"],
       ["pointer", "pointer", "pointer"],
@@ -368,6 +547,7 @@ Deno.test("Wayland vtables fill only unused slots with their exact signature", (
       KEYBOARD_EVENT_SIGNATURES,
       XDG_WM_BASE_EVENT_SIGNATURES,
       XDG_SURFACE_EVENT_SIGNATURES,
+      XDG_TOPLEVEL_DECORATION_EVENT_SIGNATURES,
       TEXT_INPUT_V3_EVENT_SIGNATURES,
     ]
   ) {
