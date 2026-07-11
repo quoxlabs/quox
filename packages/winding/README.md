@@ -90,12 +90,13 @@ become zero.
 
 ### Wayland environment permission
 
-The package selects Wayland only when it may read `WAYLAND_DISPLAY` and that variable is set. Applications that want
-automatic Wayland selection should therefore grant it explicitly:
+The package selects Wayland only on Linux when it may read a nonempty `WAYLAND_DISPLAY` or `WAYLAND_SOCKET`.
+Applications that want automatic Wayland selection, including inherited-socket launches, should therefore grant both
+explicitly:
 
 ```sh
-deno run --allow-ffi --allow-env=WAYLAND_DISPLAY app.ts
+deno run --allow-ffi --allow-env=WAYLAND_DISPLAY,WAYLAND_SOCKET app.ts
 ```
 
-Without that environment permission, the top-level loader falls back to X11. Code importing the Wayland backend directly
-may additionally need locale-variable access for XKB/compose initialization.
+When neither signal is readable and nonempty, the top-level loader falls back to X11. Code importing the Wayland backend
+directly may additionally need locale-variable access for XKB/compose initialization.
