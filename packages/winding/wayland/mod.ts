@@ -6,6 +6,11 @@ import {
   type AnyCallback,
   args,
   collectCleanupError,
+  createDefaultCursorPixels,
+  DEFAULT_CURSOR_HEIGHT,
+  DEFAULT_CURSOR_HOTSPOT_X,
+  DEFAULT_CURSOR_HOTSPOT_Y,
+  DEFAULT_CURSOR_WIDTH,
   dlsymRequired,
   hasFatalPollEvent,
   libcSymbols,
@@ -25,6 +30,7 @@ import {
 import { WaylandWindow } from "./window.ts";
 import { WaylandTextInputController } from "./text_input_controller.ts";
 import { WaylandKeyboardController } from "./keyboard_controller.ts";
+import { WaylandShmBuffer } from "./shm_buffer.ts";
 
 // WaylandLibrary coordinates globals and the extracted native controllers.
 class WaylandLibrary implements Library {
@@ -66,6 +72,11 @@ class WaylandLibrary implements Library {
   xdgWmBase: Deno.PointerObject | null = null;
   #cursorShapeManager: Deno.PointerObject | null = null;
   #cursorShapeDevice: Deno.PointerObject | null = null;
+  #coreCursorSurface: Deno.PointerObject | null = null;
+  #coreCursorBuffer: Deno.PointerObject | null = null;
+  #coreCursorBuffers: WaylandShmBuffer | null = null;
+  #coreCursorCommitted = false;
+  #coreCursorUnavailable = false;
   #seat: Deno.PointerObject | null = null;
   #pointer: Deno.PointerObject | null = null;
   #pointerFocus: WaylandWindow | null = null;
@@ -259,21 +270,135 @@ class WaylandLibrary implements Library {
       this.#setupXdgWmBaseListener(proxy);
     } else if (iface === "wp_cursor_shape_manager_v1") {
       this.#cursorShapeManager = proxy;
+      this.#ensureCursorShapeDevice();
     } else if (iface === "zwp_text_input_manager_v3") {
       this.#textInputController.bindManager(proxy);
     }
   }
 
-  #setDefaultCursorShape(serial: number): void {
-    if (!this.#cursorShapeDevice) return;
+  #setDefaultCursor(serial: number): void {
     const sym = this.wl.symbols;
+    if (this.#cursorShapeDevice) {
+      sym.wl_proxy_marshal_array_flags(
+        this.#cursorShapeDevice,
+        WlOp.WP_CURSOR_SHAPE_DEVICE_SET_SHAPE,
+        null,
+        sym.wl_proxy_get_version(this.#cursorShapeDevice),
+        0,
+        args(BigInt(serial), BigInt(WlCursorShape.DEFAULT)),
+      );
+      return;
+    }
+
+    if (!this.#pointer || !this.#ensureCoreCursor()) return;
+    const pointer = this.#pointer;
+    const cursorSurface = this.#coreCursorSurface;
+    const cursorBuffer = this.#coreCursorBuffer;
+    if (!pointer || !cursorSurface || !cursorBuffer) return;
     sym.wl_proxy_marshal_array_flags(
-      this.#cursorShapeDevice,
-      WlOp.WP_CURSOR_SHAPE_DEVICE_SET_SHAPE,
+      pointer,
+      WlOp.POINTER_SET_CURSOR,
       null,
-      sym.wl_proxy_get_version(this.#cursorShapeDevice),
+      sym.wl_proxy_get_version(pointer),
       0,
-      args(BigInt(serial), BigInt(WlCursorShape.DEFAULT)),
+      args(
+        BigInt(serial),
+        Deno.UnsafePointer.value(cursorSurface),
+        BigInt(DEFAULT_CURSOR_HOTSPOT_X),
+        BigInt(DEFAULT_CURSOR_HOTSPOT_Y),
+      ),
+    );
+    if (this.#coreCursorCommitted) return;
+    const surfaceVersion = sym.wl_proxy_get_version(cursorSurface);
+    sym.wl_proxy_marshal_array_flags(
+      cursorSurface,
+      WlOp.SURFACE_ATTACH,
+      null,
+      surfaceVersion,
+      0,
+      args(Deno.UnsafePointer.value(cursorBuffer), 0n, 0n),
+    );
+    sym.wl_proxy_marshal_array_flags(
+      cursorSurface,
+      WlOp.SURFACE_DAMAGE,
+      null,
+      surfaceVersion,
+      0,
+      args(0n, 0n, BigInt(DEFAULT_CURSOR_WIDTH), BigInt(DEFAULT_CURSOR_HEIGHT)),
+    );
+    sym.wl_proxy_marshal_array_flags(
+      cursorSurface,
+      WlOp.SURFACE_COMMIT,
+      null,
+      surfaceVersion,
+      0,
+      args(),
+    );
+    this.#coreCursorCommitted = true;
+  }
+
+  #ensureCoreCursor(): boolean {
+    if (this.#coreCursorSurface && this.#coreCursorBuffer) return true;
+    if (this.#coreCursorUnavailable || !this.compositor || !this.shm) return false;
+    const symbols = this.wl.symbols;
+    let surface: Deno.PointerObject | null = null;
+    let buffers: WaylandShmBuffer | null = null;
+    try {
+      surface = symbols.wl_proxy_marshal_array_flags(
+        this.compositor,
+        WlOp.COMPOSITOR_CREATE_SURFACE,
+        this.ifaces.surface,
+        symbols.wl_proxy_get_version(this.compositor),
+        0,
+        args(0n),
+      );
+      if (!surface) throw new Error("winding failed to create the Wayland cursor surface");
+      buffers = new WaylandShmBuffer(this);
+      const buffer = buffers.write(
+        createDefaultCursorPixels(),
+        DEFAULT_CURSOR_WIDTH,
+        DEFAULT_CURSOR_HEIGHT,
+      );
+      if (!buffer) throw new Error("winding failed to allocate the Wayland cursor buffer");
+      this.#coreCursorSurface = surface;
+      this.#coreCursorBuffer = buffer;
+      this.#coreCursorBuffers = buffers;
+      return true;
+    } catch {
+      if (surface) {
+        try {
+          symbols.wl_proxy_marshal_array_flags(
+            surface,
+            WlOp.SURFACE_DESTROY,
+            null,
+            symbols.wl_proxy_get_version(surface),
+            WL_MARSHAL_FLAG_DESTROY,
+            args(),
+          );
+        } catch {
+          // Cursor fallback is best-effort.
+        }
+      }
+      try {
+        buffers?.close();
+      } catch {
+        // Cursor fallback is best-effort.
+      }
+      this.#coreCursorUnavailable = true;
+      return false;
+    }
+  }
+
+  #ensureCursorShapeDevice(): void {
+    if (!this.#cursorShapeManager || !this.#pointer || this.#cursorShapeDevice) return;
+    const symbols = this.wl.symbols;
+    this.#cursorShapeDevice = symbols.wl_proxy_marshal_array_flags(
+      this.#cursorShapeManager,
+      WlOp.WP_CURSOR_SHAPE_MANAGER_GET_POINTER,
+      this.wpCursorShapeDeviceIface,
+      symbols.wl_proxy_get_version(this.#cursorShapeManager),
+      0,
+      args(0n, Deno.UnsafePointer.value(this.#pointer)),
     );
   }
 
@@ -349,16 +474,7 @@ class WaylandLibrary implements Library {
     if (!pointer) return;
     this.#pointer = pointer;
 
-    if (this.#cursorShapeManager && !this.#cursorShapeDevice) {
-      this.#cursorShapeDevice = sym.wl_proxy_marshal_array_flags(
-        this.#cursorShapeManager,
-        WlOp.WP_CURSOR_SHAPE_MANAGER_GET_POINTER,
-        this.wpCursorShapeDeviceIface,
-        sym.wl_proxy_get_version(this.#cursorShapeManager),
-        0,
-        args(0n, Deno.UnsafePointer.value(pointer)),
-      );
-    }
+    this.#ensureCursorShapeDevice();
 
     // wl_pointer events (indices):
     // 0=enter, 1=leave, 2=motion, 3=button, 4=axis, 5=frame, 6=axis_source, 7=axis_stop, 8=axis_discrete ...
@@ -369,7 +485,7 @@ class WaylandLibrary implements Library {
         const window = this.#windowForSurface(surface);
         if (!window) return;
         this.#pointerFocus = window;
-        this.#setDefaultCursorShape(serial);
+        this.#setDefaultCursor(serial);
         this.#events.push({ type: "mouseenter", window });
       }),
     );
@@ -658,6 +774,26 @@ class WaylandLibrary implements Library {
     collectCleanupError(errors, () => this.#textInputController.close());
 
     collectCleanupError(errors, () => this.#releasePointer(false));
+
+    const coreCursorSurface = this.#coreCursorSurface;
+    this.#coreCursorSurface = null;
+    this.#coreCursorBuffer = null;
+    this.#coreCursorCommitted = false;
+    if (coreCursorSurface) {
+      collectCleanupError(errors, () => {
+        this.wl.symbols.wl_proxy_marshal_array_flags(
+          coreCursorSurface,
+          WlOp.SURFACE_DESTROY,
+          null,
+          this.wl.symbols.wl_proxy_get_version(coreCursorSurface),
+          WL_MARSHAL_FLAG_DESTROY,
+          args(),
+        );
+      });
+    }
+    const coreCursorBuffers = this.#coreCursorBuffers;
+    this.#coreCursorBuffers = null;
+    if (coreCursorBuffers) collectCleanupError(errors, () => coreCursorBuffers.close());
 
     const cursorShapeManager = this.#cursorShapeManager;
     this.#cursorShapeManager = null;

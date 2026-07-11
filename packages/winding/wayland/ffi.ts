@@ -364,6 +364,7 @@ export const WlOp = {
   SEAT_GET_KEYBOARD: 1,
   SEAT_RELEASE: 3,
   // wl_pointer requests
+  POINTER_SET_CURSOR: 0,
   POINTER_RELEASE: 1,
   // wl_keyboard requests
   KEYBOARD_RELEASE: 0,

@@ -30,6 +30,10 @@ export const RTLD_NOLOAD = 0x4;
 export const LIBWAYLAND_CLIENT_SO = "libwayland-client.so.0";
 export const LIBXKBCOMMON_SO = "libxkbcommon.so.0";
 export const WL_MARSHAL_FLAG_DESTROY = 1;
+export const DEFAULT_CURSOR_WIDTH = 24;
+export const DEFAULT_CURSOR_HEIGHT = 24;
+export const DEFAULT_CURSOR_HOTSPOT_X = 1;
+export const DEFAULT_CURSOR_HOTSPOT_Y = 1;
 
 export type AnyCallback = { pointer: Deno.PointerObject; close(): void };
 
@@ -75,6 +79,24 @@ export function pointerCapabilityAction(
   if (available && !active) return "acquire";
   if (!available && active) return "release";
   return undefined;
+}
+
+/** Small opaque arrow used when the optional cursor-shape protocol is absent. */
+export function createDefaultCursorPixels(): Uint8Array {
+  const pixels = new Uint8Array(DEFAULT_CURSOR_WIDTH * DEFAULT_CURSOR_HEIGHT * 4);
+  for (let y = 1; y <= 20; y++) {
+    const lastX = Math.min(11, 1 + Math.floor(y / 2));
+    for (let x = 1; x <= lastX; x++) {
+      const offset = (y * DEFAULT_CURSOR_WIDTH + x) * 4;
+      const outline = y === 1 || x === 1 || x === lastX || y === 20;
+      const channel = outline ? 0 : 255;
+      pixels[offset] = channel;
+      pixels[offset + 1] = channel;
+      pixels[offset + 2] = channel;
+      pixels[offset + 3] = 255;
+    }
+  }
+  return pixels;
 }
 
 export function dlsymRequired(

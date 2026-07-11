@@ -14,6 +14,11 @@ import { TextInputV3Batch } from "./text_input.ts";
 import { keyLocationForCode, normalizeImeCursorArea, validateImeCursorRange } from "../input/mod.ts";
 import { logicalKeyFromKeysym } from "../linux/mod.ts";
 import {
+  createDefaultCursorPixels,
+  DEFAULT_CURSOR_HEIGHT,
+  DEFAULT_CURSOR_HOTSPOT_X,
+  DEFAULT_CURSOR_HOTSPOT_Y,
+  DEFAULT_CURSOR_WIDTH,
   hasFatalPollEvent,
   POLLERR,
   POLLHUP,
@@ -27,6 +32,15 @@ import {
   frameMatchesConfiguration,
   WaylandConfigureState,
 } from "./window.ts";
+
+Deno.test("Wayland core cursor fallback has a visible in-bounds hotspot", () => {
+  const pixels = createDefaultCursorPixels();
+  assertEquals(pixels.byteLength, DEFAULT_CURSOR_WIDTH * DEFAULT_CURSOR_HEIGHT * 4);
+  assert(DEFAULT_CURSOR_HOTSPOT_X >= 0 && DEFAULT_CURSOR_HOTSPOT_X < DEFAULT_CURSOR_WIDTH);
+  assert(DEFAULT_CURSOR_HOTSPOT_Y >= 0 && DEFAULT_CURSOR_HOTSPOT_Y < DEFAULT_CURSOR_HEIGHT);
+  const hotspot = (DEFAULT_CURSOR_HOTSPOT_Y * DEFAULT_CURSOR_WIDTH + DEFAULT_CURSOR_HOTSPOT_X) * 4;
+  assertEquals([...pixels.slice(hotspot, hotspot + 4)], [0, 0, 0, 255]);
+});
 
 Deno.test("Wayland surface damage uses only requests supported by the bound version", () => {
   assertEquals(damageOpcodeForSurfaceVersion(1), WlOp.SURFACE_DAMAGE);
