@@ -1066,7 +1066,7 @@ class WaylandLibrary implements Library {
       const pollView = new DataView(this.#pollFd.buffer);
       pollView.setInt16(4, POLLIN | (this.#wantsWrite ? POLLOUT : 0), true);
       pollView.setInt16(6, 0, true); // clear revents
-      const ready = this.libc.symbols.poll(this.#pollFd, 1, 0);
+      const ready = this.libc.symbols.poll(this.#pollFd, 1n, 0);
       const revents = pollView.getInt16(6, true);
       if (ready < 0) {
         sym.wl_display_cancel_read(this.display);

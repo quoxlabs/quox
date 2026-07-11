@@ -8,7 +8,7 @@ export const libcSymbols = {
   mmap: { parameters: ["pointer", "usize", "i32", "i32", "i32", "i64"], result: "pointer" },
   munmap: { parameters: ["pointer", "usize"], result: "i32" },
   close: { parameters: ["i32"], result: "i32" },
-  poll: { parameters: ["buffer", "u32", "i32"], result: "i32" },
+  poll: { parameters: ["buffer", "usize", "i32"], result: "i32" },
 } as const satisfies Deno.ForeignLibraryInterface;
 
 export type LibcLibrary = Deno.DynamicLibrary<typeof libcSymbols>;

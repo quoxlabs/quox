@@ -26,6 +26,7 @@ import {
   DEFAULT_CURSOR_HOTSPOT_Y,
   DEFAULT_CURSOR_WIDTH,
   hasFatalPollEvent,
+  libcSymbols,
   NativeInitializationCleanup,
   pointerCapabilityAction,
   POLLERR,
@@ -359,6 +360,13 @@ Deno.test("Wayland poll errors and disconnects are terminal readiness", () => {
   assertEquals(hasFatalPollEvent(POLLHUP), true);
   assertEquals(hasFatalPollEvent(POLLNVAL), true);
   assertEquals(hasFatalPollEvent(POLLIN | POLLHUP), true);
+});
+
+Deno.test("Wayland poll declares pointer-width nfds_t", () => {
+  assertEquals(libcSymbols.poll, {
+    parameters: ["buffer", "usize", "i32"],
+    result: "i32",
+  });
 });
 
 Deno.test("wl_array uint32 decoding is aligned, bounded, and null-safe", () => {
