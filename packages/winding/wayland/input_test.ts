@@ -19,6 +19,7 @@ import {
   POLLHUP,
   POLLIN,
   POLLNVAL,
+  pointerCapabilityAction,
   waylandConnectionError,
 } from "./protocol.ts";
 import {
@@ -52,6 +53,13 @@ Deno.test("Wayland poll errors and disconnects are terminal readiness", () => {
   assertEquals(hasFatalPollEvent(POLLHUP), true);
   assertEquals(hasFatalPollEvent(POLLNVAL), true);
   assertEquals(hasFatalPollEvent(POLLIN | POLLHUP), true);
+});
+
+Deno.test("Wayland pointer capability transitions are symmetric", () => {
+  assertEquals(pointerCapabilityAction(true, false), "acquire");
+  assertEquals(pointerCapabilityAction(false, true), "release");
+  assertEquals(pointerCapabilityAction(true, true), undefined);
+  assertEquals(pointerCapabilityAction(false, false), undefined);
 });
 
 Deno.test("Wayland configurations latch role state and serial as one generation", () => {

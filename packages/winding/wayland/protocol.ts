@@ -68,6 +68,15 @@ export function hasFatalPollEvent(revents: number): boolean {
   return (revents & (POLLERR | POLLHUP | POLLNVAL)) !== 0;
 }
 
+export function pointerCapabilityAction(
+  available: boolean,
+  active: boolean,
+): "acquire" | "release" | undefined {
+  if (available && !active) return "acquire";
+  if (!available && active) return "release";
+  return undefined;
+}
+
 export function dlsymRequired(
   libdl: Deno.DynamicLibrary<typeof libdlSymbols>,
   handle: Deno.PointerObject,

@@ -14,6 +14,7 @@ import {
   makeVtable,
   POLLIN,
   POLLOUT,
+  pointerCapabilityAction,
   readEventCount,
   RTLD_NOLOAD,
   RTLD_NOW,
@@ -68,6 +69,8 @@ class WaylandLibrary implements Library {
   #seat: Deno.PointerObject | null = null;
   #pointer: Deno.PointerObject | null = null;
   #pointerFocus: WaylandWindow | null = null;
+  #pointerListeners: AnyCallback[] = [];
+  #pointerVtable: BigUint64Array<ArrayBuffer> | undefined;
   readonly #textInputController: WaylandTextInputController;
   // Event queue filled by listener callbacks, drained by event()
   readonly #events = new EventQueue<UIEvent>();
@@ -303,7 +306,12 @@ class WaylandLibrary implements Library {
     const capCb = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer", "u32"], result: "void" },
       this.guardCallback((_data, _seat, caps) => {
-        if ((caps & WlSeatCap.POINTER) && !this.#pointer) this.#initPointer();
+        const pointerAction = pointerCapabilityAction(
+          (caps & WlSeatCap.POINTER) !== 0,
+          this.#pointer !== null,
+        );
+        if (pointerAction === "acquire") this.#initPointer();
+        else if (pointerAction === "release") this.#releasePointer(true);
         if ((caps & WlSeatCap.KEYBOARD) && !this.#keyboardController.active) {
           this.#keyboardController.acquire(this.#seat!);
         }
@@ -408,15 +416,66 @@ class WaylandLibrary implements Library {
         else if (axis === 1) this.#events.push({ type: "wheel", deltaX: delta, deltaY: 0, window });
       }),
     );
-    this.#listeners.push(enterCb, leaveCb, motionCb, buttonCb, axisCb);
+    this.#pointerListeners = [enterCb, leaveCb, motionCb, buttonCb, axisCb];
     const ptrEventCount = readEventCount(Deno.UnsafePointer.value(this.ifaces.pointer));
-    const ptrVtable = makeVtable(
-      [enterCb, leaveCb, motionCb, buttonCb, axisCb],
+    const pointerVtable = makeVtable(
+      this.#pointerListeners,
       ptrEventCount,
       this.noop,
     );
-    this.#vtables.push(ptrVtable);
-    sym.wl_proxy_add_listener(pointer, Deno.UnsafePointer.of(ptrVtable), null);
+    this.#pointerVtable = pointerVtable;
+    sym.wl_proxy_add_listener(pointer, Deno.UnsafePointer.of(pointerVtable), null);
+  }
+
+  #releasePointer(emitLeave: boolean): void {
+    const focusedWindow = this.#pointerFocus;
+    const cursorShapeDevice = this.#cursorShapeDevice;
+    const pointer = this.#pointer;
+    const listeners = this.#pointerListeners;
+    this.#pointerFocus = null;
+    this.#cursorShapeDevice = null;
+    this.#pointer = null;
+    this.#pointerListeners = [];
+    this.#pointerVtable = undefined;
+
+    if (emitLeave && focusedWindow) {
+      this.#events.push({ type: "mouseleave", window: focusedWindow });
+    }
+
+    const errors: unknown[] = [];
+    if (cursorShapeDevice) {
+      collectCleanupError(errors, () => {
+        this.wl.symbols.wl_proxy_marshal_array_flags(
+          cursorShapeDevice,
+          WlOp.WP_CURSOR_SHAPE_DEVICE_DESTROY,
+          null,
+          1,
+          WL_MARSHAL_FLAG_DESTROY,
+          args(),
+        );
+      });
+    }
+    if (pointer) {
+      collectCleanupError(errors, () => {
+        const version = this.wl.symbols.wl_proxy_get_version(pointer);
+        if (version >= 3) {
+          this.wl.symbols.wl_proxy_marshal_array_flags(
+            pointer,
+            WlOp.POINTER_RELEASE,
+            null,
+            version,
+            WL_MARSHAL_FLAG_DESTROY,
+            args(),
+          );
+        } else {
+          this.wl.symbols.wl_proxy_destroy(pointer);
+        }
+      });
+    }
+    for (const listener of listeners) {
+      collectCleanupError(errors, () => listener.close());
+    }
+    throwCleanupErrors("winding failed to release Wayland pointer", errors);
   }
 
   #windowForSurface(surface: Deno.PointerValue): WaylandWindow | null {
@@ -598,20 +657,7 @@ class WaylandLibrary implements Library {
     this.#windowsBySurface.clear();
     collectCleanupError(errors, () => this.#textInputController.close());
 
-    const cursorShapeDevice = this.#cursorShapeDevice;
-    this.#cursorShapeDevice = null;
-    if (cursorShapeDevice) {
-      collectCleanupError(errors, () => {
-        this.wl.symbols.wl_proxy_marshal_array_flags(
-          cursorShapeDevice,
-          WlOp.WP_CURSOR_SHAPE_DEVICE_DESTROY,
-          null,
-          1,
-          WL_MARSHAL_FLAG_DESTROY,
-          args(),
-        );
-      });
-    }
+    collectCleanupError(errors, () => this.#releasePointer(false));
 
     const cursorShapeManager = this.#cursorShapeManager;
     this.#cursorShapeManager = null;
@@ -625,27 +671,6 @@ class WaylandLibrary implements Library {
           WL_MARSHAL_FLAG_DESTROY,
           args(),
         );
-      });
-    }
-
-    const pointer = this.#pointer;
-    this.#pointer = null;
-    this.#pointerFocus = null;
-    if (pointer) {
-      collectCleanupError(errors, () => {
-        const version = this.wl.symbols.wl_proxy_get_version(pointer);
-        if (version >= 3) {
-          this.wl.symbols.wl_proxy_marshal_array_flags(
-            pointer,
-            WlOp.POINTER_RELEASE,
-            null,
-            version,
-            WL_MARSHAL_FLAG_DESTROY,
-            args(),
-          );
-        } else {
-          this.wl.symbols.wl_proxy_destroy(pointer);
-        }
       });
     }
 
