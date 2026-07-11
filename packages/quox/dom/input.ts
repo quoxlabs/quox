@@ -87,6 +87,7 @@ export interface QuoxInputRoutePort {
   appleCommand(event: QuoxAppleStandardKeybindingEvent): void;
   clearHover(): void;
   resize(event: QuoxResizeEvent): void;
+  focusChange(event: QuoxFocusChangeEvent): void;
   visibility(event: QuoxVisibilityEvent): void;
 }
 
@@ -176,11 +177,13 @@ export class QuoxInputRouter {
       case "visibilitychange":
         this.port.visibility(event);
         return undefined;
+      case "focus":
+      case "blur":
+        this.port.focusChange(event);
+        return undefined;
       case "close":
         return "close";
       case "mouseenter":
-      case "focus":
-      case "blur":
         return undefined;
       default:
         return assertNever(event);

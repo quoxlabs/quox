@@ -25,6 +25,7 @@ import {
   WindowStartupGate,
 } from "./initialization_pump.ts";
 import { documentHasActiveDispatch, releaseStoppedRenderer } from "./internals.ts";
+import { dispatchNativeWindowFocusEvent } from "./window_focus.ts";
 
 export type {
   QuoxAppleStandardKeybindingEvent,
@@ -189,6 +190,7 @@ export class QuoxWindow extends QuoxEventTarget implements Disposable {
           this.#visible = event.visible;
           if (event.visible) this.#requestRender();
         },
+        focusChange: (event) => dispatchNativeWindowFocusEvent(this, event.type),
       },
       width,
       height,

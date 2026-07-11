@@ -8,6 +8,8 @@ import {
   type QuoxInputEvent,
   QuoxInputRouter,
 } from "./input.ts";
+import { QuoxEventTarget } from "./event_target.ts";
+import { dispatchNativeWindowFocusEvent } from "./window_focus.ts";
 
 class FakeWindow implements WindingWindow {
   readonly calls: Array<[string, ...number[]]> = [];
@@ -49,6 +51,7 @@ Deno.test("pointer adapter forwards native timing and click detail", () => {
     appleCommand() {},
     clearHover() {},
     resize() {},
+    focusChange() {},
     visibility() {},
   });
 
@@ -76,6 +79,7 @@ Deno.test("wheel adapter preserves browser units and translates Blitz scroll dir
       appleCommand() {},
       clearHover() {},
       resize() {},
+      focusChange() {},
       visibility() {},
     },
     800,
@@ -302,6 +306,45 @@ Deno.test("listener errors are reported without preventing later observers", () 
   assertEquals(errors.length, 1);
 });
 
+Deno.test("native window focus dispatch precedes raw observers and isolates listener errors", () => {
+  const target = new QuoxEventTarget();
+  const order: string[] = [];
+  const errors: unknown[] = [];
+  const thrown = new Error("focus listener failed");
+  target.addEventListener("focus", () => {
+    order.push("DOM focus one");
+    throw thrown;
+  });
+  target.addEventListener("focus", () => order.push("DOM focus two"));
+  target.addEventListener("blur", () => order.push("DOM blur"));
+
+  const router = new QuoxInputRouter({
+    pointerMove() {},
+    pointerDown() {},
+    pointerUp() {},
+    wheel() {},
+    key() {},
+    ime() {},
+    appleCommand() {},
+    clearHover() {},
+    resize() {},
+    focusChange: (event) => dispatchNativeWindowFocusEvent(target, event.type, (error) => errors.push(error)),
+    visibility() {},
+  });
+  for (const type of ["focus", "blur"] as const) {
+    const event = mapWindingEvent({ type, window });
+    router.route(event);
+    notifyInputListeners(
+      [() => order.push(`raw ${type}`)],
+      event,
+      (error) => errors.push(error),
+    );
+  }
+
+  assertEquals(order, ["DOM focus one", "DOM focus two", "raw focus", "DOM blur", "raw blur"]);
+  assertEquals(errors, [thrown]);
+});
+
 Deno.test("atomic IME snapshot applies cursor geometry before enable", () => {
   const target = new FakeWindow();
   applyImeRequestSnapshot(target, new Float64Array([1, 3, 1, 2, 3, 4, 1]));
@@ -325,6 +368,7 @@ Deno.test("pure router preserves key listener then commit and DOM-input ordering
     appleCommand() {},
     clearHover() {},
     resize() {},
+    focusChange() {},
     visibility() {},
   });
   const key = mapWindingEvent({
