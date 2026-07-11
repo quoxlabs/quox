@@ -56,6 +56,28 @@ pub(super) fn public_dom_node_id(document: &BaseDocument, mut node_id: usize) ->
     }
 }
 
+/// Build the target-first DOM ancestor path for a synthetic event. The document itself has no
+/// public node handle, so connectivity is returned separately and represented by a zero marker
+/// at the JavaScript boundary.
+fn synthetic_event_node_path(document: &BaseDocument, target_id: usize) -> (Vec<usize>, bool) {
+    let mut path = Vec::new();
+    let mut current_id = Some(target_id);
+
+    while let Some(node_id) = current_id {
+        let Some(node) = document.get_node(node_id) else {
+            break;
+        };
+        match &node.data {
+            NodeData::Document => return (path, true),
+            NodeData::Element(_) | NodeData::Text(_) => path.push(node_id),
+            NodeData::AnonymousBlock(_) | NodeData::Comment => {}
+        }
+        current_id = node.parent;
+    }
+
+    (path, false)
+}
+
 /// Return exactly the node ids Blitz's `remove_and_drop_all_children` will destroy.
 fn dropped_descendant_ids(document: &BaseDocument, parent_id: usize) -> Vec<usize> {
     let Some(parent) = document.get_node(parent_id) else {
@@ -422,11 +444,30 @@ impl QuoxRenderer {
         let node_id = state.resolve_node(node_handle)?;
         Ok(state.node_kind(node_id))
     }
+
+    /// Return a target-first propagation path for a synthetic event dispatched on a DOM node.
+    /// A trailing zero marks the document; TypeScript replaces it with the document and window
+    /// objects, neither of which has a numeric node handle.
+    pub fn synthetic_event_path(&self, node_handle: f64) -> Result<Box<[u32]>, JsValue> {
+        let node_handle =
+            uint32(node_handle, "nodeHandle").map_err(NumericArgumentError::into_js)?;
+        let mut state = self.state.borrow_mut();
+        let target_id = state.resolve_node(node_handle)?;
+        let (node_ids, connected) = synthetic_event_node_path(&state.document, target_id);
+        let mut path = Vec::with_capacity(node_ids.len() + usize::from(connected));
+        for node_id in node_ids {
+            path.push(state.expose_node(node_id)?);
+        }
+        if connected {
+            path.push(0);
+        }
+        Ok(path.into_boxed_slice())
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{attr_name, attribute_value, dropped_descendant_ids};
+    use super::{attr_name, attribute_value, dropped_descendant_ids, synthetic_event_node_path};
     use crate::node_handles::NodeHandles;
     use blitz_dom::{DocumentConfig, NodeData};
     use blitz_html::{HtmlDocument, HtmlProvider};
@@ -519,6 +560,36 @@ mod tests {
 
         document.mutate().append_children(body_id, &[paragraph_id]);
         assert_eq!(handles.expose(paragraph_id), Ok(handle));
+    }
+
+    #[test]
+    fn synthetic_event_paths_distinguish_connected_and_detached_nodes() {
+        let mut document = HtmlDocument::from_html(
+            "<!doctype html><html><body><section><span>target</span></section></body></html>",
+            DocumentConfig::default(),
+        )
+        .into_inner();
+        let html_id = element_by_tag(&document, "html");
+        let body_id = element_by_tag(&document, "body");
+        let section_id = element_by_tag(&document, "section");
+        let span_id = element_by_tag(&document, "span");
+
+        assert_eq!(
+            synthetic_event_node_path(&document, span_id),
+            (vec![span_id, section_id, body_id, html_id], true)
+        );
+
+        document.mutate().remove_node(section_id);
+        assert_eq!(
+            synthetic_event_node_path(&document, span_id),
+            (vec![span_id, section_id], false)
+        );
+
+        document.mutate().append_children(body_id, &[section_id]);
+        assert_eq!(
+            synthetic_event_node_path(&document, span_id),
+            (vec![span_id, section_id, body_id, html_id], true)
+        );
     }
 
     #[test]

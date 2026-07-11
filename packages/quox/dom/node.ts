@@ -1,5 +1,6 @@
 import type { QuoxDocument } from "./document.ts";
-import { QuoxEventTarget } from "./event_target.ts";
+import type { QuoxEvent } from "./event.ts";
+import { eventTargetPath, QuoxEventTarget } from "./event_target.ts";
 import { assertUint32 } from "./ffi_numbers.ts";
 import { documentInternals } from "./internals.ts";
 
@@ -27,6 +28,18 @@ export class QuoxNode extends QuoxEventTarget {
 
   get nodeId(): number {
     return this.#nodeId;
+  }
+
+  override [eventTargetPath](event: QuoxEvent): readonly QuoxEventTarget[] {
+    const path = Array.from(
+      documentInternals(this.ownerDocument).syntheticEventPath(this.nodeId, event),
+    );
+    const resolvedTarget = path[0];
+    if (!(resolvedTarget instanceof QuoxNode) || resolvedTarget.nodeId !== this.nodeId) {
+      throw new TypeError("quox: synthetic event path does not start with its target node");
+    }
+    path[0] = this;
+    return path;
   }
 
   get textContent(): string {

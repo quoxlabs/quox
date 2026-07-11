@@ -1,12 +1,21 @@
 import { assert, assertEquals, assertFalse, assertStrictEquals, assertThrows } from "@std/assert";
 import { eventDispatchInternals, QuoxEvent } from "./event.ts";
 import {
+  eventTargetPath,
   getEventHandler,
   invokeEventListeners,
   QuoxEventTarget,
   type ReportEventListenerException,
   setEventHandler,
 } from "./event_target.ts";
+
+class RoutedEventTarget extends QuoxEventTarget {
+  path: readonly QuoxEventTarget[] = [this];
+
+  override [eventTargetPath](_event: QuoxEvent): readonly QuoxEventTarget[] {
+    return this.path;
+  }
+}
 
 function dispatchPath(
   event: QuoxEvent,
@@ -60,6 +69,34 @@ Deno.test("staged listener invocation follows capture, target, and bubble order"
     "parent capture",
     "target capture",
     "target bubble",
+    "parent bubble",
+    "root bubble",
+  ]);
+});
+
+Deno.test("dispatchEvent follows a target's frozen capture and bubble path", () => {
+  const target = new RoutedEventTarget();
+  const parent = new QuoxEventTarget();
+  const root = new QuoxEventTarget();
+  target.path = [target, parent, root];
+  const calls: string[] = [];
+
+  root.addEventListener("ping", () => calls.push("root capture"), true);
+  parent.addEventListener("ping", () => calls.push("parent capture"), true);
+  target.addEventListener("ping", (event) => {
+    calls.push("target");
+    assertFalse(event.isTrusted);
+    assertEquals(event.composedPath(), [target, parent, root]);
+    target.path = [target];
+  });
+  parent.addEventListener("ping", () => calls.push("parent bubble"));
+  root.addEventListener("ping", () => calls.push("root bubble"));
+
+  assert(target.dispatchEvent(new QuoxEvent("ping", { bubbles: true })));
+  assertEquals(calls, [
+    "root capture",
+    "parent capture",
+    "target",
     "parent bubble",
     "root bubble",
   ]);

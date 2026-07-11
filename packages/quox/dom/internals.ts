@@ -1,5 +1,7 @@
 import type { QuoxRenderer as WasmRenderer } from "../lib/quox.js";
 import type { QuoxDocument } from "./document.ts";
+import type { QuoxEvent } from "./event.ts";
+import type { QuoxEventTarget } from "./event_target.ts";
 
 export type RequestRender = () => void;
 export type AssertActive = () => void;
@@ -11,6 +13,10 @@ type DocumentInternals = {
   readonly assertActive: AssertActive;
   readonly invalidateNodeHandles: InvalidateNodeHandles;
   readonly isDispatching: () => boolean;
+  readonly syntheticEventPath: (
+    nodeHandle: number,
+    event: QuoxEvent,
+  ) => readonly QuoxEventTarget[];
 };
 
 const internals = new WeakMap<QuoxDocument, DocumentInternals>();

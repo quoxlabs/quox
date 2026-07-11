@@ -1,6 +1,6 @@
 import type { QuoxRenderer as WasmRenderer } from "../lib/quox.js";
 import { eventDispatchInternals, QuoxEvent } from "./event.ts";
-import { invokeEventListeners, QuoxEventTarget } from "./event_target.ts";
+import { eventTargetPath, invokeEventListeners, QuoxEventTarget } from "./event_target.ts";
 import {
   encodeKeyEvent,
   type QuoxAppleStandardKeybindingEvent,
@@ -45,6 +45,9 @@ import {
 type SetNativeTitle = (title: string) => void;
 type SyncNativeImeRequests = () => void;
 type NodeKindRenderer = WasmRenderer & { node_kind(nodeHandle: number): number };
+type SyntheticEventPathRenderer = WasmRenderer & {
+  synthetic_event_path(nodeHandle: number): Uint32Array;
+};
 type InvalidatingTitleRenderer = { set_title(title: string): Uint32Array };
 type LegacyHoverRenderer = { clear_hover(): boolean };
 
@@ -101,11 +104,16 @@ export class QuoxDocument extends QuoxEventTarget {
       assertActive,
       invalidateNodeHandles: (nodeHandles) => this.#nodes.invalidate(nodeHandles),
       isDispatching: () => this.#dispatchDepth !== 0,
+      syntheticEventPath: (nodeHandle, event) => this.#syntheticEventPath(nodeHandle, event),
     });
   }
 
   get defaultView(): QuoxEventTarget | null {
     return this.#defaultView;
+  }
+
+  override [eventTargetPath](event: QuoxEvent): readonly QuoxEventTarget[] {
+    return this.#defaultView === null || event.type === "load" ? [this] : [this, this.#defaultView];
   }
 
   get title(): string {
@@ -638,6 +646,39 @@ export class QuoxDocument extends QuoxEventTarget {
     nodeHandle = assertUint32(nodeHandle, "nodeHandle");
     const nodeKind = (this.#renderer as NodeKindRenderer).node_kind(nodeHandle);
     return this.#nodes.get(nodeHandle, nodeKind);
+  }
+
+  #syntheticEventPath(nodeHandle: number, event: QuoxEvent): readonly QuoxEventTarget[] {
+    this.#assertActive();
+    nodeHandle = assertUint32(nodeHandle, "nodeHandle");
+    const rawPath = (this.#renderer as SyntheticEventPathRenderer).synthetic_event_path(nodeHandle);
+    if (
+      Object.getPrototypeOf(rawPath) !== Uint32Array.prototype ||
+      rawPath.length === 0 ||
+      rawPath[0] !== nodeHandle
+    ) {
+      throw new TypeError("quox: renderer returned an invalid synthetic event path");
+    }
+
+    const path: QuoxEventTarget[] = [];
+    const seen = new Set<number>();
+    for (let index = 0; index < rawPath.length; index += 1) {
+      const handle = rawPath[index];
+      if (handle === 0) {
+        if (index !== rawPath.length - 1) {
+          throw new TypeError("quox: document marker must end a synthetic event path");
+        }
+        path.push(this);
+        if (this.#defaultView !== null && event.type !== "load") path.push(this.#defaultView);
+      } else {
+        if (seen.has(handle)) {
+          throw new TypeError("quox: synthetic event path must not repeat a node handle");
+        }
+        seen.add(handle);
+        path.push(this.#nodeForHandle(handle));
+      }
+    }
+    return path;
   }
 
   createElement(tagName: string): QuoxElement {

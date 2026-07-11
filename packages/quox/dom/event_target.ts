@@ -27,6 +27,9 @@ export type QuoxEventHandler = (this: QuoxEventTarget, event: QuoxEvent) => unkn
 /** Internal listener-list entry point used by the staged renderer bridge. */
 export const invokeEventListeners: unique symbol = Symbol("QuoxEventTarget.invokeEventListeners");
 
+/** Internal target-first propagation path used by synthetic `dispatchEvent()` calls. */
+export const eventTargetPath: unique symbol = Symbol("QuoxEventTarget.eventTargetPath");
+
 /** Internal accessors used to implement one stable listener slot for each `on*` property. */
 export const getEventHandler: unique symbol = Symbol("QuoxEventTarget.getEventHandler");
 export const setEventHandler: unique symbol = Symbol("QuoxEventTarget.setEventHandler");
@@ -179,14 +182,42 @@ export class QuoxEventTarget {
     }
 
     const dispatch = event[eventDispatchInternals];
-    dispatch.begin(this, [this], false);
+    if (dispatch.dispatching) {
+      throw new DOMException("The event is already being dispatched.", "InvalidStateError");
+    }
+    const path = Array.from(this[eventTargetPath](event));
+    if (path.some((target) => !(target instanceof QuoxEventTarget))) {
+      throw new TypeError("an event path must contain only QuoxEventTarget objects");
+    }
+    dispatch.begin(this, path, false);
     let allowed = true;
     try {
-      this[invokeEventListeners](event, "at-target", QuoxEvent.AT_TARGET);
+      let reachesTarget = true;
+      for (let index = path.length - 1; index > 0; index -= 1) {
+        path[index][invokeEventListeners](event, "capturing", QuoxEvent.CAPTURING_PHASE);
+        if (dispatch.propagationStopped) {
+          reachesTarget = false;
+          break;
+        }
+      }
+
+      if (reachesTarget) {
+        this[invokeEventListeners](event, "at-target", QuoxEvent.AT_TARGET);
+        if (event.bubbles && !dispatch.propagationStopped) {
+          for (let index = 1; index < path.length; index += 1) {
+            path[index][invokeEventListeners](event, "bubbling", QuoxEvent.BUBBLING_PHASE);
+            if (dispatch.propagationStopped) break;
+          }
+        }
+      }
     } finally {
       allowed = dispatch.end();
     }
     return allowed;
+  }
+
+  [eventTargetPath](_event: QuoxEvent): readonly QuoxEventTarget[] {
+    return [this];
   }
 
   [invokeEventListeners](

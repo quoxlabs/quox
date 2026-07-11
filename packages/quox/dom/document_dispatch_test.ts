@@ -1,4 +1,4 @@
-import { assert, assertEquals, assertStrictEquals, assertThrows } from "@std/assert";
+import { assert, assertEquals, assertFalse, assertStrictEquals, assertThrows } from "@std/assert";
 import type { QuoxRenderer as WasmRenderer } from "../lib/quox.js";
 import { QuoxDocument } from "./document.ts";
 import { QuoxEvent } from "./event.ts";
@@ -148,6 +148,7 @@ class FakeDispatchRenderer {
   readonly #nodeKinds = new Map<number, number>();
   readonly #plans: FramePlan[] = [];
   readonly #pending = new Map<number, unknown[]>();
+  readonly syntheticEventPaths = new Map<number, Uint32Array>();
   #nextNodeId = 1;
   #nextFrameId = 1;
   #nextEventId = 1;
@@ -179,6 +180,10 @@ class FakeDispatchRenderer {
     const kind = this.#nodeKinds.get(nodeHandle);
     if (kind === undefined) throw new RangeError(`unknown fake node ${nodeHandle}`);
     return kind;
+  }
+
+  synthetic_event_path(nodeHandle: number): Uint32Array {
+    return this.syntheticEventPaths.get(nodeHandle) ?? Uint32Array.of(nodeHandle);
   }
 
   set_inner_html(_nodeHandle: number, _html: string): Uint32Array {
@@ -605,6 +610,57 @@ Deno.test("nonbubbling trusted events still capture through window and document"
 
   document.dispatchPointerMove(1, 2, 0, 0);
   assertEquals(calls, ["window capture", "document capture", "parent capture", "target"]);
+});
+
+Deno.test("synthetic node events capture and bubble through DOM ancestors", () => {
+  const { document, renderer, window } = createHarness();
+  const parent = document.createElement("section");
+  const target = document.createElement("button");
+  renderer.syntheticEventPaths.set(
+    target.nodeId,
+    Uint32Array.of(target.nodeId, parent.nodeId, 0),
+  );
+  const calls: string[] = [];
+
+  window.addEventListener("custom", () => calls.push("window capture"), true);
+  document.addEventListener("custom", () => calls.push("document capture"), true);
+  parent.addEventListener("custom", () => calls.push("parent capture"), true);
+  target.addEventListener("custom", (event) => {
+    calls.push("target");
+    assertFalse(event.isTrusted);
+    assertEquals(event.composedPath(), [target, parent, document, window]);
+  });
+  parent.addEventListener("custom", () => calls.push("parent bubble"));
+  document.addEventListener("custom", () => calls.push("document bubble"));
+  window.addEventListener("custom", () => calls.push("window bubble"));
+
+  assert(target.dispatchEvent(new QuoxEvent("custom", { bubbles: true })));
+  assertEquals(calls, [
+    "window capture",
+    "document capture",
+    "parent capture",
+    "target",
+    "parent bubble",
+    "document bubble",
+    "window bubble",
+  ]);
+
+  let documentLoads = 0;
+  let windowLoads = 0;
+  document.addEventListener("load", () => documentLoads++);
+  window.addEventListener("load", () => windowLoads++);
+  assert(target.dispatchEvent(new QuoxEvent("load", { bubbles: true })));
+  assertEquals(documentLoads, 1);
+  assertEquals(windowLoads, 0);
+
+  renderer.syntheticEventPaths.set(
+    target.nodeId,
+    Uint32Array.of(target.nodeId, parent.nodeId, parent.nodeId, 0),
+  );
+  assertThrows(
+    () => target.dispatchEvent(new QuoxEvent("malformed", { bubbles: true })),
+    TypeError,
+  );
 });
 
 Deno.test("JSX handlers occupy one stable listener slot and feed preventDefault back before resume", () => {
