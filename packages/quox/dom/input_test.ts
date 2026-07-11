@@ -19,6 +19,7 @@ class FakeWindow implements WindingWindow {
   setImeEnabled(enabled: boolean): void {
     this.calls.push(["enabled", Number(enabled)]);
   }
+  setImeSurroundingText(_text: string, _selectionStartBytes: number, _selectionEndBytes: number): void {}
   setImeCursorArea(x: number, y: number, width: number, height: number): void {
     this.calls.push(["area", x, y, width, height]);
   }
