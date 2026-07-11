@@ -30,28 +30,28 @@ export const gdi32functions = {
 export const user32functions = {
   GetDC: { parameters: ["pointer"], result: "pointer" },
   GetKeyState: { parameters: ["i32"], result: "i16" },
-  GetKeyboardState: { parameters: ["buffer"], result: "bool" },
+  GetKeyboardState: { parameters: ["buffer"], result: "i32" },
   GetKeyboardLayout: { parameters: ["u32"], result: "pointer" },
   ToUnicodeEx: {
     parameters: ["u32", "u32", "buffer", "buffer", "i32", "u32", "pointer"],
     result: "i32",
   },
-  ClientToScreen: { parameters: ["pointer", "buffer"], result: "bool" },
-  GetClientRect: { parameters: ["pointer", "buffer"], result: "bool" },
+  ClientToScreen: { parameters: ["pointer", "buffer"], result: "i32" },
+  GetClientRect: { parameters: ["pointer", "buffer"], result: "i32" },
   ReleaseDC: { parameters: ["pointer", "pointer"], result: "i32" },
   SetCapture: { parameters: ["pointer"], result: "pointer" },
-  ReleaseCapture: { parameters: [], result: "bool" },
-  SetWindowTextW: { parameters: ["pointer", "buffer"], result: "bool" },
-  DestroyWindow: { parameters: ["pointer"], result: "bool" },
+  ReleaseCapture: { parameters: [], result: "i32" },
+  SetWindowTextW: { parameters: ["pointer", "buffer"], result: "i32" },
+  DestroyWindow: { parameters: ["pointer"], result: "i32" },
   LoadCursorW: { parameters: ["pointer", "usize"], result: "usize" },
-  TrackMouseEvent: { parameters: ["buffer"], result: "bool" },
+  TrackMouseEvent: { parameters: ["buffer"], result: "i32" },
   RegisterClassExW: {
     parameters: ["buffer"],
     result: "u16",
   },
   UnregisterClassW: {
     parameters: ["buffer", "usize"],
-    result: "bool",
+    result: "i32",
   },
   CreateWindowExW: {
     parameters: [
@@ -72,9 +72,9 @@ export const user32functions = {
   },
   PeekMessageW: {
     parameters: ["pointer", "pointer", "u32", "u32", "u32"],
-    result: "bool",
+    result: "i32",
   },
-  TranslateMessage: { parameters: ["pointer"], result: "bool" },
+  TranslateMessage: { parameters: ["pointer"], result: "i32" },
   DispatchMessageW: {
     parameters: ["pointer"],
     result: "usize",
@@ -87,10 +87,10 @@ export const user32functions = {
 
 export const imm32functions = {
   ImmGetContext: { parameters: ["pointer"], result: "pointer" },
-  ImmReleaseContext: { parameters: ["pointer", "pointer"], result: "bool" },
+  ImmReleaseContext: { parameters: ["pointer", "pointer"], result: "i32" },
   ImmAssociateContextEx: {
     parameters: ["pointer", "pointer", "u32"],
-    result: "bool",
+    result: "i32",
   },
   ImmGetCompositionStringW: {
     // `lpBuf` is nullable for the initial size query, so model it as a pointer
@@ -100,15 +100,15 @@ export const imm32functions = {
   },
   ImmSetCandidateWindow: {
     parameters: ["pointer", "buffer"],
-    result: "bool",
+    result: "i32",
   },
   ImmSetCompositionWindow: {
     parameters: ["pointer", "buffer"],
-    result: "bool",
+    result: "i32",
   },
   ImmNotifyIME: {
     parameters: ["pointer", "u32", "u32", "u32"],
-    result: "bool",
+    result: "i32",
   },
 } as const satisfies Deno.ForeignLibraryInterface;
 

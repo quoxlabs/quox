@@ -94,7 +94,7 @@ class Win32Window implements Window {
       lib.windows.delete(this.id);
       const errors = [error];
       try {
-        if (!lib.user32.symbols.DestroyWindow(window)) errors.push(new Error(lib.getLastError()));
+        if (lib.user32.symbols.DestroyWindow(window) === 0) errors.push(new Error(lib.getLastError()));
       } catch (cleanupError) {
         errors.push(cleanupError);
       }
@@ -108,7 +108,7 @@ class Win32Window implements Window {
 
   setTitle(title: string): void {
     const ok = this.lib.user32.symbols.SetWindowTextW(this.#hwnd, wideStringBuffer(title));
-    if (!ok) throw new Error(this.lib.getLastError());
+    if (ok === 0) throw new Error(this.lib.getLastError());
   }
 
   setImeEnabled(enabled: boolean): void {
@@ -188,7 +188,7 @@ class Win32Window implements Window {
     this.lib.purgeWindowEvents(this);
     this.lib.windows.delete(this.id);
     try {
-      if (!this.lib.user32.symbols.DestroyWindow(this.#hwnd)) errors.push(new Error(this.lib.getLastError()));
+      if (this.lib.user32.symbols.DestroyWindow(this.#hwnd) === 0) errors.push(new Error(this.lib.getLastError()));
     } catch (error) {
       errors.push(error);
     }
@@ -433,7 +433,7 @@ class Win32Library implements Library {
     if (queued !== undefined) return queued;
 
     const ptr = Deno.UnsafePointer.of(this.#msg);
-    while (this.#events.length === 0 && this.user32.symbols.PeekMessageW(ptr, null, 0, 0, PM_REMOVE)) {
+    while (this.#events.length === 0 && this.user32.symbols.PeekMessageW(ptr, null, 0, 0, PM_REMOVE) !== 0) {
       this.input.prepareKeyMessage(this.#msg);
       try {
         this.user32.symbols.TranslateMessage(ptr);
@@ -486,7 +486,7 @@ class Win32Library implements Library {
     }
     captureError(errors, () => this.input.close());
     captureError(errors, () => {
-      if (!this.user32.symbols.UnregisterClassW(this.#classNameBuffer, this.#instance)) {
+      if (this.user32.symbols.UnregisterClassW(this.#classNameBuffer, this.#instance) === 0) {
         throw new Error(this.getLastError());
       }
     });

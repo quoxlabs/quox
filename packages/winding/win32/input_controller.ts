@@ -431,7 +431,7 @@ export class Win32InputController {
 
   #snapshotKeyboardState(): Uint8Array<ArrayBuffer> {
     const state = new Uint8Array(256) as Uint8Array<ArrayBuffer>;
-    if (this.#user32.symbols.GetKeyboardState(state)) return state;
+    if (this.#user32.symbols.GetKeyboardState(state) !== 0) return state;
     for (
       const virtualKey of [
         VK.SHIFT,
@@ -528,7 +528,7 @@ export class Win32InputController {
 
   #peekNextKeyMessage(): NativeKeyMessage | undefined {
     const pointer = Deno.UnsafePointer.of(this.#peekMessage);
-    if (!this.#user32.symbols.PeekMessageW(pointer, null, WM.KEYDOWN, WM.UNICHAR, PM_NOREMOVE)) return undefined;
+    if (this.#user32.symbols.PeekMessageW(pointer, null, WM.KEYDOWN, WM.UNICHAR, PM_NOREMOVE) === 0) return undefined;
     return this.#keyMessageFromBuffer(this.#peekMessage);
   }
 
@@ -742,8 +742,8 @@ export class Win32InputController {
     const transition = state.activation.reconcile({
       activate: () => {
         const activated = this.#imm32.symbols.ImmAssociateContextEx(window.hwnd, null, IACE_DEFAULT);
-        if (activated) this.#applyImeCursorArea(window, state);
-        return activated;
+        if (activated !== 0) this.#applyImeCursorArea(window, state);
+        return activated !== 0;
       },
       deactivate: () => {
         this.#imm32.symbols.ImmAssociateContextEx(window.hwnd, null, 0);
@@ -778,7 +778,7 @@ export class Win32InputController {
     const view = new DataView(buffer);
     view.setInt32(0, x, true);
     view.setInt32(4, y, true);
-    if (!this.#user32.symbols.ClientToScreen(window.hwnd, buffer)) return undefined;
+    if (this.#user32.symbols.ClientToScreen(window.hwnd, buffer) === 0) return undefined;
     return { x: view.getInt32(0, true), y: view.getInt32(4, true) };
   }
 
@@ -800,7 +800,7 @@ export class Win32InputController {
 
   #screenDocumentRectangle(window: Win32InputWindow): ImeCursorArea | undefined {
     const buffer = new ArrayBuffer(16);
-    if (!this.#user32.symbols.GetClientRect(window.hwnd, buffer)) return undefined;
+    if (this.#user32.symbols.GetClientRect(window.hwnd, buffer) === 0) return undefined;
     const view = new DataView(buffer);
     return this.#clientRectToScreen(window, {
       x: view.getInt32(0, true),

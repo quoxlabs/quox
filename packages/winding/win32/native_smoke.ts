@@ -7,7 +7,7 @@ import { load } from "./mod.ts";
 const testUser32Functions = {
   ShowWindow: {
     parameters: ["pointer", "i32"],
-    result: "bool",
+    result: "i32",
   },
   SendMessageW: {
     parameters: ["pointer", "u32", "usize", "isize"],
@@ -15,7 +15,7 @@ const testUser32Functions = {
   },
   PostMessageW: {
     parameters: ["pointer", "u32", "usize", "isize"],
-    result: "bool",
+    result: "i32",
   },
 } as const satisfies Deno.ForeignLibraryInterface;
 
@@ -61,7 +61,7 @@ function runLifecycle(user32: Deno.DynamicLibrary<typeof testUser32Functions>): 
       );
       if (probe !== 1n) throw new Error(`WM_UNICHAR capability probe returned ${probe}`);
 
-      if (!user32.symbols.PostMessageW(window.hwnd, WM.UNICHAR, 0x41n, 1n)) {
+      if (user32.symbols.PostMessageW(window.hwnd, WM.UNICHAR, 0x41n, 1n) === 0) {
         throw new Error("PostMessageW rejected the synthetic Unicode character");
       }
 
