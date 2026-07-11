@@ -879,6 +879,8 @@ export function win32KeyIdentity(virtualKey: number, lParam: number | bigint): s
 }
 
 export interface Win32KeyMessage {
+  /** Exact WM_KEY* or WM_SYSKEY* identifier. */
+  message: number;
   phase: "down" | "up";
   virtualKey: number;
   lParam: number | bigint;
@@ -898,33 +900,139 @@ function isExtendedRightAlt(message: Win32KeyMessage): boolean {
     decoded.isExtended && decoded.scanCode === 0x38;
 }
 
+interface Win32PhysicalKeyIdentity {
+  virtualKey: number;
+  extendedScanCode: number;
+}
+
+type AltGraphControlSequence =
+  | {
+    phase: "awaiting-right-alt-down";
+    control: Win32PhysicalKeyIdentity;
+    expectedRightAlt: Win32KeyMessage;
+  }
+  | {
+    phase: "right-alt-held";
+    control: Win32PhysicalKeyIdentity;
+    rightAlt: Win32PhysicalKeyIdentity;
+  }
+  | {
+    phase: "awaiting-right-alt-up";
+    expectedRightAlt: Win32KeyMessage;
+  };
+
+function win32PhysicalKeyIdentity(message: Win32KeyMessage): Win32PhysicalKeyIdentity {
+  return {
+    virtualKey: message.virtualKey,
+    extendedScanCode: decodeKeyLParam(message.lParam).extendedScanCode,
+  };
+}
+
+function matchesWin32PhysicalKey(identity: Win32PhysicalKeyIdentity, message: Win32KeyMessage): boolean {
+  const current = win32PhysicalKeyIdentity(message);
+  return current.virtualKey === identity.virtualKey && current.extendedScanCode === identity.extendedScanCode;
+}
+
+function win32KeyTimestampsAreCompatible(left?: number, right?: number): boolean {
+  return left === undefined || right === undefined || left === right;
+}
+
+function isWin32KeyDownMessage(message: number): boolean {
+  return message === WM.KEYDOWN || message === WM.SYSKEYDOWN;
+}
+
+function isWin32KeyUpMessage(message: number): boolean {
+  return message === WM.KEYUP || message === WM.SYSKEYUP;
+}
+
+function matchesExpectedWin32KeyMessage(expected: Win32KeyMessage, current: Win32KeyMessage): boolean {
+  return current.message === expected.message && current.phase === expected.phase &&
+    current.virtualKey === expected.virtualKey &&
+    BigInt.asUintN(64, BigInt(current.lParam)) === BigInt.asUintN(64, BigInt(expected.lParam)) &&
+    win32KeyTimestampsAreCompatible(current.timestamp, expected.timestamp);
+}
+
 /**
  * Filters the fake left-Control transition Windows places around AltGr. The
  * caller supplies the next queued key message for the down-pair check.
  */
 export class AltGraphControlFilter {
-  #syntheticControlDown = false;
+  #sequence: AltGraphControlSequence | undefined;
 
   shouldSuppress(current: Win32KeyMessage, next?: Win32KeyMessage): boolean {
-    if (current.phase === "up" && this.#syntheticControlDown && isUnextendedControl(current)) {
-      this.#syntheticControlDown = false;
-      return true;
+    const sequence = this.#sequence;
+    if (sequence?.phase === "awaiting-right-alt-down") {
+      if (!matchesExpectedWin32KeyMessage(sequence.expectedRightAlt, current)) {
+        this.reset();
+        return false;
+      }
+      this.#sequence = {
+        phase: "right-alt-held",
+        control: sequence.control,
+        rightAlt: win32PhysicalKeyIdentity(current),
+      };
+      return false;
     }
+
+    if (sequence?.phase === "right-alt-held") {
+      if (current.phase === "down" && isExtendedRightAlt(current)) {
+        const repeated = decodeKeyLParam(current.lParam).isRepeat;
+        if (repeated && matchesWin32PhysicalKey(sequence.rightAlt, current)) return false;
+        this.reset();
+        return false;
+      }
+      if (current.phase === "up" && isUnextendedControl(current)) {
+        const matchingRelease = isWin32KeyUpMessage(current.message) &&
+          matchesWin32PhysicalKey(sequence.control, current) && next !== undefined &&
+          isWin32KeyUpMessage(next.message) && next.phase === "up" && isExtendedRightAlt(next) &&
+          matchesWin32PhysicalKey(sequence.rightAlt, next) &&
+          win32KeyTimestampsAreCompatible(current.timestamp, next.timestamp);
+        if (matchingRelease) {
+          this.#sequence = {
+            phase: "awaiting-right-alt-up",
+            expectedRightAlt: { ...next },
+          };
+          return true;
+        }
+        this.reset();
+        return false;
+      }
+      if (isExtendedRightAlt(current) || isUnextendedControl(current)) this.reset();
+      return false;
+    }
+
+    if (sequence?.phase === "awaiting-right-alt-up") {
+      if (!matchesExpectedWin32KeyMessage(sequence.expectedRightAlt, current)) {
+        this.reset();
+        return false;
+      }
+      this.reset();
+      return false;
+    }
+
+    const currentDecoded = decodeKeyLParam(current.lParam);
+    const nextDecoded = next === undefined ? undefined : decodeKeyLParam(next.lParam);
     if (
       current.phase !== "down" || !isUnextendedControl(current) || next?.phase !== "down" ||
-      !isExtendedRightAlt(next)
+      !isWin32KeyDownMessage(current.message) || !isWin32KeyDownMessage(next.message) ||
+      !isExtendedRightAlt(next) ||
+      currentDecoded.isRepeat || nextDecoded?.isRepeat === true
     ) {
       return false;
     }
-    if (current.timestamp !== undefined && next.timestamp !== undefined && current.timestamp !== next.timestamp) {
+    if (!win32KeyTimestampsAreCompatible(current.timestamp, next.timestamp)) {
       return false;
     }
-    this.#syntheticControlDown = true;
+    this.#sequence = {
+      phase: "awaiting-right-alt-down",
+      control: win32PhysicalKeyIdentity(current),
+      expectedRightAlt: { ...next },
+    };
     return true;
   }
 
   reset(): void {
-    this.#syntheticControlDown = false;
+    this.#sequence = undefined;
   }
 }
 

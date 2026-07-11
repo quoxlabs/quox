@@ -28,6 +28,7 @@ import {
   Win32ImeAssociationState,
   win32KeyEditDisposition,
   win32KeyIdentity,
+  type Win32KeyMessage,
   win32LanguageIdFromKeyboardLayout,
   Win32MessageQueueGate,
   Win32MouseCaptureState,
@@ -1674,24 +1675,285 @@ Deno.test("Win32 edit ownership follows WM_SYSKEYDOWN rather than inferred Alt s
   );
 });
 
-Deno.test("AltGr's paired fake Control transitions are suppressed", () => {
+function altGraphControlSequenceMessages() {
+  return {
+    controlDown: {
+      message: WM.KEYDOWN,
+      phase: "down" as const,
+      virtualKey: VK.CONTROL,
+      lParam: makeKeyLParam(0x1d),
+      timestamp: 10,
+    },
+    controlUp: {
+      message: WM.KEYUP,
+      phase: "up" as const,
+      virtualKey: VK.CONTROL,
+      lParam: makeKeyLParam(0x1d, { previous: true, transition: true }),
+      timestamp: 20,
+    },
+    rightAltDown: {
+      message: WM.KEYDOWN,
+      phase: "down" as const,
+      virtualKey: VK.MENU,
+      lParam: makeKeyLParam(0x38, { extended: true }),
+      timestamp: 10,
+    },
+    rightAltRepeat: {
+      message: WM.KEYDOWN,
+      phase: "down" as const,
+      virtualKey: VK.MENU,
+      lParam: makeKeyLParam(0x38, { extended: true, previous: true }),
+      timestamp: 15,
+    },
+    rightAltUp: {
+      message: WM.SYSKEYUP,
+      phase: "up" as const,
+      virtualKey: VK.MENU,
+      lParam: makeKeyLParam(0x38, { extended: true, previous: true, transition: true }),
+      timestamp: 20,
+    },
+    normalDown: {
+      message: WM.KEYDOWN,
+      phase: "down" as const,
+      virtualKey: 0x41,
+      lParam: makeKeyLParam(0x1e),
+      timestamp: 12,
+    },
+    normalUp: {
+      message: WM.KEYUP,
+      phase: "up" as const,
+      virtualKey: 0x41,
+      lParam: makeKeyLParam(0x1e, { previous: true, transition: true }),
+      timestamp: 13,
+    },
+  };
+}
+
+Deno.test("AltGr filter follows the complete synthetic Control and right-Alt lifetime", () => {
   const filter = new AltGraphControlFilter();
-  const controlDown = {
-    phase: "down" as const,
-    virtualKey: VK.CONTROL,
-    lParam: makeKeyLParam(0x1d),
-    timestamp: 10,
-  };
-  const rightAltDown = {
-    phase: "down" as const,
-    virtualKey: VK.MENU,
-    lParam: makeKeyLParam(0x38, { extended: true }),
-    timestamp: 10,
-  };
+  const messages = altGraphControlSequenceMessages();
+  assertEquals(filter.shouldSuppress(messages.controlDown, messages.rightAltDown), true);
+  assertEquals(filter.shouldSuppress(messages.rightAltDown), false);
+  assertEquals(filter.shouldSuppress(messages.normalDown), false);
+  assertEquals(filter.shouldSuppress(messages.normalUp), false);
+  assertEquals(filter.shouldSuppress(messages.controlUp, messages.rightAltUp), true);
+  assertEquals(filter.shouldSuppress(messages.rightAltUp), false);
+  assertEquals(filter.shouldSuppress(messages.controlUp), false);
+});
+
+Deno.test("AltGr filter rejects mismatched down, observation, and release timestamps", () => {
+  const messages = altGraphControlSequenceMessages();
+  const downMismatch = new AltGraphControlFilter();
+  assertEquals(
+    downMismatch.shouldSuppress(messages.controlDown, { ...messages.rightAltDown, timestamp: 11 }),
+    false,
+  );
+
+  const observationMismatch = new AltGraphControlFilter();
+  assertEquals(observationMismatch.shouldSuppress(messages.controlDown, messages.rightAltDown), true);
+  assertEquals(observationMismatch.shouldSuppress({ ...messages.rightAltDown, timestamp: 11 }), false);
+  assertEquals(observationMismatch.shouldSuppress(messages.rightAltUp), false);
+  assertEquals(observationMismatch.shouldSuppress(messages.controlUp), false);
+
+  const peekMismatch = new AltGraphControlFilter();
+  assertEquals(peekMismatch.shouldSuppress(messages.controlDown, messages.rightAltDown), true);
+  assertEquals(peekMismatch.shouldSuppress(messages.rightAltDown), false);
+  assertEquals(peekMismatch.shouldSuppress(messages.controlUp, { ...messages.rightAltUp, timestamp: 21 }), false);
+  assertEquals(peekMismatch.shouldSuppress(messages.rightAltUp), false);
+
+  const observationUpMismatch = new AltGraphControlFilter();
+  assertEquals(observationUpMismatch.shouldSuppress(messages.controlDown, messages.rightAltDown), true);
+  assertEquals(observationUpMismatch.shouldSuppress(messages.rightAltDown), false);
+  assertEquals(observationUpMismatch.shouldSuppress(messages.controlUp, messages.rightAltUp), true);
+  assertEquals(observationUpMismatch.shouldSuppress({ ...messages.rightAltUp, timestamp: 21 }), false);
+  assertEquals(observationUpMismatch.shouldSuppress(messages.controlUp), false);
+});
+
+Deno.test("AltGr filter resets when the immediately expected right-Alt down is missing or changed", () => {
+  const messages = altGraphControlSequenceMessages();
+  const absent = new AltGraphControlFilter();
+  assertEquals(absent.shouldSuppress(messages.controlDown), false);
+  assertEquals(absent.shouldSuppress(messages.controlUp), false);
+
+  const missing = new AltGraphControlFilter();
+  assertEquals(missing.shouldSuppress(messages.controlDown, messages.rightAltDown), true);
+  assertEquals(missing.shouldSuppress(messages.normalDown), false);
+  assertEquals(missing.shouldSuppress(messages.rightAltDown), false);
+  assertEquals(missing.shouldSuppress(messages.controlUp), false);
+  assertEquals(missing.shouldSuppress(messages.rightAltUp), false);
+
+  const changed = new AltGraphControlFilter();
+  assertEquals(changed.shouldSuppress(messages.controlDown, messages.rightAltDown), true);
+  assertEquals(changed.shouldSuppress({ ...messages.rightAltDown, virtualKey: VK.RMENU }), false);
+  assertEquals(changed.shouldSuppress(messages.controlUp), false);
+});
+
+Deno.test("AltGr filter requires the immediately peeked matching right-Alt release", () => {
+  const messages = altGraphControlSequenceMessages();
+  const missing = new AltGraphControlFilter();
+  assertEquals(missing.shouldSuppress(messages.controlDown, messages.rightAltDown), true);
+  assertEquals(missing.shouldSuppress(messages.rightAltDown), false);
+  assertEquals(missing.shouldSuppress(messages.controlUp), false);
+  assertEquals(missing.shouldSuppress(messages.rightAltUp), false);
+
+  const changedPeek = new AltGraphControlFilter();
+  assertEquals(changedPeek.shouldSuppress(messages.controlDown, messages.rightAltDown), true);
+  assertEquals(changedPeek.shouldSuppress(messages.rightAltDown), false);
+  assertEquals(
+    changedPeek.shouldSuppress(messages.controlUp, { ...messages.rightAltUp, virtualKey: VK.RMENU }),
+    false,
+  );
+  assertEquals(changedPeek.shouldSuppress(messages.rightAltUp), false);
+
+  const changedActual = new AltGraphControlFilter();
+  assertEquals(changedActual.shouldSuppress(messages.controlDown, messages.rightAltDown), true);
+  assertEquals(changedActual.shouldSuppress(messages.rightAltDown), false);
+  assertEquals(changedActual.shouldSuppress(messages.controlUp, messages.rightAltUp), true);
+  assertEquals(changedActual.shouldSuppress({ ...messages.rightAltUp, message: WM.KEYUP }), false);
+  assertEquals(changedActual.shouldSuppress(messages.rightAltUp), false);
+});
+
+Deno.test("AltGr filter preserves and matches normal versus system key message identity", () => {
+  const filter = new AltGraphControlFilter();
+  const messages = altGraphControlSequenceMessages();
+  const controlDown = { ...messages.controlDown, message: WM.SYSKEYDOWN };
+  const rightAltDown = { ...messages.rightAltDown, message: WM.SYSKEYDOWN };
+  const controlUp = { ...messages.controlUp, message: WM.SYSKEYUP };
+  const rightAltUp = { ...messages.rightAltUp, message: WM.KEYUP };
   assertEquals(filter.shouldSuppress(controlDown, rightAltDown), true);
-  assertEquals(filter.shouldSuppress({ ...controlDown, phase: "up" }), true);
-  assertEquals(filter.shouldSuppress(controlDown, { ...rightAltDown, timestamp: 11 }), false);
-  assertEquals(filter.shouldSuppress(controlDown), false);
+  assertEquals(filter.shouldSuppress(rightAltDown), false);
+  assertEquals(filter.shouldSuppress(controlUp, rightAltUp), true);
+  assertEquals(filter.shouldSuppress(rightAltUp), false);
+});
+
+Deno.test("Win32 controller peeks and verifies the raw right-Alt release after Control-up", () => {
+  const messages = altGraphControlSequenceMessages();
+  const behavior: FakeImmBehavior = {
+    keyboardLayout: 0x0409n,
+    mapVirtualKey: (virtualKey) => virtualKey === 0x51 ? 0x10 : 0,
+    toUnicode(virtualKey, _scanCode, state) {
+      if (virtualKey !== 0x51) return { result: 0, text: "" };
+      return (state[VK.RMENU] & 0x80) !== 0 ? { result: 1, text: "@" } : { result: 1, text: "q" };
+    },
+  };
+  const harness = createInputControllerHarness(behavior);
+  harness.controller.attach(harness.window);
+  const native = (message: Win32KeyMessage): FakeNativeKeyMessage => ({
+    windowId: harness.window.id,
+    message: message.message,
+    virtualKey: message.virtualKey,
+    lParam: BigInt.asIntN(64, BigInt(message.lParam)),
+    timestamp: message.timestamp ?? 0,
+  });
+  const dispatchPrepared = (message: Win32KeyMessage) => {
+    harness.controller.prepareKeyMessage(fakeNativeKeyMessageBuffer(native(message)));
+    harness.controller.handleMessage(
+      harness.window,
+      message.message,
+      message.virtualKey,
+      message.lParam,
+    );
+  };
+
+  behavior.peekKeyMessage = native(messages.rightAltDown);
+  dispatchPrepared(messages.controlDown);
+  behavior.peekKeyMessage = undefined;
+  dispatchPrepared(messages.rightAltDown);
+  behavior.peekKeyMessage = native(messages.rightAltUp);
+  dispatchPrepared(messages.controlUp);
+  behavior.peekKeyMessage = undefined;
+  dispatchPrepared(messages.rightAltUp);
+
+  assertEquals(
+    harness.events.filter((event) => event.type === "keydown" || event.type === "keyup").map((event) => ({
+      type: event.type,
+      keycode: event.keycode,
+    })),
+    [
+      { type: "keydown", keycode: VK.MENU },
+      { type: "keyup", keycode: VK.MENU },
+    ],
+  );
+});
+
+Deno.test("AltGr filter never suppresses genuine or interleaved Control releases", () => {
+  const messages = altGraphControlSequenceMessages();
+  const reordered = new AltGraphControlFilter();
+  assertEquals(reordered.shouldSuppress(messages.controlDown, messages.rightAltDown), true);
+  assertEquals(reordered.shouldSuppress(messages.rightAltDown), false);
+  assertEquals(reordered.shouldSuppress(messages.rightAltUp), false);
+  assertEquals(reordered.shouldSuppress(messages.controlUp, messages.rightAltUp), false);
+
+  const interleaved = new AltGraphControlFilter();
+  assertEquals(interleaved.shouldSuppress(messages.controlDown, messages.rightAltDown), true);
+  assertEquals(interleaved.shouldSuppress(messages.rightAltDown), false);
+  assertEquals(interleaved.shouldSuppress(messages.controlUp, messages.rightAltUp), true);
+  assertEquals(interleaved.shouldSuppress(messages.normalUp), false);
+  assertEquals(interleaved.shouldSuppress(messages.rightAltUp), false);
+
+  const changedControl = new AltGraphControlFilter();
+  assertEquals(changedControl.shouldSuppress(messages.controlDown, messages.rightAltDown), true);
+  assertEquals(changedControl.shouldSuppress(messages.rightAltDown), false);
+  assertEquals(
+    changedControl.shouldSuppress({ ...messages.controlUp, virtualKey: VK.LCONTROL }, messages.rightAltUp),
+    false,
+  );
+  assertEquals(changedControl.shouldSuppress(messages.rightAltUp), false);
+});
+
+Deno.test("AltGr filter tolerates right-Alt repeats but resets on duplicate transitions", () => {
+  const messages = altGraphControlSequenceMessages();
+  const repeated = new AltGraphControlFilter();
+  assertEquals(repeated.shouldSuppress(messages.controlDown, messages.rightAltDown), true);
+  assertEquals(repeated.shouldSuppress(messages.rightAltDown), false);
+  assertEquals(repeated.shouldSuppress(messages.rightAltRepeat), false);
+  assertEquals(repeated.shouldSuppress(messages.controlUp, messages.rightAltUp), true);
+  assertEquals(repeated.shouldSuppress(messages.rightAltUp), false);
+
+  const duplicateDown = new AltGraphControlFilter();
+  assertEquals(duplicateDown.shouldSuppress(messages.controlDown, messages.rightAltDown), true);
+  assertEquals(duplicateDown.shouldSuppress(messages.rightAltDown), false);
+  assertEquals(duplicateDown.shouldSuppress(messages.rightAltDown), false);
+  assertEquals(duplicateDown.shouldSuppress(messages.controlUp, messages.rightAltUp), false);
+
+  const duplicateUp = new AltGraphControlFilter();
+  assertEquals(duplicateUp.shouldSuppress(messages.controlDown, messages.rightAltDown), true);
+  assertEquals(duplicateUp.shouldSuppress(messages.rightAltDown), false);
+  assertEquals(duplicateUp.shouldSuppress(messages.controlUp, messages.rightAltUp), true);
+  assertEquals(duplicateUp.shouldSuppress(messages.rightAltUp), false);
+  assertEquals(duplicateUp.shouldSuppress(messages.rightAltUp), false);
+
+  const repeatedStart = new AltGraphControlFilter();
+  assertEquals(
+    repeatedStart.shouldSuppress(
+      { ...messages.controlDown, lParam: makeKeyLParam(0x1d, { previous: true }) },
+      messages.rightAltDown,
+    ),
+    false,
+  );
+  assertEquals(repeatedStart.shouldSuppress(messages.controlDown, messages.rightAltRepeat), false);
+});
+
+Deno.test("AltGr filter reset boundaries discard every partial synthetic sequence", () => {
+  const messages = altGraphControlSequenceMessages();
+  const filter = new AltGraphControlFilter();
+  assertEquals(filter.shouldSuppress(messages.controlDown, messages.rightAltDown), true);
+  filter.reset();
+  assertEquals(filter.shouldSuppress(messages.rightAltDown), false);
+  assertEquals(filter.shouldSuppress(messages.controlUp, messages.rightAltUp), false);
+
+  assertEquals(filter.shouldSuppress(messages.controlDown, messages.rightAltDown), true);
+  assertEquals(filter.shouldSuppress(messages.rightAltDown), false);
+  filter.reset();
+  assertEquals(filter.shouldSuppress(messages.controlUp, messages.rightAltUp), false);
+
+  assertEquals(filter.shouldSuppress(messages.controlDown, messages.rightAltDown), true);
+  assertEquals(filter.shouldSuppress(messages.rightAltDown), false);
+  assertEquals(filter.shouldSuppress(messages.controlUp, messages.rightAltUp), true);
+  filter.reset();
+  assertEquals(filter.shouldSuppress(messages.rightAltUp), false);
+
+  assertEquals(filter.shouldSuppress(messages.controlDown, messages.rightAltDown), true);
 });
 
 Deno.test("logical key cache resolves keyup using the keydown identity", () => {
@@ -2132,6 +2394,30 @@ function uint32Le(values: readonly number[]): Uint8Array {
   return bytes;
 }
 
+interface FakeNativeKeyMessage {
+  windowId: bigint;
+  message: number;
+  virtualKey: number;
+  lParam: bigint;
+  timestamp: number;
+}
+
+function writeFakeNativeKeyMessage(buffer: ArrayBuffer, message: FakeNativeKeyMessage): void {
+  new Uint8Array(buffer).fill(0);
+  const view = new DataView(buffer);
+  view.setBigUint64(0, message.windowId, true);
+  view.setUint32(8, message.message, true);
+  view.setBigUint64(16, BigInt(message.virtualKey), true);
+  view.setBigInt64(24, message.lParam, true);
+  view.setUint32(32, message.timestamp, true);
+}
+
+function fakeNativeKeyMessageBuffer(message: FakeNativeKeyMessage): ArrayBuffer {
+  const buffer = new ArrayBuffer(48);
+  writeFakeNativeKeyMessage(buffer, message);
+  return buffer;
+}
+
 interface FakeImmBehavior {
   associateResults?: number[];
   candidateResults?: ReadonlyMap<number, number>;
@@ -2154,6 +2440,7 @@ interface FakeImmBehavior {
   devicePixelRatio?: number;
   defaultWindowResult?: bigint;
   keyboardLayout?: bigint;
+  peekKeyMessage?: FakeNativeKeyMessage;
 }
 
 function createInputControllerHarness(behavior: FakeImmBehavior = {}) {
@@ -2276,6 +2563,11 @@ function createInputControllerHarness(behavior: FakeImmBehavior = {}) {
       },
     }),
     () => behavior.keyboardLayout,
+    (buffer) => {
+      if (behavior.peekKeyMessage === undefined) return false;
+      writeFakeNativeKeyMessage(buffer, behavior.peekKeyMessage);
+      return true;
+    },
   );
   return { calls, controller, events, keyboardLayout, window };
 }

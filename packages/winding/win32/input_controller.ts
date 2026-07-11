@@ -148,6 +148,7 @@ export class Win32InputController {
   readonly #windowById: (id: bigint) => Win32InputWindow | undefined;
   readonly #compositionAdapterForContext?: (context: Deno.PointerObject) => ImmCompositionAdapter;
   readonly #keyboardLayoutAddress: (layout: Deno.PointerValue) => bigint | undefined;
+  readonly #peekKeyMessageInto: (buffer: ArrayBuffer) => boolean;
   #preparedKey: PreparedKeyEvent | undefined;
 
   constructor(
@@ -158,6 +159,7 @@ export class Win32InputController {
     compositionAdapterForContext?: (context: Deno.PointerObject) => ImmCompositionAdapter,
     keyboardLayoutAddress: (layout: Deno.PointerValue) => bigint | undefined = (layout) =>
       layout === null ? undefined : Deno.UnsafePointer.value(layout),
+    peekKeyMessageInto?: (buffer: ArrayBuffer) => boolean,
   ) {
     this.#user32 = user32;
     this.#imm32 = imm32;
@@ -165,6 +167,10 @@ export class Win32InputController {
     this.#windowById = windowById;
     this.#compositionAdapterForContext = compositionAdapterForContext;
     this.#keyboardLayoutAddress = keyboardLayoutAddress;
+    this.#peekKeyMessageInto = peekKeyMessageInto ?? ((buffer) => {
+      const pointer = Deno.UnsafePointer.of(buffer);
+      return this.#user32.symbols.PeekMessageW(pointer, null, WM.KEYDOWN, WM.UNICHAR, PM_NOREMOVE) !== 0;
+    });
   }
 
   attach(window: Win32InputWindow): void {
@@ -544,13 +550,15 @@ export class Win32InputController {
     }
 
     const current = {
+      message: message.message,
       phase: type === "keydown" ? "down" as const : "up" as const,
       virtualKey: message.virtualKey,
       lParam: message.lParam,
       timestamp: message.timestamp,
     };
-    const nextMessage = type === "keydown" ? this.#peekNextKeyMessage() : undefined;
+    const nextMessage = this.#peekNextKeyMessage();
     const next = nextMessage === undefined || nextMessage.windowId !== message.windowId ? undefined : {
+      message: nextMessage.message,
       phase: nextMessage.message === WM.KEYDOWN || nextMessage.message === WM.SYSKEYDOWN
         ? "down" as const
         : "up" as const,
@@ -710,8 +718,7 @@ export class Win32InputController {
   }
 
   #peekNextKeyMessage(): NativeKeyMessage | undefined {
-    const pointer = Deno.UnsafePointer.of(this.#peekMessage);
-    if (this.#user32.symbols.PeekMessageW(pointer, null, WM.KEYDOWN, WM.UNICHAR, PM_NOREMOVE) === 0) return undefined;
+    if (!this.#peekKeyMessageInto(this.#peekMessage)) return undefined;
     return this.#keyMessageFromBuffer(this.#peekMessage);
   }
 
