@@ -686,6 +686,7 @@ class X11Library implements Library {
     cleanup(() => {
       this.X11.symbols.XCloseDisplay(this.display);
     });
+    cleanup(() => this.input.afterDisplayClosed());
     cleanup(() => this.X11.close());
     cleanup(() => this.libc.close());
     libraryActive = false;

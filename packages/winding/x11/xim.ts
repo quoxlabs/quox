@@ -147,6 +147,8 @@ export class XimManager implements Disposable {
   #rebuildPending = false;
   #serverDestroyed = false;
   #closed = false;
+  #destroyCallbackClosed = false;
+  #instantiateCallbackClosed = false;
   readonly #previousLocale: string | undefined;
   readonly localeIsUtf8: boolean;
 
@@ -167,7 +169,7 @@ export class XimManager implements Disposable {
     const locale = this.#libc.symbols.setlocale(LC_CTYPE, cString(""));
     this.localeIsUtf8 = isUtf8Locale(pointerString(locale));
 
-    this.#destroyCallback = new Deno.UnsafeCallback(
+    const destroyCallback = new Deno.UnsafeCallback(
       XIM_LIFECYCLE_CALLBACK_DEFINITION,
       guardNativeCallback(
         this.#callbackErrors,
@@ -183,27 +185,58 @@ export class XimManager implements Disposable {
         () => undefined,
       ),
     );
-    this.#destroyRecord = callbackRecord(this.#destroyCallback);
+    let destroyRecord: BigUint64Array<ArrayBuffer>;
+    let instantiateCallback: Deno.UnsafeCallback<typeof XIM_LIFECYCLE_CALLBACK_DEFINITION>;
+    try {
+      destroyRecord = callbackRecord(destroyCallback);
+      instantiateCallback = new Deno.UnsafeCallback(
+        XIM_LIFECYCLE_CALLBACK_DEFINITION,
+        guardNativeCallback(
+          this.#callbackErrors,
+          () => {
+            this.#rebuildPending = true;
+          },
+          () => undefined,
+        ),
+      );
+    } catch (error) {
+      destroyCallback.close();
+      if (this.#previousLocale !== undefined) {
+        this.#libc.symbols.setlocale(LC_CTYPE, cString(this.#previousLocale));
+      }
+      throw error;
+    }
+    this.#destroyCallback = destroyCallback;
+    this.#destroyRecord = destroyRecord;
+    this.#instantiateCallback = instantiateCallback;
 
-    this.#instantiateCallback = new Deno.UnsafeCallback(
-      XIM_LIFECYCLE_CALLBACK_DEFINITION,
-      guardNativeCallback(
-        this.#callbackErrors,
-        () => {
-          this.#rebuildPending = true;
-        },
-        () => undefined,
-      ),
-    );
-
-    if (locale !== null && this.#x11.XSupportsLocale() !== 0) this.#openInputMethod();
+    try {
+      if (locale !== null && this.#x11.XSupportsLocale() !== 0) this.#openInputMethod();
+    } catch (error) {
+      try {
+        this.close();
+      } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], "winding(x11): failed to initialize XIM");
+      }
+      throw error;
+    }
   }
 
   createContext(window: bigint): XimContext {
     const context = new XimContext(this, window);
     this.#contexts.add(context);
-    context.recreate();
-    return context;
+    try {
+      context.recreate();
+      return context;
+    } catch (error) {
+      this.#contexts.delete(context);
+      try {
+        context.destroy(false);
+      } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], "winding(x11): failed to create XIM context");
+      }
+      throw error;
+    }
   }
 
   removeContext(context: XimContext): void {
@@ -449,27 +482,32 @@ export class XimManager implements Disposable {
     }
     this.#contexts.clear();
     const im = this.#im;
+    let canCloseDestroyCallback = im === null || this.#serverDestroyed;
     if (im !== null && !this.#serverDestroyed) {
       cleanup(() => {
-        this.#x11.XCloseIM(im);
+        canCloseDestroyCallback = this.#x11.XCloseIM(im) !== 0;
       });
     }
     this.#im = null;
     if (this.#instantiateRegistered) {
       cleanup(() => {
-        this.#x11.XUnregisterIMInstantiateCallback(
+        const unregistered = this.#x11.XUnregisterIMInstantiateCallback(
           this.#display,
           null,
           null,
           null,
           this.#instantiateCallback.pointer,
           null,
-        );
+        ) !== 0;
+        if (unregistered) this.#instantiateRegistered = false;
       });
-      this.#instantiateRegistered = false;
     }
-    cleanup(() => this.#destroyCallback.close());
-    cleanup(() => this.#instantiateCallback.close());
+    if (canCloseDestroyCallback) {
+      cleanup(() => this.#closeDestroyCallback());
+    }
+    if (!this.#instantiateRegistered) {
+      cleanup(() => this.#closeInstantiateCallback());
+    }
     const previousLocale = this.#previousLocale;
     if (previousLocale !== undefined) {
       cleanup(() => {
@@ -480,6 +518,25 @@ export class XimManager implements Disposable {
     if (errors.length > 1) {
       throw new AggregateError(errors, "winding(x11): errors while closing XIM");
     }
+  }
+
+  /** Release callbacks retained after native unregister failure once the display is gone. */
+  afterDisplayClosed(): void {
+    this.#closeDestroyCallback();
+    this.#closeInstantiateCallback();
+    this.#instantiateRegistered = false;
+  }
+
+  #closeDestroyCallback(): void {
+    if (this.#destroyCallbackClosed) return;
+    this.#destroyCallbackClosed = true;
+    this.#destroyCallback.close();
+  }
+
+  #closeInstantiateCallback(): void {
+    if (this.#instantiateCallbackClosed) return;
+    this.#instantiateCallbackClosed = true;
+    this.#instantiateCallback.close();
   }
 
   #openInputMethod(): void {
@@ -506,15 +563,15 @@ export class XimManager implements Disposable {
       this.#styles = styles;
       this.#usingFallback = index !== 0;
       if (!this.#usingFallback && this.#instantiateRegistered) {
-        this.#x11.XUnregisterIMInstantiateCallback(
+        const unregistered = this.#x11.XUnregisterIMInstantiateCallback(
           this.#display,
           null,
           null,
           null,
           this.#instantiateCallback.pointer,
           null,
-        );
-        this.#instantiateRegistered = false;
+        ) !== 0;
+        if (unregistered) this.#instantiateRegistered = false;
       }
       return;
     }
