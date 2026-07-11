@@ -1,4 +1,5 @@
 import { makeNSRange, NS_NOT_FOUND, OBJC_BOOL_ENCODING, readNSRange } from "./ffi.ts";
+import { nativeMouseButton } from "./mod.ts";
 import {
   cocoaRectFromClient,
   logicalKeyForEvent,
@@ -42,6 +43,14 @@ Deno.test("NSRange helpers preserve ordinary ranges and NSNotFound", () => {
     location: NS_NOT_FOUND,
     length: 0n,
   });
+});
+
+Deno.test("Darwin native mouse numbers map only the three public buttons", () => {
+  assertEquals(nativeMouseButton(0n), "left");
+  assertEquals(nativeMouseButton(1n), "right");
+  assertEquals(nativeMouseButton(2n), "middle");
+  assertEquals(nativeMouseButton(3n), undefined);
+  assertEquals(nativeMouseButton(4n), undefined);
 });
 
 Deno.test("logical keys come from AppKit text rather than the physical key position", () => {

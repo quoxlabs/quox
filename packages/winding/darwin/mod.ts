@@ -963,7 +963,21 @@ class DarwinWindow implements Window, DarwinNativeResponder {
   }
 }
 
-const BUTTONS = [, "left", "middle", "right"] as const;
+export function nativeMouseButton(buttonNumber: number | bigint): "left" | "middle" | "right" | undefined {
+  switch (buttonNumber) {
+    case 0:
+    case 0n:
+      return "left";
+    case 1:
+    case 1n:
+      return "right";
+    case 2:
+    case 2n:
+      return "middle";
+    default:
+      return undefined;
+  }
+}
 
 class DarwinLibrary implements Library {
   readonly ffi: DarwinFfi;
@@ -1152,7 +1166,7 @@ function importPointerEvent(event: Deno.PointerValue, window: DarwinWindow): UIE
     case NSEventType.OtherMouseDown:
     case NSEventType.OtherMouseUp: {
       const buttonNumber = send.i64(event, sel("buttonNumber"));
-      const button = BUTTONS[Number(buttonNumber) + 1];
+      const button = nativeMouseButton(buttonNumber);
       if (button === undefined) return undefined;
       return { type: type === NSEventType.OtherMouseDown ? "mousedown" : "mouseup", button, window };
     }
