@@ -22,6 +22,46 @@ export function validateWin32Geometry(x: number, y: number, width: number, heigh
   }
 }
 
+/** Decode signed client coordinates packed into a Win32 mouse-message LPARAM. */
+export function decodeMouseLParam(lParam: number | bigint): { x: number; y: number } {
+  const value = BigInt.asUintN(32, BigInt(lParam));
+  return {
+    x: Number(BigInt.asIntN(16, value & 0xffffn)),
+    y: Number(BigInt.asIntN(16, value >> 16n)),
+  };
+}
+
+/** Per-HWND boundary state for Win32's explicitly requested leave notifications. */
+export class Win32MouseTrackingState {
+  #inside = false;
+  #trackingLeave = false;
+
+  needsLeaveTracking(pointInsideClient: boolean): boolean {
+    return pointInsideClient && !this.#trackingLeave;
+  }
+
+  markLeaveTrackingArmed(): void {
+    this.#trackingLeave = true;
+  }
+
+  observeMove(pointInsideClient: boolean): boolean {
+    if (!pointInsideClient || this.#inside) return false;
+    this.#inside = true;
+    return true;
+  }
+
+  observeLeave(): boolean {
+    const emit = this.#inside;
+    this.reset();
+    return emit;
+  }
+
+  reset(): void {
+    this.#inside = false;
+    this.#trackingLeave = false;
+  }
+}
+
 /** Virtual-key values used by the Win32 input implementation. */
 export const VK = {
   BACK: 0x08,

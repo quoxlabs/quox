@@ -1,6 +1,7 @@
 import { assert, assertEquals, assertThrows } from "jsr:@std/assert@^1.0.19";
 import {
   AltGraphControlFilter,
+  decodeMouseLParam,
   decodeKeyLParam,
   isCommitText,
   keyboardModifiers,
@@ -12,6 +13,7 @@ import {
   translateLogicalKey,
   validateWin32Geometry,
   VK,
+  Win32MouseTrackingState,
   win32KeyEditDisposition,
   win32KeyIdentity,
   WmCharDecoder,
@@ -65,6 +67,24 @@ Deno.test("Win32 validates signed outer-window geometry before native creation",
   assertThrows(() => validateWin32Geometry(0, 0, 0, 1));
   assertThrows(() => validateWin32Geometry(0, 0, 1.5, 1));
   assertThrows(() => validateWin32Geometry(0, 0, 0x80000000, 1));
+});
+
+Deno.test("Win32 mouse coordinates sign-extend and leave tracking follows real crossings", () => {
+  assertEquals(decodeMouseLParam(0xfffeffffn), { x: -1, y: -2 });
+  assertEquals(decodeMouseLParam(0x80007fffn), { x: 0x7fff, y: -0x8000 });
+
+  const tracking = new Win32MouseTrackingState();
+  assertEquals(tracking.needsLeaveTracking(false), false);
+  assertEquals(tracking.observeMove(false), false);
+  assertEquals(tracking.needsLeaveTracking(true), true);
+  tracking.markLeaveTrackingArmed();
+  assertEquals(tracking.observeMove(true), true);
+  assertEquals(tracking.needsLeaveTracking(true), false);
+  assertEquals(tracking.observeMove(true), false);
+  assertEquals(tracking.observeLeave(), true);
+  assertEquals(tracking.observeLeave(), false);
+  assertEquals(tracking.needsLeaveTracking(false), false);
+  assertEquals(tracking.needsLeaveTracking(true), true);
 });
 
 Deno.test("physical codes determine DOM key locations", () => {

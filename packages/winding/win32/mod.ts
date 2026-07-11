@@ -11,7 +11,7 @@ import {
   WHEEL_DELTA,
   WM,
 } from "./ffi.ts";
-import { validateWin32Geometry } from "./input.ts";
+import { decodeMouseLParam, validateWin32Geometry, Win32MouseTrackingState } from "./input.ts";
 import { Win32InputController } from "./input_controller.ts";
 
 // BITMAPINFOHEADER is 40 bytes; for 32bpp BI_RGB no color table follows, so
@@ -52,19 +52,19 @@ function wideStringBuffer(value: string): ArrayBuffer {
 }
 
 /**
- * Arm a one-shot `WM_MOUSELEAVE` for `hWnd`. Win32 doesn't report the pointer leaving a
- * window on its own (unlike X11's `LeaveNotify`); the window has to opt in via
- * `TrackMouseEvent`, and tracking is consumed by the very `WM_MOUSELEAVE` it requests, so it
- * must be re-armed on every `WM_MOUSEMOVE` to reliably catch the next leave.
+ * Arm a one-shot `WM_MOUSELEAVE` for `hWnd`. Tracking stays active until the requested leave,
+ * so each window arms it once when the pointer enters and re-arms only after a real crossing.
  */
-function trackMouseLeave(lib: Win32Library, hWnd: Deno.PointerValue): void {
+function trackMouseLeave(lib: Win32Library, hWnd: Deno.PointerObject): void {
   const buf = new ArrayBuffer(TRACKMOUSEEVENT_SIZE);
   const dv = new DataView(buf);
   dv.setUint32(0, TRACKMOUSEEVENT_SIZE, true); // cbSize
   dv.setUint32(4, TME_LEAVE, true); // dwFlags
   dv.setBigUint64(8, BigInt(Deno.UnsafePointer.value(hWnd)), true); // hwndTrack
   dv.setUint32(16, 0, true); // dwHoverTime (unused without TME_HOVER)
-  lib.user32.symbols.TrackMouseEvent(buf);
+  if (lib.user32.symbols.TrackMouseEvent(buf) === 0) {
+    throw new Error(lib.getLastError());
+  }
 }
 
 class Win32Window implements Window {
@@ -74,6 +74,7 @@ class Win32Window implements Window {
   #bmi = new ArrayBuffer(BITMAPINFOHEADER_SIZE);
   #frameWidth: number | undefined;
   #frameHeight: number | undefined;
+  readonly mouseTracking = new Win32MouseTrackingState();
   /** Tracks minimized state so `WM_SIZE` transitions map to a single `visibilitychange` event instead of firing on every resize message. */
   minimized = false;
   #clientWidth: number | undefined;
@@ -133,6 +134,11 @@ class Win32Window implements Window {
     this.#clientWidth = width;
     this.#clientHeight = height;
     return true;
+  }
+
+  containsClientPoint(x: number, y: number): boolean {
+    return this.#clientWidth !== undefined && this.#clientHeight !== undefined &&
+      x >= 0 && y >= 0 && x < this.#clientWidth && y < this.#clientHeight;
   }
 
   setTitle(title: string): void {
@@ -250,6 +256,7 @@ class Win32Window implements Window {
     if (this.#destroyed) return;
     this.#destroyed = true;
     this.#closing = false;
+    this.mouseTracking.reset();
     const errors: unknown[] = [];
     try {
       this.lib.input.detach(this);
@@ -360,20 +367,28 @@ class Win32Library implements Library {
             break;
           case WM.MOUSEMOVE: {
             if (win === undefined) break;
-            // Re-arm on every move: `WM_MOUSELEAVE` tracking is consumed by the leave
-            // event itself, so it must be requested again to catch the next one.
-            trackMouseLeave(this, hWnd);
+            const { x, y } = decodeMouseLParam(lParam);
+            const inside = win.containsClientPoint(x, y);
+            if (win.mouseTracking.needsLeaveTracking(inside)) {
+              trackMouseLeave(this, win.hwnd);
+              win.mouseTracking.markLeaveTrackingArmed();
+            }
+            if (win.mouseTracking.observeMove(inside)) {
+              this.#events.push({ type: "mouseenter", window: win });
+            }
             this.#events.push({
               type: "mousemove",
-              x: Number(BigInt(lParam) & 0xFFFFn),
-              y: Number((BigInt(lParam) >> 16n) & 0xFFFFn),
+              x,
+              y,
               window: win,
             });
             break;
           }
           case WM.MOUSELEAVE:
             if (win === undefined) break;
-            this.#events.push({ type: "mouseleave", window: win });
+            if (win.mouseTracking.observeLeave()) {
+              this.#events.push({ type: "mouseleave", window: win });
+            }
             break;
           case WM.LBUTTONDOWN:
           case WM.MBUTTONDOWN:
