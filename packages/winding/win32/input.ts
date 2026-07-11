@@ -163,6 +163,29 @@ export class TranslateMessageReentrancyGuard {
   }
 }
 
+/** Tracks persistent HWND↔HIMC association independently from public IME activation. */
+export class Win32ImeAssociationState {
+  #associated: boolean;
+
+  constructor(initiallyAssociated = true) {
+    this.#associated = initiallyAssociated;
+  }
+
+  get associated(): boolean {
+    return this.#associated;
+  }
+
+  reconcile(
+    shouldBeAssociated: boolean,
+    apply: (associated: boolean) => boolean,
+  ): boolean {
+    if (this.#associated === shouldBeAssociated) return true;
+    if (!apply(shouldBeAssociated)) return false;
+    this.#associated = shouldBeAssociated;
+    return true;
+  }
+}
+
 export interface Win32KeyMessageIdentity {
   windowId: bigint;
   message: number;

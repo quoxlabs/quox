@@ -55,6 +55,7 @@ import {
   type ToUnicodeAdapter,
   translateLogicalKey,
   VK,
+  Win32ImeAssociationState,
   win32KeyEditDisposition,
   win32KeyIdentity,
   WmCharDecoder,
@@ -82,6 +83,7 @@ export interface Win32InputWindow extends Window {
 
 interface WindowInputState {
   readonly activation: ImeActivationState;
+  readonly association: Win32ImeAssociationState;
   readonly composition: CompositionState;
   cursorArea?: ImeCursorArea;
   surroundingText?: {
@@ -143,6 +145,7 @@ export class Win32InputController {
     if (this.#states.has(window)) return;
     const state: WindowInputState = {
       activation: new ImeActivationState(),
+      association: new Win32ImeAssociationState(),
       composition: new CompositionState(),
       logicalKeys: new PressedLogicalKeyCache<string>(),
       altGraphTextKeys: new Set<string>(),
@@ -154,7 +157,10 @@ export class Win32InputController {
     try {
       // WM_CHAR remains available without an associated IMM context; native
       // composition is opt-in and is reconciled when the focused editor asks.
-      this.#imm32.symbols.ImmAssociateContextEx(window.hwnd, null, 0);
+      state.association.reconcile(
+        false,
+        () => this.#imm32.symbols.ImmAssociateContextEx(window.hwnd, null, 0) !== 0,
+      );
       state.activation.setAvailable(true);
     } catch (error) {
       this.#states.delete(window);
@@ -394,6 +400,7 @@ export class Win32InputController {
           } else if (!activating) {
             this.#cancelComposition(window, state);
             this.#setImeActive(window, state, false);
+            this.#reconcileImeAssociation(window, state);
           }
           return replayed ? 0n : this.#forwardImeSetContext(window, state, message, wParam, lParam);
         }
@@ -857,18 +864,25 @@ export class Win32InputController {
   }
 
   #reconcileIme(window: Win32InputWindow, state: WindowInputState): void {
+    this.#reconcileImeAssociation(window, state);
     const transition = state.activation.reconcile({
-      activate: () => {
-        const activated = this.#imm32.symbols.ImmAssociateContextEx(window.hwnd, null, IACE_DEFAULT);
-        if (activated !== 0) this.#applyImeCursorArea(window, state);
-        return activated !== 0;
-      },
-      deactivate: () => {
-        this.#imm32.symbols.ImmAssociateContextEx(window.hwnd, null, 0);
-      },
+      activate: () => state.association.associated,
+      deactivate: () => {},
     });
     if (transition !== undefined) this.#enqueue(createImeActivationEvent(window, transition));
-    if (transition === undefined && state.activation.active) this.#applyImeCursorArea(window, state);
+    if (state.activation.active) this.#applyImeCursorArea(window, state);
+  }
+
+  #reconcileImeAssociation(window: Win32InputWindow, state: WindowInputState): void {
+    state.association.reconcile(
+      state.activation.shouldBeActive,
+      (associate) =>
+        this.#imm32.symbols.ImmAssociateContextEx(
+          window.hwnd,
+          null,
+          associate ? IACE_DEFAULT : 0,
+        ) !== 0,
+    );
   }
 
   #cancelComposition(window: Win32InputWindow, state: WindowInputState): void {

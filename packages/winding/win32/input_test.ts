@@ -16,6 +16,7 @@ import {
   TranslateMessageReentrancyGuard,
   validateWin32Geometry,
   VK,
+  Win32ImeAssociationState,
   win32KeyEditDisposition,
   win32KeyIdentity,
   Win32MouseCaptureState,
@@ -34,6 +35,7 @@ import {
   withImeContext,
 } from "./imm.ts";
 import {
+  ImeActivationState,
   keyLocationForCode,
   normalizeImeCursorArea,
   PressedLogicalKeyCache,
@@ -78,6 +80,47 @@ Deno.test("TranslateMessage guard defers only sent-message reentry and preserves
   guard.end();
   assertEquals(order, ["outside", "focus", "ime"]);
   assertThrows(() => guard.end());
+});
+
+Deno.test("Win32 HIMC association remains independent across SETCONTEXT and focus orders", () => {
+  const setContextFirst = new ImeActivationState();
+  setContextFirst.setAvailable(true);
+  setContextFirst.setDesired(true);
+  setContextFirst.setFocused(true);
+  setContextFirst.markActive(true);
+  const firstAssociation = new Win32ImeAssociationState(true);
+
+  // WM_IME_SETCONTEXT(FALSE) observes native deactivation but does not prove
+  // that the persistent HWND association was removed.
+  setContextFirst.markActive(false);
+  assertEquals(setContextFirst.active, false);
+  assertEquals(firstAssociation.associated, true);
+  setContextFirst.setFocused(false);
+  const firstTransitions: boolean[] = [];
+  firstAssociation.reconcile(setContextFirst.shouldBeActive, (associated) => {
+    firstTransitions.push(associated);
+    return true;
+  });
+  assertEquals(firstTransitions, [false]);
+  assertEquals(firstAssociation.associated, false);
+
+  const focusFirst = new ImeActivationState();
+  focusFirst.setAvailable(true);
+  focusFirst.setDesired(true);
+  focusFirst.setFocused(true);
+  focusFirst.markActive(true);
+  const secondAssociation = new Win32ImeAssociationState(true);
+  focusFirst.setFocused(false);
+  const secondTransitions: boolean[] = [];
+  secondAssociation.reconcile(focusFirst.shouldBeActive, (associated) => {
+    secondTransitions.push(associated);
+    return true;
+  });
+  focusFirst.reconcile({ activate: () => true, deactivate: () => {} });
+  focusFirst.markActive(false);
+  assertEquals(secondTransitions, [false]);
+  assertEquals(secondAssociation.associated, false);
+  assertEquals(focusFirst.active, false);
 });
 
 Deno.test("prepared Win32 keys match the complete native message identity", () => {
