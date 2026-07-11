@@ -15,7 +15,12 @@ export type QuoxAppleStandardKeybindingEvent = WithoutWindow<WindingAppleStandar
 
 export type QuoxMouseMoveEvent = { type: "mousemove"; x: number; y: number };
 export type QuoxMouseButtonEvent = { type: "mousedown" | "mouseup"; button: number };
-export type QuoxMouseWheelEvent = { type: "wheel"; deltaX: number; deltaY: number };
+export type QuoxMouseWheelEvent = {
+  type: "wheel";
+  deltaX: number;
+  deltaY: number;
+  deltaMode: 0 | 1 | 2;
+};
 export type QuoxResizeEvent = { type: "resize"; width: number; height: number; frameToken?: number };
 export type QuoxCloseEvent = { type: "close" };
 export type QuoxMouseEnterLeaveEvent = { type: "mouseenter" | "mouseleave" };
@@ -49,15 +54,20 @@ export interface QuoxInputRoutePort {
 }
 
 const BUTTON_INDEX_TO_BIT = [1, 4, 2] as const;
-const WHEEL_SCROLL_SPEED = 40;
+const WHEEL_LINE_PIXELS = 40;
 
 /** Deterministic, native-independent routing from canonical Quox events to the document port. */
 export class QuoxInputRouter {
   #buttons = 0;
   #pointerX = 0;
   #pointerY = 0;
+  #viewportWidth: number;
+  #viewportHeight: number;
 
-  constructor(readonly port: QuoxInputRoutePort) {}
+  constructor(readonly port: QuoxInputRoutePort, viewportWidth = 0, viewportHeight = 0) {
+    this.#viewportWidth = viewportWidth;
+    this.#viewportHeight = viewportHeight;
+  }
 
   route(event: QuoxInputEvent): "close" | undefined {
     switch (event.type) {
@@ -74,15 +84,18 @@ export class QuoxInputRouter {
         this.port.pointerUp(this.#pointerX, this.#pointerY, event.button, this.#buttons);
         this.#buttons &= ~(BUTTON_INDEX_TO_BIT[event.button] ?? 0);
         return undefined;
-      case "wheel":
+      case "wheel": {
+        const scaleX = event.deltaMode === 0 ? 1 : event.deltaMode === 1 ? WHEEL_LINE_PIXELS : this.#viewportWidth;
+        const scaleY = event.deltaMode === 0 ? 1 : event.deltaMode === 1 ? WHEEL_LINE_PIXELS : this.#viewportHeight;
         this.port.wheel(
           this.#pointerX,
           this.#pointerY,
-          event.deltaX * WHEEL_SCROLL_SPEED,
-          event.deltaY * WHEEL_SCROLL_SPEED,
+          event.deltaX * scaleX,
+          event.deltaY * scaleY,
           this.#buttons,
         );
         return undefined;
+      }
       case "keydown":
       case "keyup":
         this.port.key(event);
@@ -97,6 +110,8 @@ export class QuoxInputRouter {
         this.port.clearHover();
         return undefined;
       case "resize":
+        this.#viewportWidth = event.width;
+        this.#viewportHeight = event.height;
         this.port.resize(event);
         return undefined;
       case "visibilitychange":
@@ -130,7 +145,12 @@ export function mapWindingEvent(event: WindingUIEvent): QuoxInputEvent {
     case "mouseup":
       return { type: "mouseup", button: BUTTON_INDEX[event.button] };
     case "wheel":
-      return { type: "wheel", deltaX: event.deltaX, deltaY: event.deltaY };
+      return {
+        type: "wheel",
+        deltaX: event.deltaX,
+        deltaY: event.deltaY,
+        deltaMode: event.deltaMode,
+      };
     case "keydown": {
       return {
         type: "keydown",

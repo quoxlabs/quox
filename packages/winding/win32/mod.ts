@@ -437,11 +437,11 @@ class Win32Library implements Library {
                 // Win32 reports a positive vertical delta for "rotated away from
                 // the user" (scroll up); every other winding backend uses the
                 // opposite convention (positive deltaY = scroll down), so flip it.
-                ? { type: "wheel", deltaX: 0, deltaY: -notches, window: win }
+                ? { type: "wheel", deltaX: 0, deltaY: -notches, deltaMode: 1, window: win }
                 // Horizontal tilt-right is already positive in both Win32 and the
                 // other backends (see Wayland's unflipped axis===1 handling), so
                 // no sign flip is needed here.
-                : { type: "wheel", deltaX: notches, deltaY: 0, window: win },
+                : { type: "wheel", deltaX: notches, deltaY: 0, deltaMode: 1, window: win },
             );
             break;
           }

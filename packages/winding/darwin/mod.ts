@@ -16,7 +16,7 @@ import {
   PressedLogicalKeyCache,
 } from "../input/mod.ts";
 import { getDomCode } from "./dom_code.ts";
-import { appKitWindowFrame, type ScreenFrame } from "./geometry.ts";
+import { appKitWindowFrame, browserWheelDelta, type ScreenFrame } from "./geometry.ts";
 import { DarwinInputState } from "./input_state.ts";
 import {
   addMethod as runtimeAddMethod,
@@ -1366,9 +1366,12 @@ function importPointerEvent(event: Deno.PointerValue, window: DarwinWindow): UIE
       return { type: "mousemove", x, y: window.height - y, window };
     }
     case NSEventType.ScrollWheel: {
-      const deltaX = send.f64(event, sel("deltaX"));
-      const deltaY = send.f64(event, sel("deltaY"));
-      return { type: "wheel", deltaX: -deltaX, deltaY: -deltaY, window };
+      const delta = browserWheelDelta(
+        send.f64(event, sel("scrollingDeltaX")),
+        send.f64(event, sel("scrollingDeltaY")),
+        send.bool(event, sel("hasPreciseScrollingDeltas")),
+      );
+      return { type: "wheel", ...delta, window };
     }
     default:
       return undefined;

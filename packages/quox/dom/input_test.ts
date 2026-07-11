@@ -26,6 +26,49 @@ class FakeWindow implements WindingWindow {
 
 const window = new FakeWindow();
 
+Deno.test("wheel adapter preserves browser units and converts them only for Blitz", () => {
+  const calls: number[][] = [];
+  const router = new QuoxInputRouter(
+    {
+      pointerMove() {},
+      pointerDown() {},
+      pointerUp() {},
+      wheel: (...values) => calls.push(values),
+      key() {},
+      ime() {},
+      appleCommand() {},
+      clearHover() {},
+      resize() {},
+      visibility() {},
+    },
+    800,
+    600,
+  );
+
+  const precise = mapWindingEvent({
+    type: "wheel",
+    window,
+    deltaX: 2.25,
+    deltaY: -3.5,
+    deltaMode: 0,
+  });
+  assertEquals(precise, {
+    type: "wheel",
+    deltaX: 2.25,
+    deltaY: -3.5,
+    deltaMode: 0,
+  });
+  router.route(precise);
+  router.route({ type: "wheel", deltaX: 1, deltaY: -2, deltaMode: 1 });
+  router.route({ type: "wheel", deltaX: 0.5, deltaY: -1, deltaMode: 2 });
+
+  assertEquals(calls, [
+    [0, 0, 2.25, -3.5, 0],
+    [0, 0, 40, -80, 0],
+    [0, 0, 400, -600, 0],
+  ]);
+});
+
 Deno.test("canonical key adapter preserves public fields and encodes editor policy", () => {
   const mapped = mapWindingEvent({
     type: "keydown",

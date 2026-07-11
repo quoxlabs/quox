@@ -528,8 +528,11 @@ class WaylandLibrary implements Library {
         const window = this.#pointerFocus;
         if (!window) return;
         const delta = value >> 8;
-        if (axis === 0) this.#events.push({ type: "wheel", deltaX: 0, deltaY: delta, window });
-        else if (axis === 1) this.#events.push({ type: "wheel", deltaX: delta, deltaY: 0, window });
+        if (axis === 0) {
+          this.#events.push({ type: "wheel", deltaX: 0, deltaY: delta, deltaMode: 0, window });
+        } else if (axis === 1) {
+          this.#events.push({ type: "wheel", deltaX: delta, deltaY: 0, deltaMode: 0, window });
+        }
       }),
     );
     this.#pointerListeners = [enterCb, leaveCb, motionCb, buttonCb, axisCb];

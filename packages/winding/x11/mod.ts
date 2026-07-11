@@ -1028,10 +1028,10 @@ function importEvent(
   switch (type) {
     case XEventType.ButtonPress: {
       const btn = view.getUint32(84, true);
-      if (btn === 4) return { type: "wheel", deltaX: 0, deltaY: -1, window };
-      if (btn === 5) return { type: "wheel", deltaX: 0, deltaY: 1, window };
-      if (btn === 6) return { type: "wheel", deltaX: -1, deltaY: 0, window };
-      if (btn === 7) return { type: "wheel", deltaX: 1, deltaY: 0, window };
+      if (btn === 4) return { type: "wheel", deltaX: 0, deltaY: -1, deltaMode: 1, window };
+      if (btn === 5) return { type: "wheel", deltaX: 0, deltaY: 1, deltaMode: 1, window };
+      if (btn === 6) return { type: "wheel", deltaX: -1, deltaY: 0, deltaMode: 1, window };
+      if (btn === 7) return { type: "wheel", deltaX: 1, deltaY: 0, deltaMode: 1, window };
       const button = BUTTONS[btn];
       if (button === undefined) return undefined;
       return { type: "mousedown", button, window };

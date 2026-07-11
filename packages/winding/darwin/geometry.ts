@@ -20,3 +20,16 @@ export function appKitWindowFrame(
     height,
   ]);
 }
+
+/** Translate AppKit scroll values into DOM direction and unit conventions. */
+export function browserWheelDelta(
+  scrollingDeltaX: number,
+  scrollingDeltaY: number,
+  precise: boolean,
+): { deltaX: number; deltaY: number; deltaMode: 0 | 1 } {
+  return {
+    deltaX: -scrollingDeltaX,
+    deltaY: -scrollingDeltaY,
+    deltaMode: precise ? 0 : 1,
+  };
+}

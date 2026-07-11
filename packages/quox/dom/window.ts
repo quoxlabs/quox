@@ -99,27 +99,31 @@ export class QuoxWindow implements Disposable {
       (title) => this.#win.setTitle(title),
       () => this.#syncNativeImeRequests(),
     );
-    this.#inputRouter = new QuoxInputRouter({
-      pointerMove: (x, y, buttons) => this.document.dispatchPointerMove(x, y, buttons),
-      pointerDown: (x, y, button, buttons) => this.document.dispatchPointerDown(x, y, button, buttons),
-      pointerUp: (x, y, button, buttons) => this.document.dispatchPointerUp(x, y, button, buttons),
-      wheel: (x, y, deltaX, deltaY, buttons) => this.document.dispatchWheel(x, y, deltaX, deltaY, buttons),
-      key: (event) => this.document.dispatchKey(event),
-      ime: (event) => this.document.dispatchIme(event),
-      appleCommand: (event) => this.document.dispatchAppleStandardKeybinding(event),
-      clearHover: () => this.document.clearHover(),
-      resize: (event) => {
-        this.#width = event.width;
-        this.#height = event.height;
-        this.#frameToken = event.frameToken;
-        this.#renderer.resize(event.width, event.height);
-        this.#requestRender();
+    this.#inputRouter = new QuoxInputRouter(
+      {
+        pointerMove: (x, y, buttons) => this.document.dispatchPointerMove(x, y, buttons),
+        pointerDown: (x, y, button, buttons) => this.document.dispatchPointerDown(x, y, button, buttons),
+        pointerUp: (x, y, button, buttons) => this.document.dispatchPointerUp(x, y, button, buttons),
+        wheel: (x, y, deltaX, deltaY, buttons) => this.document.dispatchWheel(x, y, deltaX, deltaY, buttons),
+        key: (event) => this.document.dispatchKey(event),
+        ime: (event) => this.document.dispatchIme(event),
+        appleCommand: (event) => this.document.dispatchAppleStandardKeybinding(event),
+        clearHover: () => this.document.clearHover(),
+        resize: (event) => {
+          this.#width = event.width;
+          this.#height = event.height;
+          this.#frameToken = event.frameToken;
+          this.#renderer.resize(event.width, event.height);
+          this.#requestRender();
+        },
+        visibility: (event) => {
+          this.#visible = event.visible;
+          if (event.visible) this.#requestRender();
+        },
       },
-      visibility: (event) => {
-        this.#visible = event.visible;
-        if (event.visible) this.#requestRender();
-      },
-    });
+      width,
+      height,
+    );
   }
 
   /** Open a window and create a WASM renderer with a live document. */

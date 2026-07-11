@@ -1,4 +1,4 @@
-import { appKitWindowFrame, type ScreenFrame } from "./geometry.ts";
+import { appKitWindowFrame, browserWheelDelta, type ScreenFrame } from "./geometry.ts";
 
 const primary: ScreenFrame = { x: 0, y: 0, width: 1920, height: 1080 };
 
@@ -26,6 +26,19 @@ Deno.test("Darwin window coordinates cover displays on every side of the primary
     [...appKitWindowFrame(80, 1080, 320, 200, primary)],
     [80, -200, 320, 200],
   );
+});
+
+Deno.test("Darwin wheel deltas preserve AppKit precision in browser units", () => {
+  assertEquals(browserWheelDelta(2.25, -7.5, true), {
+    deltaX: -2.25,
+    deltaY: 7.5,
+    deltaMode: 0,
+  });
+  assertEquals(browserWheelDelta(-1, 3, false), {
+    deltaX: 1,
+    deltaY: -3,
+    deltaMode: 1,
+  });
 });
 
 function assertEquals(actual: unknown, expected: unknown): void {

@@ -122,8 +122,12 @@ export interface MoveEvent extends WindowEvent<"mousemove"> {
 }
 export interface WheelEvent extends WindowEvent<"wheel"> {
   type: "wheel";
+  /** Scroll right when positive, in `deltaMode` units. */
   deltaX: number;
+  /** Scroll down when positive, in `deltaMode` units. */
   deltaY: number;
+  /** DOM WheelEvent compatible: 0 = logical pixels, 1 = lines, 2 = pages. */
+  deltaMode: 0 | 1 | 2;
 }
 export interface ResizeEvent extends WindowEvent<"resize"> {
   type: "resize";
