@@ -1,6 +1,7 @@
 import { utf8CString as cStr } from "../text_encoding.ts";
 import { WlOp, WlShmFormat } from "./ffi.ts";
 import {
+  type AnyCallback,
   args,
   collectCleanupError,
   type LibcLibrary,
@@ -72,7 +73,7 @@ class WaylandShmBufferSlot {
   #width = 0;
   #height = 0;
   #busy = false;
-  #release: Deno.UnsafeCallback | null = null;
+  #release: AnyCallback | null = null;
   #vtable: BigUint64Array<ArrayBuffer> | null = null;
 
   constructor(readonly host: WaylandShmHost) {}
