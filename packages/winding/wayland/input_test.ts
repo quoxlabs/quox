@@ -12,7 +12,35 @@ import {
 import { TextInputV3Batch } from "./text_input.ts";
 import { keyLocationForCode, normalizeImeCursorArea, validateImeCursorRange } from "../input/mod.ts";
 import { logicalKeyFromKeysym } from "../linux/mod.ts";
+import {
+  hasFatalPollEvent,
+  POLLERR,
+  POLLHUP,
+  POLLIN,
+  POLLNVAL,
+  waylandConnectionError,
+} from "./protocol.ts";
 import { frameMatchesConfiguration, WaylandConfigureState } from "./window.ts";
+
+Deno.test("Wayland connection errors retain protocol object details", () => {
+  assertEquals(
+    waylandConnectionError("dispatching display events", 71, "xdg_surface", 42, 3).message,
+    "winding Wayland connection failed during dispatching display events: " +
+      "xdg_surface@42 reported protocol error 3 (display error 71)",
+  );
+  assertEquals(
+    waylandConnectionError("reading display events", 0).message,
+    "winding Wayland connection closed during reading display events",
+  );
+});
+
+Deno.test("Wayland poll errors and disconnects are terminal readiness", () => {
+  assertEquals(hasFatalPollEvent(POLLIN), false);
+  assertEquals(hasFatalPollEvent(POLLERR), true);
+  assertEquals(hasFatalPollEvent(POLLHUP), true);
+  assertEquals(hasFatalPollEvent(POLLNVAL), true);
+  assertEquals(hasFatalPollEvent(POLLIN | POLLHUP), true);
+});
 
 Deno.test("Wayland configurations latch role state and serial as one generation", () => {
   const state = new WaylandConfigureState(640, 480);

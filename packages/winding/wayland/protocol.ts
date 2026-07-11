@@ -21,6 +21,10 @@ export const MAP_PRIVATE = 0x02;
 export const MAP_FAILED = 0xffffffffffffffffn;
 export const MFD_CLOEXEC = 1;
 export const POLLIN = 1;
+export const POLLOUT = 4;
+export const POLLERR = 8;
+export const POLLHUP = 16;
+export const POLLNVAL = 32;
 export const RTLD_NOW = 0x2;
 export const RTLD_NOLOAD = 0x4;
 export const LIBWAYLAND_CLIENT_SO = "libwayland-client.so.0";
@@ -39,6 +43,29 @@ export function nullableCString(pointer: Deno.PointerValue): string | null {
 
 export function readEventCount(ifaceAddress: bigint): number {
   return new Deno.UnsafePointerView(Deno.UnsafePointer.create(ifaceAddress)!).getUint32(24);
+}
+
+export function waylandConnectionError(
+  context: string,
+  displayError: number,
+  protocolInterface?: string,
+  protocolObjectId?: number,
+  protocolCode?: number,
+): Error {
+  if (protocolInterface !== undefined) {
+    return new Error(
+      `winding Wayland connection failed during ${context}: ${protocolInterface}@${protocolObjectId} ` +
+        `reported protocol error ${protocolCode} (display error ${displayError})`,
+    );
+  }
+  if (displayError !== 0) {
+    return new Error(`winding Wayland connection failed during ${context}: display error ${displayError}`);
+  }
+  return new Error(`winding Wayland connection closed during ${context}`);
+}
+
+export function hasFatalPollEvent(revents: number): boolean {
+  return (revents & (POLLERR | POLLHUP | POLLNVAL)) !== 0;
 }
 
 export function dlsymRequired(
@@ -99,6 +126,7 @@ export interface NativeCallbackHost {
     callback: (...args: Arguments) => void,
   ): (...args: Arguments) => void;
   pushEvent(event: UIEvent): void;
+  throwIfConnectionFailed(): void;
 }
 
 export const SUSPENDED_TOPLEVEL_STATE = XdgToplevelState.SUSPENDED;

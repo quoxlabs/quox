@@ -7,15 +7,18 @@ import {
   args,
   collectCleanupError,
   dlsymRequired,
+  hasFatalPollEvent,
   libcSymbols,
   LIBWAYLAND_CLIENT_SO,
   LIBXKBCOMMON_SO,
   makeVtable,
   POLLIN,
+  POLLOUT,
   readEventCount,
   RTLD_NOLOAD,
   RTLD_NOW,
   throwCleanupErrors,
+  waylandConnectionError,
   WL_MARSHAL_FLAG_DESTROY,
 } from "./protocol.ts";
 import { WaylandWindow } from "./window.ts";
@@ -77,6 +80,8 @@ class WaylandLibrary implements Library {
   // pollfd buffer for non-blocking display read
   #pollFd = new Uint8Array(8) as Uint8Array<ArrayBuffer>; // struct pollfd {int fd; short events; short revents;}
   #closed = false;
+  #terminalError: Error | null = null;
+  #wantsWrite = false;
 
   constructor() {
     this.libc = Deno.dlopen("libc.so.6", libcSymbols); // needed to perform a few syscalls
@@ -139,7 +144,6 @@ class WaylandLibrary implements Library {
     });
     this.#textInputController = new WaylandTextInputController({
       wl: this.wl,
-      display: this.display,
       zwpTextInputIface: this.zwpTextInputIface,
       noop: this.noop,
       guardCallback: (callback) => this.guardCallback(callback),
@@ -148,6 +152,7 @@ class WaylandLibrary implements Library {
       keyboardFocus: () => this.#keyboardController.focus,
       windows: () => this.windows,
       resetLocalCompose: () => this.#keyboardController.resetCompose(),
+      flushDisplay: (context) => this.flushDisplay(context),
     });
 
     // Set up pollfd for display fd
@@ -196,7 +201,7 @@ class WaylandLibrary implements Library {
     this.#vtables.push(regVtable);
     sym.wl_proxy_add_listener(registry, Deno.UnsafePointer.of(regVtable), null);
 
-    sym.wl_display_roundtrip(this.display);
+    this.roundtripDisplay("registry initialization");
   }
 
   #bindGlobal(registry: Deno.PointerObject, name: number, iface: string, offered: number): void {
@@ -320,7 +325,7 @@ class WaylandLibrary implements Library {
     this.#vtables.push(seatVtable);
     sym.wl_proxy_add_listener(this.#seat, Deno.UnsafePointer.of(seatVtable), null);
     this.#textInputController.setSeat(this.#seat);
-    sym.wl_display_roundtrip(this.display);
+    this.roundtripDisplay("seat initialization");
   }
 
   #initPointer(): void {
@@ -459,7 +464,36 @@ class WaylandLibrary implements Library {
     this.#callbackErrors.throwIfPending();
   }
 
+  throwIfConnectionFailed(): void {
+    if (this.#terminalError) throw this.#terminalError;
+  }
+
+  roundtripDisplay(context: string): void {
+    this.throwIfConnectionFailed();
+    if (this.wl.symbols.wl_display_roundtrip(this.display) < 0) {
+      this.#failConnection(context);
+    }
+    this.#callbackErrors.throwIfPending();
+  }
+
+  flushDisplay(context: string): void {
+    this.throwIfConnectionFailed();
+    const result = this.wl.symbols.wl_display_flush(this.display);
+    if (result >= 0) {
+      this.#wantsWrite = false;
+      return;
+    }
+    // libwayland reports EAGAIN from flush without making the display fatal.
+    // A zero display error therefore means the pending bytes need POLLOUT.
+    if (this.wl.symbols.wl_display_get_error(this.display) === 0) {
+      this.#wantsWrite = true;
+      return;
+    }
+    this.#failConnection(context);
+  }
+
   openWindow(_x = 0, _y = 0, w = 800, h = 600): WaylandWindow {
+    this.throwIfConnectionFailed();
     if (this.#closed) throw new Error("winding Wayland library is closed");
     if (!this.compositor || !this.shm || !this.xdgWmBase) {
       throw new Error("winding wayland globals not ready (compositor/shm/xdg_wm_base missing)");
@@ -468,31 +502,83 @@ class WaylandLibrary implements Library {
   }
 
   event(): UIEvent | undefined {
+    this.throwIfConnectionFailed();
     if (this.#closed) return undefined;
     const queued = this.#events.shift();
     if (queued !== undefined) return queued;
     this.#callbackErrors.throwIfPending();
     const sym = this.wl.symbols;
-    sym.wl_display_flush(this.display);
+    this.flushDisplay("event flush");
 
     // Non-blocking read: prepare_read -> poll fd -> read_events or cancel_read
     if (sym.wl_display_prepare_read(this.display) === 0) {
-      new DataView(this.#pollFd.buffer).setInt16(6, 0, true); // clear revents
+      const pollView = new DataView(this.#pollFd.buffer);
+      pollView.setInt16(4, POLLIN | (this.#wantsWrite ? POLLOUT : 0), true);
+      pollView.setInt16(6, 0, true); // clear revents
       const ready = this.libc.symbols.poll(this.#pollFd, 1, 0);
-      const revents = new DataView(this.#pollFd.buffer).getInt16(6, true);
+      const revents = pollView.getInt16(6, true);
+      if (ready < 0) {
+        sym.wl_display_cancel_read(this.display);
+        this.#failConnection("polling the display socket");
+      }
+      if (hasFatalPollEvent(revents)) {
+        sym.wl_display_cancel_read(this.display);
+        this.#failConnection("display socket readiness");
+      }
       if (ready > 0 && (revents & POLLIN)) {
-        sym.wl_display_read_events(this.display);
+        if (sym.wl_display_read_events(this.display) < 0) {
+          this.#failConnection("reading display events");
+        }
       } else {
         sym.wl_display_cancel_read(this.display);
       }
+      if (ready > 0 && (revents & POLLOUT)) this.flushDisplay("draining display requests");
     }
 
-    sym.wl_display_dispatch_pending(this.display);
+    if (sym.wl_display_dispatch_pending(this.display) < 0) {
+      this.#failConnection("dispatching display events");
+    }
     this.#keyboardController.enqueueDueRepeat();
     const dispatched = this.#events.shift();
     if (dispatched !== undefined) return dispatched;
     this.#callbackErrors.throwIfPending();
     return undefined;
+  }
+
+  #failConnection(context: string): never {
+    if (this.#terminalError) throw this.#terminalError;
+    const symbols = this.wl.symbols;
+    const displayError = symbols.wl_display_get_error(this.display);
+    const interfacePointer = new BigUint64Array(1);
+    const objectId = new Uint32Array(1);
+    const protocolCode = symbols.wl_display_get_protocol_error(
+      this.display,
+      interfacePointer,
+      objectId,
+    );
+    let interfaceName: string | undefined;
+    if (interfacePointer[0] !== 0n) {
+      const iface = Deno.UnsafePointer.create(interfacePointer[0]);
+      if (iface) {
+        const nameAddress = new Deno.UnsafePointerView(iface).getBigUint64(0);
+        const name = Deno.UnsafePointer.create(nameAddress);
+        if (name) interfaceName = new Deno.UnsafePointerView(name).getCString();
+      }
+    }
+    const error = waylandConnectionError(
+      context,
+      displayError,
+      interfaceName,
+      objectId[0],
+      protocolCode,
+    );
+    this.#terminalError = error;
+    try {
+      this.close();
+    } catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], "winding closed after a fatal Wayland connection error");
+    }
+    throw error;
   }
 
   [Symbol.dispose](): void {

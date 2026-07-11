@@ -24,7 +24,6 @@ import type { WaylandWindow } from "./window.ts";
 
 export interface WaylandTextInputHost {
   readonly wl: WaylandNativeLibrary;
-  readonly display: Deno.PointerObject;
   readonly zwpTextInputIface: Deno.PointerObject;
   readonly noop: AnyCallback;
   guardCallback<Arguments extends unknown[]>(
@@ -35,6 +34,7 @@ export interface WaylandTextInputHost {
   keyboardFocus(): WaylandWindow | null;
   windows(): Iterable<WaylandWindow>;
   resetLocalCompose(): void;
+  flushDisplay(context: string): void;
 }
 
 export class WaylandTextInputController {
@@ -101,7 +101,7 @@ export class WaylandTextInputController {
     if (!area || this.#enabledWindow !== window || this.#focus !== window || !this.#input) return;
     this.#sendCursorArea(area);
     this.#commitState();
-    this.host.wl.symbols.wl_display_flush(this.host.display);
+    this.host.flushDisplay("updating the text-input cursor rectangle");
   }
 
   close(): void {
@@ -247,7 +247,7 @@ export class WaylandTextInputController {
         if (window.imeCursorArea) this.#sendCursorArea(window.imeCursorArea);
         this.#commitState();
         this.#enabledWindow = window;
-        this.host.wl.symbols.wl_display_flush(this.host.display);
+        this.host.flushDisplay("enabling text input");
         return true;
       },
       deactivate: () => {
@@ -266,7 +266,7 @@ export class WaylandTextInputController {
             args(),
           );
           this.#commitState();
-          this.host.wl.symbols.wl_display_flush(this.host.display);
+          this.host.flushDisplay("disabling text input");
         }
         if (this.#enabledWindow === window) this.#enabledWindow = null;
       },

@@ -86,7 +86,6 @@ export class WaylandConfigureState {
 }
 
 export interface WaylandWindowHost extends NativeCallbackHost, WaylandShmHost {
-  readonly display: Deno.PointerObject;
   readonly compositor: Deno.PointerObject | null;
   readonly xdgWmBase: Deno.PointerObject | null;
   readonly xdgSurfaceIface: Deno.PointerObject;
@@ -102,6 +101,8 @@ export interface WaylandWindowHost extends NativeCallbackHost, WaylandShmHost {
   updateWindowImeState(window: WaylandWindow): void;
   updateWindowImeCursorArea(window: WaylandWindow): void;
   throwCallbackError(): void;
+  roundtripDisplay(context: string): void;
+  flushDisplay(context: string): void;
 }
 
 export class WaylandWindow implements Window {
@@ -171,7 +172,7 @@ export class WaylandWindow implements Window {
         0,
         args(),
       );
-      symbols.wl_display_roundtrip(lib.display);
+      lib.roundtripDisplay("initial window configure");
       lib.throwCallbackError();
       if (this.#configuration) this.#ackConfiguration(this.#configuration);
       return;
@@ -259,6 +260,7 @@ export class WaylandWindow implements Window {
   }
 
   setTitle(title: string): void {
+    this.lib.throwIfConnectionFailed();
     if (!this.#xdgToplevel || this.#closed) return;
     const symbols = this.lib.wl.symbols;
     const titleBuffer = cStr(title);
@@ -270,16 +272,18 @@ export class WaylandWindow implements Window {
       0,
       args(Deno.UnsafePointer.value(Deno.UnsafePointer.of(titleBuffer))),
     );
-    symbols.wl_display_flush(this.lib.display);
+    this.lib.flushDisplay("setting a window title");
   }
 
   setImeEnabled(enabled: boolean): void {
+    this.lib.throwIfConnectionFailed();
     if (this.#closed || this.imeActivation.desired === enabled) return;
     this.imeActivation.setDesired(enabled);
     this.lib.updateWindowImeState(this);
   }
 
   setImeCursorArea(x: number, y: number, width: number, height: number): void {
+    this.lib.throwIfConnectionFailed();
     if (this.#closed) return;
     const area = normalizeImeCursorArea(x, y, width, height);
     if (area === undefined) return;
@@ -288,6 +292,7 @@ export class WaylandWindow implements Window {
   }
 
   blit(rgba: Uint8Array, width: number, height: number, frameToken?: number): void {
+    this.lib.throwIfConnectionFailed();
     if (this.#closed || !this.#surface) return;
     const configuration = this.#configuration;
     if (!configuration || !frameMatchesConfiguration(configuration, width, height, frameToken)) return;
@@ -320,7 +325,7 @@ export class WaylandWindow implements Window {
       0,
       args(),
     );
-    symbols.wl_display_flush(this.lib.display);
+    this.lib.flushDisplay("presenting a window frame");
   }
 
   [Symbol.dispose](): void {
