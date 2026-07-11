@@ -61,7 +61,7 @@ struct QuoxRendererState {
     dispatch_stack: DispatchStack,
     /// Stable public handles for Blitz's internally reusable slab node ids.
     node_handles: NodeHandles,
-    /// Browser-facing live value/dirty state for Blitz-backed text controls.
+    /// Browser-facing live value/dirty state for value-mode form controls.
     text_controls: TextControlStates,
     /// Browser-facing checkedness/dirty state for every HTML input.
     checked_controls: CheckedControlStates,

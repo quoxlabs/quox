@@ -16,7 +16,7 @@ interface ControlState {
   selectionDirection: 0 | 1 | 2;
 }
 
-type InputValueMode = "value" | "unsupported-value" | "default" | "default-on" | "filename";
+type InputValueMode = "value" | "date-time-value" | "unsupported-value" | "default" | "default-on" | "filename";
 
 function inputValueMode(control: ControlState): InputValueMode {
   const type = (control.attributes.get("type") ?? "").toLowerCase();
@@ -26,6 +26,7 @@ function inputValueMode(control: ControlState): InputValueMode {
     case "month":
     case "week":
     case "time":
+      return "date-time-value";
     case "range":
     case "color":
       return "unsupported-value";
@@ -46,7 +47,86 @@ function inputValueMode(control: ControlState): InputValueMode {
 }
 
 function isValueMode(mode: InputValueMode): boolean {
-  return mode === "value" || mode === "unsupported-value";
+  return mode === "value" || mode === "date-time-value" || mode === "unsupported-value";
+}
+
+function decimalModulo(value: string, divisor: number): number {
+  let remainder = 0;
+  for (const digit of value) remainder = (remainder * 10 + Number(digit)) % divisor;
+  return remainder;
+}
+
+function validYear(value: string): boolean {
+  return value.length >= 4 && /^[0-9]+$/.test(value) && /[1-9]/.test(value);
+}
+
+function leapYear(value: string): boolean {
+  return decimalModulo(value, 400) === 0 ||
+    (decimalModulo(value, 4) === 0 && decimalModulo(value, 100) !== 0);
+}
+
+function validMonth(value: string): boolean {
+  const match = /^([0-9]{4,})-([0-9]{2})$/.exec(value);
+  if (match === null || !validYear(match[1])) return false;
+  const month = Number(match[2]);
+  return month >= 1 && month <= 12;
+}
+
+function validDate(value: string): boolean {
+  const match = /^([0-9]{4,})-([0-9]{2})-([0-9]{2})$/.exec(value);
+  if (match === null || !validYear(match[1])) return false;
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const days = [31, leapYear(match[1]) ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  return month >= 1 && month <= 12 && day >= 1 && day <= days[month - 1];
+}
+
+function validWeek(value: string): boolean {
+  const match = /^([0-9]{4,})-W([0-9]{2})$/.exec(value);
+  if (match === null || !validYear(match[1])) return false;
+  const cycleYear = decimalModulo(match[1], 400) || 400;
+  const previous = cycleYear - 1;
+  const januaryFirst = (cycleYear + Math.floor(previous / 4) - Math.floor(previous / 100) +
+    Math.floor(previous / 400)) % 7;
+  const maximum = januaryFirst === 4 || (januaryFirst === 3 && leapYear(match[1])) ? 53 : 52;
+  const week = Number(match[2]);
+  return week >= 1 && week <= maximum;
+}
+
+function parsedTime(value: string): RegExpExecArray | null {
+  const match = /^([0-9]{2}):([0-9]{2})(?::([0-9]{2})(?:\.([0-9]{1,3}))?)?$/.exec(value);
+  if (match === null || Number(match[1]) > 23 || Number(match[2]) > 59) return null;
+  if (match[3] !== undefined && Number(match[3]) > 59) return null;
+  return match;
+}
+
+function sanitizeDateTimeValue(control: ControlState, value: string): string {
+  const type = (control.attributes.get("type") ?? "").toLowerCase();
+  switch (type) {
+    case "date":
+      return validDate(value) ? value : "";
+    case "month":
+      return validMonth(value) ? value : "";
+    case "week":
+      return validWeek(value) ? value : "";
+    case "time":
+      return parsedTime(value) === null ? "" : value;
+    case "datetime-local": {
+      const match = /^(.+)[T ](.+)$/.exec(value);
+      if (match === null || !validDate(match[1])) return "";
+      const time = parsedTime(match[2]);
+      if (time === null) return "";
+      let normalizedTime = `${time[1]}:${time[2]}`;
+      const fraction = (time[4] ?? "").replace(/0+$/, "");
+      if (Number(time[3] ?? "0") !== 0 || fraction !== "") {
+        normalizedTime += `:${time[3] ?? "00"}`;
+        if (fraction !== "") normalizedTime += `.${fraction}`;
+      }
+      return `${match[1]}T${normalizedTime}`;
+    }
+    default:
+      return value;
+  }
 }
 
 function supportsSelectionRange(control: ControlState): boolean {
@@ -129,6 +209,7 @@ class FakeLiveControlRenderer {
     if (control.tagName !== "input") throw new TypeError("fake node is not a form control");
     switch (inputValueMode(control)) {
       case "value":
+      case "date-time-value":
         return control.value;
       case "default":
         return control.attributes.get("value") ?? "";
@@ -155,10 +236,12 @@ class FakeLiveControlRenderer {
         case "unsupported-value":
         case "filename":
           throw new TypeError("fake input value mode is intentionally unsupported");
+        case "date-time-value":
         case "value":
           break;
       }
     }
+    value = sanitizeDateTimeValue(control, value);
     const changed = control.value !== value;
     control.value = value;
     control.dirty = true;
@@ -249,7 +332,7 @@ class FakeLiveControlRenderer {
       control.tagName === "input" && name === "value" &&
       isValueMode(inputValueMode(control)) && !control.dirty
     ) {
-      control.value = value;
+      control.value = sanitizeDateTimeValue(control, value);
     }
     if (
       control.tagName === "input" && name === "checked" && !hadChecked &&
@@ -370,6 +453,7 @@ class FakeLiveControlRenderer {
     } else if (previousMode !== "filename" && nextMode === "filename") {
       control.value = "";
     }
+    if (isValueMode(nextMode)) control.value = sanitizeDateTimeValue(control, control.value);
   }
 
   #control(nodeHandle: number): ControlState {
@@ -649,8 +733,73 @@ Deno.test("input type changes transfer values between value and attribute modes"
   assertEquals(fallback.getAttribute("value"), null);
 });
 
-Deno.test("complex and filename input values remain explicitly unsupported", () => {
-  for (const type of ["date", "datetime-local", "month", "week", "time", "range", "color", "file"]) {
+Deno.test("date and time input values apply browser sanitizers", () => {
+  const cases = [
+    ["date", "2024-02-29", "2024-02-29"],
+    ["date", "2023-02-29", ""],
+    ["month", "2024-12", "2024-12"],
+    ["month", "2024-13", ""],
+    ["week", "2020-W53", "2020-W53"],
+    ["week", "2021-W53", ""],
+    ["time", "23:59", "23:59"],
+    ["time", "12:34:00.000", "12:34:00.000"],
+    ["time", "24:00", ""],
+    ["datetime-local", "2024-02-29 12:34:00.000", "2024-02-29T12:34"],
+    ["datetime-local", "2024-02-29T12:34:56.120", "2024-02-29T12:34:56.12"],
+    ["datetime-local", "2024-02-29T12:34Z", ""],
+  ] as const;
+
+  for (const [type, value, expected] of cases) {
+    const { document } = createDocument();
+    const input = document.createElement("input");
+    input.setAttribute("type", type);
+    input.value = value;
+    assertEquals(input.value, expected, `type=${type} value=${value}`);
+    assertEquals(input.getAttribute("value"), null, "the live setter does not rewrite the default");
+  }
+});
+
+Deno.test("date defaults stop following after an identical live assignment", () => {
+  const { document } = createDocument();
+  const input = document.createElement("input");
+  input.setAttribute("type", "date");
+  let inputs = 0;
+  let changes = 0;
+  input.addEventListener("input", () => inputs++);
+  input.addEventListener("change", () => changes++);
+
+  input.defaultValue = "not-a-date";
+  assertEquals(input.defaultValue, "not-a-date");
+  assertEquals(input.value, "");
+  input.defaultValue = "2024-02-29";
+  assertEquals(input.value, "2024-02-29");
+  input.value = "2024-02-29";
+  input.defaultValue = "2025-03-01";
+  assertEquals(input.defaultValue, "2025-03-01");
+  assertEquals(input.value, "2024-02-29");
+  assertEquals(inputs, 0);
+  assertEquals(changes, 0);
+});
+
+Deno.test("date values use Web IDL string conversion", () => {
+  const { document } = createDocument();
+  const input = document.createElement("input");
+  input.setAttribute("type", "date");
+  input.value = "2024-02-29";
+
+  (input as unknown as { value: unknown }).value = null;
+  assertEquals(input.value, "");
+  assertThrows(
+    () => {
+      (input as unknown as { value: unknown }).value = Symbol("date");
+    },
+    TypeError,
+  );
+  assertEquals(input.value, "", "failed conversion does not reach the renderer");
+});
+
+Deno.test("range, color, and filename input values remain explicitly unsupported", () => {
+  for (const type of ["range", "color", "file"]) {
     const { document } = createDocument();
     const input = document.createElement("input");
     input.setAttribute("type", type);

@@ -424,7 +424,7 @@ fn mark_checkedness_restyle(document: &mut BaseDocument, node_id: usize) {
     }
 }
 
-/// Browser-facing state which Blitz's render-only text editor does not retain itself.
+/// Browser-facing live value state which Blitz's render-only controls do not retain themselves.
 ///
 /// Raw node ids are safe keys only while this map is purged before Blitz drops nodes and can
 /// recycle their slab slots. Detached nodes remain in Blitz's slab, so their state deliberately
@@ -482,10 +482,27 @@ enum TextControlKind {
     InputEmail,
     InputMultipleEmail,
     InputNumber,
+    InputDate,
+    InputMonth,
+    InputWeek,
+    InputTime,
+    InputDateTimeLocal,
     TextArea,
 }
 
 impl TextControlKind {
+    fn uses_text_editor(self) -> bool {
+        matches!(
+            self,
+            Self::InputText
+                | Self::InputUrl
+                | Self::InputEmail
+                | Self::InputMultipleEmail
+                | Self::InputNumber
+                | Self::TextArea
+        )
+    }
+
     fn is_multiline(self) -> bool {
         matches!(self, Self::TextArea)
     }
@@ -545,6 +562,11 @@ impl TextControlKind {
                     String::new()
                 }
             }
+            Self::InputDate => sanitize_date(value),
+            Self::InputMonth => sanitize_month(value),
+            Self::InputWeek => sanitize_week(value),
+            Self::InputTime => sanitize_time(value),
+            Self::InputDateTimeLocal => sanitize_local_date_time(value),
             // DOM text normally reaches us with LF line endings, but script can still provide CR
             // through a Text node. The textarea value API exposes normalized LF line endings.
             Self::TextArea => value.replace("\r\n", "\n").replace('\r', "\n"),
@@ -565,9 +587,8 @@ struct TextControlState {
     /// independently (most importantly, a non-collapsed selection with direction `none`).
     selection: EditorSelectionState,
     dirty_value: bool,
-    /// False while an otherwise-retained valid value is passing through an input value-mode
-    /// which Quox/Blitz cannot currently render, expose, or sanitize (date/range/color and
-    /// related states). Their full value models are a separate compatibility slice.
+    /// False while an otherwise-retained value is passing through a value-mode which Quox cannot
+    /// yet expose or sanitize (currently range and color).
     active: bool,
 }
 
@@ -655,6 +676,16 @@ impl TextControlStates {
         kind: TextControlKind,
         default_value: String,
     ) {
+        // A script type mutation can move directly from an editor-backed value state into a
+        // non-editor date/time state. Capture the old editor before choosing the destination
+        // sanitizer or clearing Blitz's special data.
+        if self
+            .controls
+            .get(&node_id)
+            .is_some_and(|control| control.kind != kind)
+        {
+            self.sync_editor_value(document, node_id);
+        }
         self.sync_editor_selection(document, node_id);
         let control = self
             .controls
@@ -692,26 +723,30 @@ impl TextControlStates {
 
         let editor_value = control.editor_value.clone();
         let preserved_direction = control.selection.direction;
-        ensure_text_editor(document, node_id, kind);
-        apply_value_to_editor(
-            document,
-            node_id,
-            &editor_value,
-            false,
-            selection_projection_kind,
-        );
-        if move_selection_to_start {
-            document.with_text_input(node_id, |mut driver| driver.move_to_text_start());
-        }
-        self.record_editor_selection(
-            document,
-            node_id,
+        if kind.uses_text_editor() {
+            ensure_text_editor(document, node_id, kind);
+            apply_value_to_editor(
+                document,
+                node_id,
+                &editor_value,
+                false,
+                selection_projection_kind,
+            );
             if move_selection_to_start {
-                TextControlSelectionDirection::None
-            } else {
-                preserved_direction
-            },
-        );
+                document.with_text_input(node_id, |mut driver| driver.move_to_text_start());
+            }
+            self.record_editor_selection(
+                document,
+                node_id,
+                if move_selection_to_start {
+                    TextControlSelectionDirection::None
+                } else {
+                    preserved_direction
+                },
+            );
+        } else {
+            clear_text_editor(document, node_id);
+        }
     }
 
     /// Return the live value, including active composition text. Native defaults synchronize this
@@ -1077,11 +1112,15 @@ fn control_descriptor(
                     }
                 }
                 "number" => TextControlKind::InputNumber,
-                // Checkbox/radio and unsupported Blitz input modes are outside this isolated
-                // live-text implementation.
-                "hidden" | "date" | "datetime-local" | "month" | "week" | "time" | "range"
-                | "color" | "checkbox" | "radio" | "file" | "submit" | "image" | "reset"
-                | "button" => return None,
+                "date" => TextControlKind::InputDate,
+                "month" => TextControlKind::InputMonth,
+                "week" => TextControlKind::InputWeek,
+                "time" => TextControlKind::InputTime,
+                "datetime-local" => TextControlKind::InputDateTimeLocal,
+                // Non-value modes and the remaining unsupported Blitz value modes are outside
+                // this live-value owner.
+                "hidden" | "range" | "color" | "checkbox" | "radio" | "file" | "submit"
+                | "image" | "reset" | "button" => return None,
                 // Text-like keywords, the missing value, and the enumerated attribute's invalid
                 // value default all use the Text state.
                 _ => TextControlKind::InputText,
@@ -1140,13 +1179,199 @@ fn unmanaged_input_mode(document: &BaseDocument, node_id: usize) -> Option<Unman
         .unwrap_or("")
         .to_ascii_lowercase();
     match input_type.as_str() {
-        "date" | "datetime-local" | "month" | "week" | "time" | "range" | "color" => {
-            Some(UnmanagedInputMode::UnsupportedValue)
-        }
+        "range" | "color" => Some(UnmanagedInputMode::UnsupportedValue),
         "hidden" | "submit" | "image" | "reset" | "button" => Some(UnmanagedInputMode::Default),
         "checkbox" | "radio" => Some(UnmanagedInputMode::DefaultOn),
         "file" => Some(UnmanagedInputMode::Filename),
         _ => None,
+    }
+}
+
+fn sanitize_date(value: &str) -> String {
+    parse_date_prefix(value.as_bytes())
+        .filter(|(_, end)| *end == value.len())
+        .map_or_else(String::new, |_| value.to_owned())
+}
+
+fn sanitize_month(value: &str) -> String {
+    parse_month_prefix(value.as_bytes())
+        .filter(|(_, _, end)| *end == value.len())
+        .map_or_else(String::new, |_| value.to_owned())
+}
+
+fn sanitize_week(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let Some((year, year_end)) = parse_year_prefix(bytes) else {
+        return String::new();
+    };
+    if bytes.get(year_end..year_end + 2) != Some(b"-W") || value.len() != year_end + 4 {
+        return String::new();
+    }
+    let Some(week) = ascii_two_digits(bytes, year_end + 2) else {
+        return String::new();
+    };
+    if week == 0 || week > weeks_in_year(year) {
+        return String::new();
+    }
+    value.to_owned()
+}
+
+fn sanitize_time(value: &str) -> String {
+    parse_time(value.as_bytes()).map_or_else(String::new, |_| value.to_owned())
+}
+
+fn sanitize_local_date_time(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let Some((_, date_end)) = parse_date_prefix(bytes) else {
+        return String::new();
+    };
+    if !matches!(bytes.get(date_end), Some(b'T' | b' ')) {
+        return String::new();
+    }
+    let time = &bytes[date_end + 1..];
+    let Some(parsed_time) = parse_time(time) else {
+        return String::new();
+    };
+
+    let mut normalized = String::with_capacity(value.len());
+    normalized.push_str(&value[..date_end]);
+    normalized.push('T');
+    normalized
+        .push_str(std::str::from_utf8(&time[..5]).expect("a parsed HTML time prefix is ASCII"));
+    let fraction_end = parsed_time
+        .fraction
+        .iter()
+        .rposition(|digit| *digit != b'0')
+        .map_or(0, |index| index + 1);
+    let fraction = &parsed_time.fraction[..fraction_end];
+    if parsed_time.second != 0 || !fraction.is_empty() {
+        normalized.push(':');
+        normalized
+            .push_str(std::str::from_utf8(&time[6..8]).expect("parsed HTML seconds are ASCII"));
+        if !fraction.is_empty() {
+            normalized.push('.');
+            normalized.push_str(
+                std::str::from_utf8(fraction).expect("a parsed HTML second fraction is ASCII"),
+            );
+        }
+    }
+    normalized
+}
+
+fn parse_year_prefix(bytes: &[u8]) -> Option<(&[u8], usize)> {
+    let year_end = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_digit())
+        .unwrap_or(bytes.len());
+    let year = bytes.get(..year_end)?;
+    (year.len() >= 4 && year.iter().any(|byte| *byte != b'0')).then_some((year, year_end))
+}
+
+fn parse_month_prefix(bytes: &[u8]) -> Option<(&[u8], u8, usize)> {
+    let (year, year_end) = parse_year_prefix(bytes)?;
+    if bytes.get(year_end) != Some(&b'-') {
+        return None;
+    }
+    let month = ascii_two_digits(bytes, year_end + 1)?;
+    (1..=12)
+        .contains(&month)
+        .then_some((year, month, year_end + 3))
+}
+
+fn parse_date_prefix(bytes: &[u8]) -> Option<(&[u8], usize)> {
+    let (year, month, month_end) = parse_month_prefix(bytes)?;
+    if bytes.get(month_end) != Some(&b'-') {
+        return None;
+    }
+    let day = ascii_two_digits(bytes, month_end + 1)?;
+    (day != 0 && day <= days_in_month(year, month)).then_some((year, month_end + 3))
+}
+
+struct ParsedTime<'a> {
+    second: u8,
+    fraction: &'a [u8],
+}
+
+fn parse_time(bytes: &[u8]) -> Option<ParsedTime<'_>> {
+    let hour = ascii_two_digits(bytes, 0)?;
+    if hour > 23 || bytes.get(2) != Some(&b':') {
+        return None;
+    }
+    let minute = ascii_two_digits(bytes, 3)?;
+    if minute > 59 {
+        return None;
+    }
+    if bytes.len() == 5 {
+        return Some(ParsedTime {
+            second: 0,
+            fraction: &[],
+        });
+    }
+    if bytes.get(5) != Some(&b':') {
+        return None;
+    }
+    let second = ascii_two_digits(bytes, 6)?;
+    if second > 59 {
+        return None;
+    }
+    if bytes.len() == 8 {
+        return Some(ParsedTime {
+            second,
+            fraction: &[],
+        });
+    }
+    if bytes.get(8) != Some(&b'.') {
+        return None;
+    }
+    let fraction = bytes.get(9..)?;
+    if !(1..=3).contains(&fraction.len()) || !fraction.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    Some(ParsedTime { second, fraction })
+}
+
+fn ascii_two_digits(bytes: &[u8], index: usize) -> Option<u8> {
+    let tens = *bytes.get(index)?;
+    let ones = *bytes.get(index + 1)?;
+    if !tens.is_ascii_digit() || !ones.is_ascii_digit() {
+        return None;
+    }
+    Some((tens - b'0') * 10 + (ones - b'0'))
+}
+
+fn year_modulo(year: &[u8], divisor: u16) -> u16 {
+    year.iter().fold(0, |remainder, digit| {
+        (remainder * 10 + u16::from(*digit - b'0')) % divisor
+    })
+}
+
+fn is_leap_year(year: &[u8]) -> bool {
+    year_modulo(year, 400) == 0 || (year_modulo(year, 4) == 0 && year_modulo(year, 100) != 0)
+}
+
+fn days_in_month(year: &[u8], month: u8) -> u8 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+fn weeks_in_year(year: &[u8]) -> u8 {
+    // The Gregorian calendar repeats every 400 years, including its weekday alignment. Map a
+    // multiple of 400 to year 400 so the positive-year weekday formula stays well-defined.
+    let cycle_year = match year_modulo(year, 400) {
+        0 => 400,
+        year => year,
+    };
+    let previous = cycle_year - 1;
+    let january_first = (cycle_year + previous / 4 - previous / 100 + previous / 400) % 7;
+    if january_first == 4 || (january_first == 3 && is_leap_year(year)) {
+        53
+    } else {
+        52
     }
 }
 
@@ -1377,7 +1602,12 @@ impl SelectionProjection {
             // this helper robust if another caller inspects their editor in the future.
             TextControlKind::InputEmail
             | TextControlKind::InputMultipleEmail
-            | TextControlKind::InputNumber => raw_characters,
+            | TextControlKind::InputNumber
+            | TextControlKind::InputDate
+            | TextControlKind::InputMonth
+            | TextControlKind::InputWeek
+            | TextControlKind::InputTime
+            | TextControlKind::InputDateTimeLocal => raw_characters,
         };
 
         let mut utf16_len = 0;
@@ -2639,21 +2869,13 @@ mod tests {
     }
 
     #[test]
-    fn complex_and_filename_modes_remain_explicitly_unsupported() {
+    fn range_color_and_filename_modes_remain_explicitly_unsupported() {
         let mut document = document(
-            "<input id='date' type='date' value='sentinel'>\
-             <input id='datetime' type='datetime-local' value='sentinel'>\
-             <input id='month' type='month' value='sentinel'>\
-             <input id='week' type='week' value='sentinel'>\
-             <input id='time' type='time' value='sentinel'>\
-             <input id='range' type='range' value='sentinel'>\
+            "<input id='range' type='range' value='sentinel'>\
              <input id='color' type='color' value='sentinel'>\
              <input id='file' type='file' value='sentinel'>",
         );
-        let inputs = [
-            "date", "datetime", "month", "week", "time", "range", "color", "file",
-        ]
-        .map(|id| element(&document, id));
+        let inputs = ["range", "color", "file"].map(|id| element(&document, id));
         let mut controls = TextControlStates::default();
         controls.reconcile_document(&mut document);
 
@@ -2668,6 +2890,101 @@ mod tests {
                 Some("sentinel")
             );
         }
+    }
+
+    #[test]
+    fn date_and_time_value_modes_apply_html_sanitizers() {
+        let mut document = document("<input id='field'>");
+        let field = element(&document, "field");
+        let mut controls = TextControlStates::default();
+        controls.reconcile_document(&mut document);
+
+        let cases = [
+            ("date", "2024-02-29", "2024-02-29"),
+            ("date", "2023-02-29", ""),
+            ("date", "2000-02-29", "2000-02-29"),
+            ("date", "1900-02-29", ""),
+            ("date", "2023-04-31", ""),
+            ("date", "12345-12-31", "12345-12-31"),
+            ("date", "0000-01-01", ""),
+            ("month", "2024-12", "2024-12"),
+            ("month", "2024-13", ""),
+            ("week", "2020-W53", "2020-W53"),
+            ("week", "2021-W53", ""),
+            ("week", "2015-W53", "2015-W53"),
+            ("week", "2014-W53", ""),
+            ("week", "2020-W00", ""),
+            ("week", "2020-W54", ""),
+            ("week", "2020-w01", ""),
+            ("time", "23:59", "23:59"),
+            ("time", "12:34:00.000", "12:34:00.000"),
+            ("time", "24:00", ""),
+            ("time", "23:59:60", ""),
+            ("time", "12:34:56.1234", ""),
+            ("time", " 12:34", ""),
+            (
+                "datetime-local",
+                "2024-02-29 12:34:00.000",
+                "2024-02-29T12:34",
+            ),
+            (
+                "datetime-local",
+                "2024-02-29T12:34:56.120",
+                "2024-02-29T12:34:56.12",
+            ),
+            ("datetime-local", "2023-02-29T12:34", ""),
+            ("datetime-local", "2024-02-29T12:34Z", ""),
+        ];
+
+        for (input_type, value, expected) in cases {
+            set_input_type(&mut document, field, input_type);
+            controls.reconcile_document(&mut document);
+            controls.set_value(&mut document, field, value);
+            assert_eq!(
+                controls.value(&mut document, field).as_deref(),
+                Some(expected),
+                "type={input_type} value={value}",
+            );
+            assert!(super::editor_value(&document, field).is_none());
+        }
+    }
+
+    #[test]
+    fn date_time_defaults_follow_only_while_the_live_value_is_clean() {
+        let mut document = document("<input id='field' type='date' value='not-a-date'>");
+        let field = element(&document, "field");
+        let mut controls = TextControlStates::default();
+        controls.reconcile_document(&mut document);
+
+        assert_eq!(controls.value(&mut document, field).as_deref(), Some(""));
+        assert_eq!(
+            super::input_value_attribute(&document, field).as_deref(),
+            Some("not-a-date"),
+            "the raw default remains observable",
+        );
+        document
+            .mutate()
+            .set_attribute(field, value_attribute(), "2024-02-29");
+        controls.reconcile_document(&mut document);
+        assert_eq!(
+            controls.value(&mut document, field).as_deref(),
+            Some("2024-02-29")
+        );
+
+        assert_eq!(
+            controls.set_value(&mut document, field, "2024-02-29"),
+            Some(false),
+            "an identical assignment still makes the value dirty",
+        );
+        assert!(controls.state(field).unwrap().dirty_value);
+        document
+            .mutate()
+            .set_attribute(field, value_attribute(), "2025-03-01");
+        controls.reconcile_document(&mut document);
+        assert_eq!(
+            controls.value(&mut document, field).as_deref(),
+            Some("2024-02-29")
+        );
     }
 
     #[test]
@@ -2715,7 +3032,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_value_modes_retain_valid_live_state_until_a_supported_mode_returns() {
+    fn date_value_mode_preserves_dirty_state_across_type_and_default_changes() {
         let mut document = document(
             "<input id='dirty' type='text' value='old'><input id='clean' type='text' value='2023-01-01'>",
         );
@@ -2731,9 +3048,12 @@ mod tests {
                 .set_attribute(node_id, type_attribute(), "date");
         }
         controls.reconcile_document(&mut document);
-        assert!(!controls.state(dirty).unwrap().active);
+        assert!(controls.state(dirty).unwrap().active);
         assert!(super::editor_value(&document, dirty).is_none());
-        assert_eq!(controls.value(&mut document, dirty), None);
+        assert_eq!(
+            controls.value(&mut document, dirty).as_deref(),
+            Some("2024-01-01")
+        );
 
         document
             .mutate()
@@ -2742,6 +3062,14 @@ mod tests {
             .mutate()
             .set_attribute(clean, value_attribute(), "2025-02-02");
         controls.reconcile_document(&mut document);
+        assert_eq!(
+            controls.value(&mut document, dirty).as_deref(),
+            Some("2024-01-01")
+        );
+        assert_eq!(
+            controls.value(&mut document, clean).as_deref(),
+            Some("2025-02-02")
+        );
 
         for node_id in [dirty, clean] {
             document
@@ -2760,6 +3088,117 @@ mod tests {
             Some("2025-02-02")
         );
         assert!(!controls.state(clean).unwrap().dirty_value);
+    }
+
+    #[test]
+    fn date_type_transition_captures_the_latest_editor_value_before_sanitizing() {
+        let mut document = document("<input id='field' type='text' value='old'>");
+        let field = element(&document, "field");
+        let mut controls = TextControlStates::default();
+        controls.reconcile_document(&mut document);
+        document.with_text_input(field, |mut driver| {
+            driver.editor.set_text("2024-02-29");
+            driver.refresh_layout();
+        });
+
+        set_input_type(&mut document, field, "date");
+        controls.reconcile_document(&mut document);
+        assert_eq!(
+            controls.value(&mut document, field).as_deref(),
+            Some("2024-02-29")
+        );
+        assert!(controls.state(field).unwrap().dirty_value);
+        assert!(super::editor_value(&document, field).is_none());
+    }
+
+    #[test]
+    fn date_time_type_transitions_follow_value_mode_bookkeeping() {
+        let mut document = document(
+            "<input id='dirty' type='date' value='2024-02-29'>\
+             <input id='from-default' type='checkbox' value='2025-03-01'>\
+             <input id='valid-exit' type='date' value='2024-01-01'>\
+             <input id='empty-exit' type='date' value='not-a-date'>",
+        );
+        let dirty = element(&document, "dirty");
+        let from_default = element(&document, "from-default");
+        let valid_exit = element(&document, "valid-exit");
+        let empty_exit = element(&document, "empty-exit");
+        let mut controls = TextControlStates::default();
+        controls.reconcile_document(&mut document);
+
+        controls.set_value(&mut document, dirty, "2024-02-29");
+        set_input_type(&mut document, dirty, "time");
+        controls.reconcile_document(&mut document);
+        assert_eq!(controls.value(&mut document, dirty).as_deref(), Some(""));
+        assert!(controls.state(dirty).unwrap().dirty_value);
+
+        set_input_type(&mut document, from_default, "date");
+        controls.reconcile_document(&mut document);
+        assert_eq!(
+            controls.value(&mut document, from_default).as_deref(),
+            Some("2025-03-01")
+        );
+        assert!(!controls.state(from_default).unwrap().dirty_value);
+
+        controls.set_value(&mut document, valid_exit, "2026-04-02");
+        set_input_type(&mut document, valid_exit, "checkbox");
+        controls.reconcile_document(&mut document);
+        assert_eq!(
+            super::input_value_attribute(&document, valid_exit).as_deref(),
+            Some("2026-04-02")
+        );
+
+        set_input_type(&mut document, empty_exit, "checkbox");
+        controls.reconcile_document(&mut document);
+        assert_eq!(
+            super::input_value_attribute(&document, empty_exit).as_deref(),
+            Some("not-a-date"),
+            "an empty sanitized live value must not overwrite the raw default",
+        );
+    }
+
+    #[test]
+    fn detached_date_values_survive_but_destroyed_state_does_not() {
+        let mut document = document("<input id='field' type='date' value='2024-01-01'>");
+        let body = document
+            .tree()
+            .iter()
+            .find_map(|(node_id, node)| {
+                node.element_data()
+                    .is_some_and(|element| element.name.local.as_ref() == "body")
+                    .then_some(node_id)
+            })
+            .expect("test document should have a body");
+        let field = element(&document, "field");
+        let mut controls = TextControlStates::default();
+        controls.reconcile_document(&mut document);
+        controls.set_value(&mut document, field, "2025-02-02");
+
+        document.mutate().remove_node(field);
+        controls.reconcile_document(&mut document);
+        assert_eq!(
+            controls.value(&mut document, field).as_deref(),
+            Some("2025-02-02")
+        );
+        document.mutate().append_children(body, &[field]);
+        assert_eq!(
+            controls.value(&mut document, field).as_deref(),
+            Some("2025-02-02")
+        );
+
+        controls.invalidate_nodes([field]);
+        document.mutate().remove_and_drop_all_children(body);
+        document.mutate().set_inner_html(
+            body,
+            "<input id='replacement' type='date' value='2026-03-03'>",
+        );
+        let replacement = element(&document, "replacement");
+        controls.reconcile_document(&mut document);
+        assert_eq!(
+            controls.value(&mut document, replacement).as_deref(),
+            Some("2026-03-03")
+        );
+        assert!(!controls.state(replacement).unwrap().dirty_value);
     }
 
     #[test]
@@ -2927,7 +3366,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_controls_keep_ownership_of_any_existing_blitz_editor() {
+    fn non_editor_value_modes_discard_an_obsolete_blitz_editor() {
         let mut document = document("<input id='date' type='date'>");
         let date = element(&document, "date");
         let mut controls = TextControlStates::default();
@@ -2944,13 +3383,7 @@ mod tests {
                 .take_editor_for_value_attribute_mutation(&mut document, date)
                 .is_none()
         );
-        assert!(
-            document
-                .get_node(date)
-                .and_then(blitz_dom::Node::element_data)
-                .and_then(blitz_dom::ElementData::text_input_data)
-                .is_some()
-        );
+        assert!(super::editor_value(&document, date).is_none());
     }
 
     #[test]

@@ -1142,7 +1142,7 @@ impl QuoxRenderer {
         })
     }
 
-    /// Read a supported form-control value, including active text composition.
+    /// Read a supported live form-control value, including active text composition.
     pub fn form_control_value(&self, node_handle: f64) -> Result<String, JsValue> {
         let node_handle =
             uint32(node_handle, "nodeHandle").map_err(NumericArgumentError::into_js)?;
