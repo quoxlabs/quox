@@ -73,7 +73,7 @@ class X11Window implements Window {
   readonly id: bigint;
   readonly input: XimContext;
   readonly pressedKeys = new PressedLogicalKeyCache<number>();
-  readonly #gc: bigint;
+  readonly #gc: Deno.PointerObject;
   #image: NativeXImage;
   #width: number;
   #height: number;
@@ -117,8 +117,8 @@ class X11Window implements Window {
     this.#width = w;
     this.#height = h;
 
-    const gc = BigInt(lib.X11.symbols.XCreateGC(lib.display, window, 0n, null));
-    if (gc === 0n) {
+    const gc = lib.X11.symbols.XCreateGC(lib.display, window, 0n, null);
+    if (gc === null) {
       lib.X11.symbols.XDestroyWindow(lib.display, window);
       lib.X11.symbols.XFlush(lib.display);
       throw new Error("winding(x11): failed to create graphics context");
