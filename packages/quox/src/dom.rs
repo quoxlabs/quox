@@ -67,6 +67,44 @@ pub(super) fn public_dom_node_id(document: &BaseDocument, mut node_id: usize) ->
     }
 }
 
+/// Return the connected element which actually owns DOM focus. Blitz reports the document
+/// element when no node is focused, so the focus bit is part of the distinction.
+pub(super) fn actual_focus_node_id(document: &BaseDocument) -> Option<usize> {
+    document.get_focussed_node_id().filter(|target| {
+        document.get_node(*target).is_some_and(|node| {
+            node.element_data().is_some() && node.is_focussed() && node.flags.is_in_document()
+        })
+    })
+}
+
+/// Resolve `Document.activeElement`, including the HTML fallback used when no element owns
+/// focus: a connected body, then the connected document element, then no element.
+fn active_element_node_id(document: &BaseDocument) -> Option<usize> {
+    if let Some(node_id) = actual_focus_node_id(document) {
+        return Some(node_id);
+    }
+
+    let root = document.try_root_element()?;
+    let root_id = root.id;
+    if root.element_data().is_none() || !root.flags.is_in_document() {
+        return None;
+    }
+
+    root.children
+        .iter()
+        .copied()
+        .find(|child_id| {
+            document.get_node(*child_id).is_some_and(|child| {
+                child.flags.is_in_document()
+                    && child.element_data().is_some_and(|element| {
+                        element.name.ns == ns!(html)
+                            && matches!(element.name.local.as_ref(), "body" | "frameset")
+                    })
+            })
+        })
+        .or(Some(root_id))
+}
+
 /// Build the target-first DOM ancestor path for a synthetic event. The document itself has no
 /// public node handle, so connectivity is returned separately and represented by a zero marker
 /// at the JavaScript boundary.
@@ -418,6 +456,15 @@ impl QuoxRenderer {
         state.expose_node(node_id)
     }
 
+    /// Return the active element, applying the browser body/document-element fallback when no
+    /// connected element actually owns focus.
+    pub fn active_element(&self) -> Result<Option<u32>, JsValue> {
+        let mut state = self.state.borrow_mut();
+        active_element_node_id(&state.document)
+            .map(|node_id| state.expose_node(node_id))
+            .transpose()
+    }
+
     /// Remove an element attribute.
     pub fn remove_attribute(&self, node_handle: f64, name: &str) -> Result<(), JsValue> {
         let node_handle =
@@ -624,7 +671,10 @@ impl QuoxRenderer {
 
 #[cfg(test)]
 mod tests {
-    use super::{attr_name, attribute_value, dropped_descendant_ids, synthetic_event_node_path};
+    use super::{
+        active_element_node_id, actual_focus_node_id, attr_name, attribute_value,
+        dropped_descendant_ids, synthetic_event_node_path,
+    };
     use crate::node_handles::NodeHandles;
     use blitz_dom::{DocumentConfig, NodeData};
     use blitz_html::{HtmlDocument, HtmlProvider};
@@ -717,6 +767,56 @@ mod tests {
 
         document.mutate().append_children(body_id, &[paragraph_id]);
         assert_eq!(handles.expose(paragraph_id), Ok(handle));
+    }
+
+    #[test]
+    fn active_element_requires_connected_focus_and_uses_html_fallbacks() {
+        let mut document = HtmlDocument::from_html(
+            "<!doctype html><html><body><input></body></html>",
+            DocumentConfig::default(),
+        )
+        .into_inner();
+        let html_id = element_by_tag(&document, "html");
+        let body_id = element_by_tag(&document, "body");
+        let input_id = element_by_tag(&document, "input");
+
+        // Blitz reports the document element when focus is absent. That is only the
+        // activeElement fallback; it is not actual element focus.
+        assert_eq!(document.get_focussed_node_id(), Some(html_id));
+        assert_eq!(actual_focus_node_id(&document), None);
+        assert_eq!(active_element_node_id(&document), Some(body_id));
+
+        assert!(document.set_focus_to(input_id));
+        assert_eq!(actual_focus_node_id(&document), Some(input_id));
+        assert_eq!(active_element_node_id(&document), Some(input_id));
+
+        // A detached node can retain Blitz's focus bit until mutation handling clears it. Do
+        // not expose that stale state through the DOM API.
+        document.mutate().remove_node(input_id);
+        assert!(
+            document
+                .get_node(input_id)
+                .is_some_and(blitz_dom::Node::is_focussed)
+        );
+        assert_eq!(actual_focus_node_id(&document), None);
+        assert_eq!(active_element_node_id(&document), Some(body_id));
+
+        document.mutate().remove_node(body_id);
+        assert_eq!(active_element_node_id(&document), Some(html_id));
+
+        document.mutate().remove_node(html_id);
+        assert_eq!(active_element_node_id(&document), None);
+
+        let frameset_document = HtmlDocument::from_html(
+            "<!doctype html><html><frameset><frame></frameset></html>",
+            DocumentConfig::default(),
+        )
+        .into_inner();
+        let frameset_id = element_by_tag(&frameset_document, "frameset");
+        assert_eq!(
+            active_element_node_id(&frameset_document),
+            Some(frameset_id)
+        );
     }
 
     #[test]

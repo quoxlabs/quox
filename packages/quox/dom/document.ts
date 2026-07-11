@@ -51,6 +51,7 @@ type SyntheticEventPathRenderer = WasmRenderer & {
 type InvalidatingTitleRenderer = { set_title(title: string): Uint32Array };
 type LegacyHoverRenderer = { clear_hover(): boolean };
 type ElementInterfaceRenderer = { element_interface(nodeHandle: number): number };
+type ActiveElementRenderer = { active_element(): number | undefined };
 
 const POINTER_BUTTONS_MASK = 0x1f;
 const POINTER_MODIFIER_MASK = 0x0f;
@@ -160,6 +161,12 @@ export class QuoxDocument extends QuoxEventTarget {
   get body(): QuoxElement {
     this.#assertActive();
     return this.#elementForHandle(this.#renderer.body());
+  }
+
+  get activeElement(): QuoxElement | null {
+    this.#assertActive();
+    const nodeHandle = (this.#renderer as unknown as ActiveElementRenderer).active_element();
+    return nodeHandle === undefined ? null : this.#elementForHandle(nodeHandle);
   }
 
   /**

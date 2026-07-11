@@ -2,7 +2,7 @@ use super::{
     apply_ime_delete_surrounding, is_insertable_text, key_event, mouse_button, pointer_buttons,
     preedit_cursor, validate_key_abi,
 };
-use crate::dom::public_dom_node_id;
+use crate::dom::{actual_focus_node_id, public_dom_node_id};
 use crate::ffi_numbers::{
     NumericArgumentError, finite_f32, finite_f64, integer_range, known_mask, nonnegative_f64,
     uint32, wasm_usize,
@@ -1225,14 +1225,6 @@ fn is_focus_event(data: &DomEventData) -> bool {
             | DomEventData::Focus(_)
             | DomEventData::FocusIn(_)
     )
-}
-
-fn actual_focus_node_id(document: &BaseDocument) -> Option<usize> {
-    document.get_focussed_node_id().filter(|target| {
-        document
-            .get_node(*target)
-            .is_some_and(blitz_dom::Node::is_focussed)
-    })
 }
 
 fn plan_pointer(
