@@ -12,7 +12,7 @@ import {
 } from "./input.ts";
 import { isVNode, mount, type QuoxRenderable } from "./mount.ts";
 import type { QuoxElement, QuoxInnerHTML } from "./node.ts";
-import { fitRgbaToFramebuffer } from "./framebuffer.ts";
+import { fitRgbaToFramebuffer, FramebufferState } from "./framebuffer.ts";
 
 export type {
   QuoxAppleStandardKeybindingEvent,
@@ -67,8 +67,7 @@ export class QuoxWindow implements Disposable {
   readonly #win: WindingWindow;
   #width: number;
   #height: number;
-  #framebufferWidth: number;
-  #framebufferHeight: number;
+  readonly #framebuffer: FramebufferState;
   #devicePixelRatio = 1;
   #frameToken: number | undefined;
   readonly #renderer: WasmRenderer;
@@ -95,8 +94,7 @@ export class QuoxWindow implements Disposable {
     this.#win = win;
     this.#width = width;
     this.#height = height;
-    this.#framebufferWidth = width;
-    this.#framebufferHeight = height;
+    this.#framebuffer = new FramebufferState(width, height);
     this.#renderer = renderer;
     this.document = new QuoxDocument(
       renderer,
@@ -121,8 +119,7 @@ export class QuoxWindow implements Disposable {
         resize: (event) => {
           this.#width = event.width;
           this.#height = event.height;
-          this.#framebufferWidth = event.framebufferWidth;
-          this.#framebufferHeight = event.framebufferHeight;
+          this.#framebuffer.update(event.framebufferWidth, event.framebufferHeight);
           this.#devicePixelRatio = event.devicePixelRatio;
           this.#frameToken = event.frameToken;
           (this.#renderer as unknown as {
@@ -256,16 +253,16 @@ export class QuoxWindow implements Disposable {
 
   async #renderIfNeeded(): Promise<void> {
     if (this.#stopped || this.#disposed || this.#rendering || !this.#needsRender) return;
-    // Skip the actual render while minimized, but leave `#needsRender` set so becoming
-    // visible again immediately catches up. Event polling itself is never gated.
-    if (!this.#visible) return;
+    // Keep `#needsRender` set while minimized or without a drawable framebuffer
+    // so the next visible, positive resize immediately catches up. Event polling
+    // and logical resize routing continue while rendering is suspended.
+    if (!this.#visible || !this.#framebuffer.drawable) return;
 
     this.#rendering = true;
     this.#needsRender = false;
     const renderWidth = this.#width;
     const renderHeight = this.#height;
-    const renderFramebufferWidth = this.#framebufferWidth;
-    const renderFramebufferHeight = this.#framebufferHeight;
+    const framebuffer = this.#framebuffer.snapshot();
     const renderFrameToken = this.#frameToken;
     try {
       this.document.syncNativeTitle();
@@ -275,16 +272,16 @@ export class QuoxWindow implements Disposable {
         await this.#renderer.render(),
         renderWidth,
         renderHeight,
-        renderFramebufferWidth,
-        renderFramebufferHeight,
+        framebuffer.width,
+        framebuffer.height,
       );
 
-      if (!this.#stopped && !this.#disposed) {
+      if (!this.#stopped && !this.#disposed && this.#framebuffer.drawable && this.#framebuffer.isCurrent(framebuffer)) {
         // Blit RGBA buffer to the window (conversion to native pixel format is handled by winding).
         this.#win.blit(
           rgba,
-          renderFramebufferWidth,
-          renderFramebufferHeight,
+          framebuffer.width,
+          framebuffer.height,
           renderFrameToken,
         );
       }

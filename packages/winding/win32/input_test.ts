@@ -3,6 +3,7 @@ import {
   AltGraphControlFilter,
   decodeKeyLParam,
   decodeMouseLParam,
+  decodeWin32ClientRect,
   decodeWin32QueuedMessage,
   isCommitText,
   keyboardModifiers,
@@ -17,6 +18,7 @@ import {
   TranslateMessageReentrancyGuard,
   validateWin32Geometry,
   VK,
+  Win32ClientState,
   Win32ImeAssociationState,
   win32KeyEditDisposition,
   win32KeyIdentity,
@@ -141,6 +143,45 @@ Deno.test("Win32 queue gate preserves WM_QUIT and latches after its signed exit 
   // The queue record was only observed, not removed; a second poll will not
   // repeatedly rediscover it and cannot turn into a busy loop.
   assertEquals(quit.wParam, 0xffffffffffffff85n);
+});
+
+Deno.test("Win32 client state reports visibility and authoritative size independently", () => {
+  const state = new Win32ClientState();
+  assertEquals(state.observe(false, 800, 600), { size: { width: 800, height: 600 } });
+  assertEquals(state.observe(true, 800, 600), { visible: false });
+
+  // A size change while minimized must not wait for an unrelated later resize.
+  assertEquals(state.observe(true, 640, 480), { size: { width: 640, height: 480 } });
+  // Restore can carry both visibility and a new drawable size.
+  assertEquals(state.observe(false, 1024, 768), {
+    visible: true,
+    size: { width: 1024, height: 768 },
+  });
+  assertEquals(state.observe(false, 1024, 768), {});
+  // Maximize is still visible, so only its dimensions change.
+  assertEquals(state.observe(false, 1920, 1080), { size: { width: 1920, height: 1080 } });
+});
+
+Deno.test("Win32 client state preserves zero and dimensions wider than WM_SIZE words", () => {
+  const rectangle = new ArrayBuffer(16);
+  const view = new DataView(rectangle);
+  view.setInt32(0, 0, true);
+  view.setInt32(4, 0, true);
+  view.setInt32(8, 70_000, true);
+  view.setInt32(12, 0, true);
+  const oversizedZeroHeight = decodeWin32ClientRect(rectangle);
+  assertEquals(oversizedZeroHeight, { width: 70_000, height: 0 });
+
+  const state = new Win32ClientState();
+  assertEquals(state.observe(false, oversizedZeroHeight.width, oversizedZeroHeight.height), {
+    size: oversizedZeroHeight,
+  });
+  assertEquals(state.contains(69_999, 0), false);
+  assertThrows(() => decodeWin32ClientRect(new ArrayBuffer(15)), RangeError, "truncated RECT");
+
+  view.setInt32(0, 10, true);
+  view.setInt32(8, 9, true);
+  assertThrows(() => decodeWin32ClientRect(rectangle), Error, "invalid client rectangle");
 });
 
 Deno.test("Win32 HIMC association remains independent across SETCONTEXT and focus orders", () => {

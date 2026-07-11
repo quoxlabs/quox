@@ -146,6 +146,11 @@ export interface WheelEvent extends PointerEventBase<"wheel"> {
   /** DOM WheelEvent compatible: 0 = logical pixels, 1 = lines, 2 = pages. */
   deltaMode: 0 | 1 | 2;
 }
+/**
+ * Logical dimensions remain meaningful when a native surface temporarily has
+ * no drawable pixels. If either framebuffer dimension is zero, retain this
+ * resize but suspend rendering and blitting until a positive resize.
+ */
 export interface ResizeEvent extends WindowEvent<"resize"> {
   type: "resize";
   /** Logical client width; input and IME coordinates use the same units. */

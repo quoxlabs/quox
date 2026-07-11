@@ -1,3 +1,41 @@
+export interface FramebufferSnapshot {
+  width: number;
+  height: number;
+  generation: number;
+}
+
+/** Retains zero-sized drawable state and invalidates renders across every size transition. */
+export class FramebufferState {
+  #width: number;
+  #height: number;
+  #generation = 0;
+
+  constructor(width: number, height: number) {
+    this.#width = width;
+    this.#height = height;
+  }
+
+  update(width: number, height: number): void {
+    if (width === this.#width && height === this.#height) return;
+    this.#width = width;
+    this.#height = height;
+    this.#generation++;
+  }
+
+  get drawable(): boolean {
+    return this.#width > 0 && this.#height > 0;
+  }
+
+  snapshot(): FramebufferSnapshot {
+    return { width: this.#width, height: this.#height, generation: this.#generation };
+  }
+
+  isCurrent(snapshot: FramebufferSnapshot): boolean {
+    return snapshot.generation === this.#generation &&
+      snapshot.width === this.#width && snapshot.height === this.#height;
+  }
+}
+
 /**
  * Keep the intentionally stale checked-in WASM presentable until a normal
  * build picks up its HiDPI renderer source. Rebuilt renderers already return

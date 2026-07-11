@@ -56,6 +56,50 @@ export function win32QuitExitCode(wParam: bigint): number {
   return Number(BigInt.asIntN(32, wParam));
 }
 
+export interface Win32ClientStateChange {
+  /** Present only when minimized/restored visibility changed. */
+  visible?: boolean;
+  /** Present only when either authoritative client dimension changed. */
+  size?: { width: number; height: number };
+}
+
+/**
+ * Tracks client dimensions independently from minimized visibility. Zero is a
+ * valid drawable dimension and values are not limited to WM_SIZE's 16-bit words.
+ */
+export class Win32ClientState {
+  #minimized = false;
+  #width: number | undefined;
+  #height: number | undefined;
+
+  observe(minimized: boolean, width: number, height: number): Win32ClientStateChange {
+    const visibilityChanged = minimized !== this.#minimized;
+    const sizeChanged = width !== this.#width || height !== this.#height;
+    this.#minimized = minimized;
+    this.#width = width;
+    this.#height = height;
+    return {
+      ...(visibilityChanged ? { visible: !minimized } : {}),
+      ...(sizeChanged ? { size: { width, height } } : {}),
+    };
+  }
+
+  contains(x: number, y: number): boolean {
+    return this.#width !== undefined && this.#height !== undefined &&
+      x >= 0 && y >= 0 && x < this.#width && y < this.#height;
+  }
+}
+
+/** Decode GetClientRect's signed LONG coordinates into authoritative dimensions. */
+export function decodeWin32ClientRect(buffer: ArrayBuffer): { width: number; height: number } {
+  if (buffer.byteLength < 16) throw new RangeError("winding(win32): truncated RECT buffer");
+  const view = new DataView(buffer);
+  const width = view.getInt32(8, true) - view.getInt32(0, true);
+  const height = view.getInt32(12, true) - view.getInt32(4, true);
+  if (width < 0 || height < 0) throw new Error("winding(win32): invalid client rectangle");
+  return { width, height };
+}
+
 /** Validate top-left logical outer-window geometry accepted by CreateWindowExW. */
 export function validateWin32Geometry(x: number, y: number, width: number, height: number): void {
   if (

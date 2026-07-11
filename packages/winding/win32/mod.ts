@@ -15,9 +15,11 @@ import {
 } from "./ffi.ts";
 import {
   decodeMouseLParam,
+  decodeWin32ClientRect,
   decodeWin32QueuedMessage,
   TranslateMessageReentrancyGuard,
   validateWin32Geometry,
+  Win32ClientState,
   Win32MessageQueueGate,
   type Win32MouseButton,
   Win32MouseCaptureState,
@@ -95,10 +97,7 @@ class Win32Window implements Window {
   #frameHeight: number | undefined;
   readonly mouseTracking = new Win32MouseTrackingState();
   pointerSnapshot: Win32PointerSnapshot | undefined;
-  /** Tracks minimized state so `WM_SIZE` transitions map to a single `visibilitychange` event instead of firing on every resize message. */
-  minimized = false;
-  #clientWidth: number | undefined;
-  #clientHeight: number | undefined;
+  readonly clientState = new Win32ClientState();
   #closing = false;
   #destroyed = false;
 
@@ -149,16 +148,8 @@ class Win32Window implements Window {
     return this.#hwnd;
   }
 
-  observeClientSize(width: number, height: number): boolean {
-    if (this.#clientWidth === width && this.#clientHeight === height) return false;
-    this.#clientWidth = width;
-    this.#clientHeight = height;
-    return true;
-  }
-
   containsClientPoint(x: number, y: number): boolean {
-    return this.#clientWidth !== undefined && this.#clientHeight !== undefined &&
-      x >= 0 && y >= 0 && x < this.#clientWidth && y < this.#clientHeight;
+    return this.clientState.contains(x, y);
   }
 
   setTitle(title: string): void {
@@ -387,23 +378,7 @@ class Win32Library implements Library {
           }
           case WM.SIZE: {
             if (win === undefined) break;
-            const w = Number(BigInt(lParam) & 0xFFFFn);
-            const h = Number((BigInt(lParam) >> 16n) & 0xFFFFn);
-            const minimized = Number(wParam) === SIZE_MINIMIZED;
-            if (win !== undefined && minimized !== win.minimized) {
-              win.minimized = minimized;
-              this.#events.push({ type: "visibilitychange", visible: !minimized, window: win });
-            } else if (w > 0 && h > 0 && win.observeClientSize(w, h)) {
-              this.#events.push({
-                type: "resize",
-                width: w,
-                height: h,
-                framebufferWidth: w,
-                framebufferHeight: h,
-                devicePixelRatio: 1,
-                window: win,
-              });
-            }
+            this.#publishClientState(win, Number(wParam) === SIZE_MINIMIZED);
             break;
           }
           case WM.CLOSE:
@@ -724,28 +699,34 @@ class Win32Library implements Library {
   }
 
   publishInitialWindowState(window: Win32Window): void {
-    const clientRect = new ArrayBuffer(16);
-    if (this.user32.symbols.GetClientRect(window.hwnd, clientRect) === 0) {
-      throw new Error(this.getLastError());
-    }
-    const rect = new DataView(clientRect);
-    const width = Math.max(0, rect.getInt32(8, true) - rect.getInt32(0, true));
-    const height = Math.max(0, rect.getInt32(12, true) - rect.getInt32(4, true));
-    if (window.observeClientSize(width, height)) {
-      this.#events.push({
-        type: "resize",
-        width,
-        height,
-        framebufferWidth: width,
-        framebufferHeight: height,
-        devicePixelRatio: 1,
-        window,
-      });
-    }
+    this.#publishClientState(window, false);
 
     const focus = this.user32.symbols.GetFocus();
     const focused = focus !== null && BigInt(Deno.UnsafePointer.value(focus)) === window.id;
     this.input.observeNativeFocus(window, focused);
+  }
+
+  #publishClientState(window: Win32Window, minimized: boolean): void {
+    const clientRect = new ArrayBuffer(16);
+    if (this.user32.symbols.GetClientRect(window.hwnd, clientRect) === 0) {
+      throw new Error(this.getLastError());
+    }
+    const { width, height } = decodeWin32ClientRect(clientRect);
+    const change = window.clientState.observe(minimized, width, height);
+    if (change.visible !== undefined) {
+      this.#events.push({ type: "visibilitychange", visible: change.visible, window });
+    }
+    if (change.size !== undefined) {
+      this.#events.push({
+        type: "resize",
+        width: change.size.width,
+        height: change.size.height,
+        framebufferWidth: change.size.width,
+        framebufferHeight: change.size.height,
+        devicePixelRatio: 1,
+        window,
+      });
+    }
   }
 
   readonly windows = new Map<bigint, Win32Window>();
