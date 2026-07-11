@@ -51,10 +51,37 @@ export type QuoxInputEvent =
   | QuoxVisibilityEvent;
 
 export interface QuoxInputRoutePort {
-  pointerMove(x: number, y: number, buttons: number, modifierBits: number): void;
-  pointerDown(x: number, y: number, button: number, buttons: number, modifierBits: number): void;
-  pointerUp(x: number, y: number, button: number, buttons: number, modifierBits: number): void;
-  wheel(x: number, y: number, deltaX: number, deltaY: number, buttons: number, modifierBits: number): void;
+  pointerMove(x: number, y: number, buttons: number, modifierBits: number, timeStamp: number): void;
+  pointerDown(
+    x: number,
+    y: number,
+    button: number,
+    buttons: number,
+    modifierBits: number,
+    timeStamp: number,
+    detail: number,
+  ): void;
+  pointerUp(
+    x: number,
+    y: number,
+    button: number,
+    buttons: number,
+    modifierBits: number,
+    timeStamp: number,
+    detail: number,
+  ): void;
+  wheel(
+    x: number,
+    y: number,
+    blitzDeltaX: number,
+    blitzDeltaY: number,
+    buttons: number,
+    modifierBits: number,
+    deltaX: number,
+    deltaY: number,
+    deltaMode: number,
+    timeStamp: number,
+  ): void;
   key(event: QuoxKeyboardEvent): void;
   ime(event: QuoxImeEvent): void;
   appleCommand(event: QuoxAppleStandardKeybindingEvent): void;
@@ -76,7 +103,13 @@ export class QuoxInputRouter {
   route(event: QuoxInputEvent): "close" | undefined {
     switch (event.type) {
       case "mousemove":
-        this.port.pointerMove(event.x, event.y, event.buttons, encodePointerModifiers(event));
+        this.port.pointerMove(
+          event.x,
+          event.y,
+          event.buttons,
+          encodePointerModifiers(event),
+          event.timeStamp,
+        );
         return undefined;
       case "mousedown":
         this.port.pointerDown(
@@ -85,6 +118,8 @@ export class QuoxInputRouter {
           event.button,
           event.buttons,
           encodePointerModifiers(event),
+          event.timeStamp,
+          event.detail,
         );
         return undefined;
       case "mouseup":
@@ -94,6 +129,8 @@ export class QuoxInputRouter {
           event.button,
           event.buttons,
           encodePointerModifiers(event),
+          event.timeStamp,
+          event.detail,
         );
         return undefined;
       case "wheel": {
@@ -111,6 +148,10 @@ export class QuoxInputRouter {
           deltaY,
           event.buttons,
           encodePointerModifiers(event),
+          event.deltaX,
+          event.deltaY,
+          event.deltaMode,
+          event.timeStamp,
         );
         return undefined;
       }
@@ -315,6 +356,7 @@ export function mapWindingEvent(event: WindingUIEvent): QuoxInputEvent {
 export interface EncodedKeyEvent {
   code: string;
   key: string;
+  keycode: number;
   modifierBits: number;
   location: number;
   eventFlags: number;
@@ -329,6 +371,9 @@ export function encodeKeyEvent(event: QuoxKeyboardEvent): EncodedKeyEvent {
   if (event.capsLock) modifierBits |= KeyModifierMask.CapsLock;
   if (event.altGraphKey) modifierBits |= KeyModifierMask.AltGraph;
   if (event.accelKey) modifierBits |= KeyModifierMask.Accelerator;
+  // Kept separate from Accelerator so Rust can preserve the physical DOM modifier without
+  // changing Blitz's runtime-platform editor-command projection.
+  if (event.ctrlKey) modifierBits |= KeyModifierMask.Control;
 
   let eventFlags = event.isComposing ? KeyEventFlag.Composing : 0;
   if (event.type === "keydown") {
@@ -340,6 +385,7 @@ export function encodeKeyEvent(event: QuoxKeyboardEvent): EncodedKeyEvent {
   return {
     code: event.code,
     key: event.key,
+    keycode: event.keycode,
     modifierBits,
     location: event.location,
     eventFlags,

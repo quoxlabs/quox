@@ -88,6 +88,7 @@ export interface DomDispatchRendererSource {
     y: number,
     buttons: number,
     modifierBits: number,
+    timeStamp: number,
   ): unknown;
   begin_pointer_down(
     x: number,
@@ -95,6 +96,8 @@ export interface DomDispatchRendererSource {
     button: number,
     buttons: number,
     modifierBits: number,
+    timeStamp: number,
+    detail: number,
   ): unknown;
   begin_pointer_up(
     x: number,
@@ -102,18 +105,25 @@ export interface DomDispatchRendererSource {
     button: number,
     buttons: number,
     modifierBits: number,
+    timeStamp: number,
+    detail: number,
   ): unknown;
   begin_wheel(
     x: number,
     y: number,
+    blitzDeltaX: number,
+    blitzDeltaY: number,
     deltaX: number,
     deltaY: number,
+    deltaMode: number,
     buttons: number,
     modifierBits: number,
+    timeStamp: number,
   ): unknown;
   begin_key_event(
     code: string,
     key: string,
+    keycode: number,
     modifierBits: number,
     location: number,
     eventFlags: number,
@@ -366,8 +376,16 @@ export class DomDispatchRendererPort {
     }
   }
 
-  beginPointerMove(x: number, y: number, buttons: number, modifierBits: number): DomDispatchStep {
-    return this.#validateInitial(this.#renderer.begin_pointer_move(x, y, buttons, modifierBits));
+  beginPointerMove(
+    x: number,
+    y: number,
+    buttons: number,
+    modifierBits: number,
+    timeStamp: number,
+  ): DomDispatchStep {
+    return this.#validateInitial(
+      this.#renderer.begin_pointer_move(x, y, buttons, modifierBits, timeStamp),
+    );
   }
 
   beginPointerDown(
@@ -376,9 +394,19 @@ export class DomDispatchRendererPort {
     button: number,
     buttons: number,
     modifierBits: number,
+    timeStamp: number,
+    detail: number,
   ): DomDispatchStep {
     return this.#validateInitial(
-      this.#renderer.begin_pointer_down(x, y, button, buttons, modifierBits),
+      this.#renderer.begin_pointer_down(
+        x,
+        y,
+        button,
+        buttons,
+        modifierBits,
+        timeStamp,
+        detail,
+      ),
     );
   }
 
@@ -388,34 +416,52 @@ export class DomDispatchRendererPort {
     button: number,
     buttons: number,
     modifierBits: number,
+    timeStamp: number,
+    detail: number,
   ): DomDispatchStep {
     return this.#validateInitial(
-      this.#renderer.begin_pointer_up(x, y, button, buttons, modifierBits),
+      this.#renderer.begin_pointer_up(x, y, button, buttons, modifierBits, timeStamp, detail),
     );
   }
 
   beginWheel(
     x: number,
     y: number,
+    blitzDeltaX: number,
+    blitzDeltaY: number,
     deltaX: number,
     deltaY: number,
+    deltaMode: number,
     buttons: number,
     modifierBits: number,
+    timeStamp: number,
   ): DomDispatchStep {
     return this.#validateInitial(
-      this.#renderer.begin_wheel(x, y, deltaX, deltaY, buttons, modifierBits),
+      this.#renderer.begin_wheel(
+        x,
+        y,
+        blitzDeltaX,
+        blitzDeltaY,
+        deltaX,
+        deltaY,
+        deltaMode,
+        buttons,
+        modifierBits,
+        timeStamp,
+      ),
     );
   }
 
   beginKeyEvent(
     code: string,
     key: string,
+    keycode: number,
     modifierBits: number,
     location: number,
     eventFlags: number,
   ): DomDispatchStep {
     return this.#validateInitial(
-      this.#renderer.begin_key_event(code, key, modifierBits, location, eventFlags),
+      this.#renderer.begin_key_event(code, key, keycode, modifierBits, location, eventFlags),
     );
   }
 

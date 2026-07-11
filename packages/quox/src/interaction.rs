@@ -56,6 +56,8 @@ pub enum KeyModifierMask {
     CapsLock = 8,
     AltGraph = 16,
     Accelerator = 32,
+    /// Physical Control, kept separate from the runtime platform accelerator.
+    Control = 64,
 }
 
 /// Stable event-state bit values used by the generated TypeScript keyboard bridge.
@@ -81,12 +83,14 @@ const KEY_MOD_META: u32 = KeyModifierMask::Meta as u32;
 const KEY_MOD_CAPS_LOCK: u32 = KeyModifierMask::CapsLock as u32;
 const KEY_MOD_ALT_GRAPH: u32 = KeyModifierMask::AltGraph as u32;
 const KEY_MOD_ACCEL: u32 = KeyModifierMask::Accelerator as u32;
+const KEY_MOD_CONTROL: u32 = KeyModifierMask::Control as u32;
 const KEY_MOD_KNOWN: u32 = KEY_MOD_SHIFT
     | KEY_MOD_ALT
     | KEY_MOD_META
     | KEY_MOD_CAPS_LOCK
     | KEY_MOD_ALT_GRAPH
-    | KEY_MOD_ACCEL;
+    | KEY_MOD_ACCEL
+    | KEY_MOD_CONTROL;
 
 const KEY_EVENT_PRESSED: u32 = KeyEventFlag::Pressed as u32;
 const KEY_EVENT_REPEAT: u32 = KeyEventFlag::Repeat as u32;
@@ -392,9 +396,10 @@ impl QuoxRenderer {
 mod tests {
     use super::{
         KEY_EVENT_COMPOSING, KEY_EVENT_PRESSED, KEY_EVENT_REPEAT, KEY_MOD_ACCEL, KEY_MOD_ALT,
-        KEY_MOD_ALT_GRAPH, KEY_MOD_META, KEY_MOD_SHIFT, apply_ime_delete_surrounding,
-        build_editor_modifiers, build_pointer_modifiers, is_insertable_text, key_event,
-        mouse_button, preedit_cursor, validate_key_abi, viewport_point_to_page,
+        KEY_MOD_ALT_GRAPH, KEY_MOD_CONTROL, KEY_MOD_META, KEY_MOD_SHIFT,
+        apply_ime_delete_surrounding, build_editor_modifiers, build_pointer_modifiers,
+        is_insertable_text, key_event, mouse_button, preedit_cursor, validate_key_abi,
+        viewport_point_to_page,
     };
     use blitz_dom::{BaseDocument, DocumentConfig};
     use blitz_html::HtmlDocument;
@@ -564,7 +569,7 @@ mod tests {
         assert!(darwin_command.contains(Modifiers::CONTROL));
         assert!(darwin_command.contains(Modifiers::META));
 
-        let darwin_physical_control = build_editor_modifiers(0);
+        let darwin_physical_control = build_editor_modifiers(KEY_MOD_CONTROL);
         assert!(!darwin_physical_control.contains(Modifiers::CONTROL));
 
         let alt_graph = build_editor_modifiers(KEY_MOD_ALT | KEY_MOD_ALT_GRAPH);
@@ -591,6 +596,14 @@ mod tests {
 
     #[test]
     fn key_abi_rejects_values_that_would_have_wrapped_a_narrow_mask() {
+        assert_eq!(
+            validate_key_abi(
+                f64::from(KEY_MOD_CONTROL),
+                0.0,
+                f64::from(KEY_EVENT_PRESSED)
+            ),
+            Ok((KEY_MOD_CONTROL, 0, KEY_EVENT_PRESSED))
+        );
         assert!(validate_key_abi(65_536.0, 0.0, f64::from(KEY_EVENT_PRESSED)).is_err());
         assert!(validate_key_abi(4_294_967_296.0, 0.0, f64::from(KEY_EVENT_PRESSED)).is_err());
     }

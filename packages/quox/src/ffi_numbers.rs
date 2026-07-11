@@ -32,6 +32,13 @@ pub(super) fn finite_f64(value: f64, name: &'static str) -> NumericResult<f64> {
         .ok_or_else(|| NumericArgumentError::new(name, "be finite"))
 }
 
+pub(super) fn nonnegative_f64(value: f64, name: &'static str) -> NumericResult<f64> {
+    let value = finite_f64(value, name)?;
+    (value >= 0.0)
+        .then_some(value)
+        .ok_or_else(|| NumericArgumentError::new(name, "be finite and nonnegative"))
+}
+
 pub(super) fn finite_f32(value: f64, name: &'static str) -> NumericResult<f32> {
     let value = finite_f64(value, name)?;
     #[allow(clippy::cast_possible_truncation)]
@@ -91,7 +98,9 @@ pub(super) fn wasm_usize(value: f64, name: &'static str) -> NumericResult<usize>
 
 #[cfg(test)]
 mod tests {
-    use super::{finite_f32, finite_f64, integer_range, known_mask, positive_f32, uint32};
+    use super::{
+        finite_f32, finite_f64, integer_range, known_mask, nonnegative_f64, positive_f32, uint32,
+    };
 
     #[test]
     fn rejects_values_that_integer_wasm_parameters_would_wrap_or_truncate() {
@@ -112,6 +121,9 @@ mod tests {
         assert!(finite_f32(f64::MAX, "coordinate").is_err());
         assert!(finite_f32(f64::MIN_POSITIVE, "coordinate").is_err());
         assert!(finite_f64(f64::INFINITY, "delta").is_err());
+        assert_eq!(nonnegative_f64(0.0, "timeStamp"), Ok(0.0));
+        assert_eq!(nonnegative_f64(12.5, "timeStamp"), Ok(12.5));
+        assert!(nonnegative_f64(-0.5, "timeStamp").is_err());
         assert!(positive_f32(0.0, "scale").is_err());
     }
 }

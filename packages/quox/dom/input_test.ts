@@ -37,6 +37,32 @@ const pointer = {
   metaKey: true,
 };
 
+Deno.test("pointer adapter forwards native timing and click detail", () => {
+  const calls: Array<[string, ...number[]]> = [];
+  const router = new QuoxInputRouter({
+    pointerMove: (...values) => calls.push(["move", ...values]),
+    pointerDown: (...values) => calls.push(["down", ...values]),
+    pointerUp: (...values) => calls.push(["up", ...values]),
+    wheel() {},
+    key() {},
+    ime() {},
+    appleCommand() {},
+    clearHover() {},
+    resize() {},
+    visibility() {},
+  });
+
+  router.route({ type: "mousemove", ...pointer });
+  router.route({ type: "mousedown", button: 0, detail: 2, ...pointer });
+  router.route({ type: "mouseup", button: 0, detail: 2, ...pointer });
+
+  assertEquals(calls, [
+    ["move", 7, 9, 5, 9, 12],
+    ["down", 7, 9, 0, 5, 9, 12, 2],
+    ["up", 7, 9, 0, 5, 9, 12, 2],
+  ]);
+});
+
 Deno.test("wheel adapter preserves browser units and translates Blitz scroll direction", () => {
   const calls: number[][] = [];
   const router = new QuoxInputRouter(
@@ -76,9 +102,9 @@ Deno.test("wheel adapter preserves browser units and translates Blitz scroll dir
   router.route({ type: "wheel", deltaX: 0.5, deltaY: -1, deltaMode: 2, ...pointer });
 
   assertEquals(calls, [
-    [7, 9, -2.25, 3.5, 5, 9],
-    [7, 9, -40, 80, 5, 9],
-    [7, 9, -400, 600, 5, 9],
+    [7, 9, -2.25, 3.5, 5, 9, 2.25, -3.5, 0, 12],
+    [7, 9, -40, 80, 5, 9, 1, -2, 1, 12],
+    [7, 9, -400, 600, 5, 9, 0.5, -1, 2, 12],
   ]);
 });
 
@@ -132,6 +158,7 @@ Deno.test("canonical key adapter preserves public fields and encodes editor poli
   assertEquals(encodeKeyEvent(mapped), {
     code: "KeyZ",
     key: "y",
+    keycode: 44,
     // Shift | Meta | runtime accelerator.
     modifierBits: 37,
     location: 0,
@@ -140,7 +167,7 @@ Deno.test("canonical key adapter preserves public fields and encodes editor poli
   });
 });
 
-Deno.test("AltGraph preserves raw Ctrl publicly but omits it from the editor projection", () => {
+Deno.test("AltGraph preserves physical Ctrl separately from the runtime accelerator", () => {
   const mapped = mapWindingEvent({
     type: "keydown",
     window,
@@ -163,7 +190,8 @@ Deno.test("AltGraph preserves raw Ctrl publicly but omits it from the editor pro
   if (mapped.type !== "keydown") throw new TypeError("expected keydown");
   const encoded = encodeKeyEvent(mapped);
   assertEquals(mapped.ctrlKey, true);
-  assertEquals(encoded.modifierBits, 18); // Alt | AltGraph
+  assertEquals(encoded.modifierBits, 82); // Alt | AltGraph | physical Control
+  assertEquals(encoded.modifierBits & 32, 0); // Not the editor accelerator.
   assertEquals(encoded.eventFlags, 9); // Pressed | PreventDefault
 });
 

@@ -146,8 +146,14 @@ class FakeRenderer implements DomDispatchRendererSource {
     return this.nextStep;
   }
 
-  begin_pointer_move(x: number, y: number, buttons: number, modifierBits: number): unknown {
-    return this.#call("begin_pointer_move", x, y, buttons, modifierBits);
+  begin_pointer_move(
+    x: number,
+    y: number,
+    buttons: number,
+    modifierBits: number,
+    timeStamp: number,
+  ): unknown {
+    return this.#call("begin_pointer_move", x, y, buttons, modifierBits, timeStamp);
   }
 
   begin_pointer_down(
@@ -156,8 +162,19 @@ class FakeRenderer implements DomDispatchRendererSource {
     button: number,
     buttons: number,
     modifierBits: number,
+    timeStamp: number,
+    detail: number,
   ): unknown {
-    return this.#call("begin_pointer_down", x, y, button, buttons, modifierBits);
+    return this.#call(
+      "begin_pointer_down",
+      x,
+      y,
+      button,
+      buttons,
+      modifierBits,
+      timeStamp,
+      detail,
+    );
   }
 
   begin_pointer_up(
@@ -166,29 +183,48 @@ class FakeRenderer implements DomDispatchRendererSource {
     button: number,
     buttons: number,
     modifierBits: number,
+    timeStamp: number,
+    detail: number,
   ): unknown {
-    return this.#call("begin_pointer_up", x, y, button, buttons, modifierBits);
+    return this.#call("begin_pointer_up", x, y, button, buttons, modifierBits, timeStamp, detail);
   }
 
   begin_wheel(
     x: number,
     y: number,
+    blitzDeltaX: number,
+    blitzDeltaY: number,
     deltaX: number,
     deltaY: number,
+    deltaMode: number,
     buttons: number,
     modifierBits: number,
+    timeStamp: number,
   ): unknown {
-    return this.#call("begin_wheel", x, y, deltaX, deltaY, buttons, modifierBits);
+    return this.#call(
+      "begin_wheel",
+      x,
+      y,
+      blitzDeltaX,
+      blitzDeltaY,
+      deltaX,
+      deltaY,
+      deltaMode,
+      buttons,
+      modifierBits,
+      timeStamp,
+    );
   }
 
   begin_key_event(
     code: string,
     key: string,
+    keycode: number,
     modifierBits: number,
     location: number,
     eventFlags: number,
   ): unknown {
-    return this.#call("begin_key_event", code, key, modifierBits, location, eventFlags);
+    return this.#call("begin_key_event", code, key, keycode, modifierBits, location, eventFlags);
   }
 
   begin_apple_standard_keybinding(command: string): unknown {
@@ -229,11 +265,11 @@ Deno.test("renderer port forwards every staged entry point and validates its res
   const renderer = new FakeRenderer();
   const port = new DomDispatchRendererPort(renderer);
 
-  port.beginPointerMove(1, 2, 3, 4);
-  port.beginPointerDown(1, 2, 0, 3, 4);
-  port.beginPointerUp(1, 2, 0, 2, 4);
-  port.beginWheel(1, 2, 3.5, -4.5, 0, 4);
-  port.beginKeyEvent("KeyA", "a", 1, 0, 1);
+  port.beginPointerMove(1, 2, 3, 4, 12.5);
+  port.beginPointerDown(1, 2, 0, 3, 4, 13, 2);
+  port.beginPointerUp(1, 2, 0, 2, 4, 14, 2);
+  port.beginWheel(1, 2, 3.5, -4.5, -0.25, 0.5, 1, 0, 4, 15);
+  port.beginKeyEvent("KeyA", "a", 44, 1, 0, 1);
   port.beginAppleStandardKeybinding("moveLeft:");
   port.beginImeEnabled();
   port.beginImeDisabled();
@@ -242,11 +278,11 @@ Deno.test("renderer port forwards every staged entry point and validates its res
   port.beginImeDeleteSurrounding(2, 3);
 
   assertEquals(renderer.calls, [
-    ["begin_pointer_move", 1, 2, 3, 4],
-    ["begin_pointer_down", 1, 2, 0, 3, 4],
-    ["begin_pointer_up", 1, 2, 0, 2, 4],
-    ["begin_wheel", 1, 2, 3.5, -4.5, 0, 4],
-    ["begin_key_event", "KeyA", "a", 1, 0, 1],
+    ["begin_pointer_move", 1, 2, 3, 4, 12.5],
+    ["begin_pointer_down", 1, 2, 0, 3, 4, 13, 2],
+    ["begin_pointer_up", 1, 2, 0, 2, 4, 14, 2],
+    ["begin_wheel", 1, 2, 3.5, -4.5, -0.25, 0.5, 1, 0, 4, 15],
+    ["begin_key_event", "KeyA", "a", 44, 1, 0, 1],
     ["begin_apple_standard_keybinding", "moveLeft:"],
     ["begin_ime_enabled"],
     ["begin_ime_disabled"],

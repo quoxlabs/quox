@@ -34,11 +34,17 @@ type LegacyHoverRenderer = { clear_hover(): boolean };
 
 const POINTER_BUTTONS_MASK = 0x1f;
 const POINTER_MODIFIER_MASK = 0x0f;
-const KEY_MODIFIER_MASK = 0x3f;
+const KEY_MODIFIER_MASK = 0x7f;
 const KEY_EVENT_PRESSED = 0x01;
 const KEY_EVENT_REPEAT = 0x02;
 const KEY_EVENT_PREVENT_DEFAULT = 0x08;
 const KEY_EVENT_MASK = 0x0f;
+
+function assertEventTimeStamp(value: unknown): number {
+  const timeStamp = assertFiniteNumber(value, "timeStamp");
+  if (timeStamp < 0) throw new RangeError("quox: timeStamp must be finite and nonnegative");
+  return timeStamp;
+}
 
 export class QuoxDocument extends QuoxEventTarget {
   readonly #renderer: WasmRenderer;
@@ -145,47 +151,106 @@ export class QuoxDocument extends QuoxEventTarget {
   }
 
   /** Feed a pointer-move event into Blitz. Drives hover/`:hover` and cursor resolution. */
-  dispatchPointerMove(x: number, y: number, buttons: number, modifierBits: number): void {
+  dispatchPointerMove(
+    x: number,
+    y: number,
+    buttons: number,
+    modifierBits: number,
+    timeStamp = performance.now(),
+  ): void {
     this.#assertActive();
     x = assertFloat32(x, "x");
     y = assertFloat32(y, "y");
     buttons = assertKnownMask(buttons, POINTER_BUTTONS_MASK, "buttons");
     modifierBits = assertKnownMask(modifierBits, POINTER_MODIFIER_MASK, "modifierBits");
-    this.#dispatchInputEvent(() => this.#dispatchPort.beginPointerMove(x, y, buttons, modifierBits));
+    timeStamp = assertEventTimeStamp(timeStamp);
+    this.#dispatchInputEvent(() => this.#dispatchPort.beginPointerMove(x, y, buttons, modifierBits, timeStamp));
   }
 
   /** Feed a pointer-down event into Blitz. Drives `:active`, click timing, and focus. */
-  dispatchPointerDown(x: number, y: number, button: number, buttons: number, modifierBits: number): void {
+  dispatchPointerDown(
+    x: number,
+    y: number,
+    button: number,
+    buttons: number,
+    modifierBits: number,
+    timeStamp = performance.now(),
+    detail = 0,
+  ): void {
     this.#assertActive();
     x = assertFloat32(x, "x");
     y = assertFloat32(y, "y");
     button = assertIntegerRange(button, 0, 4, "button");
     buttons = assertKnownMask(buttons, POINTER_BUTTONS_MASK, "buttons");
     modifierBits = assertKnownMask(modifierBits, POINTER_MODIFIER_MASK, "modifierBits");
-    this.#dispatchInputEvent(() => this.#dispatchPort.beginPointerDown(x, y, button, buttons, modifierBits));
+    timeStamp = assertEventTimeStamp(timeStamp);
+    detail = assertUint32(detail, "detail");
+    this.#dispatchInputEvent(() =>
+      this.#dispatchPort.beginPointerDown(x, y, button, buttons, modifierBits, timeStamp, detail)
+    );
   }
 
   /** Feed a pointer-up event into Blitz. Synthesizes `click`/`dblclick`/`contextmenu`. */
-  dispatchPointerUp(x: number, y: number, button: number, buttons: number, modifierBits: number): void {
+  dispatchPointerUp(
+    x: number,
+    y: number,
+    button: number,
+    buttons: number,
+    modifierBits: number,
+    timeStamp = performance.now(),
+    detail = 0,
+  ): void {
     this.#assertActive();
     x = assertFloat32(x, "x");
     y = assertFloat32(y, "y");
     button = assertIntegerRange(button, 0, 4, "button");
     buttons = assertKnownMask(buttons, POINTER_BUTTONS_MASK, "buttons");
     modifierBits = assertKnownMask(modifierBits, POINTER_MODIFIER_MASK, "modifierBits");
-    this.#dispatchInputEvent(() => this.#dispatchPort.beginPointerUp(x, y, button, buttons, modifierBits));
+    timeStamp = assertEventTimeStamp(timeStamp);
+    detail = assertUint32(detail, "detail");
+    this.#dispatchInputEvent(() =>
+      this.#dispatchPort.beginPointerUp(x, y, button, buttons, modifierBits, timeStamp, detail)
+    );
   }
 
   /** Feed a wheel event into Blitz, scrolling whatever's hovered (not just the viewport). */
-  dispatchWheel(x: number, y: number, deltaX: number, deltaY: number, buttons: number, modifierBits: number): void {
+  dispatchWheel(
+    x: number,
+    y: number,
+    blitzDeltaX: number,
+    blitzDeltaY: number,
+    buttons: number,
+    modifierBits: number,
+    deltaX = -blitzDeltaX,
+    deltaY = -blitzDeltaY,
+    deltaMode = 0,
+    timeStamp = performance.now(),
+  ): void {
     this.#assertActive();
     x = assertFloat32(x, "x");
     y = assertFloat32(y, "y");
+    blitzDeltaX = assertFiniteNumber(blitzDeltaX, "blitzDeltaX");
+    blitzDeltaY = assertFiniteNumber(blitzDeltaY, "blitzDeltaY");
     deltaX = assertFiniteNumber(deltaX, "deltaX");
     deltaY = assertFiniteNumber(deltaY, "deltaY");
+    deltaMode = assertIntegerRange(deltaMode, 0, 2, "deltaMode");
     buttons = assertKnownMask(buttons, POINTER_BUTTONS_MASK, "buttons");
     modifierBits = assertKnownMask(modifierBits, POINTER_MODIFIER_MASK, "modifierBits");
-    this.#dispatchInputEvent(() => this.#dispatchPort.beginWheel(x, y, deltaX, deltaY, buttons, modifierBits));
+    timeStamp = assertEventTimeStamp(timeStamp);
+    this.#dispatchInputEvent(() =>
+      this.#dispatchPort.beginWheel(
+        x,
+        y,
+        blitzDeltaX,
+        blitzDeltaY,
+        deltaX,
+        deltaY,
+        deltaMode,
+        buttons,
+        modifierBits,
+        timeStamp,
+      )
+    );
   }
 
   /** Feed a canonical native key event into Blitz. Character insertion remains a later Commit. */
@@ -193,6 +258,7 @@ export class QuoxDocument extends QuoxEventTarget {
     this.#assertActive();
     const encoded = encodeKeyEvent(event);
     encoded.modifierBits = assertKnownMask(encoded.modifierBits, KEY_MODIFIER_MASK, "modifierBits");
+    encoded.keycode = assertUint32(encoded.keycode, "keycode");
     encoded.location = assertIntegerRange(encoded.location, 0, 3, "location");
     encoded.eventFlags = assertKnownMask(encoded.eventFlags, KEY_EVENT_MASK, "eventFlags");
     if (
@@ -205,6 +271,7 @@ export class QuoxDocument extends QuoxEventTarget {
       this.#dispatchPort.beginKeyEvent(
         encoded.code,
         encoded.key,
+        encoded.keycode,
         encoded.modifierBits,
         encoded.location,
         encoded.eventFlags,

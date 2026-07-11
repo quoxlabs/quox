@@ -167,7 +167,7 @@ Deno.test("keyboard dispatch forwards logical key, policy, and repeat without sy
   assertEquals(renderer.calls, [{
     method: "keyEvent",
     // modifiers = Shift | Alt | CapsLock; flags = Pressed | Repeat | PreventDefault
-    args: ["KeyZ", "y", 11, 0, 11],
+    args: ["KeyZ", "y", 44, 11, 0, 11],
   }]);
   assertEquals(renders.count, 1);
   assertEquals(syncs.count, 1);
@@ -277,9 +277,19 @@ Deno.test("invalid numeric input is rejected before renderer or IME synchronizat
   const { document, renderer, renders, syncs } = createDocument();
 
   assertThrows(() => document.dispatchPointerMove(NaN, 20, 0, 0), RangeError);
+  assertThrows(() => document.dispatchPointerMove(10, 20, 0, 0, -1), RangeError);
   assertThrows(() => document.dispatchPointerDown(10, 20, 256, 1, 0), RangeError);
+  assertThrows(() => document.dispatchPointerDown(10, 20, 0, 1, 0, 1, 1.5), RangeError);
   assertThrows(() => document.dispatchPointerUp(10, 20, 0, 0x20, 0), RangeError);
   assertThrows(() => document.dispatchWheel(10, 20, Infinity, 0, 0, 0), RangeError);
+  assertThrows(
+    () => document.dispatchWheel(10, 20, 0, 0, 0, 0, 0, 0, 3, 1),
+    RangeError,
+  );
+  assertThrows(
+    () => document.dispatchWheel(10, 20, 0, 0, 0, 0, Infinity, 0, 0, 1),
+    RangeError,
+  );
   assertThrows(
     () => document.dispatchIme({ type: "ime", kind: "preedit", text: "éx", cursorRange: [1, 3] }),
     RangeError,

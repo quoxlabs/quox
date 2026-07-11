@@ -123,13 +123,36 @@ export class QuoxWindow extends QuoxEventTarget implements Disposable {
     );
     this.#inputRouter = new QuoxInputRouter(
       {
-        pointerMove: (x, y, buttons, modifiers) => this.document.dispatchPointerMove(x, y, buttons, modifiers),
-        pointerDown: (x, y, button, buttons, modifiers) =>
-          this.document.dispatchPointerDown(x, y, button, buttons, modifiers),
-        pointerUp: (x, y, button, buttons, modifiers) =>
-          this.document.dispatchPointerUp(x, y, button, buttons, modifiers),
-        wheel: (x, y, deltaX, deltaY, buttons, modifiers) =>
-          this.document.dispatchWheel(x, y, deltaX, deltaY, buttons, modifiers),
+        pointerMove: (x, y, buttons, modifiers, timeStamp) =>
+          this.document.dispatchPointerMove(x, y, buttons, modifiers, timeStamp),
+        pointerDown: (x, y, button, buttons, modifiers, timeStamp, detail) =>
+          this.document.dispatchPointerDown(x, y, button, buttons, modifiers, timeStamp, detail),
+        pointerUp: (x, y, button, buttons, modifiers, timeStamp, detail) =>
+          this.document.dispatchPointerUp(x, y, button, buttons, modifiers, timeStamp, detail),
+        wheel: (
+          x,
+          y,
+          blitzDeltaX,
+          blitzDeltaY,
+          buttons,
+          modifiers,
+          deltaX,
+          deltaY,
+          deltaMode,
+          timeStamp,
+        ) =>
+          this.document.dispatchWheel(
+            x,
+            y,
+            blitzDeltaX,
+            blitzDeltaY,
+            buttons,
+            modifiers,
+            deltaX,
+            deltaY,
+            deltaMode,
+            timeStamp,
+          ),
         key: (event) => this.document.dispatchKey(event),
         ime: (event) => this.document.dispatchIme(event),
         appleCommand: (event) => this.document.dispatchAppleStandardKeybinding(event),
