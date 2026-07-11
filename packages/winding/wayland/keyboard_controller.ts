@@ -81,7 +81,7 @@ export class WaylandKeyboardController {
       } catch (cleanupError) {
         throw new AggregateError([error, cleanupError], "failed to acquire and unwind the Wayland keyboard");
       }
-      return false;
+      throw error;
     }
   }
 

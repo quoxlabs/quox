@@ -69,7 +69,7 @@ export class WaylandGlobalRegistry<Binding> {
   }
 
   close(): void {
-    const active = [...this.#active.values()];
+    const active = [...this.#active.values()].reverse();
     this.#active.clear();
     this.#offers.clear();
 

@@ -59,7 +59,21 @@ export class WaylandXkbController {
     const context = xkb.symbols.xkb_context_new(XKB_CONTEXT_NO_FLAGS);
     if (!context) throw new Error("winding failed to create xkb context");
     this.#context = context;
-    this.#initCompose();
+    try {
+      this.#initCompose();
+    } catch (error) {
+      const errors: unknown[] = [error];
+      if (this.#composeState) {
+        collectCleanupError(errors, () => this.xkb.symbols.xkb_compose_state_unref(this.#composeState!));
+        this.#composeState = null;
+      }
+      if (this.#composeTable) {
+        collectCleanupError(errors, () => this.xkb.symbols.xkb_compose_table_unref(this.#composeTable!));
+        this.#composeTable = null;
+      }
+      collectCleanupError(errors, () => this.xkb.symbols.xkb_context_unref(context));
+      throwCleanupErrors("winding failed to initialize and unwind xkb state", errors);
+    }
   }
 
   get modifiers(): KeyModifiers {
@@ -221,12 +235,13 @@ export class WaylandXkbController {
         XKB_COMPOSE_COMPILE_NO_FLAGS,
       );
       if (!table) return false;
+      this.#composeTable = table;
       const state = this.xkb.symbols.xkb_compose_state_new(table, XKB_COMPOSE_STATE_NO_FLAGS);
       if (!state) {
         this.xkb.symbols.xkb_compose_table_unref(table);
+        this.#composeTable = null;
         return false;
       }
-      this.#composeTable = table;
       this.#composeState = state;
       return true;
     };

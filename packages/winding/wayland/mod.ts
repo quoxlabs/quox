@@ -17,6 +17,7 @@ import {
   LIBWAYLAND_CLIENT_SO,
   LIBXKBCOMMON_SO,
   makeVtable,
+  NativeInitializationCleanup,
   pointerCapabilityAction,
   POLLIN,
   POLLOUT,
@@ -42,24 +43,25 @@ import { WaylandPointerFrameAccumulator, WaylandPointerPosition } from "./pointe
 
 // WaylandLibrary coordinates globals and the extracted native controllers.
 class WaylandLibrary implements Library {
-  readonly libc: Deno.DynamicLibrary<typeof libcSymbols>;
-  readonly libdl: Deno.DynamicLibrary<typeof libdlSymbols>;
-  readonly #wlHandle: Deno.PointerObject;
-  readonly wl: Deno.DynamicLibrary<typeof waylandSymbols>;
-  readonly xkb: Deno.DynamicLibrary<typeof xkbSymbols>;
-  readonly #keyboardController: WaylandKeyboardController;
-  readonly display: Deno.PointerObject;
+  // Construction either initializes every asserted field or unwinds and throws.
+  readonly libc!: Deno.DynamicLibrary<typeof libcSymbols>;
+  readonly libdl!: Deno.DynamicLibrary<typeof libdlSymbols>;
+  readonly #wlHandle!: Deno.PointerObject;
+  readonly wl!: Deno.DynamicLibrary<typeof waylandSymbols>;
+  readonly xkb!: Deno.DynamicLibrary<typeof xkbSymbols>;
+  readonly #keyboardController!: WaylandKeyboardController;
+  readonly display!: Deno.PointerObject;
   // XDG interface structs -- built lazily in the constructor, mem kept alive to
   // prevent the pinned buffer from being GC'd.
-  readonly #xdgMem: Uint8Array<ArrayBuffer>;
-  readonly xdgWmBaseIface: Deno.PointerObject;
-  readonly xdgSurfaceIface: Deno.PointerObject;
-  readonly xdgToplevelIface: Deno.PointerObject;
-  readonly wpCursorShapeManagerIface: Deno.PointerObject;
-  readonly wpCursorShapeDeviceIface: Deno.PointerObject;
-  readonly zwpTextInputManagerIface: Deno.PointerObject;
-  readonly zwpTextInputIface: Deno.PointerObject;
-  readonly ifaces: {
+  readonly #xdgMem!: Uint8Array<ArrayBuffer>;
+  readonly xdgWmBaseIface!: Deno.PointerObject;
+  readonly xdgSurfaceIface!: Deno.PointerObject;
+  readonly xdgToplevelIface!: Deno.PointerObject;
+  readonly wpCursorShapeManagerIface!: Deno.PointerObject;
+  readonly wpCursorShapeDeviceIface!: Deno.PointerObject;
+  readonly zwpTextInputManagerIface!: Deno.PointerObject;
+  readonly zwpTextInputIface!: Deno.PointerObject;
+  readonly ifaces!: {
     registry: Deno.PointerObject;
     compositor: Deno.PointerObject;
     shm: Deno.PointerObject;
@@ -101,113 +103,136 @@ class WaylandLibrary implements Library {
   readonly #clickCounter = new ClickCounter<MouseButton>();
   #pointerListeners: AnyCallback[] = [];
   #pointerVtable: BigUint64Array<ArrayBuffer> | undefined;
-  readonly #textInputController: WaylandTextInputController;
-  readonly #globals: WaylandGlobalRegistry<Deno.PointerObject>;
+  readonly #textInputController!: WaylandTextInputController;
+  readonly #globals!: WaylandGlobalRegistry<Deno.PointerObject>;
   #xdgWmBaseListener: AnyCallback | null = null;
   #xdgWmBaseVtable: BigUint64Array<ArrayBuffer> | undefined;
   // Event queue filled by listener callbacks, drained by event()
   readonly #events = new EventQueue<UIEvent>();
   readonly #callbackErrors = new DeferredNativeError();
   // Shared no-op callback for unused vtable slots
-  readonly noop: Deno.UnsafeCallback;
+  readonly noop!: Deno.UnsafeCallback;
   // All listeners kept alive to prevent GC
   #listeners: AnyCallback[] = [];
   #vtables: BigUint64Array<ArrayBuffer>[] = [];
   // pollfd buffer for non-blocking display read
   #pollFd = new Uint8Array(8) as Uint8Array<ArrayBuffer>; // struct pollfd {int fd; short events; short revents;}
+  #initialized = false;
   #closed = false;
   #terminalError: Error | null = null;
   #wantsWrite = false;
 
   constructor() {
-    this.libc = Deno.dlopen("libc.so.6", libcSymbols); // needed to perform a few syscalls
-    this.libdl = Deno.dlopen("libdl.so.2", libdlSymbols);
-    this.wl = Deno.dlopen(LIBWAYLAND_CLIENT_SO, waylandSymbols);
-    this.xkb = Deno.dlopen(LIBXKBCOMMON_SO, xkbSymbols);
-    // Retrieve an existing loader handle for dlsym without loading a second time.
-    const wlHandle = this.libdl.symbols.dlopen(cStr(LIBWAYLAND_CLIENT_SO), RTLD_NOW | RTLD_NOLOAD);
-    if (!wlHandle) throw new Error(`winding failed to get existing ${LIBWAYLAND_CLIENT_SO} handle via libdl`);
-    this.#wlHandle = wlHandle;
-    const ifaces = {
-      registry: dlsymRequired(this.libdl, wlHandle, "wl_registry_interface"),
-      compositor: dlsymRequired(this.libdl, wlHandle, "wl_compositor_interface"),
-      shm: dlsymRequired(this.libdl, wlHandle, "wl_shm_interface"),
-      shmPool: dlsymRequired(this.libdl, wlHandle, "wl_shm_pool_interface"),
-      buffer: dlsymRequired(this.libdl, wlHandle, "wl_buffer_interface"),
-      surface: dlsymRequired(this.libdl, wlHandle, "wl_surface_interface"),
-      output: dlsymRequired(this.libdl, wlHandle, "wl_output_interface"),
-      seat: dlsymRequired(this.libdl, wlHandle, "wl_seat_interface"),
-      pointer: dlsymRequired(this.libdl, wlHandle, "wl_pointer_interface"),
-      keyboard: dlsymRequired(this.libdl, wlHandle, "wl_keyboard_interface"),
-    };
-    const {
-      mem,
-      xdgWmBaseIface,
-      xdgSurfaceIface,
-      xdgToplevelIface,
-      wpCursorShapeManagerIface,
-      wpCursorShapeDeviceIface,
-      zwpTextInputManagerIface,
-      zwpTextInputIface,
-    } = buildXdgIfaces(ifaces.seat, ifaces.surface, ifaces.pointer, ifaces.output);
-    this.#xdgMem = mem;
-    this.xdgWmBaseIface = xdgWmBaseIface;
-    this.xdgSurfaceIface = xdgSurfaceIface;
-    this.xdgToplevelIface = xdgToplevelIface;
-    this.wpCursorShapeManagerIface = wpCursorShapeManagerIface;
-    this.wpCursorShapeDeviceIface = wpCursorShapeDeviceIface;
-    this.zwpTextInputManagerIface = zwpTextInputManagerIface;
-    this.zwpTextInputIface = zwpTextInputIface;
-    this.ifaces = ifaces;
-    const sym = this.wl.symbols;
+    const cleanup = new NativeInitializationCleanup();
+    try {
+      this.libc = Deno.dlopen("libc.so.6", libcSymbols); // needed to perform a few syscalls
+      cleanup.defer(() => this.libc.close());
+      this.libdl = Deno.dlopen("libdl.so.2", libdlSymbols);
+      cleanup.defer(() => this.libdl.close());
+      this.wl = Deno.dlopen(LIBWAYLAND_CLIENT_SO, waylandSymbols);
+      cleanup.defer(() => this.wl.close());
+      this.xkb = Deno.dlopen(LIBXKBCOMMON_SO, xkbSymbols);
+      cleanup.defer(() => this.xkb.close());
+      // Retrieve an existing loader handle for dlsym without loading a second time.
+      const wlHandle = this.libdl.symbols.dlopen(cStr(LIBWAYLAND_CLIENT_SO), RTLD_NOW | RTLD_NOLOAD);
+      if (!wlHandle) throw new Error(`winding failed to get existing ${LIBWAYLAND_CLIENT_SO} handle via libdl`);
+      this.#wlHandle = wlHandle;
+      cleanup.defer(() => {
+        if (this.libdl.symbols.dlclose(wlHandle) !== 0) {
+          throw new Error("winding failed to close Wayland loader handle during initialization unwind");
+        }
+      });
+      const ifaces = {
+        registry: dlsymRequired(this.libdl, wlHandle, "wl_registry_interface"),
+        compositor: dlsymRequired(this.libdl, wlHandle, "wl_compositor_interface"),
+        shm: dlsymRequired(this.libdl, wlHandle, "wl_shm_interface"),
+        shmPool: dlsymRequired(this.libdl, wlHandle, "wl_shm_pool_interface"),
+        buffer: dlsymRequired(this.libdl, wlHandle, "wl_buffer_interface"),
+        surface: dlsymRequired(this.libdl, wlHandle, "wl_surface_interface"),
+        output: dlsymRequired(this.libdl, wlHandle, "wl_output_interface"),
+        seat: dlsymRequired(this.libdl, wlHandle, "wl_seat_interface"),
+        pointer: dlsymRequired(this.libdl, wlHandle, "wl_pointer_interface"),
+        keyboard: dlsymRequired(this.libdl, wlHandle, "wl_keyboard_interface"),
+      };
+      const {
+        mem,
+        xdgWmBaseIface,
+        xdgSurfaceIface,
+        xdgToplevelIface,
+        wpCursorShapeManagerIface,
+        wpCursorShapeDeviceIface,
+        zwpTextInputManagerIface,
+        zwpTextInputIface,
+      } = buildXdgIfaces(ifaces.seat, ifaces.surface, ifaces.pointer, ifaces.output);
+      this.#xdgMem = mem;
+      this.xdgWmBaseIface = xdgWmBaseIface;
+      this.xdgSurfaceIface = xdgSurfaceIface;
+      this.xdgToplevelIface = xdgToplevelIface;
+      this.wpCursorShapeManagerIface = wpCursorShapeManagerIface;
+      this.wpCursorShapeDeviceIface = wpCursorShapeDeviceIface;
+      this.zwpTextInputManagerIface = zwpTextInputManagerIface;
+      this.zwpTextInputIface = zwpTextInputIface;
+      this.ifaces = ifaces;
+      const sym = this.wl.symbols;
 
-    // NULL asks libwayland to use the default display from the environment.
-    const display = sym.wl_display_connect(null);
-    if (!display) throw new Error("winding failed to connect to Wayland display");
-    this.display = display;
+      // NULL asks libwayland to use the default display from the environment.
+      const display = sym.wl_display_connect(null);
+      if (!display) throw new Error("winding failed to connect to Wayland display");
+      this.display = display;
+      cleanup.defer(() => this.wl.symbols.wl_display_disconnect(display));
 
-    this.noop = new Deno.UnsafeCallback({ parameters: [], result: "void" }, () => {});
-    this.#keyboardController = new WaylandKeyboardController({
-      wl: this.wl,
-      xkb: this.xkb,
-      libc: this.libc,
-      keyboardIface: this.ifaces.keyboard,
-      noop: this.noop,
-      guardCallback: (callback) => this.guardCallback(callback),
-      pushEvent: (event) => this.pushEvent(event),
-      windowForSurface: (surface) => this.#windowForSurface(surface),
-      syncTextInput: (window) => this.#textInputController.syncWindow(window, true),
-    });
-    this.#textInputController = new WaylandTextInputController({
-      wl: this.wl,
-      zwpTextInputIface: this.zwpTextInputIface,
-      noop: this.noop,
-      guardCallback: (callback) => this.guardCallback(callback),
-      pushEvent: (event) => this.pushEvent(event),
-      windowForSurface: (surface) => this.#windowForSurface(surface),
-      keyboardFocus: () => this.#keyboardController.focus,
-      windows: () => this.windows,
-      resetLocalCompose: () => this.#keyboardController.resetCompose(),
-      flushDisplay: (context) => this.flushDisplay(context),
-    });
-    this.#globals = new WaylandGlobalRegistry(
-      (offer) => this.#bindGlobal(offer),
-      (global) => this.#releaseGlobal(global),
-    );
+      this.noop = new Deno.UnsafeCallback({ parameters: [], result: "void" }, () => {});
+      cleanup.defer(() => this.noop.close());
+      this.#keyboardController = new WaylandKeyboardController({
+        wl: this.wl,
+        xkb: this.xkb,
+        libc: this.libc,
+        keyboardIface: this.ifaces.keyboard,
+        noop: this.noop,
+        guardCallback: (callback) => this.guardCallback(callback),
+        pushEvent: (event) => this.pushEvent(event),
+        windowForSurface: (surface) => this.#windowForSurface(surface),
+        syncTextInput: (window) => this.#textInputController.syncWindow(window, true),
+      });
+      cleanup.defer(() => this.#keyboardController.close());
+      this.#textInputController = new WaylandTextInputController({
+        wl: this.wl,
+        zwpTextInputIface: this.zwpTextInputIface,
+        noop: this.noop,
+        guardCallback: (callback) => this.guardCallback(callback),
+        pushEvent: (event) => this.pushEvent(event),
+        windowForSurface: (surface) => this.#windowForSurface(surface),
+        keyboardFocus: () => this.#keyboardController.focus,
+        windows: () => this.windows,
+        resetLocalCompose: () => this.#keyboardController.resetCompose(),
+        flushDisplay: (context) => this.flushDisplay(context),
+      });
+      cleanup.defer(() => this.#textInputController.close());
+      this.#globals = new WaylandGlobalRegistry(
+        (offer) => this.#bindGlobal(offer),
+        (global) => this.#releaseGlobal(global),
+      );
+      cleanup.defer(() => this.#closeProtocolInitialization());
 
-    // Set up pollfd for display fd
-    const fd = sym.wl_display_get_fd(display);
-    const pollDv = new DataView(this.#pollFd.buffer);
-    pollDv.setInt32(0, fd, true); // fd
-    pollDv.setInt16(4, POLLIN, true); // events = POLLIN
-    // revents at offset 6 is zeroed by default
+      // Set up pollfd for display fd
+      const fd = sym.wl_display_get_fd(display);
+      const pollDv = new DataView(this.#pollFd.buffer);
+      pollDv.setInt32(0, fd, true); // fd
+      pollDv.setInt16(4, POLLIN, true); // events = POLLIN
+      // revents at offset 6 is zeroed by default
 
-    this.#initGlobals();
-    // Global events can bind objects while the registry roundtrip is already dispatching. A second
-    // roundtrip makes those objects' seat-capability and SHM-format events available before return.
-    if (this.#seat || this.shm) this.roundtripDisplay("bound global initialization");
-    this.#callbackErrors.throwIfPending();
-    if (this.shm) this.requireArgb8888ShmFormat();
+      this.#initGlobals();
+      // Global events can bind objects while the registry roundtrip is already dispatching. A second
+      // roundtrip makes those objects' seat-capability and SHM-format events available before return.
+      if (this.#seat || this.shm) this.roundtripDisplay("bound global initialization");
+      this.#callbackErrors.throwIfPending();
+      if (this.shm) this.requireArgb8888ShmFormat();
+      this.#initialized = true;
+    } catch (error) {
+      this.#closed = true;
+      this.#events.close();
+      cleanup.fail(error, "winding failed to initialize Wayland library");
+    }
   }
 
   #initGlobals(): void {
@@ -237,6 +262,7 @@ class WaylandLibrary implements Library {
         this.#globals.announce({ name, interface: iface, offeredVersion: version });
       }),
     );
+    this.#listeners.push(globalCb);
     const globalRemoveCb = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer", "u32"], result: "void" },
       this.guardCallback((_data, _registry, name) => {
@@ -244,11 +270,13 @@ class WaylandLibrary implements Library {
         this.#globals.remove(name);
       }),
     );
-    this.#listeners.push(globalCb, globalRemoveCb);
+    this.#listeners.push(globalRemoveCb);
 
     const regVtable = makeVtable([globalCb, globalRemoveCb], 2, this.noop);
     this.#vtables.push(regVtable);
-    sym.wl_proxy_add_listener(registry, Deno.UnsafePointer.of(regVtable), null);
+    if (sym.wl_proxy_add_listener(registry, Deno.UnsafePointer.of(regVtable), null) !== 0) {
+      throw new Error("winding failed to listen to the Wayland global registry");
+    }
 
     this.roundtripDisplay("registry initialization");
   }
@@ -824,7 +852,7 @@ class WaylandLibrary implements Library {
       } catch (cleanupError) {
         throw new AggregateError([error, cleanupError], "failed to acquire and unwind the Wayland pointer");
       }
-      // Pointer input is an optional seat capability; keep the selected seat usable for keyboard.
+      throw error;
     }
   }
 
@@ -1097,6 +1125,7 @@ class WaylandLibrary implements Library {
       protocolCode,
     );
     this.#terminalError = error;
+    if (!this.#initialized) throw error;
     try {
       this.close();
     } catch (cleanupError) {
@@ -1105,27 +1134,17 @@ class WaylandLibrary implements Library {
     throw error;
   }
 
-  [Symbol.dispose](): void {
-    this.close();
-  }
-
-  close(): void {
-    if (this.#closed) return;
-    this.#closed = true;
-    this.#events.close();
+  #closeProtocolInitialization(): void {
     const errors: unknown[] = [];
-
-    for (const window of [...this.windows]) {
-      collectCleanupError(errors, () => window.close());
-    }
-    this.windows.clear();
-    this.#windowsBySurface.clear();
     collectCleanupError(errors, () => this.#releasePointer(false));
 
     const coreCursorSurface = this.#coreCursorSurface;
     this.#coreCursorSurface = null;
     this.#coreCursorAttachment = null;
     this.#coreCursorCommitted = false;
+    const coreCursorBuffers = this.#coreCursorBuffers;
+    this.#coreCursorBuffers = null;
+    if (coreCursorBuffers) collectCleanupError(errors, () => coreCursorBuffers.close());
     if (coreCursorSurface) {
       collectCleanupError(errors, () => {
         this.wl.symbols.wl_proxy_marshal_array_flags(
@@ -1138,24 +1157,38 @@ class WaylandLibrary implements Library {
         );
       });
     }
-    const coreCursorBuffers = this.#coreCursorBuffers;
-    this.#coreCursorBuffers = null;
-    if (coreCursorBuffers) collectCleanupError(errors, () => coreCursorBuffers.close());
 
     collectCleanupError(errors, () => this.#globals.close());
+    const registry = this.#registry;
+    this.#registry = null;
+    if (registry) collectCleanupError(errors, () => this.wl.symbols.wl_proxy_destroy(registry));
+
+    const listeners = this.#listeners.splice(0);
+    this.#vtables = [];
+    for (const callback of listeners) collectCleanupError(errors, () => callback.close());
+    collectCleanupError(errors, () => this.#callbackErrors.throwIfPending());
+    throwCleanupErrors("winding failed to close Wayland protocol initialization", errors);
+  }
+
+  [Symbol.dispose](): void {
+    this.close();
+  }
+
+  close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#initialized = false;
+    this.#events.close();
+    const errors: unknown[] = [];
+
+    for (const window of [...this.windows]) {
+      collectCleanupError(errors, () => window.close());
+    }
+    this.windows.clear();
+    this.#windowsBySurface.clear();
+    collectCleanupError(errors, () => this.#closeProtocolInitialization());
     collectCleanupError(errors, () => this.#textInputController.close());
     collectCleanupError(errors, () => this.#keyboardController.close());
-
-    if (this.#registry) {
-      collectCleanupError(errors, () => this.wl.symbols.wl_proxy_destroy(this.#registry!));
-    }
-    this.#registry = null;
-
-    for (const callback of this.#listeners) {
-      collectCleanupError(errors, () => callback.close());
-    }
-    this.#listeners = [];
-    this.#vtables = [];
     collectCleanupError(errors, () => this.noop.close());
     collectCleanupError(errors, () => this.xkb.close());
     collectCleanupError(errors, () => this.wl.symbols.wl_display_disconnect(this.display));
@@ -1167,7 +1200,6 @@ class WaylandLibrary implements Library {
     });
     collectCleanupError(errors, () => this.libdl.close());
     collectCleanupError(errors, () => this.libc.close());
-    collectCleanupError(errors, () => this.#callbackErrors.throwIfPending());
     throwCleanupErrors("winding failed to close Wayland library", errors);
   }
 }

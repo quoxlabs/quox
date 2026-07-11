@@ -165,6 +165,24 @@ export function collectCleanupError(errors: unknown[], action: () => void): void
   }
 }
 
+/** Reverse-order ownership stack for constructors that cannot return a partial native object. */
+export class NativeInitializationCleanup {
+  readonly #actions: Array<() => void> = [];
+
+  defer(action: () => void): void {
+    this.#actions.push(action);
+  }
+
+  fail(primaryError: unknown, message: string): never {
+    const errors: unknown[] = [primaryError];
+    for (let index = this.#actions.length - 1; index >= 0; index--) {
+      collectCleanupError(errors, this.#actions[index]);
+    }
+    if (errors.length === 1) throw primaryError;
+    throw new AggregateError(errors, message);
+  }
+}
+
 export function throwCleanupErrors(message: string, errors: unknown[]): void {
   if (errors.length === 1) throw errors[0];
   if (errors.length > 1) throw new AggregateError(errors, message);

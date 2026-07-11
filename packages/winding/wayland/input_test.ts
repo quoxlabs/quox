@@ -26,6 +26,7 @@ import {
   DEFAULT_CURSOR_HOTSPOT_Y,
   DEFAULT_CURSOR_WIDTH,
   hasFatalPollEvent,
+  NativeInitializationCleanup,
   pointerCapabilityAction,
   POLLERR,
   POLLHUP,
@@ -115,12 +116,16 @@ Deno.test("Wayland global lifecycle supports late arrivals, failed binds, and in
 
 Deno.test("Wayland global candidates are selected independently per interface", () => {
   const active = new Map<WaylandGlobalInterface, number>();
+  const released: number[] = [];
   const registry = new WaylandGlobalRegistry<number>(
     (offer) => {
       active.set(offer.interface, offer.name);
       return offer.name;
     },
-    (global) => active.delete(global.interface),
+    (global) => {
+      released.push(global.binding);
+      active.delete(global.interface);
+    },
   );
 
   registry.announce({ name: 12, interface: "wl_compositor", offeredVersion: 4 });
@@ -131,6 +136,8 @@ Deno.test("Wayland global candidates are selected independently per interface", 
   registry.remove(12);
   assertEquals(registry.active("wl_compositor")?.name, 14);
   assertEquals(active.get("wl_compositor"), 14);
+  registry.close();
+  assertEquals(released, [12, 14, 13]);
 });
 
 Deno.test("Wayland SHM format advertisements require ARGB8888", () => {
@@ -308,6 +315,42 @@ Deno.test("Wayland connection errors retain protocol object details", () => {
     waylandConnectionError("reading display events", 0).message,
     "winding Wayland connection closed during reading display events",
   );
+});
+
+Deno.test("Wayland initialization cleanup preserves the primary error and unwinds in reverse", () => {
+  const primary = new Error("initialization failed");
+  const clean = new NativeInitializationCleanup();
+  clean.defer(() => {});
+  try {
+    clean.fail(primary, "unreachable aggregate");
+  } catch (error) {
+    assert(error === primary, "cleanup without failures must rethrow the original error object");
+  }
+
+  const order: string[] = [];
+  const firstCleanupError = new Error("first cleanup failed");
+  const lastCleanupError = new Error("last cleanup failed");
+  const failing = new NativeInitializationCleanup();
+  failing.defer(() => {
+    order.push("first acquired");
+    throw firstCleanupError;
+  });
+  failing.defer(() => order.push("second acquired"));
+  failing.defer(() => {
+    order.push("last acquired");
+    throw lastCleanupError;
+  });
+
+  try {
+    failing.fail(primary, "winding initialization unwind failed");
+  } catch (error) {
+    assert(error instanceof AggregateError);
+    assertEquals(error.message, "winding initialization unwind failed");
+    assert(error.errors[0] === primary);
+    assert(error.errors[1] === lastCleanupError);
+    assert(error.errors[2] === firstCleanupError);
+  }
+  assertEquals(order, ["last acquired", "second acquired", "first acquired"]);
 });
 
 Deno.test("Wayland poll errors and disconnects are terminal readiness", () => {

@@ -237,11 +237,13 @@ export class WaylandWindow implements Window {
       }),
     );
     this.#surfaceVtable = makeVtable([this.#xdgSurfaceConfigure], 1, this.lib.noop);
-    symbols.wl_proxy_add_listener(
-      this.#xdgSurface!,
-      Deno.UnsafePointer.of(this.#surfaceVtable),
-      null,
-    );
+    if (
+      symbols.wl_proxy_add_listener(
+        this.#xdgSurface!,
+        Deno.UnsafePointer.of(this.#surfaceVtable),
+        null,
+      ) !== 0
+    ) throw new Error("winding failed to listen to the Wayland window surface");
 
     this.#toplevelConfigure = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer", "i32", "i32", "pointer"], result: "void" },
@@ -259,11 +261,13 @@ export class WaylandWindow implements Window {
       4,
       this.lib.noop,
     );
-    symbols.wl_proxy_add_listener(
-      this.#xdgToplevel!,
-      Deno.UnsafePointer.of(this.#toplevelVtable),
-      null,
-    );
+    if (
+      symbols.wl_proxy_add_listener(
+        this.#xdgToplevel!,
+        Deno.UnsafePointer.of(this.#toplevelVtable),
+        null,
+      ) !== 0
+    ) throw new Error("winding failed to listen to the Wayland top-level window");
   }
 
   #ackConfiguration(configuration: WaylandConfiguration): void {
