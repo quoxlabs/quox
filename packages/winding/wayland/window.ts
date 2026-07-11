@@ -15,6 +15,10 @@ import {
 } from "./protocol.ts";
 import { WaylandShmBuffer, type WaylandShmHost } from "./shm_buffer.ts";
 
+export function damageOpcodeForSurfaceVersion(version: number): number {
+  return version >= 4 ? WlOp.SURFACE_DAMAGE_BUFFER : WlOp.SURFACE_DAMAGE;
+}
+
 export interface WaylandConfiguration {
   readonly serial: number;
   readonly width: number;
@@ -311,7 +315,7 @@ export class WaylandWindow implements Window {
     );
     symbols.wl_proxy_marshal_array_flags(
       this.#surface,
-      WlOp.SURFACE_DAMAGE_BUFFER,
+      damageOpcodeForSurfaceVersion(version),
       null,
       version,
       0,

@@ -9,6 +9,7 @@ import {
   waylandKeyEditDisposition,
   type XkbKeyTranslator,
 } from "./keyboard.ts";
+import { WlOp } from "./ffi.ts";
 import { TextInputV3Batch } from "./text_input.ts";
 import { keyLocationForCode, normalizeImeCursorArea, validateImeCursorRange } from "../input/mod.ts";
 import { logicalKeyFromKeysym } from "../linux/mod.ts";
@@ -20,7 +21,18 @@ import {
   POLLNVAL,
   waylandConnectionError,
 } from "./protocol.ts";
-import { frameMatchesConfiguration, WaylandConfigureState } from "./window.ts";
+import {
+  damageOpcodeForSurfaceVersion,
+  frameMatchesConfiguration,
+  WaylandConfigureState,
+} from "./window.ts";
+
+Deno.test("Wayland surface damage uses only requests supported by the bound version", () => {
+  assertEquals(damageOpcodeForSurfaceVersion(1), WlOp.SURFACE_DAMAGE);
+  assertEquals(damageOpcodeForSurfaceVersion(3), WlOp.SURFACE_DAMAGE);
+  assertEquals(damageOpcodeForSurfaceVersion(4), WlOp.SURFACE_DAMAGE_BUFFER);
+  assertEquals(damageOpcodeForSurfaceVersion(6), WlOp.SURFACE_DAMAGE_BUFFER);
+});
 
 Deno.test("Wayland connection errors retain protocol object details", () => {
   assertEquals(
