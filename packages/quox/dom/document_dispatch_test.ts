@@ -195,7 +195,6 @@ Deno.test("trusted staged events preserve multiplicity and capture, target, bubb
   const { document, renderer, window } = createHarness();
   const root = document.createElement("main");
   const parent = document.createElement("button");
-  const text = document.createTextNode("Save");
   const calls: string[] = [];
   let firstEvent: unknown;
 
@@ -203,22 +202,21 @@ Deno.test("trusted staged events preserve multiplicity and capture, target, bubb
   document.addEventListener("click", () => calls.push("document capture"), true);
   root.addEventListener("click", () => calls.push("root capture"), true);
   parent.addEventListener("click", () => calls.push("parent capture"), true);
-  text.addEventListener("click", (event) => {
-    calls.push("text target");
+  parent.addEventListener("click", (event) => {
+    calls.push("parent target");
     firstEvent = event;
     assert(event.isTrusted);
     assertEquals(event.timeStamp, 42.5);
-    assertStrictEquals(event.target, text);
-    assertEquals(event.composedPath(), [text, parent, root, document, window]);
+    assertStrictEquals(event.target, parent);
+    assertEquals(event.composedPath(), [parent, root, document, window]);
   });
-  parent.addEventListener("click", () => calls.push("parent bubble"));
   root.addEventListener("click", () => calls.push("root bubble"));
   document.addEventListener("click", () => calls.push("document bubble"));
   window.addEventListener("click", () => calls.push("window bubble"));
 
   renderer.queueFrame([
-    { type: "click", target: text.nodeId, path: [text.nodeId, parent.nodeId, root.nodeId], timeStamp: 42.5 },
-    { type: "click", target: text.nodeId, path: [text.nodeId, parent.nodeId, root.nodeId], timeStamp: 42.5 },
+    { type: "click", target: parent.nodeId, path: [parent.nodeId, root.nodeId], timeStamp: 42.5 },
+    { type: "click", target: parent.nodeId, path: [parent.nodeId, root.nodeId], timeStamp: 42.5 },
   ]);
   document.dispatchPointerMove(1, 2, 0, 0);
 
@@ -227,8 +225,7 @@ Deno.test("trusted staged events preserve multiplicity and capture, target, bubb
     "document capture",
     "root capture",
     "parent capture",
-    "text target",
-    "parent bubble",
+    "parent target",
     "root bubble",
     "document bubble",
     "window bubble",

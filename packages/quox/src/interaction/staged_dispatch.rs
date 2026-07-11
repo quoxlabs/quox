@@ -45,6 +45,25 @@ struct GuardedNode {
     handle: u32,
 }
 
+/// A Blitz event target together with the stable public DOM node which owns that raw layout
+/// target. Pointer hit testing may return a text node or an anonymous layout box, both of which
+/// must remain available to Blitz's default action even though neither is an author-facing
+/// pointer event target.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GuardedRawNode {
+    raw: usize,
+    public: GuardedNode,
+}
+
+impl GuardedRawNode {
+    fn from_public(public: GuardedNode) -> Self {
+        Self {
+            raw: public.raw,
+            public,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct EventMetadata {
     time_stamp: f64,
@@ -77,14 +96,15 @@ impl EventMetadata {
 #[derive(Clone, Debug)]
 struct GuardedDomEvent {
     event: DomEvent,
+    default_target: GuardedRawNode,
     target: GuardedNode,
     path: Vec<GuardedNode>,
     metadata: EventMetadata,
 }
 
 impl GuardedDomEvent {
-    fn is_target_live(&self, document: &BaseDocument, handles: &NodeHandles) -> bool {
-        node_is_live(self.target, document, handles)
+    fn is_default_target_live(&self, document: &BaseDocument, handles: &NodeHandles) -> bool {
+        raw_node_is_live(self.default_target, document, handles)
     }
 }
 
@@ -102,7 +122,8 @@ enum PlannedWork {
         suppress_default: bool,
     },
     Pointer {
-        target: GuardedNode,
+        default_target: GuardedRawNode,
+        author_target: GuardedNode,
         data: BlitzPointerEvent,
         flavor: PointerFlavor,
         metadata: EventMetadata,
@@ -129,7 +150,8 @@ enum DispatchAction {
 #[derive(Clone, Copy)]
 struct PlannedHover {
     raw: Option<usize>,
-    target: Option<GuardedNode>,
+    default_target: Option<GuardedRawNode>,
+    author_target: Option<GuardedNode>,
 }
 
 #[derive(Clone, Copy)]
@@ -534,23 +556,27 @@ impl DispatchStack {
                     }
                 }
                 PlannedWork::Pointer {
-                    target,
+                    default_target,
+                    author_target,
                     mut data,
                     flavor,
                     metadata,
                 } => {
-                    if !node_is_live(target, document, handles) {
+                    if !raw_node_is_live(default_target, document, handles)
+                        || !node_is_live(author_target, document, handles)
+                    {
                         continue;
                     }
-                    if let Some(rect) = document.get_client_bounding_rect(target.raw) {
+                    if let Some(rect) = document.get_client_bounding_rect(default_target.raw) {
                         data.element.x = data.coords.client_x - rect.x as f32;
                         data.element.y = data.coords.client_y - rect.y as f32;
                     }
                     let pointer_data = pointer_dom_data(flavor, data.clone(), false);
-                    let Some(pointer_default) = guard_event_with_target(
+                    let Some(pointer_default) = guard_event_with_targets(
                         document,
                         handles,
-                        target,
+                        default_target,
+                        author_target,
                         pointer_data,
                         metadata.clone(),
                     )?
@@ -624,8 +650,23 @@ impl DispatchStack {
         handles: &mut NodeHandles,
         mut guarded: GuardedDomEvent,
     ) -> Result<(), DispatchError> {
-        if !guarded.is_target_live(document, handles) {
+        if !node_is_live(guarded.target, document, handles) {
             return Ok(());
+        }
+        let needs_element_target = event_has_element_target(&guarded.event.data);
+        let raw_target_is_usable = guarded.is_default_target_live(document, handles)
+            && (!needs_element_target
+                || pointer_author_target_id(document, guarded.default_target.raw)
+                    == Some(guarded.target.raw));
+        if !raw_target_is_usable {
+            if !needs_element_target {
+                return Ok(());
+            }
+            // A listener may replace the glyph which was hit while leaving the frozen author
+            // target alive. Retarget only Blitz's internal default to that same element; never
+            // run a default against a new occupant of the stale raw node id.
+            guarded.event.target = guarded.target.raw;
+            guarded.default_target = GuardedRawNode::from_public(guarded.target);
         }
 
         let mut generated = Vec::new();
@@ -654,13 +695,9 @@ impl DispatchStack {
     ) -> Result<(), DispatchError> {
         match action {
             DispatchAction::PointerDownState(hover) => {
-                let target_is_live = hover.target.is_some_and(|target| {
-                    node_is_live(target, document, handles)
-                        && hover.raw.is_some_and(|raw| {
-                            document.get_node(raw).is_some()
-                                && public_dom_node_id(document, raw) == Some(target.raw)
-                        })
-                });
+                let target_is_live = hover
+                    .default_target
+                    .is_some_and(|target| raw_node_is_live(target, document, handles));
                 if target_is_live && document.get_hover_node_id() == hover.raw {
                     document.active_node();
                     document.set_mousedown_node_id(hover.raw);
@@ -746,11 +783,17 @@ fn plan_pointer(
         PointerFlavor::Move => {}
     }
 
-    let target = hover
-        .target
-        .unwrap_or(guarded_target_or_root(document, handles, None)?);
+    let (default_target, author_target) = if let (Some(default_target), Some(author_target)) =
+        (hover.default_target, hover.author_target)
+    {
+        (default_target, author_target)
+    } else {
+        let root = guarded_target_or_root(document, handles, None)?;
+        (GuardedRawNode::from_public(root), root)
+    };
     planned.push_back(PlannedWork::Pointer {
-        target,
+        default_target,
+        author_target,
         data: event.clone(),
         flavor,
         metadata,
@@ -779,16 +822,21 @@ fn plan_hover_transitions(
     let previous = document.get_hover_node_id();
     let changed = document.set_hover_to(event.page_x(), event.page_y());
     let current = document.get_hover_node_id();
-    let new_chain = public_hover_chain(document, handles, current)?;
-    let guarded_current = new_chain.first().copied();
+    let default_target = current
+        .map(|raw| guard_raw_node(document, handles, raw))
+        .transpose()?
+        .flatten();
+    let new_chain = pointer_author_chain(document, handles, current)?;
+    let author_target = new_chain.first().copied();
     if !changed {
         return Ok(PlannedHover {
             raw: current,
-            target: guarded_current,
+            default_target,
+            author_target,
         });
     }
 
-    let mut old_chain = public_hover_chain(document, handles, previous)?;
+    let mut old_chain = pointer_author_chain(document, handles, previous)?;
     let mut new_chain = new_chain;
     if old_chain == new_chain {
         // Blitz may move between an anonymous layout wrapper and its real DOM parent even though
@@ -796,7 +844,8 @@ fn plan_hover_transitions(
         // manufacture duplicate boundary events for that internal transition.
         return Ok(PlannedHover {
             raw: current,
-            target: guarded_current,
+            default_target,
+            author_target,
         });
     }
 
@@ -878,7 +927,8 @@ fn plan_hover_transitions(
 
     Ok(PlannedHover {
         raw: current,
-        target: guarded_current,
+        default_target,
+        author_target,
     })
 }
 
@@ -896,9 +946,10 @@ fn push_guarded_work(
     });
 }
 
-/// Convert Blitz's target-first raw chain to an author-visible target-first DOM chain. Multiple
-/// anonymous wrappers can normalize to the same real ancestor, so deduplicate after mapping.
-fn public_hover_chain(
+/// Convert Blitz's target-first raw hover chain to the target-first element chain exposed for
+/// pointer and compatibility mouse events. Text nodes and anonymous layout wrappers can both
+/// normalize to the same real element, so deduplicate after mapping.
+fn pointer_author_chain(
     document: &BaseDocument,
     handles: &mut NodeHandles,
     target: Option<usize>,
@@ -908,7 +959,7 @@ fn public_hover_chain(
     };
     let mut chain = Vec::new();
     for raw in document.node_chain(target) {
-        let Some(raw) = public_dom_node_id(document, raw) else {
+        let Some(raw) = pointer_author_target_id(document, raw) else {
             continue;
         };
         if chain.iter().any(|guard: &GuardedNode| guard.raw == raw) {
@@ -962,12 +1013,32 @@ fn guard_queued_event(
     mut event: DomEvent,
     metadata: EventMetadata,
 ) -> Result<Option<GuardedDomEvent>, DispatchError> {
-    let Some(target) = guard_node(document, handles, event.target)? else {
+    let Some(default_target) = guard_raw_node(document, handles, event.target)? else {
         return Ok(None);
     };
-    event.target = target.raw;
+    let (default_target, author_raw) = if event_has_element_target(&event.data) {
+        (
+            default_target,
+            pointer_author_target_id(document, event.target),
+        )
+    } else {
+        // Preserve the pre-existing target projection for non-pointer records. Only pointer,
+        // mouse, and click-family events need separate raw and author-facing targets.
+        event.target = default_target.public.raw;
+        (
+            GuardedRawNode::from_public(default_target.public),
+            Some(default_target.public.raw),
+        )
+    };
+    let Some(author_raw) = author_raw else {
+        return Ok(None);
+    };
+    let Some(target) = guard_node(document, handles, author_raw)? else {
+        return Ok(None);
+    };
     Ok(Some(GuardedDomEvent {
         event,
+        default_target,
         target,
         path: Vec::new(),
         metadata,
@@ -981,12 +1052,31 @@ fn guard_event_with_target(
     data: DomEventData,
     metadata: EventMetadata,
 ) -> Result<Option<GuardedDomEvent>, DispatchError> {
+    guard_event_with_targets(
+        document,
+        handles,
+        GuardedRawNode::from_public(target),
+        target,
+        data,
+        metadata,
+    )
+}
+
+fn guard_event_with_targets(
+    document: &BaseDocument,
+    handles: &mut NodeHandles,
+    default_target: GuardedRawNode,
+    author_target: GuardedNode,
+    data: DomEventData,
+    metadata: EventMetadata,
+) -> Result<Option<GuardedDomEvent>, DispatchError> {
     freeze_event_path(
         document,
         handles,
         GuardedDomEvent {
-            event: DomEvent::new(target.raw, data),
-            target,
+            event: DomEvent::new(default_target.raw, data),
+            default_target,
+            target: author_target,
             path: Vec::new(),
             metadata,
         },
@@ -998,7 +1088,9 @@ fn freeze_event_path(
     handles: &mut NodeHandles,
     mut guarded: GuardedDomEvent,
 ) -> Result<Option<GuardedDomEvent>, DispatchError> {
-    if !guarded.is_target_live(document, handles) {
+    if !guarded.is_default_target_live(document, handles)
+        || !node_is_live(guarded.target, document, handles)
+    {
         return Ok(None);
     }
 
@@ -1040,8 +1132,62 @@ fn guard_node(
     Ok(Some(GuardedNode { raw, handle }))
 }
 
+fn guard_raw_node(
+    document: &BaseDocument,
+    handles: &mut NodeHandles,
+    raw: usize,
+) -> Result<Option<GuardedRawNode>, DispatchError> {
+    let Some(public_raw) = public_dom_node_id(document, raw) else {
+        return Ok(None);
+    };
+    let Some(public) = guard_node(document, handles, public_raw)? else {
+        return Ok(None);
+    };
+    Ok(Some(GuardedRawNode { raw, public }))
+}
+
 fn node_is_live(guard: GuardedNode, document: &BaseDocument, handles: &NodeHandles) -> bool {
     handles.resolve(guard.handle) == Some(guard.raw) && document.get_node(guard.raw).is_some()
+}
+
+fn raw_node_is_live(guard: GuardedRawNode, document: &BaseDocument, handles: &NodeHandles) -> bool {
+    node_is_live(guard.public, document, handles)
+        && document.get_node(guard.raw).is_some()
+        && public_dom_node_id(document, guard.raw) == Some(guard.public.raw)
+}
+
+fn pointer_author_target_id(document: &BaseDocument, mut raw: usize) -> Option<usize> {
+    loop {
+        raw = public_dom_node_id(document, raw)?;
+        let node = document.get_node(raw)?;
+        if matches!(&node.data, blitz_dom::NodeData::Element(_)) {
+            return Some(raw);
+        }
+        raw = node.parent.or_else(|| node.layout_parent.get())?;
+    }
+}
+
+fn event_has_element_target(data: &DomEventData) -> bool {
+    matches!(
+        data,
+        DomEventData::PointerMove(_)
+            | DomEventData::PointerDown(_)
+            | DomEventData::PointerUp(_)
+            | DomEventData::PointerEnter(_)
+            | DomEventData::PointerLeave(_)
+            | DomEventData::PointerOver(_)
+            | DomEventData::PointerOut(_)
+            | DomEventData::MouseMove(_)
+            | DomEventData::MouseDown(_)
+            | DomEventData::MouseUp(_)
+            | DomEventData::MouseEnter(_)
+            | DomEventData::MouseLeave(_)
+            | DomEventData::MouseOver(_)
+            | DomEventData::MouseOut(_)
+            | DomEventData::Click(_)
+            | DomEventData::ContextMenu(_)
+            | DomEventData::DoubleClick(_)
+    )
 }
 
 fn event_is_composed(data: &DomEventData) -> bool {
@@ -1491,6 +1637,21 @@ mod tests {
                 .unwrap_or_else(|| panic!("test element #{id} should exist"))
         }
 
+        fn text_child(&self, parent_id: usize) -> usize {
+            self.document
+                .get_node(parent_id)
+                .expect("test parent should exist")
+                .children
+                .iter()
+                .copied()
+                .find(|child_id| {
+                    self.document
+                        .get_node(*child_id)
+                        .is_some_and(|child| matches!(&child.data, NodeData::Text(_)))
+                })
+                .expect("test parent should have a text child")
+        }
+
         #[allow(
             clippy::cast_possible_truncation,
             reason = "test pointer inputs use the same f32 coordinate boundary as Blitz"
@@ -1510,8 +1671,24 @@ mod tests {
             clippy::cast_possible_truncation,
             reason = "test hit inputs use the same f32 coordinate boundary as Blitz"
         )]
-        fn point_hitting(&self, node_id: usize) -> Option<(f32, f32)> {
-            let rect = self.document.get_client_bounding_rect(node_id)?;
+        fn points_hitting(&self, node_id: usize) -> Vec<(f32, f32)> {
+            let mut bounds_id = node_id;
+            let rect = loop {
+                if let Some(rect) = self.document.get_client_bounding_rect(bounds_id)
+                    && rect.width > 0.0
+                    && rect.height > 0.0
+                {
+                    break rect;
+                }
+                let Some(node) = self.document.get_node(bounds_id) else {
+                    return Vec::new();
+                };
+                let Some(parent) = node.parent.or_else(|| node.layout_parent.get()) else {
+                    return Vec::new();
+                };
+                bounds_id = parent;
+            };
+            let mut points = Vec::new();
             for y_step in 0..24 {
                 for x_step in 0..24 {
                     let x = rect.x + rect.width * (f64::from(x_step) + 0.5) / 24.0;
@@ -1521,11 +1698,53 @@ mod tests {
                         .hit(x as f32, y as f32)
                         .is_some_and(|hit| hit.node_id == node_id)
                     {
-                        return Some((x as f32, y as f32));
+                        points.push((x as f32, y as f32));
                     }
                 }
             }
-            None
+            points
+        }
+
+        fn point_hitting(&self, node_id: usize) -> Option<(f32, f32)> {
+            self.points_hitting(node_id).into_iter().next()
+        }
+
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "test hit inputs use the same f32 coordinate boundary as Blitz"
+        )]
+        fn glyph_points_targeting(&self, element_id: usize) -> Vec<(f32, f32)> {
+            let mut bounds_id = element_id;
+            let rect = loop {
+                if let Some(rect) = self.document.get_client_bounding_rect(bounds_id)
+                    && rect.width > 0.0
+                    && rect.height > 0.0
+                {
+                    break rect;
+                }
+                let Some(node) = self.document.get_node(bounds_id) else {
+                    return Vec::new();
+                };
+                let Some(parent) = node.parent.or_else(|| node.layout_parent.get()) else {
+                    return Vec::new();
+                };
+                bounds_id = parent;
+            };
+            let mut points = Vec::new();
+            for y_step in 0..24 {
+                for x_step in 0..24 {
+                    let x = rect.x + rect.width * (f64::from(x_step) + 0.5) / 24.0;
+                    let y = rect.y + rect.height * (f64::from(y_step) + 0.5) / 24.0;
+                    if self.document.hit(x as f32, y as f32).is_some_and(|hit| {
+                        hit.is_text
+                            && pointer_author_target_id(&self.document, hit.node_id)
+                                == Some(element_id)
+                    }) {
+                        points.push((x as f32, y as f32));
+                    }
+                }
+            }
+            points
         }
 
         fn raw_text(&mut self, node_id: usize) -> String {
@@ -1609,6 +1828,42 @@ mod tests {
         }
     }
 
+    fn stage_generated(
+        context: &mut TestContext,
+        target: usize,
+        data: DomEventData,
+    ) -> DispatchEventStep {
+        let guarded = guard_queued_event(
+            &context.document,
+            &mut context.handles,
+            DomEvent::new(target, data),
+            EventMetadata::native(),
+        )
+        .expect("target handles should fit")
+        .expect("generated target should be live");
+        let frame_id = context
+            .stack
+            .allocate_frame_id()
+            .expect("frame id should fit");
+        context.stack.frames.push(DispatchFrame {
+            id: frame_id,
+            planned: VecDeque::new(),
+            generated: VecDeque::from([guarded]),
+            pending: None,
+            redraw_requested: false,
+        });
+        event(
+            context
+                .stack
+                .advance(
+                    &mut context.document,
+                    &mut context.handles,
+                    context.redraw.as_ref(),
+                )
+                .expect("generated event should stage"),
+        )
+    }
+
     #[test]
     fn preserves_pinned_hover_and_compatibility_mouse_order() {
         let mut context = TestContext::new(
@@ -1672,7 +1927,7 @@ mod tests {
         );
         assert_eq!(context.document.get_hover_node_id(), Some(anonymous));
 
-        let step = context.begin(DispatchRequest::Pointer {
+        let pointer_move = event(context.begin(DispatchRequest::Pointer {
             event: pointer(
                 host_point.0,
                 host_point.1,
@@ -1680,8 +1935,10 @@ mod tests {
                 MouseEventButtons::None,
             ),
             flavor: PointerFlavor::Move,
-        });
-        let (types, _, _) = drain(&mut context, step);
+        }));
+        assert_eq!(context.handles.resolve(pointer_move.target), Some(host));
+        assert_eq!(context.handles.resolve(pointer_move.path[0]), Some(host));
+        let (types, _, _) = drain(&mut context, DispatchStep::Event(pointer_move));
         assert_eq!(types, ["pointermove", "mousemove"]);
 
         assert!(
@@ -1699,6 +1956,8 @@ mod tests {
             flavor: PointerFlavor::Down,
         }));
         assert_eq!(pointer_down.event_type, "pointerdown");
+        assert_eq!(context.handles.resolve(pointer_down.target), Some(host));
+        assert_eq!(context.handles.resolve(pointer_down.path[0]), Some(host));
         assert!(
             context
                 .document
@@ -1707,6 +1966,232 @@ mod tests {
         );
         complete(context.resume(&pointer_down, true));
         context.document.unactive_node();
+    }
+
+    #[test]
+    fn text_glyph_pointer_targets_are_elements_while_raw_defaults_extend_selection() {
+        let mut context =
+            TestContext::new("<span id='label' style='font-size:32px'>Selectable words</span>");
+        let label = context.element("label");
+        let points = context.glyph_points_targeting(label);
+        let start = points
+            .iter()
+            .copied()
+            .min_by(|left, right| left.0.total_cmp(&right.0))
+            .expect("the first text glyph should be hittable");
+        let end = points
+            .iter()
+            .copied()
+            .max_by(|left, right| left.0.total_cmp(&right.0))
+            .expect("the last text glyph should be hittable");
+        assert!(end.0 - start.0 > 2.0);
+        let start_hit = context.document.hit(start.0, start.1).unwrap();
+        let end_hit = context.document.hit(end.0, end.1).unwrap();
+        assert!(start_hit.is_text);
+        assert!(end_hit.is_text);
+        assert_eq!(
+            pointer_author_target_id(&context.document, start_hit.node_id),
+            Some(label)
+        );
+        assert_eq!(
+            pointer_author_target_id(&context.document, end_hit.node_id),
+            Some(label)
+        );
+        assert!(context.document.set_hover_to(start.0, start.1));
+
+        let pointer_down = event(context.begin(DispatchRequest::Pointer {
+            event: pointer(
+                start.0,
+                start.1,
+                MouseEventButton::Main,
+                MouseEventButtons::Primary,
+            ),
+            flavor: PointerFlavor::Down,
+        }));
+        assert_eq!(context.handles.resolve(pointer_down.target), Some(label));
+        assert_eq!(context.handles.resolve(pointer_down.path[0]), Some(label));
+        assert_eq!(
+            context
+                .stack
+                .frames
+                .last()
+                .and_then(|frame| frame.pending.as_ref())
+                .map(|pending| pending.guarded.default_target.raw),
+            Some(start_hit.node_id)
+        );
+
+        let mouse_down = event(context.resume(&pointer_down, false));
+        assert_eq!(mouse_down.event_type, "mousedown");
+        assert_eq!(context.handles.resolve(mouse_down.target), Some(label));
+        complete(context.resume(&mouse_down, false));
+
+        let pointer_move = event(context.begin(DispatchRequest::Pointer {
+            event: pointer(
+                end.0,
+                end.1,
+                MouseEventButton::Main,
+                MouseEventButtons::Primary,
+            ),
+            flavor: PointerFlavor::Move,
+        }));
+        assert_eq!(pointer_move.event_type, "pointermove");
+        assert_eq!(context.handles.resolve(pointer_move.target), Some(label));
+        let mouse_move = event(context.resume(&pointer_move, false));
+        assert_eq!(mouse_move.event_type, "mousemove");
+        assert_eq!(context.handles.resolve(mouse_move.target), Some(label));
+        complete(context.resume(&mouse_move, false));
+
+        assert!(context.document.has_text_selection());
+        assert!(
+            context
+                .document
+                .get_selected_text()
+                .is_some_and(|text| !text.is_empty())
+        );
+    }
+
+    #[test]
+    fn text_glyph_click_targets_the_label_while_its_default_activates_the_control() {
+        let mut context = TestContext::new(
+            "<input id='box' type='checkbox'>\
+             <label id='label' for='box' style='font-size:32px'>Toggle</label>",
+        );
+        let checkbox = context.element("box");
+        let label = context.element("label");
+        let (x, y) = context
+            .glyph_points_targeting(label)
+            .into_iter()
+            .next()
+            .expect("the label's text glyph should be hittable");
+        let hit = context.document.hit(x, y).unwrap();
+        assert!(hit.is_text);
+        assert_eq!(
+            pointer_author_target_id(&context.document, hit.node_id),
+            Some(label)
+        );
+        assert!(context.document.set_hover_to(x, y));
+
+        let down = context.begin(DispatchRequest::Pointer {
+            event: pointer(x, y, MouseEventButton::Main, MouseEventButtons::Primary),
+            flavor: PointerFlavor::Down,
+        });
+        let (down_types, _, _) = drain(&mut context, down);
+        assert_eq!(down_types, ["pointerdown", "mousedown"]);
+
+        let mut step = context.begin(DispatchRequest::Pointer {
+            event: pointer(x, y, MouseEventButton::Main, MouseEventButtons::None),
+            flavor: PointerFlavor::Up,
+        });
+        let mut types = Vec::new();
+        while let DispatchStep::Event(current) = step {
+            types.push(current.event_type.clone());
+            if matches!(
+                current.event_type.as_str(),
+                "pointerup" | "mouseup" | "click"
+            ) {
+                assert_eq!(context.handles.resolve(current.target), Some(label));
+                assert_eq!(context.handles.resolve(current.path[0]), Some(label));
+            }
+            if current.event_type == "click" {
+                assert_eq!(
+                    context
+                        .stack
+                        .frames
+                        .last()
+                        .and_then(|frame| frame.pending.as_ref())
+                        .map(|pending| pending.guarded.default_target.raw),
+                    Some(hit.node_id)
+                );
+            }
+            step = context.resume(&current, false);
+        }
+
+        assert!(types.iter().any(|event_type| event_type == "click"));
+        assert!(types.iter().any(|event_type| event_type == "input"));
+        assert_eq!(context.document.get_focussed_node_id(), Some(checkbox));
+    }
+
+    #[test]
+    fn removed_raw_glyph_retargets_the_default_to_its_live_author_element() {
+        let mut context = TestContext::new(
+            "<input id='box' type='checkbox'><label id='label' for='box'>Original</label>\
+             <input id='other' type='checkbox'><label id='other-label' for='other'></label>",
+        );
+        let checkbox = context.element("box");
+        let other_checkbox = context.element("other");
+        let label = context.element("label");
+        let other_label = context.element("other-label");
+        let text = context.text_child(label);
+        let click = stage_generated(
+            &mut context,
+            text,
+            DomEventData::Click(pointer(
+                0.0,
+                0.0,
+                MouseEventButton::Main,
+                MouseEventButtons::None,
+            )),
+        );
+        assert_eq!(context.handles.resolve(click.target), Some(label));
+
+        let stale_handle = context
+            .handles
+            .invalidate_node(text)
+            .expect("the raw text target should have been guarded");
+        let replacement = {
+            let mut mutator = context.document.mutate();
+            mutator.remove_and_drop_node(text);
+            let replacement = mutator.create_text_node("Replacement");
+            mutator.append_children(other_label, &[replacement]);
+            replacement
+        };
+        assert_eq!(replacement, text, "the Blitz slab should reuse the raw id");
+        let replacement_handle = context
+            .handles
+            .expose(replacement)
+            .expect("replacement handle should fit");
+        assert_ne!(replacement_handle, stale_handle);
+
+        let resumed = context.resume(&click, false);
+        let (types, _, _) = drain(&mut context, resumed);
+        assert!(types.iter().any(|event_type| event_type == "input"));
+        assert_eq!(context.document.get_focussed_node_id(), Some(checkbox));
+        assert_ne!(
+            context.document.get_focussed_node_id(),
+            Some(other_checkbox)
+        );
+    }
+
+    #[test]
+    fn destroyed_author_element_suppresses_its_pending_raw_glyph_default() {
+        let mut context = TestContext::new(
+            "<input id='box' type='checkbox'><label id='label' for='box'>Original</label>",
+        );
+        let checkbox = context.element("box");
+        let label = context.element("label");
+        let text = context.text_child(label);
+        let initial_focus = context.document.get_focussed_node_id();
+        let click = stage_generated(
+            &mut context,
+            text,
+            DomEventData::Click(pointer(
+                0.0,
+                0.0,
+                MouseEventButton::Main,
+                MouseEventButtons::None,
+            )),
+        );
+        assert_eq!(context.handles.resolve(click.target), Some(label));
+
+        context
+            .handles
+            .invalidate_node(label)
+            .expect("the author target should have been guarded");
+        context.document.mutate().remove_and_drop_node(label);
+
+        complete(context.resume(&click, false));
+        assert_eq!(context.document.get_focussed_node_id(), initial_focus);
+        assert_ne!(context.document.get_focussed_node_id(), Some(checkbox));
     }
 
     #[test]
