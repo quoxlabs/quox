@@ -708,7 +708,7 @@ function testProtocolAndStructAbis(): void {
         malformedAlloc,
         sel(runtime, "initWithCharacters:length:"),
         new Uint16Array([0xd800]),
-        1,
+        1n,
       );
       assert(malformed !== null, "failed to initialize malformed NSString");
       try {
