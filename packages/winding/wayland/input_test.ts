@@ -9,7 +9,7 @@ import {
   waylandKeyEditDisposition,
   type XkbKeyTranslator,
 } from "./keyboard.ts";
-import { WlOp } from "./ffi.ts";
+import { CURSOR_SHAPE_MANAGER_V1_REQUESTS, WlOp } from "./ffi.ts";
 import { createWaylandSurroundingTextState, TextInputV3Batch } from "./text_input.ts";
 import { keyLocationForCode, normalizeImeCursorArea, validateImeCursorRange } from "../input/mod.ts";
 import { logicalKeyFromKeysym } from "../linux/mod.ts";
@@ -28,6 +28,15 @@ import {
   waylandConnectionError,
 } from "./protocol.ts";
 import { damageOpcodeForSurfaceVersion, frameMatchesConfiguration, WaylandConfigureState } from "./window.ts";
+
+Deno.test("cursor-shape manager metadata includes the version-1 tablet request", () => {
+  assertEquals(CURSOR_SHAPE_MANAGER_V1_REQUESTS, [
+    { name: "destroy", signature: "", objectTypes: [] },
+    { name: "get_pointer", signature: "no", objectTypes: ["cursorShapeDevice", "wlPointer"] },
+    { name: "get_tablet_tool_v2", signature: "no", objectTypes: ["cursorShapeDevice", "tabletToolV2"] },
+  ]);
+  assertEquals(WlOp.WP_CURSOR_SHAPE_MANAGER_GET_TABLET_TOOL_V2, 2);
+});
 
 Deno.test("Wayland core cursor fallback has a visible in-bounds hotspot", () => {
   const pixels = createDefaultCursorPixels();

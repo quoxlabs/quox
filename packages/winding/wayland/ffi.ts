@@ -35,6 +35,7 @@ type InterfaceKey =
   | "xdgPopup"
   | "cursorShapeManager"
   | "cursorShapeDevice"
+  | "tabletToolV2"
   | "textInputManager"
   | "textInput";
 
@@ -45,6 +46,12 @@ interface InterfaceDef {
   readonly methods: MessageDef[];
   readonly events: MessageDef[];
 }
+
+export const CURSOR_SHAPE_MANAGER_V1_REQUESTS = [
+  { name: "destroy", signature: "", objectTypes: [] },
+  { name: "get_pointer", signature: "no", objectTypes: ["cursorShapeDevice", "wlPointer"] },
+  { name: "get_tablet_tool_v2", signature: "no", objectTypes: ["cursorShapeDevice", "tabletToolV2"] },
+] as const;
 
 function validateTypes(
   messageName: string,
@@ -156,6 +163,16 @@ export function buildXdgIfaces(
     return o;
   }
 
+  function cursorShapeManagerMethods(): MessageDef[] {
+    return CURSOR_SHAPE_MANAGER_V1_REQUESTS.map((request) => [
+      request.name,
+      request.signature,
+      request.objectTypes.length === 0
+        ? undefined
+        : request.objectTypes.map((type) => type === "wlPointer" ? wlPointerIface : type),
+    ]);
+  }
+
   const definitions: InterfaceDef[] = [
     {
       key: "xdgWmBase",
@@ -246,10 +263,7 @@ export function buildXdgIfaces(
       key: "cursorShapeManager",
       name: "wp_cursor_shape_manager_v1",
       version: 1,
-      methods: [
-        ["destroy", ""],
-        ["get_pointer", "no", ["cursorShapeDevice", wlPointerIface]],
-      ],
+      methods: cursorShapeManagerMethods(),
       events: [],
     },
     {
@@ -260,6 +274,16 @@ export function buildXdgIfaces(
         ["destroy", ""],
         ["set_shape", "uu"],
       ],
+      events: [],
+    },
+    {
+      // cursor-shape references this external tablet protocol interface. The
+      // backend does not bind tablet-v2, but the type table still needs a
+      // named interface object for logging and future request validation.
+      key: "tabletToolV2",
+      name: "zwp_tablet_tool_v2",
+      version: 1,
+      methods: [],
       events: [],
     },
     {
@@ -383,6 +407,7 @@ export const WlOp = {
   // wp_cursor_shape_manager_v1 requests
   WP_CURSOR_SHAPE_MANAGER_DESTROY: 0,
   WP_CURSOR_SHAPE_MANAGER_GET_POINTER: 1,
+  WP_CURSOR_SHAPE_MANAGER_GET_TABLET_TOOL_V2: 2,
   // wp_cursor_shape_device_v1 requests
   WP_CURSOR_SHAPE_DEVICE_DESTROY: 0,
   WP_CURSOR_SHAPE_DEVICE_SET_SHAPE: 1,
