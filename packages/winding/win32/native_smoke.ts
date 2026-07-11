@@ -25,6 +25,29 @@ const testUser32Functions = {
     parameters: ["pointer", "buffer"],
     result: "i32",
   },
+  InvalidateRect: {
+    parameters: ["pointer", "pointer", "i32"],
+    result: "i32",
+  },
+  UpdateWindow: {
+    parameters: ["pointer"],
+    result: "i32",
+  },
+  GetDC: {
+    parameters: ["pointer"],
+    result: "pointer",
+  },
+  ReleaseDC: {
+    parameters: ["pointer", "pointer"],
+    result: "i32",
+  },
+} as const satisfies Deno.ForeignLibraryInterface;
+
+const testGdi32Functions = {
+  GetPixel: {
+    parameters: ["pointer", "i32", "i32"],
+    result: "u32",
+  },
 } as const satisfies Deno.ForeignLibraryInterface;
 
 interface NativeWin32Window extends Window {
@@ -40,23 +63,42 @@ Deno.test({
   fn() {
     const user32 = Deno.dlopen("user32", testUser32Functions);
     try {
-      // A second pass verifies that close destroys the HWND and unregisters
-      // the class before its callback and DLL handles are released.
-      for (let iteration = 0; iteration < 2; iteration++) runLifecycle(user32, iteration === 1);
+      const gdi32 = Deno.dlopen("gdi32", testGdi32Functions);
+      try {
+        // A second pass verifies that close destroys the HWND and unregisters
+        // the class before its callback and DLL handles are released.
+        for (let iteration = 0; iteration < 2; iteration++) runLifecycle(user32, gdi32, iteration === 1);
+      } finally {
+        gdi32.close();
+      }
     } finally {
       user32.close();
     }
   },
 });
 
-function runLifecycle(user32: Deno.DynamicLibrary<typeof testUser32Functions>, destroyExternally: boolean): void {
+function runLifecycle(
+  user32: Deno.DynamicLibrary<typeof testUser32Functions>,
+  gdi32: Deno.DynamicLibrary<typeof testGdi32Functions>,
+  destroyExternally: boolean,
+): void {
   const library = load();
   try {
     assertConcurrentLibraryRejected();
-    const window = library.openWindow(0, 0, 64, 48) as NativeWin32Window;
+    const window = library.openWindow(0, 0, 320, 240) as NativeWin32Window;
     try {
-      assertWindowGeometry(user32, window, 0, 0, 64, 48);
-      assertSingleInitialResize(library, window);
+      assertWindowGeometry(user32, window, 0, 0, 320, 240);
+      const size = assertSingleInitialResize(library, window);
+      assertRepaintPixel(user32, gdi32, window, 0x000000);
+      const rgba = new Uint8Array(size.width * size.height * 4);
+      for (let offset = 0; offset < rgba.length; offset += 4) {
+        rgba[offset] = 0x12;
+        rgba[offset + 1] = 0x34;
+        rgba[offset + 2] = 0x56;
+        rgba[offset + 3] = 0xff;
+      }
+      window.blit(rgba, size.width, size.height);
+      assertRepaintPixel(user32, gdi32, window, 0x563412);
       // Keep hosted CI independent of foreground-window and desktop behavior.
       user32.symbols.ShowWindow(window.hwnd, 0);
       window.setImeCursorArea(4, 8, 2, 16);
@@ -133,14 +175,46 @@ function assertWindowGeometry(
   }
 }
 
-function assertSingleInitialResize(library: Library, window: Window): void {
+function assertSingleInitialResize(library: Library, window: Window): { width: number; height: number } {
   let resizeCount = 0;
+  let size: { width: number; height: number } | undefined;
   for (let count = 0; count < 64; count++) {
     const event = library.event();
     if (event === undefined) break;
-    if (event.type === "resize" && event.window === window) resizeCount++;
+    if (event.type === "resize" && event.window === window) {
+      resizeCount++;
+      size = { width: event.width, height: event.height };
+    }
   }
   if (resizeCount !== 1) throw new Error(`Expected one initial Win32 resize event, received ${resizeCount}`);
+  if (size === undefined || size.width <= 0 || size.height <= 0) {
+    throw new Error("Expected positive initial Win32 client dimensions");
+  }
+  return size;
+}
+
+function assertRepaintPixel(
+  user32: Deno.DynamicLibrary<typeof testUser32Functions>,
+  gdi32: Deno.DynamicLibrary<typeof testGdi32Functions>,
+  window: NativeWin32Window,
+  expected: number,
+): void {
+  if (user32.symbols.InvalidateRect(window.hwnd, null, 0) === 0) {
+    throw new Error("InvalidateRect rejected the Win32 repaint test");
+  }
+  if (user32.symbols.UpdateWindow(window.hwnd) === 0) {
+    throw new Error("UpdateWindow did not dispatch the Win32 repaint test");
+  }
+  const hdc = user32.symbols.GetDC(window.hwnd);
+  if (hdc === null) throw new Error("GetDC rejected the Win32 repaint test");
+  try {
+    const actual = gdi32.symbols.GetPixel(hdc, 0, 0);
+    if (actual !== expected) {
+      throw new Error(`Expected Win32 repaint pixel ${expected.toString(16)}, received ${actual.toString(16)}`);
+    }
+  } finally {
+    user32.symbols.ReleaseDC(window.hwnd, hdc);
+  }
 }
 
 function nextImeEdit(library: Library, window: Window): ImeEvent | undefined {

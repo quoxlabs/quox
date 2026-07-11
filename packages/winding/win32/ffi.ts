@@ -8,6 +8,10 @@ export const kernel32functions = {
 } as const satisfies Deno.ForeignLibraryInterface;
 
 export const gdi32functions = {
+  PatBlt: {
+    parameters: ["pointer", "i32", "i32", "i32", "i32", "u32"],
+    result: "i32",
+  },
   SetDIBitsToDevice: {
     parameters: [
       "pointer",
@@ -28,6 +32,8 @@ export const gdi32functions = {
 } as const satisfies Deno.ForeignLibraryInterface;
 
 export const user32functions = {
+  BeginPaint: { parameters: ["pointer", "buffer"], result: "pointer" },
+  EndPaint: { parameters: ["pointer", "buffer"], result: "i32" },
   GetDC: { parameters: ["pointer"], result: "pointer" },
   GetFocus: { parameters: [], result: "pointer" },
   GetKeyState: { parameters: ["i32"], result: "i16" },
@@ -131,6 +137,7 @@ export enum WM {
   IME_ENDCOMPOSITION = 0x010E,
   IME_COMPOSITION = 0x010F,
   SIZE = 0x0005,
+  PAINT = 0x000F,
   CLOSE = 0x0010,
   SETFOCUS = 0x0007,
   KILLFOCUS = 0x0008,

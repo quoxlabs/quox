@@ -17,7 +17,9 @@ import { Win32InputController } from "./input_controller.ts";
 // BITMAPINFOHEADER is 40 bytes; for 32bpp BI_RGB no color table follows, so
 // this buffer alone is a valid BITMAPINFO for SetDIBitsToDevice.
 const BITMAPINFOHEADER_SIZE = 40;
+const PAINTSTRUCT_SIZE = 72;
 const BI_RGB = 0;
+const BLACKNESS = 0x00000042;
 const DIB_RGB_COLORS = 0;
 const ERROR_CLASS_DOES_NOT_EXIST = 1411;
 const SW_SHOW = 5;
@@ -70,6 +72,8 @@ class Win32Window implements Window {
   readonly #hwnd: Deno.PointerObject;
   #bgra = new Uint8Array(0) as Uint8Array<ArrayBuffer>;
   #bmi = new ArrayBuffer(BITMAPINFOHEADER_SIZE);
+  #frameWidth: number | undefined;
+  #frameHeight: number | undefined;
   /** Tracks minimized state so `WM_SIZE` transitions map to a single `visibilitychange` event instead of firing on every resize message. */
   minimized = false;
   #clientWidth: number | undefined;
@@ -181,27 +185,44 @@ class Win32Window implements Window {
     dv.setInt32(28, 0, true); // biYPelsPerMeter
     dv.setUint32(32, 0, true); // biClrUsed
     dv.setUint32(36, 0, true); // biClrImportant
+    this.#frameWidth = width;
+    this.#frameHeight = height;
 
     const hdc = this.lib.user32.symbols.GetDC(this.#hwnd);
     if (hdc == null) throw new Error(this.lib.getLastError());
     try {
-      this.lib.gdi32.symbols.SetDIBitsToDevice(
-        hdc,
-        0,
-        0,
-        width,
-        height,
-        0,
-        0,
-        0,
-        height,
-        bgra,
-        this.#bmi,
-        DIB_RGB_COLORS,
-      );
+      this.#drawFrame(hdc, width, height);
     } finally {
       this.lib.user32.symbols.ReleaseDC(this.#hwnd, hdc);
     }
+  }
+
+  paint(hdc: Deno.PointerObject, left: number, top: number, right: number, bottom: number): void {
+    const width = Math.max(0, right - left);
+    const height = Math.max(0, bottom - top);
+    if (width > 0 && height > 0 && this.lib.gdi32.symbols.PatBlt(hdc, left, top, width, height, BLACKNESS) === 0) {
+      throw new Error("winding(win32): failed to clear the paint region");
+    }
+    if (this.#frameWidth !== undefined && this.#frameHeight !== undefined) {
+      this.#drawFrame(hdc, this.#frameWidth, this.#frameHeight);
+    }
+  }
+
+  #drawFrame(hdc: Deno.PointerObject, width: number, height: number): void {
+    this.lib.gdi32.symbols.SetDIBitsToDevice(
+      hdc,
+      0,
+      0,
+      width,
+      height,
+      0,
+      0,
+      0,
+      height,
+      this.#bgra,
+      this.#bmi,
+      DIB_RGB_COLORS,
+    );
   }
   [Symbol.dispose]() {
     this.close();
@@ -294,6 +315,27 @@ class Win32Library implements Library {
         const inputResult = this.input.handleMessage(win, uMsg, wParam, lParam);
         if (inputResult !== undefined) return inputResult;
         switch (uMsg) {
+          case WM.PAINT: {
+            if (win === undefined) break;
+            const paint = new ArrayBuffer(PAINTSTRUCT_SIZE);
+            const hdc = this.user32.symbols.BeginPaint(hWnd, paint);
+            if (hdc === null) throw new Error("winding(win32): BeginPaint failed");
+            try {
+              const view = new DataView(paint);
+              win.paint(
+                hdc,
+                view.getInt32(12, true),
+                view.getInt32(16, true),
+                view.getInt32(20, true),
+                view.getInt32(24, true),
+              );
+            } finally {
+              if (this.user32.symbols.EndPaint(hWnd, paint) === 0) {
+                throw new Error("winding(win32): EndPaint failed");
+              }
+            }
+            return 0n;
+          }
           case WM.SIZE: {
             if (win === undefined) break;
             const w = Number(BigInt(lParam) & 0xFFFFn);
