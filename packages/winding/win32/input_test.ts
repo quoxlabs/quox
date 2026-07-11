@@ -1,8 +1,8 @@
 import { assert, assertEquals, assertThrows } from "jsr:@std/assert@^1.0.19";
 import {
   AltGraphControlFilter,
-  decodeMouseLParam,
   decodeKeyLParam,
+  decodeMouseLParam,
   isCommitText,
   keyboardModifiers,
   keyboardStateForTranslation,
@@ -13,10 +13,10 @@ import {
   translateLogicalKey,
   validateWin32Geometry,
   VK,
-  Win32MouseCaptureState,
-  Win32MouseTrackingState,
   win32KeyEditDisposition,
   win32KeyIdentity,
+  Win32MouseCaptureState,
+  Win32MouseTrackingState,
   WmCharDecoder,
 } from "./input.ts";
 import {
