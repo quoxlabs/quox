@@ -197,22 +197,9 @@ class X11Window implements Window {
       throw new RangeError("winding(x11): RGBA buffer size does not match its dimensions");
     }
     if (width !== this.#width || height !== this.#height) {
-      const visual = this.lib.X11.symbols.XDefaultVisualOfScreen(this.lib.screen);
-      if (visual === null) throw new Error("winding(x11): failed to get default visual");
-      const depth = this.lib.X11.symbols.XDefaultDepthOfScreen(this.lib.screen);
-      const image = new NativeXImage(
-        this.lib.X11.symbols,
-        this.lib.libc.symbols,
-        this.lib.display,
-        visual,
-        depth,
-        width,
-        height,
+      throw new RangeError(
+        `winding(x11): ${width}x${height} frame does not match ${this.#width}x${this.#height} window`,
       );
-      this.#image.close();
-      this.#image = image;
-      this.#width = width;
-      this.#height = height;
     }
     this.#image.write(rgba);
     this.reblit();
@@ -239,6 +226,17 @@ class X11Window implements Window {
       this.#height,
     );
     this.lib.X11.symbols.XFlush(this.lib.display);
+  }
+
+  updateSize(width: number, height: number): boolean {
+    this.#assertOpen();
+    if (width === this.#width && height === this.#height) return false;
+    const image = this.#createImage(width, height);
+    this.#image.close();
+    this.#image = image;
+    this.#width = width;
+    this.#height = height;
+    return true;
   }
 
   [Symbol.dispose](): void {
@@ -273,6 +271,20 @@ class X11Window implements Window {
 
   #assertOpen(): void {
     if (this.#closed) throw new Error("winding(x11): window is closed");
+  }
+
+  #createImage(width: number, height: number): NativeXImage {
+    const visual = this.lib.X11.symbols.XDefaultVisualOfScreen(this.lib.screen);
+    if (visual === null) throw new Error("winding(x11): failed to get default visual");
+    return new NativeXImage(
+      this.lib.X11.symbols,
+      this.lib.libc.symbols,
+      this.lib.display,
+      visual,
+      this.lib.X11.symbols.XDefaultDepthOfScreen(this.lib.screen),
+      width,
+      height,
+    );
   }
 }
 
@@ -418,7 +430,11 @@ class X11Library implements Library {
       );
 
       const type = view.getInt32(0, true);
-      const windowId = view.getBigUint64(32, true);
+      // XConfigureEvent distinguishes the event recipient from the drawable
+      // whose geometry changed; all other routed events use XAnyEvent.window.
+      const windowId = type === XEventType.ConfigureNotify
+        ? view.getBigUint64(40, true)
+        : view.getBigUint64(32, true);
       const window = this.windows.get(windowId);
 
       const routedKey =
@@ -597,6 +613,13 @@ class X11Library implements Library {
       if (type === XEventType.Expose) {
         window?.reblit();
         continue;
+      }
+
+      if (type === XEventType.ConfigureNotify && window !== undefined) {
+        const width = view.getInt32(56, true);
+        const height = view.getInt32(60, true);
+        if (!window.updateSize(width, height)) continue;
+        return { type: "resize", width, height, window };
       }
 
       const event = importEvent(view, window, this.wmProtocols, this.wmDeleteWindow);
@@ -795,12 +818,6 @@ function importEvent(
         y: view.getInt32(68, true),
         window,
       };
-    case XEventType.ConfigureNotify: {
-      // XConfigureEvent: width at offset 56, height at offset 60.
-      const width = view.getInt32(56, true);
-      const height = view.getInt32(60, true);
-      return { type: "resize", width, height, window };
-    }
     case XEventType.ClientMessage: {
       // XClientMessageEvent: message_type (Atom) at offset 40, data.l[0] at offset 56.
       // Check for WM_DELETE_WINDOW sent via WM_PROTOCOLS.
