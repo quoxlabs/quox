@@ -16,7 +16,7 @@ import {
   XimCaretDirection,
 } from "./xim_preedit.ts";
 import { packRgbaPixels } from "./native_image.ts";
-import { supportsX11Abi } from "./mod.ts";
+import { supportsX11Abi, validateX11Geometry } from "./mod.ts";
 import { selectXimStyles } from "./xim.ts";
 
 Deno.test("X11 logical keys prefer layout-aware printable text", () => {
@@ -31,6 +31,14 @@ Deno.test("X11 rejects layouts its native structure decoder cannot represent", (
   assertEquals(supportsX11Abi("linux", "x86_64", false), false);
   assertEquals(supportsX11Abi("linux", "x86", true), false);
   assertEquals(supportsX11Abi("freebsd", "x86_64", true), false);
+});
+
+Deno.test("X11 validates protocol geometry before native calls", () => {
+  validateX11Geometry(-100, 20, 800, 600);
+  assertThrows(() => validateX11Geometry(0, 0, 0, 1));
+  assertThrows(() => validateX11Geometry(0, 0, 1.5, 1));
+  assertThrows(() => validateX11Geometry(0x8000, 0, 1, 1));
+  assertThrows(() => validateX11Geometry(0, 0, 0x10000, 1));
 });
 
 Deno.test("X11 logical keys use KeySym names for controls and named keys", () => {
@@ -206,4 +214,13 @@ function assertArrayEquals(actual: Uint8Array, expected: readonly number[]): voi
   if (actual.length !== expected.length || actual.some((value, index) => value !== expected[index])) {
     throw new Error(`Expected [${expected.join(", ")}], got [${actual.join(", ")}]`);
   }
+}
+
+function assertThrows(callback: () => void): void {
+  try {
+    callback();
+  } catch {
+    return;
+  }
+  throw new Error("Expected callback to throw");
 }

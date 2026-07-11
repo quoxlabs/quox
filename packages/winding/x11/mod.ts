@@ -67,6 +67,24 @@ const XK_ISO_LEVEL5_SHIFT = 0xfe11n;
 const XKB_USE_CORE_KBD = 0x0100;
 const XKB_KEY_NAMES_MASK = 1 << 9;
 const XKB_ALL_COMPONENTS_MASK = 0x7f;
+const X_ERROR_HANDLER_DEFINITION = {
+  parameters: ["pointer", "pointer"],
+  result: "i32",
+} as const;
+
+export function validateX11Geometry(x: number, y: number, width: number, height: number): void {
+  if (
+    !Number.isInteger(x) || !Number.isInteger(y) || x < -0x8000 || x > 0x7fff || y < -0x8000 || y > 0x7fff
+  ) {
+    throw new RangeError("winding(x11): window position must fit X11 signed 16-bit coordinates");
+  }
+  if (
+    !Number.isInteger(width) || !Number.isInteger(height) ||
+    width <= 0 || height <= 0 || width > 0xffff || height > 0xffff
+  ) {
+    throw new RangeError("winding(x11): window dimensions must be positive X11 16-bit integers");
+  }
+}
 
 class X11Window implements Window {
   readonly id: bigint;
@@ -167,11 +185,13 @@ class X11Window implements Window {
   setImeEnabled(enabled: boolean): void {
     this.#assertOpen();
     this.input.setEnabled(enabled);
+    this.lib.syncAndCheck();
   }
 
   setImeCursorArea(x: number, y: number, width: number, height: number): void {
     this.#assertOpen();
     this.input.setCursorArea(x, y, width, height);
+    this.lib.syncAndCheck();
   }
 
   setImeSurroundingText(text: string, selectionStartBytes: number, selectionEndBytes: number): void {
@@ -198,7 +218,7 @@ class X11Window implements Window {
       titleBytes.length,
     );
     this.lib.X11.symbols.XStoreName(this.lib.display, this.id, latin1CString(normalizedTitle));
-    this.lib.X11.symbols.XFlush(this.lib.display);
+    this.lib.syncAndCheck();
   }
 
   /**
@@ -243,7 +263,7 @@ class X11Window implements Window {
       this.#width,
       this.#height,
     );
-    this.lib.X11.symbols.XFlush(this.lib.display);
+    this.lib.syncAndCheck();
   }
 
   updateSize(width: number, height: number): boolean {
@@ -277,6 +297,17 @@ class X11Window implements Window {
     this.#closed = true;
     this.#releaseNativeResources(false);
     return true;
+  }
+
+  handleDisplayLoss(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.lib.unregisterWindow(this);
+    this.pressedKeys.clear();
+    // XImage destruction is client-local. GC/window destruction would write
+    // to the dead display and must deliberately be abandoned.
+    this.#image.close();
+    this.input.close();
   }
 
   #releaseNativeResources(destroyWindow: boolean): void {
@@ -389,6 +420,9 @@ class X11Library implements Library {
   };
   #domCodes = new Map<number, string>();
   #detectableAutoRepeat = false;
+  #errorCallback: Deno.UnsafeCallback<typeof X_ERROR_HANDLER_DEFINITION> | undefined;
+  #previousErrorHandler: Deno.PointerValue = null;
+  #pendingProtocolError: Error | undefined;
   #closed = false;
   constructor() {
     this.X11 = openX11Library();
@@ -468,10 +502,27 @@ class X11Library implements Library {
       this.X11.close();
       throw error;
     }
+    try {
+      this.#installErrorHandler();
+    } catch (error) {
+      try {
+        this.input.close();
+      } finally {
+        this.X11.symbols.XCloseDisplay(display);
+        this.libc.close();
+        this.X11.close();
+      }
+      throw error;
+    }
   }
   openWindow(x = 0, y = 0, w = 800, h = 600): X11Window {
     if (this.#closed) throw new Error("winding(x11): library is closed");
-    return new X11Window(this, x, y, w, h);
+    this.#ensureDisplayConnection();
+    this.#throwIfProtocolFailed();
+    validateX11Geometry(x, y, w, h);
+    const window = new X11Window(this, x, y, w, h);
+    this.syncAndCheck();
+    return window;
   }
 
   unregisterWindow(window: X11Window): void {
@@ -479,11 +530,19 @@ class X11Library implements Library {
     this.windows.delete(window.id);
     this.#events.purgeWindow(window);
   }
+  syncAndCheck(): void {
+    if (this.#closed) throw new Error("winding(x11): library is closed");
+    this.#ensureDisplayConnection();
+    this.X11.symbols.XSync(this.display, 0);
+    this.#throwIfProtocolFailed();
+  }
   #event = new ArrayBuffer(192);
   #peekEvent = new ArrayBuffer(192);
   event(): UIEvent | undefined {
     if (this.#closed) return undefined;
+    this.#ensureDisplayConnection();
     this.#processInternalConnections();
+    this.#throwIfProtocolFailed();
     this.input.processDeferred();
     this.input.throwIfCallbackFailed();
     const queued = this.#events.shift();
@@ -496,11 +555,15 @@ class X11Library implements Library {
     // caller would stop the outer while-loop in #tick, causing subsequent handled
     // events (e.g. ConfigureNotify after a ReparentNotify) to be delayed by a
     // full tick.
-    while (this.X11.symbols.XPending(this.display) !== 0) {
+    while (true) {
+      const pending = this.X11.symbols.XPending(this.display);
+      this.#throwIfProtocolFailed();
+      if (pending === 0) break;
       this.X11.symbols.XNextEvent(
         this.display,
         eventPointer,
       );
+      this.#throwIfProtocolFailed();
 
       const type = view.getInt32(0, true);
       // XConfigureEvent distinguishes the event recipient from the drawable
@@ -729,6 +792,7 @@ class X11Library implements Library {
       this.X11.symbols.XCloseDisplay(this.display);
     });
     cleanup(() => this.input.afterDisplayClosed());
+    cleanup(() => this.#restoreErrorHandler());
     cleanup(() => this.X11.close());
     cleanup(() => this.libc.close());
     libraryActive = false;
@@ -736,6 +800,85 @@ class X11Library implements Library {
     if (errors.length > 1) {
       throw new AggregateError(errors, "winding(x11): errors while closing library");
     }
+  }
+
+  #installErrorHandler(): void {
+    const callback = new Deno.UnsafeCallback(
+      X_ERROR_HANDLER_DEFINITION,
+      (_display, nativeEvent) => {
+        try {
+          if (nativeEvent === null) {
+            this.#pendingProtocolError ??= new Error("winding(x11): unknown X protocol error");
+            return 0;
+          }
+          const event = new Deno.UnsafePointerView(nativeEvent);
+          const resource = event.getBigUint64(16);
+          const serial = event.getBigUint64(24);
+          const code = event.getUint8(32);
+          const request = event.getUint8(33);
+          const minor = event.getUint8(34);
+          this.#pendingProtocolError ??= new Error(
+            `winding(x11): protocol error ${code} in request ${request}.${minor} ` +
+              `(resource ${resource}, serial ${serial})`,
+          );
+        } catch {
+          this.#pendingProtocolError ??= new Error("winding(x11): malformed X protocol error");
+        }
+        return 0;
+      },
+    );
+    this.#previousErrorHandler = this.X11.symbols.XSetErrorHandler(callback.pointer);
+    this.#errorCallback = callback;
+  }
+
+  #restoreErrorHandler(): void {
+    const callback = this.#errorCallback;
+    if (callback === undefined) return;
+    this.#errorCallback = undefined;
+    this.X11.symbols.XSetErrorHandler(this.#previousErrorHandler);
+    callback.close();
+  }
+
+  #throwIfProtocolFailed(): void {
+    const error = this.#pendingProtocolError;
+    if (error === undefined) return;
+    this.#pendingProtocolError = undefined;
+    try {
+      this.close();
+    } catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], "winding(x11): protocol failure during cleanup");
+    }
+    throw error;
+  }
+
+  #ensureDisplayConnection(): void {
+    const pollBuffer = new ArrayBuffer(8);
+    const pollView = new DataView(pollBuffer);
+    pollView.setInt32(0, this.X11.symbols.XConnectionNumber(this.display), true);
+    pollView.setInt16(4, 0x19, true); // POLLIN | POLLERR | POLLHUP
+    if (this.libc.symbols.poll(pollBuffer, 1n, 0) < 0) return;
+    if ((pollView.getInt16(6, true) & 0x38) === 0) return; // POLLERR | POLLHUP | POLLNVAL
+    const error = new Error("winding(x11): display connection was closed");
+    const cleanupErrors: unknown[] = [];
+    const cleanup = (operation: () => void): void => {
+      try {
+        operation();
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError);
+      }
+    };
+    this.#closed = true;
+    this.#events.close();
+    cleanup(() => this.input.abandonDisplay());
+    for (const window of [...this.windows.values()]) cleanup(() => window.handleDisplayLoss());
+    cleanup(() => this.#restoreErrorHandler());
+    cleanup(() => this.X11.close());
+    cleanup(() => this.libc.close());
+    libraryActive = false;
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError([error, ...cleanupErrors], "winding(x11): display loss cleanup failed");
+    }
+    throw error;
   }
 
   #refreshModifierMapping(): void {
@@ -861,7 +1004,9 @@ class X11Library implements Library {
 
   #isAutoRepeatRelease(release: DataView<ArrayBuffer>): boolean {
     if (this.#detectableAutoRepeat) return false;
-    if (this.X11.symbols.XPending(this.display) === 0) return false;
+    const pending = this.X11.symbols.XPending(this.display);
+    this.#throwIfProtocolFailed();
+    if (pending === 0) return false;
     const peekPointer = Deno.UnsafePointer.of(this.#peekEvent)!;
     this.X11.symbols.XPeekEvent(this.display, peekPointer);
     const press = new DataView(this.#peekEvent);

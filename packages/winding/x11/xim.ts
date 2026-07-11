@@ -585,6 +585,17 @@ export class XimManager implements Disposable {
     this.#instantiateRegistered = false;
   }
 
+  /** Tear down only client-side state after the server connection is already unusable. */
+  abandonDisplay(): void {
+    if (this.#closed) return;
+    this.#serverDestroyed = true;
+    this.#instantiateRegistered = false;
+    this.#im = null;
+    for (const context of this.#contexts) context.invalidateFromServer();
+    this.close();
+    this.afterDisplayClosed();
+  }
+
   #closeDestroyCallback(): void {
     if (this.#destroyCallbackClosed) return;
     this.#destroyCallbackClosed = true;
