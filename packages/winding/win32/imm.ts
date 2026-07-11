@@ -162,9 +162,19 @@ export function withImeContext<Context, Result>(
 ): Result | undefined {
   const context = acquire();
   if (context === null || context === undefined) return undefined;
+  let result: Result | undefined;
+  const errors: unknown[] = [];
   try {
-    return callback(context);
-  } finally {
-    release(context);
+    result = callback(context);
+  } catch (error) {
+    errors.push(error);
   }
+  try {
+    release(context);
+  } catch (error) {
+    errors.push(error);
+  }
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) throw new AggregateError(errors, "IME context operation and release both failed");
+  return result;
 }

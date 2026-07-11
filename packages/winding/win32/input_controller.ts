@@ -85,6 +85,7 @@ interface WindowInputState {
   readonly activation: ImeActivationState;
   readonly association: Win32ImeAssociationState;
   readonly composition: CompositionState;
+  nativeCompositionDirty: boolean;
   cursorArea?: ImeCursorArea;
   surroundingText?: {
     text: string;
@@ -147,6 +148,7 @@ export class Win32InputController {
       activation: new ImeActivationState(),
       association: new Win32ImeAssociationState(),
       composition: new CompositionState(),
+      nativeCompositionDirty: false,
       logicalKeys: new PressedLogicalKeyCache<string>(),
       altGraphTextKeys: new Set<string>(),
       altGraphControlFilter: new AltGraphControlFilter(),
@@ -157,10 +159,11 @@ export class Win32InputController {
     try {
       // WM_CHAR remains available without an associated IMM context; native
       // composition is opt-in and is reconciled when the focused editor asks.
-      state.association.reconcile(
+      const disassociated = state.association.reconcile(
         false,
         () => this.#imm32.symbols.ImmAssociateContextEx(window.hwnd, null, 0) !== 0,
       );
+      if (!disassociated) throw new Error("winding(win32): failed to disassociate the initial HIMC");
       state.activation.setAvailable(true);
     } catch (error) {
       this.#states.delete(window);
@@ -174,15 +177,17 @@ export class Win32InputController {
     const errors: unknown[] = [];
     if (state.composition.active) {
       try {
-        this.#withImeContext(window, (context) => {
-          this.#imm32.symbols.ImmNotifyIME(context, NI_COMPOSITIONSTR, CPS_CANCEL, 0);
-        });
+        this.#cancelComposition(window, state);
       } catch (error) {
         errors.push(error);
       }
     }
     try {
-      this.#imm32.symbols.ImmAssociateContextEx(window.hwnd, null, 0);
+      if (this.#imm32.symbols.ImmAssociateContextEx(window.hwnd, null, 0) === 0) {
+        throw new Error("winding(win32): failed to disassociate HIMC during detach");
+      }
+      state.association.reconcile(false, () => true);
+      state.nativeCompositionDirty = false;
     } catch (error) {
       errors.push(error);
     }
@@ -199,11 +204,13 @@ export class Win32InputController {
 
   setImeEnabled(window: Win32InputWindow, enabled: boolean): void {
     const state = this.#state(window);
+    const errors: unknown[] = [];
     if (state.activation.desired !== enabled) {
-      if (!enabled) this.#cancelComposition(window, state);
+      if (!enabled) captureError(errors, () => this.#cancelComposition(window, state));
       state.activation.setDesired(enabled);
     }
-    this.#reconcileIme(window, state);
+    captureError(errors, () => this.#reconcileIme(window, state));
+    throwCollected(errors, "Failed to change Win32 IME state");
   }
 
   setImeCursorArea(window: Win32InputWindow, x: number, y: number, width: number, height: number): void {
@@ -241,13 +248,15 @@ export class Win32InputController {
       this.#reconcileIme(window, state);
       return;
     }
-    this.#cancelComposition(window, state);
+    const errors: unknown[] = [];
+    captureError(errors, () => this.#cancelComposition(window, state));
     state.activation.setFocused(false);
-    this.#reconcileIme(window, state);
+    captureError(errors, () => this.#reconcileIme(window, state));
     state.logicalKeys.clear();
     state.altGraphTextKeys.clear();
     state.altGraphControlFilter.reset();
     this.#enqueue({ type: "blur", window });
+    throwCollected(errors, "Failed to blur Win32 IME state");
   }
 
   /** Queue IME-owning sent-message work while TranslateMessage has the IME on its stack. */
@@ -393,16 +402,18 @@ export class Win32InputController {
         return undefined;
       case WM.IME_SETCONTEXT:
         if (window !== undefined && state !== undefined) {
+          const errors: unknown[] = [];
           const activating = BigInt(wParam) !== 0n;
           if (activating && state.activation.desired) {
-            this.#reconcileIme(window, state);
-            this.#applyImeCursorArea(window, state);
+            captureError(errors, () => this.#reconcileIme(window, state));
           } else if (!activating) {
-            this.#cancelComposition(window, state);
+            captureError(errors, () => this.#cancelComposition(window, state));
             this.#setImeActive(window, state, false);
-            this.#reconcileImeAssociation(window, state);
+            captureError(errors, () => this.#reconcileImeAssociation(window, state));
           }
-          return replayed ? 0n : this.#forwardImeSetContext(window, state, message, wParam, lParam);
+          const result = replayed ? 0n : this.#forwardImeSetContext(window, state, message, wParam, lParam);
+          throwCollected(errors, "Failed to reconcile WM_IME_SETCONTEXT");
+          return result;
         }
         return undefined;
       case WM.IME_REQUEST:
@@ -780,7 +791,9 @@ export class Win32InputController {
     return withImeContext(
       () => this.#imm32.symbols.ImmGetContext(window.hwnd),
       (context) => {
-        this.#imm32.symbols.ImmReleaseContext(window.hwnd, context);
+        if (this.#imm32.symbols.ImmReleaseContext(window.hwnd, context) === 0) {
+          throw new Error("winding(win32): ImmReleaseContext failed");
+        }
       },
       callback,
     );
@@ -874,35 +887,72 @@ export class Win32InputController {
   }
 
   #reconcileImeAssociation(window: Win32InputWindow, state: WindowInputState): void {
-    state.association.reconcile(
-      state.activation.shouldBeActive,
-      (associate) =>
-        this.#imm32.symbols.ImmAssociateContextEx(
-          window.hwnd,
-          null,
-          associate ? IACE_DEFAULT : 0,
-        ) !== 0,
-    );
+    const apply = (associate: boolean) => {
+      const changed = this.#imm32.symbols.ImmAssociateContextEx(
+        window.hwnd,
+        null,
+        associate ? IACE_DEFAULT : 0,
+      ) !== 0;
+      if (changed && !associate) state.nativeCompositionDirty = false;
+      return changed;
+    };
+    if (state.nativeCompositionDirty && !state.association.associated) {
+      state.nativeCompositionDirty = false;
+    }
+    if (
+      state.activation.shouldBeActive && state.nativeCompositionDirty &&
+      !state.association.reconcile(false, apply)
+    ) {
+      throw new Error("winding(win32): failed to clean a dirty HIMC association");
+    }
+    if (!state.association.reconcile(state.activation.shouldBeActive, apply)) {
+      throw new Error(
+        state.activation.shouldBeActive
+          ? "winding(win32): failed to associate the HIMC"
+          : "winding(win32): failed to disassociate the HIMC",
+      );
+    }
+    if (!state.association.associated) state.nativeCompositionDirty = false;
   }
 
   #cancelComposition(window: Win32InputWindow, state: WindowInputState): void {
+    let cancelError: Error | undefined;
     if (state.composition.active) {
-      this.#withImeContext(window, (context) => {
-        this.#imm32.symbols.ImmNotifyIME(context, NI_COMPOSITIONSTR, CPS_CANCEL, 0);
-      });
+      try {
+        const contextUsed = this.#withImeContext(window, (context) => {
+          if (this.#imm32.symbols.ImmNotifyIME(context, NI_COMPOSITIONSTR, CPS_CANCEL, 0) === 0) {
+            throw new Error("winding(win32): ImmNotifyIME cancellation failed");
+          }
+          return true;
+        });
+        if (contextUsed !== true) throw new Error("winding(win32): no HIMC was available for cancellation");
+        state.nativeCompositionDirty = false;
+      } catch (error) {
+        state.nativeCompositionDirty = true;
+        cancelError = error instanceof Error ? error : new Error(String(error));
+      }
     }
     this.#flushCharDecoder(window, state);
     this.#queuePreedit(window, state.composition.cancel());
     state.resultEcho.clear();
+    if (cancelError !== undefined) throw cancelError;
   }
 
   #applyImeCursorArea(window: Win32InputWindow, state: WindowInputState): void {
     const rectangle = state.cursorArea;
     if (rectangle === undefined) return;
-    this.#withImeContext(window, (context) => {
-      this.#imm32.symbols.ImmSetCandidateWindow(context, encodeCandidateForm(rectangle));
-      this.#imm32.symbols.ImmSetCompositionWindow(context, encodeCompositionForm(rectangle));
+    const applied = this.#withImeContext(window, (context) => {
+      const errors: unknown[] = [];
+      if (this.#imm32.symbols.ImmSetCandidateWindow(context, encodeCandidateForm(rectangle)) === 0) {
+        errors.push(new Error("winding(win32): ImmSetCandidateWindow failed"));
+      }
+      if (this.#imm32.symbols.ImmSetCompositionWindow(context, encodeCompositionForm(rectangle)) === 0) {
+        errors.push(new Error("winding(win32): ImmSetCompositionWindow failed"));
+      }
+      throwCollected(errors, "Failed to position Win32 IME windows");
+      return true;
     });
+    if (applied !== true) throw new Error("winding(win32): no HIMC was available for IME placement");
   }
 
   #clientPointToScreen(window: Win32InputWindow, x: number, y: number): { x: number; y: number } | undefined {
@@ -988,4 +1038,12 @@ function createWin32KeyEvent(
 function throwCollected(errors: unknown[], message: string): void {
   if (errors.length === 1) throw errors[0];
   if (errors.length > 1) throw new AggregateError(errors, message);
+}
+
+function captureError(errors: unknown[], operation: () => void): void {
+  try {
+    operation();
+  } catch (error) {
+    errors.push(error);
+  }
 }

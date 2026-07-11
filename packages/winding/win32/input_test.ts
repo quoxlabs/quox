@@ -34,6 +34,8 @@ import {
   utf16CursorRangeToUtf8,
   withImeContext,
 } from "./imm.ts";
+import { imm32functions, user32functions, WM } from "./ffi.ts";
+import { Win32InputController, type Win32InputWindow } from "./input_controller.ts";
 import {
   ImeActivationState,
   keyLocationForCode,
@@ -121,6 +123,66 @@ Deno.test("Win32 HIMC association remains independent across SETCONTEXT and focu
   assertEquals(secondTransitions, [false]);
   assertEquals(secondAssociation.associated, false);
   assertEquals(focusFirst.active, false);
+});
+
+Deno.test("Win32 HIMC association advances only after confirmed native success", () => {
+  const association = new Win32ImeAssociationState(true);
+  const attempts: boolean[] = [];
+  assertEquals(
+    association.reconcile(false, (next) => {
+      attempts.push(next);
+      return false;
+    }),
+    false,
+  );
+  assertEquals(association.associated, true);
+  assertEquals(
+    association.reconcile(false, (next) => {
+      attempts.push(next);
+      return true;
+    }),
+    true,
+  );
+  assertEquals(attempts, [false, false]);
+  assertEquals(association.associated, false);
+});
+
+Deno.test("Win32 input rejects failed initial disassociation", () => {
+  const harness = createInputControllerHarness({ associateResults: [0] });
+  assertThrows(() => harness.controller.attach(harness.window), Error, "initial HIMC");
+  assertEquals(harness.calls.associationFlags, [0]);
+});
+
+Deno.test("Win32 input reports both failed IME placement operations", () => {
+  const harness = createInputControllerHarness({ candidateResult: 0, compositionResult: 0 });
+  harness.controller.attach(harness.window);
+  harness.controller.observeNativeFocus(harness.window, true);
+  harness.controller.setImeCursorArea(harness.window, 1, 2, 3, 4);
+  assertThrows(() => harness.controller.setImeEnabled(harness.window, true), AggregateError);
+  assertEquals(harness.calls.candidatePlacements, 1);
+  assertEquals(harness.calls.compositionPlacements, 1);
+  assertEquals(harness.calls.releases, 1);
+});
+
+Deno.test("Win32 input recovers association after native cancellation failure", () => {
+  const harness = createInputControllerHarness({ notifyResult: 0 });
+  harness.controller.attach(harness.window);
+  harness.controller.observeNativeFocus(harness.window, true);
+  harness.controller.setImeEnabled(harness.window, true);
+  assertEquals(harness.controller.handleMessage(harness.window, WM.IME_STARTCOMPOSITION, 0n, 0n), 0n);
+  assertThrows(() => harness.controller.setImeEnabled(harness.window, false), Error, "cancellation failed");
+  assertEquals(harness.calls.notifications, 1);
+  assertEquals(harness.calls.associationFlags.at(-1), 0);
+});
+
+Deno.test("Win32 input reports context release failure", () => {
+  const harness = createInputControllerHarness({ releaseResult: 0 });
+  harness.controller.attach(harness.window);
+  harness.controller.observeNativeFocus(harness.window, true);
+  harness.controller.setImeEnabled(harness.window, true);
+  assertEquals(harness.controller.handleMessage(harness.window, WM.IME_STARTCOMPOSITION, 0n, 0n), 0n);
+  assertThrows(() => harness.controller.setImeEnabled(harness.window, false), Error, "ImmReleaseContext failed");
+  assertEquals(harness.calls.releases, 1);
 });
 
 Deno.test("prepared Win32 keys match the complete native message identity", () => {
@@ -578,6 +640,34 @@ Deno.test("IME context helper releases exactly once after success or failure", (
   assertEquals(releases, 2);
 });
 
+Deno.test("IME context helper reports release failure without hiding operation failure", () => {
+  assertThrows(
+    () =>
+      withImeContext(
+        () => ({ id: 1 }),
+        () => {
+          throw new Error("release failed");
+        },
+        () => "done",
+      ),
+    Error,
+    "release failed",
+  );
+  assertThrows(
+    () =>
+      withImeContext(
+        () => ({ id: 2 }),
+        () => {
+          throw new Error("release failed");
+        },
+        () => {
+          throw new Error("operation failed");
+        },
+      ),
+    AggregateError,
+  );
+});
+
 interface KeyLParamOptions {
   repeatCount?: number;
   extended?: boolean;
@@ -619,4 +709,68 @@ function utf16Le(text: string): Uint8Array {
   const view = new DataView(bytes.buffer);
   for (let index = 0; index < text.length; index++) view.setUint16(index * 2, text.charCodeAt(index), true);
   return bytes;
+}
+
+interface FakeImmBehavior {
+  associateResults?: number[];
+  candidateResult?: number;
+  compositionResult?: number;
+  notifyResult?: number;
+  releaseResult?: number;
+}
+
+function createInputControllerHarness(behavior: FakeImmBehavior = {}) {
+  const hwnd = {} as Deno.PointerObject;
+  const context = {} as Deno.PointerObject;
+  const calls = {
+    associationFlags: [] as number[],
+    candidatePlacements: 0,
+    compositionPlacements: 0,
+    notifications: 0,
+    releases: 0,
+  };
+  const user32 = {
+    symbols: {
+      DefWindowProcW: () => 0n,
+    },
+  } as unknown as Deno.DynamicLibrary<typeof user32functions>;
+  const imm32 = {
+    symbols: {
+      ImmAssociateContextEx(_window: unknown, _context: unknown, flags: number) {
+        calls.associationFlags.push(flags);
+        return behavior.associateResults?.shift() ?? 1;
+      },
+      ImmGetContext: () => context,
+      ImmReleaseContext() {
+        calls.releases++;
+        return behavior.releaseResult ?? 1;
+      },
+      ImmNotifyIME() {
+        calls.notifications++;
+        return behavior.notifyResult ?? 1;
+      },
+      ImmSetCandidateWindow() {
+        calls.candidatePlacements++;
+        return behavior.candidateResult ?? 1;
+      },
+      ImmSetCompositionWindow() {
+        calls.compositionPlacements++;
+        return behavior.compositionResult ?? 1;
+      },
+      ImmGetCompositionStringW: () => 0,
+    },
+  } as unknown as Deno.DynamicLibrary<typeof imm32functions>;
+  const window: Win32InputWindow = {
+    id: 1n,
+    hwnd,
+    close() {},
+    setTitle() {},
+    blit() {},
+    setImeEnabled() {},
+    setImeSurroundingText() {},
+    setImeCursorArea() {},
+    [Symbol.dispose]() {},
+  };
+  const controller = new Win32InputController(user32, imm32, () => {}, (id) => id === window.id ? window : undefined);
+  return { calls, controller, window };
 }
