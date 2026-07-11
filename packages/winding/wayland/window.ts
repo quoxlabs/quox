@@ -7,6 +7,7 @@ import {
   type AnyCallback,
   args,
   collectCleanupError,
+  FRACTIONAL_SCALE_EVENT_SIGNATURES,
   hasXdgToplevelState,
   makeVtable,
   type NativeCallbackHost,
@@ -39,6 +40,12 @@ import {
   type WaylandOutputScaleSnapshot,
   WaylandSurfaceOutputScaleState,
 } from "./output.ts";
+import {
+  type WaylandFractionalScaleChildGeneration,
+  WaylandFractionalScaleLifecycle,
+  type WaylandFractionalScaleManagerPair,
+  WaylandFractionalSurfaceOwnership,
+} from "./fractional_scale.ts";
 
 export const DEFAULT_WAYLAND_APP_ID = "winding";
 
@@ -84,6 +91,7 @@ export interface WaylandConfiguration {
   readonly devicePixelRatio: number;
   readonly suspended: boolean;
   readonly frameToken: number;
+  readonly fractionalScaleNumerator?: number;
 }
 
 export interface CompletedWaylandConfiguration {
@@ -158,19 +166,124 @@ export class WaylandConfigureState {
     const framebufferWidth = configuration.width * scale;
     const framebufferHeight = configuration.height * scale;
     if (
+      configuration.fractionalScaleNumerator === undefined &&
       configuration.devicePixelRatio === scale &&
       configuration.framebufferWidth === framebufferWidth &&
       configuration.framebufferHeight === framebufferHeight
     ) return configuration;
     if (advanceFrameToken) this.#nextFrameToken++;
+    const { fractionalScaleNumerator: _fractionalScaleNumerator, ...unscaled } = configuration;
     return {
-      ...configuration,
+      ...unscaled,
       framebufferWidth,
       framebufferHeight,
       devicePixelRatio: scale,
       frameToken: advanceFrameToken ? this.#nextFrameToken : configuration.frameToken,
     };
   }
+
+  applyFractionalScale(
+    configuration: WaylandConfiguration,
+    framebufferWidth: number,
+    framebufferHeight: number,
+    devicePixelRatio: number,
+    numerator: number,
+    advanceFrameToken: boolean,
+  ): WaylandConfiguration {
+    if (
+      configuration.devicePixelRatio === devicePixelRatio &&
+      configuration.framebufferWidth === framebufferWidth &&
+      configuration.framebufferHeight === framebufferHeight &&
+      configuration.fractionalScaleNumerator === numerator
+    ) return configuration;
+    if (advanceFrameToken) this.#nextFrameToken++;
+    return {
+      ...configuration,
+      framebufferWidth,
+      framebufferHeight,
+      devicePixelRatio,
+      frameToken: advanceFrameToken ? this.#nextFrameToken : configuration.frameToken,
+      fractionalScaleNumerator: numerator,
+    };
+  }
+}
+
+export function selectWaylandConfigurationScale(
+  configureState: WaylandConfigureState,
+  configuration: WaylandConfiguration,
+  fractionalScale: WaylandFractionalScaleLifecycle,
+  outputScale: WaylandSurfaceOutputScaleState | undefined,
+  advanceFrameToken: boolean,
+): WaylandConfiguration {
+  const fractionalSize = fractionalScale.framebufferSize(
+    configuration.width,
+    configuration.height,
+    (size) => {
+      try {
+        validateWaylandShmLayout(size.width, size.height);
+        return true;
+      } catch {
+        return false;
+      }
+    },
+  );
+  if (fractionalSize !== undefined) {
+    return configureState.applyFractionalScale(
+      configuration,
+      fractionalSize.width,
+      fractionalSize.height,
+      fractionalSize.devicePixelRatio,
+      fractionalSize.numerator,
+      advanceFrameToken,
+    );
+  }
+  const scale = outputScale?.effectiveScale((candidate) => {
+    try {
+      validateWaylandShmLayout(configuration.width * candidate, configuration.height * candidate);
+      return true;
+    } catch {
+      return false;
+    }
+  }) ?? 1;
+  return configureState.applyScale(configuration, scale, advanceFrameToken);
+}
+
+export function createInitialWaylandBlackFrame(configuration: WaylandConfiguration): Uint8Array {
+  return createOpaqueBlackFrame(configuration.framebufferWidth, configuration.framebufferHeight);
+}
+
+export function dispatchWaylandWindowCallbackIfOpen(closed: boolean, callback: () => void): boolean {
+  if (closed) return false;
+  callback();
+  return true;
+}
+
+/** Remove public/native routing before an optional child destructor can strand the owner. */
+export function teardownWaylandWindowChildrenAfterUnregister(
+  registered: boolean,
+  markUnregistered: () => void,
+  unregister: () => void,
+  teardownChildren: () => boolean,
+  reportError: (error: unknown) => void,
+): boolean {
+  if (registered) {
+    markUnregistered();
+    try {
+      unregister();
+    } catch (error) {
+      reportError(error);
+    }
+  }
+  return teardownChildren();
+}
+
+export function teardownWaylandOptionalWindowChildren(
+  teardownDecoration: () => boolean,
+  teardownFractionalScale: () => boolean,
+): boolean {
+  const decorationDestroyed = teardownDecoration();
+  const fractionalScaleDestroyed = teardownFractionalScale();
+  return decorationDestroyed && fractionalScaleDestroyed;
 }
 
 export interface WaylandWindowHost extends NativeCallbackHost, WaylandShmHost {
@@ -179,7 +292,10 @@ export interface WaylandWindowHost extends NativeCallbackHost, WaylandShmHost {
   readonly xdgSurfaceIface: Deno.PointerObject;
   readonly xdgToplevelIface: Deno.PointerObject;
   readonly zxdgToplevelDecorationIface: Deno.PointerObject;
+  readonly wpFractionalScaleIface: Deno.PointerObject;
+  readonly wpViewportIface: Deno.PointerObject;
   readonly decorationManager: WaylandDecorationManagerBinding<Deno.PointerObject> | undefined;
+  readonly fractionalScaleManagers: WaylandFractionalScaleManagerPair<Deno.PointerObject> | undefined;
   readonly ifaces: {
     readonly surface: Deno.PointerObject;
     readonly shmPool: Deno.PointerObject;
@@ -218,6 +334,14 @@ export class WaylandWindow implements Window {
   #decorationConfigure: AnyCallback | null = null;
   #decorationVtable: BigUint64Array<ArrayBuffer> | undefined;
   readonly #decorationLifecycle = new WaylandDecorationLifecycle();
+  readonly #fractionalScaleOwnership = new WaylandFractionalSurfaceOwnership<
+    Deno.PointerObject,
+    AnyCallback,
+    BigUint64Array<ArrayBuffer>,
+    WaylandWindow
+  >(this);
+  #fractionalScaleGeneration: WaylandFractionalScaleChildGeneration | undefined;
+  readonly #fractionalScaleLifecycle = new WaylandFractionalScaleLifecycle();
   readonly #shmBuffer: WaylandShmBuffer;
   readonly #configureState: WaylandConfigureState;
   #surfaceOutputScale: WaylandSurfaceOutputScaleState | undefined;
@@ -270,6 +394,7 @@ export class WaylandWindow implements Window {
       if (!this.#xdgToplevel) throw new Error("winding failed to create xdg_toplevel");
 
       this.#setupListeners();
+      this.tryCreateFractionalScale();
       this.setTitle("winding");
       lib.registerWindow(this.#surface, this);
       this.#registered = true;
@@ -300,7 +425,7 @@ export class WaylandWindow implements Window {
       if (!configuration) throw new Error("winding Wayland compositor did not send an initial configure");
       this.#abandonUnconfiguredInitialDecoration();
       this.#present(
-        createOpaqueBlackFrame(configuration.framebufferWidth, configuration.framebufferHeight),
+        createInitialWaylandBlackFrame(configuration),
         configuration.framebufferWidth,
         configuration.framebufferHeight,
         configuration,
@@ -350,7 +475,10 @@ export class WaylandWindow implements Window {
       const configure = new Deno.UnsafeCallback(
         { parameters: ["pointer", "pointer", "u32"], result: "void" },
         this.lib.guardCallback((_data, _decoration, mode) => {
-          this.#decorationLifecycle.configure(generation, mode);
+          dispatchWaylandWindowCallbackIfOpen(
+            this.#closed,
+            () => this.#decorationLifecycle.configure(generation, mode),
+          );
         }),
       );
       this.#decorationConfigure = configure;
@@ -373,6 +501,65 @@ export class WaylandWindow implements Window {
       );
     } catch {
       this.#cleanupDecoration([]);
+    }
+  }
+
+  tryCreateFractionalScale(): void {
+    if (this.#closed || !this.#surface) return;
+    const managers = this.lib.fractionalScaleManagers;
+    if (managers === undefined) return;
+    const generation = this.#fractionalScaleLifecycle.begin(managers);
+    if (generation === undefined) return;
+    this.#fractionalScaleGeneration = generation;
+
+    try {
+      const symbols = this.lib.wl.symbols;
+      const fractionalScale = symbols.wl_proxy_marshal_array_flags(
+        managers.fractionalScale.manager,
+        WlOp.WP_FRACTIONAL_SCALE_MANAGER_GET_FRACTIONAL_SCALE,
+        this.lib.wpFractionalScaleIface,
+        managers.fractionalScale.version,
+        0,
+        args(0n, Deno.UnsafePointer.value(this.#surface)),
+      );
+      if (!fractionalScale) throw new Error("winding could not create optional Wayland fractional scale");
+      this.#fractionalScaleOwnership.installFractionalScaleProxy(fractionalScale);
+
+      const preferred = new Deno.UnsafeCallback(
+        { parameters: ["pointer", "pointer", "u32"], result: "void" },
+        this.lib.guardCallback((_data, _fractionalScale, numerator) => {
+          if (this.#closed || !this.#fractionalScaleLifecycle.prefer(generation, numerator)) return;
+          this.#reconcileOutputScale();
+        }),
+      );
+      this.#fractionalScaleOwnership.installPreferredCallback(preferred);
+      const vtable = makeVtable(
+        [preferred],
+        FRACTIONAL_SCALE_EVENT_SIGNATURES,
+        this.lib.noops,
+      );
+      this.#fractionalScaleOwnership.installVtable(vtable);
+      if (symbols.wl_proxy_add_listener(fractionalScale, Deno.UnsafePointer.of(vtable), null) !== 0) {
+        throw new Error("winding could not listen to optional Wayland fractional scale");
+      }
+
+      const viewport = symbols.wl_proxy_marshal_array_flags(
+        managers.viewporter.manager,
+        WlOp.WP_VIEWPORTER_GET_VIEWPORT,
+        this.lib.wpViewportIface,
+        managers.viewporter.version,
+        0,
+        args(0n, Deno.UnsafePointer.value(this.#surface)),
+      );
+      if (!viewport) throw new Error("winding could not create optional Wayland viewport");
+      this.#fractionalScaleOwnership.installViewport(viewport);
+      if (!this.#fractionalScaleLifecycle.activate(generation)) {
+        throw new Error("winding could not activate optional Wayland fractional scale");
+      }
+    } catch {
+      // Both extensions are optional. Safely unwind whatever was created and retain any
+      // unconfirmed proxy/listener ownership rather than poisoning the core integer path.
+      this.#cleanupFractionalScale([]);
     }
   }
 
@@ -401,15 +588,13 @@ export class WaylandWindow implements Window {
     configuration: WaylandConfiguration,
     advanceFrameToken: boolean,
   ): WaylandConfiguration {
-    const scale = this.#surfaceOutputScale?.effectiveScale((candidate) => {
-      try {
-        validateWaylandShmLayout(configuration.width * candidate, configuration.height * candidate);
-        return true;
-      } catch {
-        return false;
-      }
-    }) ?? 1;
-    return this.#configureState.applyScale(configuration, scale, advanceFrameToken);
+    return selectWaylandConfigurationScale(
+      this.#configureState,
+      configuration,
+      this.#fractionalScaleLifecycle,
+      this.#surfaceOutputScale,
+      advanceFrameToken,
+    );
   }
 
   #emitResize(configuration: WaylandConfiguration): void {
@@ -469,17 +654,19 @@ export class WaylandWindow implements Window {
     this.#xdgSurfaceConfigure = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer", "u32"], result: "void" },
       this.lib.guardCallback((_data, _surface, serial) => {
-        const completed = this.#configureState.complete(serial);
-        const configuration = this.#configurationWithCurrentScale(completed.configuration, false);
-        this.#configuration = configuration;
-        this.#emitResize(configuration);
-        if (completed.visibilityChanged) {
-          this.lib.pushEvent({
-            type: "visibilitychange",
-            visible: !configuration.suspended,
-            window: this,
-          });
-        }
+        dispatchWaylandWindowCallbackIfOpen(this.#closed, () => {
+          const completed = this.#configureState.complete(serial);
+          const configuration = this.#configurationWithCurrentScale(completed.configuration, false);
+          this.#configuration = configuration;
+          this.#emitResize(configuration);
+          if (completed.visibilityChanged) {
+            this.lib.pushEvent({
+              type: "visibilitychange",
+              visible: !configuration.suspended,
+              window: this,
+            });
+          }
+        });
       }),
     );
     this.#surfaceVtable = makeVtable(
@@ -498,13 +685,20 @@ export class WaylandWindow implements Window {
     this.#toplevelConfigure = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer", "i32", "i32", "pointer"], result: "void" },
       this.lib.guardCallback((_data, _toplevel, width, height, states) => {
-        const suspended = hasXdgToplevelState(states, SUSPENDED_TOPLEVEL_STATE);
-        this.#configureState.stageToplevel(width, height, suspended);
+        dispatchWaylandWindowCallbackIfOpen(this.#closed, () => {
+          const suspended = hasXdgToplevelState(states, SUSPENDED_TOPLEVEL_STATE);
+          this.#configureState.stageToplevel(width, height, suspended);
+        });
       }),
     );
     this.#toplevelClose = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer"], result: "void" },
-      this.lib.guardCallback(() => this.lib.pushEvent({ type: "close", window: this })),
+      this.lib.guardCallback(() => {
+        dispatchWaylandWindowCallbackIfOpen(
+          this.#closed,
+          () => this.lib.pushEvent({ type: "close", window: this }),
+        );
+      }),
     );
     this.#toplevelVtable = makeVtable(
       [this.#toplevelConfigure, this.#toplevelClose],
@@ -617,6 +811,10 @@ export class WaylandWindow implements Window {
       configuration.height,
       configuration.framebufferWidth,
       configuration.framebufferHeight,
+      {
+        viewportAvailable: this.#fractionalScaleOwnership.viewport !== null,
+        fractionalScaleNumerator: configuration.fractionalScaleNumerator,
+      },
     );
     for (const request of requests) {
       switch (request.kind) {
@@ -630,6 +828,19 @@ export class WaylandWindow implements Window {
             args(BigInt(request.scale)),
           );
           break;
+        case "set-viewport-destination": {
+          const viewport = this.#fractionalScaleOwnership.viewport;
+          if (!viewport) break;
+          symbols.wl_proxy_marshal_array_flags(
+            viewport,
+            WlOp.WP_VIEWPORT_SET_DESTINATION,
+            null,
+            symbols.wl_proxy_get_version(viewport),
+            0,
+            args(BigInt(request.width), BigInt(request.height)),
+          );
+          break;
+        }
         case "attach":
           symbols.wl_proxy_marshal_array_flags(
             this.#surface,
@@ -684,6 +895,48 @@ export class WaylandWindow implements Window {
     this.#cleanupDecoration([]);
   }
 
+  #cleanupFractionalScale(errors: unknown[]): boolean {
+    const symbols = this.lib.wl.symbols;
+    const destroyed = this.#fractionalScaleOwnership.cleanup({
+      destroyViewport: (proxy) => {
+        symbols.wl_proxy_marshal_array_flags(
+          proxy,
+          WlOp.WP_VIEWPORT_DESTROY,
+          null,
+          symbols.wl_proxy_get_version(proxy),
+          WL_MARSHAL_FLAG_DESTROY,
+          args(),
+        );
+      },
+      destroyFractionalScale: (proxy) => {
+        symbols.wl_proxy_marshal_array_flags(
+          proxy,
+          WlOp.WP_FRACTIONAL_SCALE_DESTROY,
+          null,
+          symbols.wl_proxy_get_version(proxy),
+          WL_MARSHAL_FLAG_DESTROY,
+          args(),
+        );
+      },
+      closeCallback: (callback) => callback.close(),
+      retainCallback: (callback) => this.lib.retainNativeCallbackRoot(callback),
+      releaseCallback: (callback) => this.lib.releaseNativeCallbackRoot(callback),
+      retainOwnershipRoot: (root) => this.lib.retainNativeResourceRoot(root),
+      releaseOwnershipRoot: (root) => this.lib.releaseNativeResourceRoot(root),
+      reportError: (error) => errors.push(error),
+    });
+
+    const generation = this.#fractionalScaleGeneration;
+    if (destroyed) {
+      this.#fractionalScaleGeneration = undefined;
+      if (generation !== undefined) this.#fractionalScaleLifecycle.finish(generation);
+      return true;
+    }
+
+    if (generation !== undefined) this.#fractionalScaleLifecycle.disable(generation);
+    return false;
+  }
+
   #cleanupDecoration(errors: unknown[]): boolean {
     const decoration = this.#decoration;
     const configure = this.#decorationConfigure;
@@ -722,12 +975,24 @@ export class WaylandWindow implements Window {
   }
 
   #cleanup(errors: unknown[]): void {
-    if (!this.#cleanupDecoration(errors)) return;
     const surface = this.#surface;
-    if (surface && this.#registered) {
-      this.#registered = false;
-      collectCleanupError(errors, () => this.lib.unregisterWindow(surface, this));
-    }
+    const childrenDestroyed = teardownWaylandWindowChildrenAfterUnregister(
+      this.#registered,
+      () => {
+        this.#registered = false;
+      },
+      () => {
+        if (!surface) throw new Error("winding lost a registered Wayland surface during cleanup");
+        this.lib.unregisterWindow(surface, this);
+      },
+      () =>
+        teardownWaylandOptionalWindowChildren(
+          () => this.#cleanupDecoration(errors),
+          () => this.#cleanupFractionalScale(errors),
+        ),
+      (error) => errors.push(error),
+    );
+    if (!childrenDestroyed) return;
     collectCleanupError(errors, () => this.#shmBuffer.close());
     const symbols = this.lib.wl.symbols;
     const toplevel = this.#xdgToplevel;

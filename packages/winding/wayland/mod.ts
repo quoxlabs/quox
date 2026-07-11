@@ -49,6 +49,7 @@ import {
 } from "./global_registry.ts";
 import { WaylandPointerFrameAccumulator, WaylandPointerPosition } from "./pointer.ts";
 import { type WaylandDecorationManagerBinding, WaylandDecorationManagerState } from "./decoration.ts";
+import { type WaylandFractionalScaleManagerPair, WaylandFractionalScaleManagerState } from "./fractional_scale.ts";
 import {
   outputReleaseStrategy,
   type WaylandOutputBinding,
@@ -111,6 +112,10 @@ class WaylandLibrary implements Library {
   readonly wpCursorShapeDeviceIface!: Deno.PointerObject;
   readonly zxdgDecorationManagerIface!: Deno.PointerObject;
   readonly zxdgToplevelDecorationIface!: Deno.PointerObject;
+  readonly wpFractionalScaleManagerIface!: Deno.PointerObject;
+  readonly wpFractionalScaleIface!: Deno.PointerObject;
+  readonly wpViewporterIface!: Deno.PointerObject;
+  readonly wpViewportIface!: Deno.PointerObject;
   readonly zwpTextInputManagerIface!: Deno.PointerObject;
   readonly zwpTextInputIface!: Deno.PointerObject;
   readonly ifaces!: {
@@ -137,6 +142,7 @@ class WaylandLibrary implements Library {
   #shmFormatVtable: BigUint64Array<ArrayBuffer> | undefined;
   xdgWmBase: Deno.PointerObject | null = null;
   readonly #decorationManagers = new WaylandDecorationManagerState<Deno.PointerObject>();
+  readonly #fractionalScaleManagers = new WaylandFractionalScaleManagerState<Deno.PointerObject>();
   #cursorShapeManager: Deno.PointerObject | null = null;
   #cursorShapeDevice: Deno.PointerObject | null = null;
   #coreCursorSurface: Deno.PointerObject | null = null;
@@ -225,6 +231,10 @@ class WaylandLibrary implements Library {
         wpCursorShapeDeviceIface,
         zxdgDecorationManagerIface,
         zxdgToplevelDecorationIface,
+        wpFractionalScaleManagerIface,
+        wpFractionalScaleIface,
+        wpViewporterIface,
+        wpViewportIface,
         zwpTextInputManagerIface,
         zwpTextInputIface,
       } = buildXdgIfaces(ifaces.seat, ifaces.surface, ifaces.pointer, ifaces.output);
@@ -236,6 +246,10 @@ class WaylandLibrary implements Library {
       this.wpCursorShapeDeviceIface = wpCursorShapeDeviceIface;
       this.zxdgDecorationManagerIface = zxdgDecorationManagerIface;
       this.zxdgToplevelDecorationIface = zxdgToplevelDecorationIface;
+      this.wpFractionalScaleManagerIface = wpFractionalScaleManagerIface;
+      this.wpFractionalScaleIface = wpFractionalScaleIface;
+      this.wpViewporterIface = wpViewporterIface;
+      this.wpViewportIface = wpViewportIface;
       this.zwpTextInputManagerIface = zwpTextInputManagerIface;
       this.zwpTextInputIface = zwpTextInputIface;
       this.ifaces = ifaces;
@@ -307,6 +321,10 @@ class WaylandLibrary implements Library {
 
   get decorationManager(): WaylandDecorationManagerBinding<Deno.PointerObject> | undefined {
     return this.#decorationManagers.current;
+  }
+
+  get fractionalScaleManagers(): WaylandFractionalScaleManagerPair<Deno.PointerObject> | undefined {
+    return this.#fractionalScaleManagers.current;
   }
 
   #initGlobals(): void {
@@ -492,6 +510,12 @@ class WaylandLibrary implements Library {
     } else if (offer.interface === "zxdg_decoration_manager_v1") {
       ifacePtr = this.zxdgDecorationManagerIface;
       version = Math.min(offer.offeredVersion, 2);
+    } else if (offer.interface === "wp_fractional_scale_manager_v1") {
+      ifacePtr = this.wpFractionalScaleManagerIface;
+      version = Math.min(offer.offeredVersion, 1);
+    } else if (offer.interface === "wp_viewporter") {
+      ifacePtr = this.wpViewporterIface;
+      version = Math.min(offer.offeredVersion, 1);
     } else if (offer.interface === "wp_cursor_shape_manager_v1") {
       ifacePtr = this.wpCursorShapeManagerIface;
       version = Math.min(offer.offeredVersion, 1);
@@ -499,21 +523,28 @@ class WaylandLibrary implements Library {
       ifacePtr = this.zwpTextInputManagerIface;
       version = Math.min(offer.offeredVersion, 1);
     }
+    if (version < 1) return null;
 
     const ifaceName = cStr(offer.interface);
-    const proxy = sym.wl_proxy_marshal_array_flags(
-      registry,
-      WlOp.REGISTRY_BIND,
-      ifacePtr,
-      version,
-      0,
-      args(
-        BigInt(offer.name),
-        Deno.UnsafePointer.value(Deno.UnsafePointer.of(ifaceName)),
-        BigInt(version),
-        0n,
-      ),
-    );
+    let proxy: Deno.PointerValue;
+    try {
+      proxy = sym.wl_proxy_marshal_array_flags(
+        registry,
+        WlOp.REGISTRY_BIND,
+        ifacePtr,
+        version,
+        0,
+        args(
+          BigInt(offer.name),
+          Deno.UnsafePointer.value(Deno.UnsafePointer.of(ifaceName)),
+          BigInt(version),
+          0n,
+        ),
+      );
+    } catch (error) {
+      if (isOptionalFractionalScaleManager(offer.interface)) return null;
+      throw error;
+    }
     if (!proxy) return null;
 
     try {
@@ -533,6 +564,12 @@ class WaylandLibrary implements Library {
       } else if (offer.interface === "zxdg_decoration_manager_v1") {
         this.#decorationManagers.bind(proxy, version);
         for (const window of this.windows) window.tryCreateDecoration();
+      } else if (offer.interface === "wp_fractional_scale_manager_v1") {
+        this.#fractionalScaleManagers.bind("fractional-scale", proxy, version);
+        for (const window of this.windows) window.tryCreateFractionalScale();
+      } else if (offer.interface === "wp_viewporter") {
+        this.#fractionalScaleManagers.bind("viewporter", proxy, version);
+        for (const window of this.windows) window.tryCreateFractionalScale();
       } else if (offer.interface === "wp_cursor_shape_manager_v1") {
         this.#cursorShapeManager = proxy;
         this.#ensureCursorShapeDevice();
@@ -546,6 +583,8 @@ class WaylandLibrary implements Library {
       }
       if (
         offer.interface === "zxdg_decoration_manager_v1" ||
+        offer.interface === "wp_fractional_scale_manager_v1" ||
+        offer.interface === "wp_viewporter" ||
         offer.interface === "wp_cursor_shape_manager_v1" ||
         offer.interface === "zwp_text_input_manager_v3"
       ) return null;
@@ -613,6 +652,16 @@ class WaylandLibrary implements Library {
       );
       return;
     }
+    if (global.interface === "wp_fractional_scale_manager_v1") {
+      this.#fractionalScaleManagers.unbind("fractional-scale", proxy);
+      this.#destroyOptionalFractionalScaleManager(proxy, WlOp.WP_FRACTIONAL_SCALE_MANAGER_DESTROY);
+      return;
+    }
+    if (global.interface === "wp_viewporter") {
+      this.#fractionalScaleManagers.unbind("viewporter", proxy);
+      this.#destroyOptionalFractionalScaleManager(proxy, WlOp.WP_VIEWPORTER_DESTROY);
+      return;
+    }
     if (global.interface === "wp_cursor_shape_manager_v1") {
       if (this.#cursorShapeManager === proxy) this.#cursorShapeManager = null;
       const device = this.#cursorShapeDevice;
@@ -644,6 +693,23 @@ class WaylandLibrary implements Library {
       return;
     }
     this.#textInputController.unbindManager(proxy);
+  }
+
+  #destroyOptionalFractionalScaleManager(proxy: Deno.PointerObject, opcode: number): void {
+    try {
+      this.wl.symbols.wl_proxy_marshal_array_flags(
+        proxy,
+        opcode,
+        null,
+        this.wl.symbols.wl_proxy_get_version(proxy),
+        WL_MARSHAL_FLAG_DESTROY,
+        args(),
+      );
+    } catch {
+      // Do not locally abandon a server-side object whose destructor could not be confirmed.
+      // It has no listener, but the proxy itself must stay owned until display disconnect.
+      this.retainNativeResourceRoot(proxy);
+    }
   }
 
   #setupShmFormatListener(proxy: Deno.PointerObject): void {
@@ -1462,6 +1528,10 @@ function pointerModifiers(modifiers: {
 
 function mouseButtonMask(button: MouseButton): number {
   return button === "left" ? 1 : button === "right" ? 2 : button === "middle" ? 4 : button === "back" ? 8 : 16;
+}
+
+function isOptionalFractionalScaleManager(interfaceName: string): boolean {
+  return interfaceName === "wp_fractional_scale_manager_v1" || interfaceName === "wp_viewporter";
 }
 
 export function validateWaylandNativeLayout(os: string, arch: string, littleEndian: boolean): void {

@@ -1,5 +1,11 @@
 /** Pure core-output scale, membership, and frame-request state. */
 
+import {
+  calculateWaylandFractionalFramebufferSize,
+  isValidWaylandFractionalScaleNumerator,
+} from "./fractional_scale.ts";
+import { validateWaylandShmLayout } from "./shm_buffer.ts";
+
 const MAX_WAYLAND_SCALE = 0x7fffffff;
 
 export type WaylandOutputGeneration = symbol;
@@ -146,9 +152,15 @@ export class WaylandConfigureAckState {
 
 export type WaylandSurfaceFrameRequest =
   | { readonly kind: "set-buffer-scale"; readonly scale: number }
+  | { readonly kind: "set-viewport-destination"; readonly width: number; readonly height: number }
   | { readonly kind: "attach" }
   | { readonly kind: "damage-buffer" | "damage-surface"; readonly width: number; readonly height: number }
   | { readonly kind: "commit" };
+
+export interface WaylandSurfaceFrameOptions {
+  readonly viewportAvailable?: boolean;
+  readonly fractionalScaleNumerator?: number;
+}
 
 export function planWaylandSurfaceFrame(
   surfaceVersion: number,
@@ -157,10 +169,38 @@ export function planWaylandSurfaceFrame(
   logicalHeight: number,
   framebufferWidth: number,
   framebufferHeight: number,
+  options: WaylandSurfaceFrameOptions = {},
 ): readonly WaylandSurfaceFrameRequest[] {
-  const effectiveScale = surfaceVersion >= 3 && isValidWaylandScale(scale) ? scale : 1;
+  let useFractionalScale = false;
+  if (
+    options.viewportAvailable === true &&
+    options.fractionalScaleNumerator !== undefined &&
+    isValidWaylandFractionalScaleNumerator(options.fractionalScaleNumerator)
+  ) {
+    const selected = calculateWaylandFractionalFramebufferSize(
+      logicalWidth,
+      logicalHeight,
+      options.fractionalScaleNumerator,
+    );
+    if (selected?.width === framebufferWidth && selected.height === framebufferHeight) {
+      try {
+        validateWaylandShmLayout(selected.width, selected.height);
+        useFractionalScale = true;
+      } catch {
+        // A syntactically valid preference is not selected when its buffer cannot be represented.
+      }
+    }
+  }
+  const effectiveScale = useFractionalScale ? 1 : surfaceVersion >= 3 && isValidWaylandScale(scale) ? scale : 1;
   const requests: WaylandSurfaceFrameRequest[] = [];
   if (surfaceVersion >= 3) requests.push({ kind: "set-buffer-scale", scale: effectiveScale });
+  if (options.viewportAvailable) {
+    requests.push({
+      kind: "set-viewport-destination",
+      width: useFractionalScale ? logicalWidth : -1,
+      height: useFractionalScale ? logicalHeight : -1,
+    });
+  }
   requests.push({ kind: "attach" });
   requests.push(
     surfaceVersion >= 4

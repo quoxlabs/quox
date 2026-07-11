@@ -38,8 +38,14 @@ type InterfaceKey =
   | "tabletToolV2"
   | "decorationManager"
   | "toplevelDecoration"
+  | "fractionalScaleManager"
+  | "fractionalScale"
+  | "viewporter"
+  | "viewport"
   | "textInputManager"
   | "textInput";
+
+type LocalProtocolObjectType = InterfaceKey | "wlSurface";
 
 interface InterfaceDef {
   readonly key: InterfaceKey;
@@ -83,6 +89,48 @@ export const XDG_DECORATION_PROTOCOL_METADATA = {
   },
 } as const;
 
+/** Scanner-equivalent version-1 metadata from fractional-scale-v1.xml and viewporter.xml. */
+export const FRACTIONAL_SCALE_PROTOCOL_METADATA = {
+  fractionalScaleManager: {
+    name: "wp_fractional_scale_manager_v1",
+    version: 1,
+    requests: [
+      { name: "destroy", signature: "", objectTypes: [] },
+      {
+        name: "get_fractional_scale",
+        signature: "no",
+        objectTypes: ["fractionalScale", "wlSurface"],
+      },
+    ],
+    events: [],
+  },
+  fractionalScale: {
+    name: "wp_fractional_scale_v1",
+    version: 1,
+    requests: [{ name: "destroy", signature: "", objectTypes: [] }],
+    events: [{ name: "preferred_scale", signature: "u", objectTypes: [] }],
+  },
+  viewporter: {
+    name: "wp_viewporter",
+    version: 1,
+    requests: [
+      { name: "destroy", signature: "", objectTypes: [] },
+      { name: "get_viewport", signature: "no", objectTypes: ["viewport", "wlSurface"] },
+    ],
+    events: [],
+  },
+  viewport: {
+    name: "wp_viewport",
+    version: 1,
+    requests: [
+      { name: "destroy", signature: "", objectTypes: [] },
+      { name: "set_source", signature: "ffff", objectTypes: [] },
+      { name: "set_destination", signature: "ii", objectTypes: [] },
+    ],
+    events: [],
+  },
+} as const;
+
 function validateTypes(
   messageName: string,
   signature: string,
@@ -112,6 +160,10 @@ export interface XdgIfaces {
   wpCursorShapeDeviceIface: Deno.PointerObject;
   zxdgDecorationManagerIface: Deno.PointerObject;
   zxdgToplevelDecorationIface: Deno.PointerObject;
+  wpFractionalScaleManagerIface: Deno.PointerObject;
+  wpFractionalScaleIface: Deno.PointerObject;
+  wpViewporterIface: Deno.PointerObject;
+  wpViewportIface: Deno.PointerObject;
   zwpTextInputManagerIface: Deno.PointerObject;
   zwpTextInputIface: Deno.PointerObject;
 }
@@ -209,13 +261,15 @@ export function buildXdgIfaces(
     messages: readonly {
       readonly name: string;
       readonly signature: string;
-      readonly objectTypes: readonly InterfaceKey[];
+      readonly objectTypes: readonly LocalProtocolObjectType[];
     }[],
   ): MessageDef[] {
     return messages.map((message) => [
       message.name,
       message.signature,
-      message.objectTypes.length === 0 ? undefined : [...message.objectTypes],
+      message.objectTypes.length === 0
+        ? undefined
+        : message.objectTypes.map((type) => type === "wlSurface" ? wlSurfaceIface : type),
     ]);
   }
 
@@ -347,6 +401,34 @@ export function buildXdgIfaces(
       events: localProtocolMessages(XDG_DECORATION_PROTOCOL_METADATA.toplevelDecoration.events),
     },
     {
+      key: "fractionalScaleManager",
+      name: FRACTIONAL_SCALE_PROTOCOL_METADATA.fractionalScaleManager.name,
+      version: FRACTIONAL_SCALE_PROTOCOL_METADATA.fractionalScaleManager.version,
+      methods: localProtocolMessages(FRACTIONAL_SCALE_PROTOCOL_METADATA.fractionalScaleManager.requests),
+      events: localProtocolMessages(FRACTIONAL_SCALE_PROTOCOL_METADATA.fractionalScaleManager.events),
+    },
+    {
+      key: "fractionalScale",
+      name: FRACTIONAL_SCALE_PROTOCOL_METADATA.fractionalScale.name,
+      version: FRACTIONAL_SCALE_PROTOCOL_METADATA.fractionalScale.version,
+      methods: localProtocolMessages(FRACTIONAL_SCALE_PROTOCOL_METADATA.fractionalScale.requests),
+      events: localProtocolMessages(FRACTIONAL_SCALE_PROTOCOL_METADATA.fractionalScale.events),
+    },
+    {
+      key: "viewporter",
+      name: FRACTIONAL_SCALE_PROTOCOL_METADATA.viewporter.name,
+      version: FRACTIONAL_SCALE_PROTOCOL_METADATA.viewporter.version,
+      methods: localProtocolMessages(FRACTIONAL_SCALE_PROTOCOL_METADATA.viewporter.requests),
+      events: localProtocolMessages(FRACTIONAL_SCALE_PROTOCOL_METADATA.viewporter.events),
+    },
+    {
+      key: "viewport",
+      name: FRACTIONAL_SCALE_PROTOCOL_METADATA.viewport.name,
+      version: FRACTIONAL_SCALE_PROTOCOL_METADATA.viewport.version,
+      methods: localProtocolMessages(FRACTIONAL_SCALE_PROTOCOL_METADATA.viewport.requests),
+      events: localProtocolMessages(FRACTIONAL_SCALE_PROTOCOL_METADATA.viewport.events),
+    },
+    {
       key: "textInput",
       name: "zwp_text_input_v3",
       version: 1,
@@ -405,6 +487,10 @@ export function buildXdgIfaces(
   const wpCursorShapeDeviceIface = interfacePointer("cursorShapeDevice");
   const zxdgDecorationManagerIface = interfacePointer("decorationManager");
   const zxdgToplevelDecorationIface = interfacePointer("toplevelDecoration");
+  const wpFractionalScaleManagerIface = interfacePointer("fractionalScaleManager");
+  const wpFractionalScaleIface = interfacePointer("fractionalScale");
+  const wpViewporterIface = interfacePointer("viewporter");
+  const wpViewportIface = interfacePointer("viewport");
   const zwpTextInputManagerIface = interfacePointer("textInputManager");
   const zwpTextInputIface = interfacePointer("textInput");
 
@@ -417,6 +503,10 @@ export function buildXdgIfaces(
     wpCursorShapeDeviceIface,
     zxdgDecorationManagerIface,
     zxdgToplevelDecorationIface,
+    wpFractionalScaleManagerIface,
+    wpFractionalScaleIface,
+    wpViewporterIface,
+    wpViewportIface,
     zwpTextInputManagerIface,
     zwpTextInputIface,
   };
@@ -478,6 +568,18 @@ export const WlOp = {
   ZXDG_TOPLEVEL_DECORATION_DESTROY: 0,
   ZXDG_TOPLEVEL_DECORATION_SET_MODE: 1,
   ZXDG_TOPLEVEL_DECORATION_UNSET_MODE: 2,
+  // wp_fractional_scale_manager_v1 requests
+  WP_FRACTIONAL_SCALE_MANAGER_DESTROY: 0,
+  WP_FRACTIONAL_SCALE_MANAGER_GET_FRACTIONAL_SCALE: 1,
+  // wp_fractional_scale_v1 requests
+  WP_FRACTIONAL_SCALE_DESTROY: 0,
+  // wp_viewporter requests
+  WP_VIEWPORTER_DESTROY: 0,
+  WP_VIEWPORTER_GET_VIEWPORT: 1,
+  // wp_viewport requests
+  WP_VIEWPORT_DESTROY: 0,
+  WP_VIEWPORT_SET_SOURCE: 1,
+  WP_VIEWPORT_SET_DESTINATION: 2,
   // wp_cursor_shape_manager_v1 requests
   WP_CURSOR_SHAPE_MANAGER_DESTROY: 0,
   WP_CURSOR_SHAPE_MANAGER_GET_POINTER: 1,
