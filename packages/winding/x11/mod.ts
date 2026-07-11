@@ -17,9 +17,9 @@ import { libcFunctions, NotifyInferior, NotifyNormal, x11functions, XEventMask, 
 import {
   isAutoRepeatPair,
   isTopLevelFocusTransition,
-  type X11ModifierMapping,
   x11CommittedText,
   x11KeyEditDisposition,
+  type X11ModifierMapping,
   x11ModifierSnapshot,
 } from "./input.ts";
 import { NativeXImage } from "./native_image.ts";
@@ -457,8 +457,8 @@ class X11Library implements Library {
     this.#refreshModifierMapping();
     this.#refreshDomCodes();
     const detectable = new Int32Array(1);
-    this.#detectableAutoRepeat =
-      this.X11.symbols.XkbSetDetectableAutoRepeat(display, 1, detectable) !== 0 && detectable[0] !== 0;
+    this.#detectableAutoRepeat = this.X11.symbols.XkbSetDetectableAutoRepeat(display, 1, detectable) !== 0 &&
+      detectable[0] !== 0;
     try {
       this.input = new XimManager(
         this.X11,
@@ -568,16 +568,12 @@ class X11Library implements Library {
       const type = view.getInt32(0, true);
       // XConfigureEvent distinguishes the event recipient from the drawable
       // whose geometry changed; all other routed events use XAnyEvent.window.
-      const structureEvent =
-        type === XEventType.ConfigureNotify || type === XEventType.DestroyNotify ||
+      const structureEvent = type === XEventType.ConfigureNotify || type === XEventType.DestroyNotify ||
         type === XEventType.MapNotify || type === XEventType.UnmapNotify;
-      const windowId = structureEvent
-        ? view.getBigUint64(40, true)
-        : view.getBigUint64(32, true);
+      const windowId = structureEvent ? view.getBigUint64(40, true) : view.getBigUint64(32, true);
       const window = this.windows.get(windowId);
 
-      const routedKey =
-        (type === XEventType.KeyPress || type === XEventType.KeyRelease) && window !== undefined;
+      const routedKey = (type === XEventType.KeyPress || type === XEventType.KeyRelease) && window !== undefined;
       if (!routedKey) {
         const filtered = this.input.filterEvent(eventPointer);
         this.input.throwIfCallbackFailed();
@@ -888,10 +884,9 @@ class X11Library implements Library {
       const view = new Deno.UnsafePointerView(native);
       const keysPerModifier = view.getInt32(0);
       const keycodesAddress = view.getBigUint64(8);
-      const keycodes = keycodesAddress === 0n
-        ? undefined
-        : new Deno.UnsafePointerView(Deno.UnsafePointer.create(keycodesAddress));
-      if (keysPerModifier <= 0 || keycodes === undefined) return;
+      const keycodesPointer = Deno.UnsafePointer.create(keycodesAddress);
+      if (keysPerModifier <= 0 || keycodesPointer === null) return;
+      const keycodes = new Deno.UnsafePointerView(keycodesPointer);
 
       let altMask = 0;
       let metaMask = 0;
@@ -955,11 +950,13 @@ class X11Library implements Library {
       const minimum = keyboardView.getUint8(12);
       const maximum = keyboardView.getUint8(13);
       const namesAddress = keyboardView.getBigUint64(48);
-      if (namesAddress === 0n) return;
-      const names = new Deno.UnsafePointerView(Deno.UnsafePointer.create(namesAddress));
+      const namesPointer = Deno.UnsafePointer.create(namesAddress);
+      if (namesPointer === null) return;
+      const names = new Deno.UnsafePointerView(namesPointer);
       const keysAddress = names.getBigUint64(456);
-      if (keysAddress === 0n) return;
-      const keys = new Deno.UnsafePointerView(Deno.UnsafePointer.create(keysAddress));
+      const keysPointer = Deno.UnsafePointer.create(keysAddress);
+      if (keysPointer === null) return;
+      const keys = new Deno.UnsafePointerView(keysPointer);
       const decoder = new TextDecoder("ascii");
       for (let keycode = minimum; keycode <= maximum; keycode++) {
         const bytes = new Uint8Array(4);

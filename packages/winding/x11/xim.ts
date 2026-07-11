@@ -13,18 +13,8 @@ import {
 import { logicalKeyFromKeysym, unicodeTextFromKeysym } from "../linux/mod.ts";
 import { utf8CString as cString } from "../text_encoding.ts";
 import { libcFunctions, x11functions } from "./ffi.ts";
-import {
-  callbackRecord,
-  MAX_XIM_TEXT_BYTES,
-  packXPoint,
-  pointerFromAddress,
-  readXimText,
-} from "./xim_abi.ts";
-import {
-  applyPreeditChange,
-  movePreeditCaret,
-  preeditCursorByteOffset,
-} from "./xim_preedit.ts";
+import { callbackRecord, MAX_XIM_TEXT_BYTES, packXPoint, pointerFromAddress, readXimText } from "./xim_abi.ts";
+import { applyPreeditChange, movePreeditCaret, preeditCursorByteOffset } from "./xim_preedit.ts";
 import { fallbackLookupText } from "./input.ts";
 
 type X11Library = Deno.DynamicLibrary<typeof x11functions>;
@@ -981,9 +971,7 @@ export class XimContext implements Disposable {
     if (callData === null) return;
     const surrounding = this.#surrounding;
     const text = surrounding?.text ?? "";
-    const cursorUtf16 = surrounding === undefined
-      ? 0
-      : utf8OffsetToUtf16Index(text, surrounding.selectionEnd) ?? 0;
+    const cursorUtf16 = surrounding === undefined ? 0 : utf8OffsetToUtf16Index(text, surrounding.selectionEnd) ?? 0;
     const scalars = [...text];
     const cursor = [...text.slice(0, cursorUtf16)].length;
     const start = Math.max(0, Math.min(cursor - 32767, scalars.length - 65535));

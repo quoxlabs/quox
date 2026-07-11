@@ -9,12 +9,7 @@ import {
   x11KeyEditDisposition,
   x11ModifierSnapshot,
 } from "./input.ts";
-import {
-  applyPreeditChange,
-  movePreeditCaret,
-  preeditCursorByteOffset,
-  XimCaretDirection,
-} from "./xim_preedit.ts";
+import { applyPreeditChange, movePreeditCaret, preeditCursorByteOffset, XimCaretDirection } from "./xim_preedit.ts";
 import { packRgbaPixels } from "./native_image.ts";
 import { supportsX11Abi, validateX11Geometry } from "./mod.ts";
 import { selectXimStyles } from "./xim.ts";

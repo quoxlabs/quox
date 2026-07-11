@@ -157,7 +157,7 @@ export class NativeXImage implements Disposable {
       // XCreateImage initializes its format before storage is supplied. Once
       // attached, XDestroyImage owns and frees this allocation.
       const dataAddress = new BigUint64Array([Deno.UnsafePointer.value(data)]);
-      const dataField = Deno.UnsafePointer.offset(image, 16n);
+      const dataField = Deno.UnsafePointer.offset(image, 16);
       libc.memcpy(dataField, dataAddress, 8n);
     } catch (error) {
       libc.free(data);
