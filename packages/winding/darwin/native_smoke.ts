@@ -56,6 +56,7 @@ runCase(
 );
 runCase("modifier transitions never query key-only character properties", testModifierTransitions);
 runCase("blit uses exact backing pixels retained by Core Graphics", testBlitStorageLifetime);
+runCase("validated outer-frame geometries accept their first framebuffer", testWindowGeometryValidation);
 runCase("windows opt into ordinary mouse-move delivery", testMouseMoveDeliveryEnabled);
 runCase("closed windows and libraries reject every native operation", testClosedMethodGuards);
 runCase("only one library owns the process-wide AppKit queue", testSingleLibraryOwnership);
@@ -66,7 +67,7 @@ runCase(
 );
 runCase("text input survives repeated library and window lifecycles", testRepeatedLifecycles);
 await runAsyncCase("duplicate module copies share one AppKit owner", testDuplicateModuleOwnership);
-console.log("Darwin native smoke: 11 passed");
+console.log("Darwin native smoke: 12 passed");
 
 /**
  * Deliberately violate an NSArray precondition. This must only be launched as
@@ -549,6 +550,42 @@ function testBlitStorageLifetime(): void {
       closeAll(handles);
     }
   });
+}
+
+function testWindowGeometryValidation(): void {
+  const library = load();
+  try {
+    assertThrowsMessage(
+      () => library.openWindow(Number.NaN, 0, 64, 64),
+      "outer window position",
+    );
+    assertThrowsMessage(
+      () => library.openWindow(0, 0, 64.5, 64),
+      "outer window dimensions",
+    );
+
+    for (
+      const geometry of [
+        [-120.5, 80.25, 64, 64],
+        [0, 0, 10_000, 64],
+        [0, 0, 64, 10_000],
+      ] as const
+    ) {
+      const window = library.openWindow(geometry[0], geometry[1], geometry[2], geometry[3]);
+      try {
+        const resize = takeResizeEvent(library, window);
+        window.blit(
+          new Uint8Array(resize.framebufferWidth * resize.framebufferHeight * 4),
+          resize.framebufferWidth,
+          resize.framebufferHeight,
+        );
+      } finally {
+        window.close();
+      }
+    }
+  } finally {
+    library.close();
+  }
 }
 
 function testMouseMoveDeliveryEnabled(): void {

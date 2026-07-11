@@ -1,4 +1,12 @@
-import { appKitWindowFrame, browserWheelDelta, type ScreenFrame, surfaceMetrics } from "./geometry.ts";
+import {
+  appKitWindowFrame,
+  browserWheelDelta,
+  DARWIN_WINDOW_DIMENSION_LIMIT,
+  DARWIN_WINDOW_POSITION_LIMIT,
+  type ScreenFrame,
+  surfaceMetrics,
+  validateDarwinGeometry,
+} from "./geometry.ts";
 
 const primary: ScreenFrame = { x: 0, y: 0, width: 1920, height: 1080 };
 
@@ -51,8 +59,50 @@ Deno.test("Darwin keeps logical bounds independent from exact backing pixels", (
   });
 });
 
+Deno.test("Darwin validates logical outer frames before native window creation", () => {
+  validateDarwinGeometry(-120.5, 80.25, 800, 600);
+  validateDarwinGeometry(
+    -DARWIN_WINDOW_POSITION_LIMIT,
+    DARWIN_WINDOW_POSITION_LIMIT,
+    DARWIN_WINDOW_DIMENSION_LIMIT,
+    DARWIN_WINDOW_DIMENSION_LIMIT,
+  );
+
+  const ordinary = [0, 0, 800, 600] as const;
+  for (let field = 0; field < ordinary.length; field++) {
+    for (const invalid of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+      const geometry = [...ordinary] as [number, number, number, number];
+      geometry[field] = invalid;
+      assertRangeError(() => validateDarwinGeometry(...geometry));
+    }
+  }
+
+  for (const x of [-DARWIN_WINDOW_POSITION_LIMIT - 0.5, DARWIN_WINDOW_POSITION_LIMIT + 0.5]) {
+    assertRangeError(() => validateDarwinGeometry(x, 0, 1, 1));
+  }
+  for (const y of [-Number.MAX_VALUE, Number.MAX_VALUE]) {
+    assertRangeError(() => validateDarwinGeometry(0, y, 1, 1));
+  }
+  for (const dimension of [-1, 0, 0.5, DARWIN_WINDOW_DIMENSION_LIMIT + 1, Number.MAX_SAFE_INTEGER]) {
+    assertRangeError(() => validateDarwinGeometry(0, 0, dimension, 1));
+    assertRangeError(() => validateDarwinGeometry(0, 0, 1, dimension));
+  }
+});
+
 function assertEquals(actual: unknown, expected: unknown): void {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
     throw new Error(`expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
+  }
+}
+
+function assertRangeError(operation: () => void): void {
+  let thrown: unknown;
+  try {
+    operation();
+  } catch (error) {
+    thrown = error;
+  }
+  if (!(thrown instanceof RangeError)) {
+    throw new Error(`expected RangeError, got ${String(thrown)}`);
   }
 }

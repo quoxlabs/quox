@@ -25,6 +25,7 @@ import {
   type ScreenFrame,
   type SurfaceMetrics,
   surfaceMetrics,
+  validateDarwinGeometry,
 } from "./geometry.ts";
 import { DarwinInputState } from "./input_state.ts";
 import {
@@ -1310,6 +1311,7 @@ class DarwinLibrary implements Library {
 
   openWindow(x = 0, y = 0, w = 800, h = 600): DarwinWindow {
     this.assertOpen();
+    validateDarwinGeometry(x, y, w, h);
     return this.withAutoreleasePool(() => new DarwinWindow(this, x, y, w, h));
   }
 

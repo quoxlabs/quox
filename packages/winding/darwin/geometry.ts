@@ -5,6 +5,37 @@ export interface ScreenFrame {
   height: number;
 }
 
+export const DARWIN_WINDOW_POSITION_LIMIT = 16_000;
+export const DARWIN_WINDOW_DIMENSION_LIMIT = 10_000;
+
+/** Validate Winding's logical outer frame before any AppKit window message. */
+export function validateDarwinGeometry(
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+): void {
+  if (
+    !Number.isFinite(x) || !Number.isFinite(y) ||
+    Math.abs(x) > DARWIN_WINDOW_POSITION_LIMIT ||
+    Math.abs(y) > DARWIN_WINDOW_POSITION_LIMIT
+  ) {
+    throw new RangeError(
+      `winding(darwin): outer window position must be finite and within ±${DARWIN_WINDOW_POSITION_LIMIT} logical units`,
+    );
+  }
+  if (
+    !Number.isInteger(width) || !Number.isInteger(height) ||
+    width <= 0 || height <= 0 ||
+    width > DARWIN_WINDOW_DIMENSION_LIMIT ||
+    height > DARWIN_WINDOW_DIMENSION_LIMIT
+  ) {
+    throw new RangeError(
+      `winding(darwin): outer window dimensions must be positive integers no larger than ${DARWIN_WINDOW_DIMENSION_LIMIT} logical units`,
+    );
+  }
+}
+
 export interface SurfaceMetrics {
   /** Rounded logical client dimensions used by input and layout. */
   width: number;

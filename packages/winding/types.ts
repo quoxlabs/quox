@@ -214,7 +214,9 @@ export interface Library {
    * relative to the primary display's top-left, and `w` and `h` are outer
    * frame dimensions. All four values use platform logical screen units;
    * displays above or left of the primary display use negative coordinates.
-   * A window manager or compositor may constrain or ignore the requested frame.
+   * Positions must be finite and dimensions must be positive integers. Native
+   * coordinate and size limits can be narrower. A window manager or compositor
+   * may constrain or ignore the requested frame.
    */
   openWindow(): Window;
   openWindow(x: number, y: number): Window;
