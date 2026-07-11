@@ -35,12 +35,25 @@ import {
   encodeCandidateForm,
   encodeCompositionForm,
   encodeImeCharPosition,
+  immCompositionRangeToUtf8,
   insertCompositionCharacter,
+  readImmBytes,
   readImmUtf16,
   utf16CursorRangeToUtf8,
   withImeContext,
 } from "./imm.ts";
-import { imm32functions, IMR_QUERYCHARPOSITION, user32functions, WM } from "./ffi.ts";
+import {
+  ATTR_TARGET_CONVERTED,
+  ATTR_TARGET_NOTCONVERTED,
+  GCS_COMPATTR,
+  GCS_COMPCLAUSE,
+  GCS_COMPSTR,
+  GCS_CURSORPOS,
+  imm32functions,
+  IMR_QUERYCHARPOSITION,
+  user32functions,
+  WM,
+} from "./ffi.ts";
 import { Win32InputController, type Win32InputWindow } from "./input_controller.ts";
 import {
   ImeActivationState,
@@ -364,6 +377,43 @@ Deno.test("Win32 input reports context release failure", () => {
   assertEquals(harness.controller.handleMessage(harness.window, WM.IME_STARTCOMPOSITION, 0n, 0n), 0n);
   assertThrows(() => harness.controller.setImeEnabled(harness.window, false), Error, "ImmReleaseContext failed");
   assertEquals(harness.calls.releases, 1);
+});
+
+Deno.test({
+  name: "Win32 publishes clause-only metadata completion and attribute-only target movement",
+  fn() {
+    const compositionData = new Map<number, Uint8Array | number>([
+      [GCS_COMPSTR, utf16Le("abcde")],
+      [GCS_COMPATTR, new Uint8Array([0, 0, ATTR_TARGET_CONVERTED, ATTR_TARGET_CONVERTED, ATTR_TARGET_CONVERTED])],
+      [GCS_COMPCLAUSE, uint32Le([0, 2, 5])],
+      [GCS_CURSORPOS, 5],
+    ]);
+    const harness = createInputControllerHarness({ compositionData });
+    harness.controller.attach(harness.window);
+    harness.controller.observeNativeFocus(harness.window, true);
+    harness.controller.setImeEnabled(harness.window, true);
+    harness.controller.handleMessage(harness.window, WM.IME_STARTCOMPOSITION, 0n, 0n);
+    harness.controller.handleMessage(
+      harness.window,
+      WM.IME_COMPOSITION,
+      0n,
+      GCS_COMPSTR | GCS_COMPATTR | GCS_CURSORPOS,
+    );
+    harness.controller.handleMessage(harness.window, WM.IME_COMPOSITION, 0n, GCS_COMPCLAUSE);
+
+    compositionData.set(
+      GCS_COMPATTR,
+      new Uint8Array([ATTR_TARGET_NOTCONVERTED, ATTR_TARGET_NOTCONVERTED, 2, 2, 2]),
+    );
+    harness.controller.handleMessage(harness.window, WM.IME_COMPOSITION, 0n, GCS_COMPATTR);
+
+    const preedits = harness.events.filter((event) => event.type === "ime" && event.kind === "preedit");
+    assertEquals(preedits.map((event) => [event.text, event.cursorRange]), [
+      ["abcde", [5, 5]],
+      ["abcde", [2, 5]],
+      ["abcde", [0, 2]],
+    ]);
+  },
 });
 
 Deno.test("Win32 leaves character-position requests unhandled when inactive, active, or unfocused", () => {
@@ -707,6 +757,86 @@ Deno.test("IMM UTF-16 cursor positions convert to UTF-8 byte offsets only at sca
   assertEquals(utf8OffsetToUtf16Index(text, 100), undefined);
 });
 
+Deno.test("IMM converted and unconverted target clauses become movable preedit selections", () => {
+  const text = "ab日語";
+  const clauses = uint32Le([0, 2, 4]);
+  assertEquals(
+    immCompositionRangeToUtf8(
+      text,
+      4,
+      new Uint8Array([0, 0, ATTR_TARGET_CONVERTED, ATTR_TARGET_CONVERTED]),
+      clauses,
+    ),
+    [2, 8],
+  );
+  assertEquals(
+    immCompositionRangeToUtf8(
+      text,
+      4,
+      new Uint8Array([ATTR_TARGET_NOTCONVERTED, ATTR_TARGET_NOTCONVERTED, 2, 2]),
+      clauses,
+    ),
+    [0, 2],
+  );
+});
+
+Deno.test("IMM target clauses preserve supplementary text boundaries", () => {
+  const text = "a🙂bc";
+  const clauses = uint32Le([0, 3, 5]);
+  assertEquals(
+    immCompositionRangeToUtf8(
+      text,
+      5,
+      new Uint8Array([
+        ATTR_TARGET_CONVERTED,
+        ATTR_TARGET_CONVERTED,
+        ATTR_TARGET_CONVERTED,
+        2,
+        2,
+      ]),
+      clauses,
+    ),
+    [0, 5],
+  );
+  assertEquals(
+    immCompositionRangeToUtf8(
+      text,
+      0,
+      new Uint8Array([2, 2, 2, ATTR_TARGET_NOTCONVERTED, ATTR_TARGET_NOTCONVERTED]),
+      clauses,
+    ),
+    [5, 7],
+  );
+});
+
+Deno.test("malformed IMM target metadata falls back to a validated caret", () => {
+  const text = "a🙂bc";
+  const caret: readonly [number, number] = [5, 5];
+  const malformed: ReadonlyArray<readonly [Uint8Array | undefined, Uint8Array | undefined]> = [
+    [undefined, undefined],
+    [new Uint8Array(4), uint32Le([0, 3, 5])],
+    [new Uint8Array(5), new Uint8Array([0, 0, 0])],
+    [new Uint8Array(5), uint32Le([1, 3, 5])],
+    [new Uint8Array(5), uint32Le([0, 2, 5])],
+    [new Uint8Array(5), uint32Le([0, 3, 4])],
+    [new Uint8Array([ATTR_TARGET_CONVERTED, 0, 0, 0, 0]), uint32Le([0, 3, 5])],
+    [
+      new Uint8Array([
+        ATTR_TARGET_CONVERTED,
+        ATTR_TARGET_CONVERTED,
+        ATTR_TARGET_CONVERTED,
+        ATTR_TARGET_NOTCONVERTED,
+        ATTR_TARGET_NOTCONVERTED,
+      ]),
+      uint32Le([0, 3, 5]),
+    ],
+  ];
+  for (const [attributes, clauses] of malformed) {
+    assertEquals(immCompositionRangeToUtf8(text, 3, attributes, clauses), caret);
+  }
+  assertEquals(immCompositionRangeToUtf8(text, 2, undefined, undefined), undefined);
+});
+
 Deno.test("CS_INSERTCHAR splices into cached preedit and applies its caret flag", () => {
   const text = "a🙂b";
   assertEquals(insertCompositionCharacter(text, [1, 1], "漢", false), {
@@ -819,6 +949,19 @@ Deno.test("IMM reader handles empty, odd, and native-error responses without dec
   );
 });
 
+Deno.test("IMM byte reader preserves non-string attribute payloads", () => {
+  const payload = new Uint8Array([0, ATTR_TARGET_CONVERTED, ATTR_TARGET_NOTCONVERTED]);
+  assertEquals(
+    readImmBytes({
+      getCompositionString(_index, buffer) {
+        if (buffer !== undefined) buffer.set(payload);
+        return payload.byteLength;
+      },
+    }, GCS_COMPATTR),
+    payload,
+  );
+});
+
 Deno.test("IME context helper releases exactly once after success or failure", () => {
   let releases = 0;
   assertEquals(withImeContext(() => ({ id: 1 }), () => releases++, (context) => context.id + 1), 2);
@@ -909,6 +1052,13 @@ function utf16Le(text: string): Uint8Array {
   return bytes;
 }
 
+function uint32Le(values: readonly number[]): Uint8Array {
+  const bytes = new Uint8Array(values.length * 4);
+  const view = new DataView(bytes.buffer);
+  for (let index = 0; index < values.length; index++) view.setUint32(index * 4, values[index], true);
+  return bytes;
+}
+
 interface FakeImmBehavior {
   associateResults?: number[];
   candidateResult?: number;
@@ -917,6 +1067,7 @@ interface FakeImmBehavior {
   releaseResult?: number;
   keyText?: ReadonlyMap<number, string>;
   keyboardState?: ReadonlyArray<readonly [virtualKey: number, state: number]>;
+  compositionData?: ReadonlyMap<number, Uint8Array | number>;
 }
 
 function createInputControllerHarness(behavior: FakeImmBehavior = {}) {
@@ -977,7 +1128,10 @@ function createInputControllerHarness(behavior: FakeImmBehavior = {}) {
         calls.compositionPlacements++;
         return behavior.compositionResult ?? 1;
       },
-      ImmGetCompositionStringW: () => 0,
+      ImmGetCompositionStringW(_context: unknown, index: number) {
+        const value = behavior.compositionData?.get(index);
+        return typeof value === "number" ? value : 0;
+      },
     },
   } as unknown as Deno.DynamicLibrary<typeof imm32functions>;
   const window: Win32InputWindow = {
@@ -996,6 +1150,17 @@ function createInputControllerHarness(behavior: FakeImmBehavior = {}) {
     imm32,
     (event) => events.push(event),
     (id) => id === window.id ? window : undefined,
+    behavior.compositionData === undefined ? undefined : () => ({
+      getCompositionString(index, buffer) {
+        const value = behavior.compositionData?.get(index);
+        if (typeof value === "number") return value;
+        if (value === undefined) return 0;
+        if (buffer === undefined) return value.byteLength;
+        const copied = Math.min(buffer.byteLength, value.byteLength);
+        buffer.set(value.subarray(0, copied));
+        return copied;
+      },
+    }),
   );
   return { calls, controller, events, window };
 }

@@ -196,6 +196,10 @@ export const GCS_RESULTCLAUSE = 0x1000;
 export const CS_INSERTCHAR = 0x2000;
 export const CS_NOMOVECARET = 0x4000;
 
+/** Composition attributes identifying the clause currently targeted by the user. */
+export const ATTR_TARGET_CONVERTED = 0x01;
+export const ATTR_TARGET_NOTCONVERTED = 0x03;
+
 /** `ImmAssociateContextEx` flags. */
 export const IACE_DEFAULT = 0x0010;
 export const IACE_IGNORENOCONTEXT = 0x0020;

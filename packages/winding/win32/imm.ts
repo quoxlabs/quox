@@ -1,6 +1,7 @@
 /** Pure IMM32 composition parsing and native structure encoders. */
 
 import { type ImeCursorArea, utf16IndexToUtf8Offset, utf8OffsetToUtf16Index } from "../input/ime.ts";
+import { ATTR_TARGET_CONVERTED, ATTR_TARGET_NOTCONVERTED } from "./ffi.ts";
 
 const UTF8_ENCODER = new TextEncoder();
 const INT32_MIN = -0x80000000;
@@ -18,6 +19,63 @@ export type PreeditCursorRange = readonly [start: number, end: number];
 export function utf16CursorRangeToUtf8(text: string, utf16Index: number): PreeditCursorRange | undefined {
   const offset = utf16IndexToUtf8Offset(text, utf16Index);
   return offset === undefined ? undefined : [offset, offset];
+}
+
+/**
+ * Resolve IMM32's target clause to a UTF-8 preedit selection.
+ * Invalid or incomplete native metadata degrades to the validated caret.
+ */
+export function immCompositionRangeToUtf8(
+  text: string,
+  cursorUtf16: number,
+  attributes: Uint8Array | undefined,
+  clauseBytes: Uint8Array | undefined,
+): PreeditCursorRange | undefined {
+  const caret = utf16CursorRangeToUtf8(text, cursorUtf16);
+  const target = targetClauseUtf16Range(text, attributes, clauseBytes);
+  if (target === undefined) return caret;
+
+  const start = utf16IndexToUtf8Offset(text, target[0]);
+  const end = utf16IndexToUtf8Offset(text, target[1]);
+  return start === undefined || end === undefined ? caret : [start, end];
+}
+
+function targetClauseUtf16Range(
+  text: string,
+  attributes: Uint8Array | undefined,
+  clauseBytes: Uint8Array | undefined,
+): readonly [start: number, end: number] | undefined {
+  if (
+    text.length === 0 || attributes === undefined || attributes.byteLength !== text.length ||
+    clauseBytes === undefined || clauseBytes.byteLength < 8 || (clauseBytes.byteLength & 3) !== 0
+  ) return undefined;
+
+  const clauseView = new DataView(clauseBytes.buffer, clauseBytes.byteOffset, clauseBytes.byteLength);
+  const boundaries: number[] = [];
+  for (let offset = 0; offset < clauseBytes.byteLength; offset += 4) {
+    const boundary = clauseView.getUint32(offset, true);
+    const previous = boundaries.at(-1);
+    if (
+      (previous === undefined ? boundary !== 0 : boundary <= previous) || boundary > text.length ||
+      utf16IndexToUtf8Offset(text, boundary) === undefined
+    ) return undefined;
+    boundaries.push(boundary);
+  }
+  if (boundaries.at(-1) !== text.length) return undefined;
+
+  let target: readonly [number, number] | undefined;
+  for (let index = 0; index + 1 < boundaries.length; index++) {
+    const start = boundaries[index];
+    const end = boundaries[index + 1];
+    const attribute = attributes[start];
+    for (let character = start + 1; character < end; character++) {
+      if (attributes[character] !== attribute) return undefined;
+    }
+    if (attribute !== ATTR_TARGET_CONVERTED && attribute !== ATTR_TARGET_NOTCONVERTED) continue;
+    if (target !== undefined) return undefined;
+    target = [start, end];
+  }
+  return target;
 }
 
 /** Apply WM_IME_COMPOSITION's CS_INSERTCHAR operation to cached preedit state. */
@@ -112,37 +170,60 @@ export interface ImmCompositionAdapter {
   getCompositionString(index: number, buffer?: Uint8Array): number;
 }
 
+/** Read an arbitrary IMM payload whose queried and copied lengths are bytes. */
+export function readImmBytes(
+  adapter: ImmCompositionAdapter,
+  index: number,
+  maximumAttempts = 3,
+): Uint8Array | undefined {
+  return readImmPayload(adapter, index, 1, maximumAttempts);
+}
+
 /** Read an IMM string whose reported lengths are bytes, not UTF-16 units. */
 export function readImmUtf16(
   adapter: ImmCompositionAdapter,
   index: number,
   maximumAttempts = 3,
 ): string | undefined {
+  const bytes = readImmPayload(adapter, index, 2, maximumAttempts);
+  return bytes === undefined ? undefined : decodeUtf16Le(bytes);
+}
+
+function readImmPayload(
+  adapter: ImmCompositionAdapter,
+  index: number,
+  alignment: number,
+  maximumAttempts: number,
+): Uint8Array | undefined {
   for (let attempt = 0; attempt < Math.max(1, maximumAttempts); attempt++) {
     const byteLength = adapter.getCompositionString(index);
-    if (!Number.isSafeInteger(byteLength) || byteLength < 0 || (byteLength & 1) !== 0) return undefined;
-    if (byteLength === 0) return "";
+    if (!isAlignedByteLength(byteLength, alignment)) return undefined;
+    if (byteLength === 0) return new Uint8Array();
 
     const buffer = new Uint8Array(byteLength);
     const bytesWritten = adapter.getCompositionString(index, buffer);
     if (!Number.isSafeInteger(bytesWritten)) return undefined;
     if (bytesWritten < 0) {
       const currentLength = adapter.getCompositionString(index);
-      if (Number.isSafeInteger(currentLength) && currentLength > buffer.byteLength && (currentLength & 1) === 0) {
+      if (isAlignedByteLength(currentLength, alignment) && currentLength > buffer.byteLength) {
         continue;
       }
       return undefined;
     }
-    if ((bytesWritten & 1) !== 0) return undefined;
+    if (!isAlignedByteLength(bytesWritten, alignment)) return undefined;
     if (bytesWritten > buffer.byteLength) continue;
     const currentLength = adapter.getCompositionString(index);
-    if (Number.isSafeInteger(currentLength) && currentLength >= 0 && (currentLength & 1) === 0) {
+    if (isAlignedByteLength(currentLength, alignment)) {
       if (currentLength !== bytesWritten) continue;
     }
-    if (bytesWritten === 0) return currentLength === 0 ? "" : undefined;
-    return decodeUtf16Le(buffer.subarray(0, bytesWritten));
+    if (bytesWritten === 0) return currentLength === 0 ? new Uint8Array() : undefined;
+    return buffer.slice(0, bytesWritten);
   }
   return undefined;
+}
+
+function isAlignedByteLength(value: number, alignment: number): boolean {
+  return Number.isSafeInteger(value) && value >= 0 && value % alignment === 0;
 }
 
 function decodeUtf16Le(bytes: Uint8Array): string {

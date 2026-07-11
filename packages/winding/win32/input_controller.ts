@@ -63,9 +63,11 @@ import {
   encodeCandidateForm,
   encodeCompositionForm,
   type ImeCompositionUpdate,
+  type ImmCompositionAdapter,
+  immCompositionRangeToUtf8,
   insertCompositionCharacter,
+  readImmBytes,
   readImmUtf16,
-  utf16CursorRangeToUtf8,
   withImeContext,
 } from "./imm.ts";
 
@@ -83,6 +85,8 @@ interface WindowInputState {
   readonly activation: ImeActivationState;
   readonly association: Win32ImeAssociationState;
   readonly composition: CompositionState;
+  compositionAttributes?: Uint8Array;
+  compositionClauses?: Uint8Array;
   nativeCompositionDirty: boolean;
   cursorArea?: ImeCursorArea;
   surroundingText?: {
@@ -126,6 +130,7 @@ export class Win32InputController {
   readonly #imm32: Imm32Library;
   readonly #enqueue: (event: UIEvent) => void;
   readonly #windowById: (id: bigint) => Win32InputWindow | undefined;
+  readonly #compositionAdapterForContext?: (context: Deno.PointerObject) => ImmCompositionAdapter;
   #preparedKey: PreparedKeyEvent | undefined;
 
   constructor(
@@ -133,11 +138,13 @@ export class Win32InputController {
     imm32: Imm32Library,
     enqueue: (event: UIEvent) => void,
     windowById: (id: bigint) => Win32InputWindow | undefined,
+    compositionAdapterForContext?: (context: Deno.PointerObject) => ImmCompositionAdapter,
   ) {
     this.#user32 = user32;
     this.#imm32 = imm32;
     this.#enqueue = enqueue;
     this.#windowById = windowById;
+    this.#compositionAdapterForContext = compositionAdapterForContext;
   }
 
   attach(window: Win32InputWindow): void {
@@ -375,6 +382,7 @@ export class Win32InputController {
         if (window !== undefined && state?.activation.desired) {
           this.#flushCharDecoder(window, state);
           state.composition.start();
+          this.#clearCompositionMetadata(state);
           state.resultEcho.clear();
           if (!state.activation.active) this.#setImeActive(window, state, true);
           this.#applyImeCursorArea(window, state);
@@ -391,6 +399,7 @@ export class Win32InputController {
         if (window !== undefined && state?.activation.desired) {
           this.#flushCharDecoder(window, state);
           this.#queuePreedit(window, state.composition.cancel());
+          this.#clearCompositionMetadata(state);
           return 0n;
         }
         return undefined;
@@ -735,12 +744,14 @@ export class Win32InputController {
   #applyImeUpdate(window: Win32InputWindow, state: WindowInputState, update: ImeCompositionUpdate): void {
     if (update.result !== undefined && isCommitText(update.result)) {
       state.composition.commit();
+      this.#clearCompositionMetadata(state);
       const commit = createImeCommitEvent(window, update.result);
       if (commit !== undefined) this.#enqueue(commit);
     }
     if (update.preedit === undefined) return;
     if (update.preedit === null || update.preedit.text.length === 0) {
       this.#queuePreedit(window, state.composition.cancel());
+      this.#clearCompositionMetadata(state);
       return;
     }
     this.#queuePreedit(
@@ -802,7 +813,15 @@ export class Win32InputController {
   }
 
   #readCompositionString(context: Deno.PointerObject, index: number): string | undefined {
-    return readImmUtf16({
+    return readImmUtf16(this.#compositionAdapter(context), index);
+  }
+
+  #readCompositionBytes(context: Deno.PointerObject, index: number): Uint8Array | undefined {
+    return readImmBytes(this.#compositionAdapter(context), index);
+  }
+
+  #compositionAdapter(context: Deno.PointerObject): ImmCompositionAdapter {
+    return this.#compositionAdapterForContext?.(context) ?? {
       getCompositionString: (compositionIndex, buffer) =>
         this.#imm32.symbols.ImmGetCompositionStringW(
           context,
@@ -810,7 +829,12 @@ export class Win32InputController {
           buffer === undefined ? null : Deno.UnsafePointer.of(buffer),
           buffer?.byteLength ?? 0,
         ),
-    }, index);
+    };
+  }
+
+  #clearCompositionMetadata(state: WindowInputState): void {
+    state.compositionAttributes = undefined;
+    state.compositionClauses = undefined;
   }
 
   #handleImeComposition(
@@ -838,38 +862,57 @@ export class Win32InputController {
       }
     }
     if ((flags & GCS_ALL) === 0) {
-      if (insertedPreedit !== undefined) this.#applyImeUpdate(window, state, { preedit: insertedPreedit });
+      if (insertedPreedit !== undefined) {
+        this.#clearCompositionMetadata(state);
+        this.#applyImeUpdate(window, state, { preedit: insertedPreedit });
+      }
       return true;
     }
 
-    const update = this.#withImeContext(window, (context) => {
+    const response = this.#withImeContext(window, (context) => {
       let result: string | undefined;
       let preedit: { text: string; cursorRange?: readonly [number, number] } | null | undefined = insertedPreedit;
+      let attributes = insertedPreedit === undefined ? state.compositionAttributes : undefined;
+      let clauses = insertedPreedit === undefined ? state.compositionClauses : undefined;
+      let metadataChanged = insertedPreedit !== undefined;
       if ((flags & GCS_RESULTSTR) !== 0) {
         result = this.#readCompositionString(context, GCS_RESULTSTR);
         if (result === undefined) return null;
       }
+
+      let text = insertedPreedit?.text ?? state.composition.text;
       if ((flags & GCS_COMPSTR) !== 0) {
-        const text = this.#readCompositionString(context, GCS_COMPSTR);
-        if (text === undefined) return null;
-        const cursorPosition = this.#imm32.symbols.ImmGetCompositionStringW(context, GCS_CURSORPOS, null, 0);
-        const cursorRange = cursorPosition < 0 ? undefined : utf16CursorRangeToUtf8(text, cursorPosition);
-        preedit = text.length === 0 ? null : { text, ...(cursorRange === undefined ? {} : { cursorRange }) };
-      } else if ((flags & GCS_CURSORPOS) !== 0 && state.composition.text.length > 0) {
-        const cursorPosition = this.#imm32.symbols.ImmGetCompositionStringW(context, GCS_CURSORPOS, null, 0);
-        const cursorRange = cursorPosition < 0
-          ? undefined
-          : utf16CursorRangeToUtf8(state.composition.text, cursorPosition);
-        preedit = {
-          text: state.composition.text,
-          ...(cursorRange === undefined ? {} : { cursorRange }),
-        };
+        const compositionText = this.#readCompositionString(context, GCS_COMPSTR);
+        if (compositionText === undefined) return null;
+        text = compositionText;
+        attributes = undefined;
+        clauses = undefined;
+        metadataChanged = true;
       }
-      return { result, preedit };
+      if ((flags & GCS_COMPATTR) !== 0) {
+        attributes = this.#readCompositionBytes(context, GCS_COMPATTR);
+        metadataChanged = true;
+      }
+      if ((flags & GCS_COMPCLAUSE) !== 0) {
+        clauses = this.#readCompositionBytes(context, GCS_COMPCLAUSE);
+        metadataChanged = true;
+      }
+
+      if ((flags & (GCS_COMPSTR | GCS_CURSORPOS | GCS_COMPATTR | GCS_COMPCLAUSE)) !== 0) {
+        const cursorPosition = this.#imm32.symbols.ImmGetCompositionStringW(context, GCS_CURSORPOS, null, 0);
+        const cursorRange = immCompositionRangeToUtf8(text, cursorPosition, attributes, clauses);
+        preedit = text.length === 0 ? null : { text, ...(cursorRange === undefined ? {} : { cursorRange }) };
+      }
+      return { update: { result, preedit }, attributes, clauses, metadataChanged };
     });
-    if (update === undefined || update === null) return false;
+    if (response === undefined || response === null) return false;
+    const update = response.update;
     if (update.result !== undefined && isCommitText(update.result)) state.resultEcho.expect(update.result);
     this.#applyImeUpdate(window, state, update);
+    if (response.metadataChanged && update.preedit !== undefined && update.preedit !== null) {
+      state.compositionAttributes = response.attributes;
+      state.compositionClauses = response.clauses;
+    }
     return true;
   }
 
@@ -936,6 +979,7 @@ export class Win32InputController {
     }
     this.#flushCharDecoder(window, state);
     this.#queuePreedit(window, state.composition.cancel());
+    this.#clearCompositionMetadata(state);
     state.resultEcho.clear();
     if (cancelError !== undefined) throw cancelError;
   }

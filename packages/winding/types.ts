@@ -75,7 +75,11 @@ export interface KeyUpEvent extends KeyEventBase {
 
 export type KeyEvent = KeyDownEvent | KeyUpEvent;
 
-/** Inclusive/exclusive UTF-8 byte offsets into preedit text. */
+/**
+ * Inclusive/exclusive UTF-8 byte offsets into preedit text.
+ * A collapsed range is a caret; a non-collapsed range may be the native
+ * input method's selected or target clause.
+ */
 export type ImeCursorRange = readonly [start: number, end: number];
 
 /** Native text-input offsets and lengths are UTF-8 byte counts. */
