@@ -316,6 +316,7 @@ class DarwinWindow implements Window, DarwinNativeResponder {
   readonly #layer: Deno.PointerValue;
   readonly #delegate: Deno.PointerValue;
   readonly inputState: DarwinInputState;
+  #viewImage: Deno.PointerValue = null;
   #width: number;
   #height: number;
   #discardingMarkedText = false;
@@ -505,6 +506,12 @@ class DarwinWindow implements Window, DarwinNativeResponder {
     if (this.#closed || event === null) return;
     const translated = importPointerEvent(event, this);
     if (translated !== undefined) this.lib.pushEvent(translated);
+  }
+
+  handleNativeUpdateLayer(): void {
+    if (this.#closed) return;
+    const { sel, send } = this.lib.ffi;
+    send.void_id(this.#layer, sel("setContents:"), this.#viewImage);
   }
 
   handleNativeInsertText(
@@ -974,7 +981,17 @@ class DarwinWindow implements Window, DarwinNativeResponder {
         0,
       );
       if (image === null) throw new Error("winding(darwin): CGImageCreate failed");
-      send.void_id(this.#layer, sel("setContents:"), image);
+      const previous = this.#viewImage;
+      this.#viewImage = image;
+      image = null;
+      try {
+        send.void_bool(this.contentView, sel("setNeedsDisplay:"), true);
+      } catch (error) {
+        image = this.#viewImage;
+        this.#viewImage = previous;
+        throw error;
+      }
+      if (previous !== null) cf.symbols.CFRelease(previous);
     } finally {
       try {
         if (image !== null) cf.symbols.CFRelease(image);
@@ -1014,6 +1031,12 @@ class DarwinWindow implements Window, DarwinNativeResponder {
     cleanup(() => this.inputState.close());
     cleanup(() => this.#discardNativeMarkedText());
     const { sel, send } = this.lib.ffi;
+    cleanup(() => {
+      if (this.#viewImage !== null) {
+        this.lib.ffi.cf.symbols.CFRelease(this.#viewImage);
+        this.#viewImage = null;
+      }
+    });
     cleanup(() => send.void_id(this.nsWindow, sel("setDelegate:"), null));
     cleanup(() => send.bool_id(this.nsWindow, sel("makeFirstResponder:"), null));
     cleanup(() => send.void_id(this.nsWindow, sel("orderOut:"), null));

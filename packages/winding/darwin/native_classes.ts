@@ -44,6 +44,7 @@ export interface DarwinNativeResponder {
     event: Deno.PointerValue,
   ): void;
   handleNativePointerEvent(event: Deno.PointerValue): void;
+  handleNativeUpdateLayer(): void;
   handleNativeInsertText(
     text: Deno.PointerValue,
     replacementLocation: bigint,
@@ -224,6 +225,18 @@ export class DarwinNativeClasses {
     const acceptsFirstResponder = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer"], result: "bool" },
       guardNativeCallback(this.#errors, () => true, () => false),
+    );
+    const wantsUpdateLayer = new Deno.UnsafeCallback(
+      { parameters: ["pointer", "pointer"], result: "bool" },
+      guardNativeCallback(this.#errors, () => true, () => false),
+    );
+    const updateLayer = new Deno.UnsafeCallback(
+      { parameters: ["pointer", "pointer"], result: "void" },
+      guardNativeCallback(
+        this.#errors,
+        (self: Deno.PointerValue) => this.#view(self)?.handleNativeUpdateLayer(),
+        () => undefined,
+      ),
     );
     const keyDown = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer", "pointer"], result: "void" },
@@ -424,6 +437,8 @@ export class DarwinNativeClasses {
     );
     this.#callbacks.push(
       acceptsFirstResponder,
+      wantsUpdateLayer,
+      updateLayer,
       keyDown,
       keyUp,
       flagsChanged,
@@ -449,6 +464,8 @@ export class DarwinNativeClasses {
       acceptsFirstResponder.pointer,
       `${OBJC_BOOL_ENCODING}@:`,
     );
+    addMethod(contentView, sel("wantsUpdateLayer"), wantsUpdateLayer.pointer, `${OBJC_BOOL_ENCODING}@:`);
+    addMethod(contentView, sel("updateLayer"), updateLayer.pointer, "v@:");
     addMethod(contentView, sel("keyDown:"), keyDown.pointer, "v@:@");
     addMethod(contentView, sel("keyUp:"), keyUp.pointer, "v@:@");
     addMethod(contentView, sel("flagsChanged:"), flagsChanged.pointer, "v@:@");

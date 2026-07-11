@@ -393,6 +393,7 @@ function testBlitStorageLifetime(): void {
       const runtime = Deno.dlopen(LIBOBJC, runtimeSymbols);
       handles.push(runtime);
       const sendId = openMessage(handles, ["pointer", "pointer"], "pointer");
+      const sendVoid = openMessage(handles, ["pointer", "pointer"], "void");
       const cg = Deno.dlopen(
         CORE_GRAPHICS,
         {
@@ -419,6 +420,7 @@ function testBlitStorageLifetime(): void {
       window.blit(pixels, 2, 1);
       pixels.fill(0);
 
+      sendVoid(window.contentView, sel(runtime, "displayIfNeeded"));
       const layer = sendId(window.contentView, sel(runtime, "layer"));
       assert(layer !== null, "content view has no layer after blit");
       const image = sendId(layer, sel(runtime, "contents"));
@@ -562,6 +564,16 @@ function testProtocolAndStructAbis(): void {
         );
       }
       for (const selector of POINTER_INPUT_SELECTORS) {
+        assert(
+          respondsToSelector(
+            viewClass,
+            sel(runtime, "instancesRespondToSelector:"),
+            sel(runtime, selector),
+          ),
+          `WindingContentView does not respond to ${selector}`,
+        );
+      }
+      for (const selector of ["wantsUpdateLayer", "updateLayer"]) {
         assert(
           respondsToSelector(
             viewClass,
