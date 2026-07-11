@@ -48,6 +48,7 @@ class WaylandLibrary implements Library {
     shmPool: Deno.PointerObject;
     buffer: Deno.PointerObject;
     surface: Deno.PointerObject;
+    output: Deno.PointerObject;
     seat: Deno.PointerObject;
     pointer: Deno.PointerObject;
     keyboard: Deno.PointerObject;
@@ -93,6 +94,7 @@ class WaylandLibrary implements Library {
       shmPool: dlsymRequired(this.libdl, wlHandle, "wl_shm_pool_interface"),
       buffer: dlsymRequired(this.libdl, wlHandle, "wl_buffer_interface"),
       surface: dlsymRequired(this.libdl, wlHandle, "wl_surface_interface"),
+      output: dlsymRequired(this.libdl, wlHandle, "wl_output_interface"),
       seat: dlsymRequired(this.libdl, wlHandle, "wl_seat_interface"),
       pointer: dlsymRequired(this.libdl, wlHandle, "wl_pointer_interface"),
       keyboard: dlsymRequired(this.libdl, wlHandle, "wl_keyboard_interface"),
@@ -106,7 +108,7 @@ class WaylandLibrary implements Library {
       wpCursorShapeDeviceIface,
       zwpTextInputManagerIface,
       zwpTextInputIface,
-    } = buildXdgIfaces(ifaces.seat, ifaces.surface);
+    } = buildXdgIfaces(ifaces.seat, ifaces.surface, ifaces.pointer, ifaces.output);
     this.#xdgMem = mem;
     this.xdgWmBaseIface = xdgWmBaseIface;
     this.xdgSurfaceIface = xdgSurfaceIface;
