@@ -43,9 +43,9 @@ fn invalid_element(node_handle: u32) -> JsValue {
     JsValue::from_str(&format!("DOM node handle is not an element: {node_handle}"))
 }
 
-fn invalid_text_control(node_handle: u32) -> JsValue {
+fn unsupported_form_control_value(node_handle: u32) -> JsValue {
     js_sys::TypeError::new(&format!(
-        "DOM node handle is not a rendered text-like input or textarea: {node_handle}"
+        "DOM node handle does not identify a supported form-control value: {node_handle}"
     ))
     .into()
 }
@@ -564,7 +564,7 @@ impl QuoxRenderer {
         })
     }
 
-    /// Read the live value of a rendered text-like form control, including active composition.
+    /// Read a supported form-control value, including active text composition.
     pub fn form_control_value(&self, node_handle: f64) -> Result<String, JsValue> {
         let node_handle =
             uint32(node_handle, "nodeHandle").map_err(NumericArgumentError::into_js)?;
@@ -577,10 +577,11 @@ impl QuoxRenderer {
         } = &mut *state;
         text_controls
             .value(document, node_id)
-            .ok_or_else(|| invalid_text_control(node_handle))
+            .ok_or_else(|| unsupported_form_control_value(node_handle))
     }
 
-    /// Set a live value without dispatching an event. Returns whether the value changed.
+    /// Set a supported form-control value without dispatching an event.
+    /// Returns whether its rendered or attribute state changed.
     pub fn set_form_control_value(&self, node_handle: f64, value: &str) -> Result<bool, JsValue> {
         let node_handle =
             uint32(node_handle, "nodeHandle").map_err(NumericArgumentError::into_js)?;
@@ -595,7 +596,7 @@ impl QuoxRenderer {
             } = &mut *state;
             text_controls
                 .set_value(document, node_id, value)
-                .ok_or_else(|| invalid_text_control(node_handle))?
+                .ok_or_else(|| unsupported_form_control_value(node_handle))?
         };
         state.reconcile_native_ime_after_editor_mutation(ime_before);
         Ok(changed)

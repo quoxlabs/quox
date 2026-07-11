@@ -11,6 +11,39 @@ interface ControlState {
   dirty: boolean;
 }
 
+type InputValueMode = "value" | "unsupported-value" | "default" | "default-on" | "filename";
+
+function inputValueMode(control: ControlState): InputValueMode {
+  const type = (control.attributes.get("type") ?? "").toLowerCase();
+  switch (type) {
+    case "date":
+    case "datetime-local":
+    case "month":
+    case "week":
+    case "time":
+    case "range":
+    case "color":
+      return "unsupported-value";
+    case "hidden":
+    case "submit":
+    case "image":
+    case "reset":
+    case "button":
+      return "default";
+    case "checkbox":
+    case "radio":
+      return "default-on";
+    case "file":
+      return "filename";
+    default:
+      return "value";
+  }
+}
+
+function isValueMode(mode: InputValueMode): boolean {
+  return mode === "value" || mode === "unsupported-value";
+}
+
 class FakeLiveControlRenderer {
   readonly #controls = new Map<number, ControlState>();
   readonly #pending = new Map<number, unknown>();
@@ -50,11 +83,41 @@ class FakeLiveControlRenderer {
   }
 
   form_control_value(nodeHandle: number): string {
-    return this.#control(nodeHandle).value;
+    const control = this.#control(nodeHandle);
+    if (control.tagName === "textarea") return control.value;
+    if (control.tagName !== "input") throw new TypeError("fake node is not a form control");
+    switch (inputValueMode(control)) {
+      case "value":
+        return control.value;
+      case "default":
+        return control.attributes.get("value") ?? "";
+      case "default-on":
+        return control.attributes.get("value") ?? "on";
+      case "unsupported-value":
+      case "filename":
+        throw new TypeError("fake input value mode is intentionally unsupported");
+    }
   }
 
   set_form_control_value(nodeHandle: number, value: string): boolean {
     const control = this.#control(nodeHandle);
+    if (control.tagName === "input") {
+      switch (inputValueMode(control)) {
+        case "default":
+        case "default-on": {
+          if (control.attributes.get("value") === value && control.attributes.has("value")) {
+            return false;
+          }
+          control.attributes.set("value", value);
+          return true;
+        }
+        case "unsupported-value":
+        case "filename":
+          throw new TypeError("fake input value mode is intentionally unsupported");
+        case "value":
+          break;
+      }
+    }
     const changed = control.value !== value;
     control.value = value;
     control.dirty = true;
@@ -67,16 +130,30 @@ class FakeLiveControlRenderer {
 
   set_attribute(nodeHandle: number, name: string, value: string): void {
     const control = this.#control(nodeHandle);
-    control.attributes.set(name.toLowerCase(), value);
-    if (control.tagName === "input" && name.toLowerCase() === "value" && !control.dirty) {
+    name = name.toLowerCase();
+    const previousMode = control.tagName === "input" && name === "type" ? inputValueMode(control) : undefined;
+    control.attributes.set(name, value);
+    if (previousMode !== undefined) {
+      this.#applyTypeTransition(control, previousMode);
+    } else if (
+      control.tagName === "input" && name === "value" &&
+      isValueMode(inputValueMode(control)) && !control.dirty
+    ) {
       control.value = value;
     }
   }
 
   remove_attribute(nodeHandle: number, name: string): void {
     const control = this.#control(nodeHandle);
-    control.attributes.delete(name.toLowerCase());
-    if (control.tagName === "input" && name.toLowerCase() === "value" && !control.dirty) {
+    name = name.toLowerCase();
+    const previousMode = control.tagName === "input" && name === "type" ? inputValueMode(control) : undefined;
+    control.attributes.delete(name);
+    if (previousMode !== undefined) {
+      this.#applyTypeTransition(control, previousMode);
+    } else if (
+      control.tagName === "input" && name === "value" &&
+      isValueMode(inputValueMode(control)) && !control.dirty
+    ) {
       control.value = "";
     }
   }
@@ -128,6 +205,21 @@ class FakeLiveControlRenderer {
   abort_dom_dispatch(frameId: number): boolean {
     this.#pending.delete(frameId);
     return false;
+  }
+
+  #applyTypeTransition(control: ControlState, previousMode: InputValueMode): void {
+    const nextMode = inputValueMode(control);
+    if (
+      isValueMode(previousMode) && !isValueMode(nextMode) && nextMode !== "filename" &&
+      control.value !== ""
+    ) {
+      control.attributes.set("value", control.value);
+    } else if (!isValueMode(previousMode) && isValueMode(nextMode)) {
+      control.value = control.attributes.get("value") ?? "";
+      control.dirty = false;
+    } else if (previousMode !== "filename" && nextMode === "filename") {
+      control.value = "";
+    }
   }
 
   #control(nodeHandle: number): ControlState {
@@ -223,6 +315,144 @@ Deno.test("value setters use Web IDL string conversion, repair surrogates, and e
   assertEquals(textarea.value, "");
   (textarea as unknown as { defaultValue: unknown }).defaultValue = null;
   assertEquals(textarea.defaultValue, "null");
+});
+
+Deno.test("default input value modes reflect the value content attribute", () => {
+  for (const type of ["hidden", "submit", "image", "reset", "button"]) {
+    const { document, renders } = createDocument();
+    const input = document.createElement("input");
+    input.setAttribute("type", type);
+    let inputEvents = 0;
+    let changeEvents = 0;
+    input.addEventListener("input", () => inputEvents++);
+    input.addEventListener("change", () => changeEvents++);
+    const setupRenders = renders.count;
+
+    assertEquals(input.value, "", `${type} has an empty missing-attribute fallback`);
+    assertEquals(input.getAttribute("value"), null);
+
+    input.value = "";
+    assertEquals(input.value, "");
+    assertEquals(input.getAttribute("value"), "");
+    assertEquals(renders.count, setupRenders + 1, "creating an empty attribute must repaint");
+
+    input.value = "";
+    assertEquals(renders.count, setupRenders + 1, "an identical present attribute is unchanged");
+
+    input.value = "button label";
+    assertEquals(input.value, "button label");
+    assertEquals(input.defaultValue, "button label");
+    assertEquals(renders.count, setupRenders + 2);
+
+    input.removeAttribute("value");
+    assertEquals(input.value, "");
+    assertEquals(input.getAttribute("value"), null);
+    assertEquals(inputEvents, 0);
+    assertEquals(changeEvents, 0);
+  }
+});
+
+Deno.test("checkbox and radio value modes use on only for a missing attribute", () => {
+  for (const type of ["checkbox", "radio"]) {
+    const { document, renders } = createDocument();
+    const input = document.createElement("input");
+    input.setAttribute("type", type);
+    let inputEvents = 0;
+    let changeEvents = 0;
+    input.addEventListener("input", () => inputEvents++);
+    input.addEventListener("change", () => changeEvents++);
+    const setupRenders = renders.count;
+
+    assertEquals(input.value, "on");
+    assertEquals(input.defaultValue, "");
+    assertEquals(input.getAttribute("value"), null);
+
+    input.value = "on";
+    assertEquals(input.value, "on");
+    assertEquals(input.getAttribute("value"), "on");
+    assertEquals(renders.count, setupRenders + 1, "creating the fallback text as an attribute repaints");
+
+    input.value = "on";
+    assertEquals(renders.count, setupRenders + 1);
+
+    input.value = "";
+    assertEquals(input.value, "", "a present empty attribute does not use the on fallback");
+    assertEquals(input.getAttribute("value"), "");
+    assertEquals(renders.count, setupRenders + 2);
+
+    input.removeAttribute("value");
+    assertEquals(input.value, "on");
+    (input as unknown as { value: unknown }).value = null;
+    assertEquals(input.value, "", "LegacyNullToEmptyString creates an empty attribute");
+    assertEquals(input.getAttribute("value"), "");
+    assertEquals(inputEvents, 0);
+    assertEquals(changeEvents, 0);
+  }
+});
+
+Deno.test("input type changes transfer values between value and attribute modes", () => {
+  const { document } = createDocument();
+
+  for (const type of ["checkbox", "hidden"]) {
+    const dirty = document.createElement("input");
+    dirty.defaultValue = "old default";
+    dirty.value = "live value";
+    dirty.setAttribute("type", type);
+    assertEquals(dirty.value, "live value");
+    assertEquals(dirty.getAttribute("value"), "live value");
+
+    dirty.setAttribute("type", "text");
+    assertEquals(dirty.value, "live value");
+    dirty.defaultValue = "new default";
+    assertEquals(dirty.value, "new default", "returning to value mode resets the dirty flag");
+
+    const empty = document.createElement("input");
+    empty.defaultValue = "old default";
+    empty.value = "";
+    empty.setAttribute("type", type);
+    assertEquals(empty.value, "old default", "an empty live value does not overwrite the old attribute");
+  }
+
+  const checkbox = document.createElement("input");
+  checkbox.setAttribute("type", "checkbox");
+  assertEquals(checkbox.value, "on");
+  checkbox.setAttribute("type", "text");
+  assertEquals(checkbox.value, "", "the default-on fallback is not copied into value mode");
+
+  const assignedCheckbox = document.createElement("input");
+  assignedCheckbox.setAttribute("type", "checkbox");
+  assignedCheckbox.value = "choice";
+  assignedCheckbox.setAttribute("type", "text");
+  assertEquals(assignedCheckbox.value, "choice");
+  assignedCheckbox.defaultValue = "replacement default";
+  assertEquals(assignedCheckbox.value, "replacement default");
+
+  const fallback = document.createElement("input");
+  fallback.setAttribute("type", "hidden");
+  assertEquals(fallback.value, "");
+  fallback.setAttribute("type", "radio");
+  assertEquals(fallback.value, "on");
+  fallback.setAttribute("type", "hidden");
+  assertEquals(fallback.value, "");
+  assertEquals(fallback.getAttribute("value"), null);
+});
+
+Deno.test("complex and filename input values remain explicitly unsupported", () => {
+  for (const type of ["date", "datetime-local", "month", "week", "time", "range", "color", "file"]) {
+    const { document } = createDocument();
+    const input = document.createElement("input");
+    input.setAttribute("type", type);
+
+    assertThrows(() => input.value, TypeError, "intentionally unsupported");
+    assertThrows(
+      () => {
+        input.value = "replacement";
+      },
+      TypeError,
+      "intentionally unsupported",
+    );
+    assertEquals(input.getAttribute("value"), null);
+  }
 });
 
 Deno.test("a native edit is visible before its first input listener", () => {

@@ -107,8 +107,9 @@ struct TextControlState {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UnmanagedInputMode {
-    Value,
-    Attribute,
+    UnsupportedValue,
+    Default,
+    DefaultOn,
     Filename,
 }
 
@@ -123,7 +124,14 @@ impl TextControlStates {
             if document.get_node(node_id).is_none() {
                 self.controls.remove(&node_id);
             } else if control_descriptor(document, node_id).is_none() {
-                if unmanaged_input_mode(document, node_id) == Some(UnmanagedInputMode::Value) {
+                // Capture the previous value mode's final editor contents before applying the
+                // type-change bookkeeping. In particular, active composition text is part of
+                // the value which a transition to default/default-on mode can copy to the
+                // content attribute.
+                self.sync_editor_value(document, node_id);
+                if unmanaged_input_mode(document, node_id)
+                    == Some(UnmanagedInputMode::UnsupportedValue)
+                {
                     // Preserve valid internal values and the dirty flag across unsupported
                     // value-mode states so returning to a supported mode does not resurrect the
                     // old default. Destination-specific sanitizers remain deliberately outside
@@ -227,13 +235,24 @@ impl TextControlStates {
         if self.controls.contains_key(&node_id) {
             self.sync_editor_value(document, node_id);
         }
-        self.reconcile_control(document, node_id)
-            .then(|| self.controls.get(&node_id).map(|state| state.value.clone()))
-            .flatten()
+        if self.reconcile_control(document, node_id) {
+            return self.controls.get(&node_id).map(|state| state.value.clone());
+        }
+
+        match unmanaged_input_mode(document, node_id)? {
+            UnmanagedInputMode::Default => {
+                Some(input_value_attribute(document, node_id).unwrap_or_default())
+            }
+            UnmanagedInputMode::DefaultOn => {
+                Some(input_value_attribute(document, node_id).unwrap_or_else(|| "on".to_owned()))
+            }
+            UnmanagedInputMode::UnsupportedValue | UnmanagedInputMode::Filename => None,
+        }
     }
 
-    /// Set a script value without producing an event. The dirty flag is set even for an
-    /// assignment of the existing value, while the caret moves only for an actual value change.
+    /// Set a supported script value without producing an event. Editor-backed value modes become
+    /// dirty even for an identical assignment; default/default-on modes instead reflect the
+    /// content attribute and report its observable presence/value change.
     pub(crate) fn set_value(
         &mut self,
         document: &mut BaseDocument,
@@ -241,7 +260,12 @@ impl TextControlStates {
         value: &str,
     ) -> Option<bool> {
         if !self.reconcile_control(document, node_id) {
-            return None;
+            return match unmanaged_input_mode(document, node_id)? {
+                UnmanagedInputMode::Default | UnmanagedInputMode::DefaultOn => {
+                    Some(set_input_value_attribute(document, node_id, value))
+                }
+                UnmanagedInputMode::UnsupportedValue | UnmanagedInputMode::Filename => None,
+            };
         }
 
         let control = self
@@ -386,10 +410,35 @@ fn html_input_element(document: &BaseDocument, node_id: usize) -> Option<&blitz_
 }
 
 fn input_default_value(document: &BaseDocument, node_id: usize) -> String {
-    html_input_element(document, node_id)
-        .and_then(|element| element.attr(local_name!("value")))
-        .unwrap_or("")
-        .to_owned()
+    input_value_attribute(document, node_id).unwrap_or_default()
+}
+
+fn input_value_attribute(document: &BaseDocument, node_id: usize) -> Option<String> {
+    html_input_element(document, node_id)?
+        .attr(local_name!("value"))
+        .map(str::to_owned)
+}
+
+/// Set an input value content attribute and report attribute identity, not exposed-value
+/// equality. An absent checkbox and `value="on"` have the same getter result, but creating the
+/// attribute is observable and can affect selectors; likewise an empty submit value suppresses
+/// its implementation-defined fallback label.
+fn set_input_value_attribute(document: &mut BaseDocument, node_id: usize, value: &str) -> bool {
+    if input_value_attribute(document, node_id).as_deref() == Some(value) {
+        return false;
+    }
+    document
+        .mutate()
+        .set_attribute(node_id, value_attribute_name(), value);
+    true
+}
+
+fn value_attribute_name() -> QualName {
+    QualName {
+        prefix: None,
+        ns: ns!(),
+        local: local_name!("value"),
+    }
 }
 
 fn unmanaged_input_mode(document: &BaseDocument, node_id: usize) -> Option<UnmanagedInputMode> {
@@ -399,11 +448,10 @@ fn unmanaged_input_mode(document: &BaseDocument, node_id: usize) -> Option<Unman
         .to_ascii_lowercase();
     match input_type.as_str() {
         "date" | "datetime-local" | "month" | "week" | "time" | "range" | "color" => {
-            Some(UnmanagedInputMode::Value)
+            Some(UnmanagedInputMode::UnsupportedValue)
         }
-        "hidden" | "checkbox" | "radio" | "submit" | "image" | "reset" | "button" => {
-            Some(UnmanagedInputMode::Attribute)
-        }
+        "hidden" | "submit" | "image" | "reset" | "button" => Some(UnmanagedInputMode::Default),
+        "checkbox" | "radio" => Some(UnmanagedInputMode::DefaultOn),
         "file" => Some(UnmanagedInputMode::Filename),
         _ => None,
     }
@@ -455,18 +503,14 @@ fn is_valid_floating_point_number(value: &str) -> bool {
 /// to Blitz. A nonempty live value becomes the content default; returning to a supported value
 /// mode initializes from that attribute with a fresh dirty flag.
 fn transition_out_of_text_value_mode(document: &mut BaseDocument, node_id: usize, value: &str) {
-    if unmanaged_input_mode(document, node_id) == Some(UnmanagedInputMode::Attribute)
-        && !value.is_empty()
+    if matches!(
+        unmanaged_input_mode(document, node_id),
+        Some(UnmanagedInputMode::Default | UnmanagedInputMode::DefaultOn)
+    ) && !value.is_empty()
     {
-        document.mutate().set_attribute(
-            node_id,
-            QualName {
-                prefix: None,
-                ns: ns!(),
-                local: local_name!("value"),
-            },
-            value,
-        );
+        document
+            .mutate()
+            .set_attribute(node_id, value_attribute_name(), value);
     }
 
     clear_text_editor(document, node_id);
@@ -651,6 +695,12 @@ mod tests {
             ns: ns!(),
             local: local_name!("type"),
         }
+    }
+
+    fn set_input_type(document: &mut BaseDocument, node_id: usize, input_type: &str) {
+        document
+            .mutate()
+            .set_attribute(node_id, type_attribute(), input_type);
     }
 
     fn editor_selection(document: &BaseDocument, node_id: usize) -> std::ops::Range<usize> {
@@ -996,6 +1046,257 @@ mod tests {
             controls.value(&mut document, textarea).as_deref(),
             Some("one\ntwo\nthree")
         );
+    }
+
+    #[test]
+    fn default_modes_reflect_value_attribute_presence_and_contents() {
+        let mut document = document(
+            "<input id='hidden' type='hidden'>\
+             <input id='submit' type='submit'>\
+             <input id='image' type='image'>\
+             <input id='reset' type='reset'>\
+             <input id='button' type='button'>",
+        );
+        let inputs =
+            ["hidden", "submit", "image", "reset", "button"].map(|id| element(&document, id));
+        let mut controls = TextControlStates::default();
+        controls.reconcile_document(&mut document);
+
+        for input in inputs {
+            assert_eq!(controls.value(&mut document, input).as_deref(), Some(""));
+            assert_eq!(controls.set_value(&mut document, input, ""), Some(true));
+            assert_eq!(
+                super::input_value_attribute(&document, input).as_deref(),
+                Some("")
+            );
+            assert_eq!(controls.set_value(&mut document, input, ""), Some(false));
+
+            assert_eq!(
+                controls.set_value(&mut document, input, "button label"),
+                Some(true)
+            );
+            assert_eq!(
+                controls.value(&mut document, input).as_deref(),
+                Some("button label")
+            );
+            assert_eq!(
+                super::input_value_attribute(&document, input).as_deref(),
+                Some("button label")
+            );
+
+            document.mutate().clear_attribute(input, value_attribute());
+            assert_eq!(controls.value(&mut document, input).as_deref(), Some(""));
+            assert!(controls.state(input).is_none());
+            assert!(super::editor_value(&document, input).is_none());
+        }
+    }
+
+    #[test]
+    fn default_on_modes_use_on_only_while_the_value_attribute_is_missing() {
+        let mut document = document(
+            "<input id='checkbox' type='checkbox' checked>\
+             <input id='radio' type='radio' checked>",
+        );
+        let inputs = ["checkbox", "radio"].map(|id| element(&document, id));
+        let mut controls = TextControlStates::default();
+        controls.reconcile_document(&mut document);
+
+        for input in inputs {
+            assert_eq!(controls.value(&mut document, input).as_deref(), Some("on"));
+            assert_eq!(controls.set_value(&mut document, input, "on"), Some(true));
+            assert_eq!(
+                super::input_value_attribute(&document, input).as_deref(),
+                Some("on")
+            );
+            assert_eq!(controls.set_value(&mut document, input, "on"), Some(false));
+
+            assert_eq!(controls.set_value(&mut document, input, ""), Some(true));
+            assert_eq!(controls.value(&mut document, input).as_deref(), Some(""));
+            assert_eq!(
+                super::input_value_attribute(&document, input).as_deref(),
+                Some("")
+            );
+
+            document.mutate().clear_attribute(input, value_attribute());
+            assert_eq!(controls.value(&mut document, input).as_deref(), Some("on"));
+            assert!(
+                document
+                    .get_node(input)
+                    .and_then(blitz_dom::Node::element_data)
+                    .is_some_and(|element| element.has_attr(local_name!("checked")))
+            );
+            assert!(controls.state(input).is_none());
+            assert!(super::editor_value(&document, input).is_none());
+        }
+    }
+
+    #[test]
+    fn non_value_type_changes_follow_html_value_bookkeeping() {
+        let mut document = document(
+            "<input id='dirty-checkbox' value='old default'>\
+             <input id='dirty-hidden' value='old default'>\
+             <input id='empty-checkbox' value='old default'>\
+             <input id='empty-hidden' value='old default'>\
+             <input id='absent-checkbox' type='checkbox'>\
+             <input id='assigned-checkbox' type='checkbox'>\
+             <input id='fallback' type='hidden'>",
+        );
+        let dirty_checkbox = element(&document, "dirty-checkbox");
+        let dirty_hidden = element(&document, "dirty-hidden");
+        let empty_checkbox = element(&document, "empty-checkbox");
+        let empty_hidden = element(&document, "empty-hidden");
+        let absent_checkbox = element(&document, "absent-checkbox");
+        let assigned_checkbox = element(&document, "assigned-checkbox");
+        let fallback = element(&document, "fallback");
+        let mut controls = TextControlStates::default();
+        controls.reconcile_document(&mut document);
+
+        for input in [dirty_checkbox, dirty_hidden] {
+            controls.set_value(&mut document, input, "live value");
+        }
+        for input in [empty_checkbox, empty_hidden] {
+            controls.set_value(&mut document, input, "");
+        }
+        set_input_type(&mut document, dirty_checkbox, "checkbox");
+        set_input_type(&mut document, dirty_hidden, "hidden");
+        set_input_type(&mut document, empty_checkbox, "checkbox");
+        set_input_type(&mut document, empty_hidden, "hidden");
+        controls.reconcile_document(&mut document);
+
+        for input in [dirty_checkbox, dirty_hidden] {
+            assert_eq!(
+                super::input_value_attribute(&document, input).as_deref(),
+                Some("live value")
+            );
+            assert_eq!(
+                controls.value(&mut document, input).as_deref(),
+                Some("live value")
+            );
+            assert!(controls.state(input).is_none());
+        }
+        for input in [empty_checkbox, empty_hidden] {
+            assert_eq!(
+                super::input_value_attribute(&document, input).as_deref(),
+                Some("old default")
+            );
+            assert_eq!(
+                controls.value(&mut document, input).as_deref(),
+                Some("old default")
+            );
+        }
+
+        for input in [dirty_checkbox, dirty_hidden] {
+            set_input_type(&mut document, input, "text");
+        }
+        controls.reconcile_document(&mut document);
+        for input in [dirty_checkbox, dirty_hidden] {
+            assert_eq!(
+                controls.value(&mut document, input).as_deref(),
+                Some("live value")
+            );
+            assert!(!controls.state(input).unwrap().dirty_value);
+            document
+                .mutate()
+                .set_attribute(input, value_attribute(), "new default");
+        }
+        controls.reconcile_document(&mut document);
+        for input in [dirty_checkbox, dirty_hidden] {
+            assert_eq!(
+                controls.value(&mut document, input).as_deref(),
+                Some("new default")
+            );
+        }
+
+        set_input_type(&mut document, absent_checkbox, "text");
+        assert_eq!(
+            controls.set_value(&mut document, assigned_checkbox, "choice"),
+            Some(true)
+        );
+        set_input_type(&mut document, assigned_checkbox, "text");
+        controls.reconcile_document(&mut document);
+        assert_eq!(
+            controls.value(&mut document, absent_checkbox).as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            controls.value(&mut document, assigned_checkbox).as_deref(),
+            Some("choice")
+        );
+        assert!(!controls.state(absent_checkbox).unwrap().dirty_value);
+        assert!(!controls.state(assigned_checkbox).unwrap().dirty_value);
+
+        assert_eq!(controls.value(&mut document, fallback).as_deref(), Some(""));
+        set_input_type(&mut document, fallback, "checkbox");
+        controls.reconcile_document(&mut document);
+        assert_eq!(
+            controls.value(&mut document, fallback).as_deref(),
+            Some("on")
+        );
+        assert!(super::input_value_attribute(&document, fallback).is_none());
+        set_input_type(&mut document, fallback, "hidden");
+        controls.reconcile_document(&mut document);
+        assert_eq!(controls.value(&mut document, fallback).as_deref(), Some(""));
+        assert!(super::input_value_attribute(&document, fallback).is_none());
+    }
+
+    #[test]
+    fn type_change_copies_the_latest_active_composition_to_default_on_mode() {
+        let mut document = document("<input id='field' value='before'>");
+        let input = element(&document, "field");
+        let mut controls = TextControlStates::default();
+        controls.reconcile_document(&mut document);
+        document.with_text_input(input, |mut driver| {
+            driver.move_to_text_end();
+            driver.set_compose("候補", None);
+        });
+
+        document
+            .mutate()
+            .set_attribute(input, type_attribute(), "checkbox");
+        controls.reconcile_document(&mut document);
+
+        assert_eq!(
+            super::input_value_attribute(&document, input).as_deref(),
+            Some("before候補")
+        );
+        assert_eq!(
+            controls.value(&mut document, input).as_deref(),
+            Some("before候補")
+        );
+        assert!(controls.state(input).is_none());
+        assert!(super::editor_value(&document, input).is_none());
+    }
+
+    #[test]
+    fn complex_and_filename_modes_remain_explicitly_unsupported() {
+        let mut document = document(
+            "<input id='date' type='date' value='sentinel'>\
+             <input id='datetime' type='datetime-local' value='sentinel'>\
+             <input id='month' type='month' value='sentinel'>\
+             <input id='week' type='week' value='sentinel'>\
+             <input id='time' type='time' value='sentinel'>\
+             <input id='range' type='range' value='sentinel'>\
+             <input id='color' type='color' value='sentinel'>\
+             <input id='file' type='file' value='sentinel'>",
+        );
+        let inputs = [
+            "date", "datetime", "month", "week", "time", "range", "color", "file",
+        ]
+        .map(|id| element(&document, id));
+        let mut controls = TextControlStates::default();
+        controls.reconcile_document(&mut document);
+
+        for input in inputs {
+            assert_eq!(controls.value(&mut document, input), None);
+            assert_eq!(
+                controls.set_value(&mut document, input, "replacement"),
+                None
+            );
+            assert_eq!(
+                super::input_value_attribute(&document, input).as_deref(),
+                Some("sentinel")
+            );
+        }
     }
 
     #[test]
