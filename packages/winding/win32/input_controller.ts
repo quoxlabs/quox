@@ -38,9 +38,9 @@ import {
   IACE_DEFAULT,
   type imm32functions,
   ISC_SHOWUICOMPOSITIONWINDOW,
+  MAPVK_VK_TO_VSC_EX,
   NI_COMPOSITIONSTR,
   PM_NOREMOVE,
-  TU_NO_STATE_CHANGE,
   UNICODE_NOCHAR,
   type user32functions,
   WM,
@@ -56,6 +56,7 @@ import {
   keyboardModifiers,
   logicalKeyFromVirtualKey,
   matchesWin32KeyMessage,
+  probeWin32AltGraphLayout,
   repeatedWmCharText,
   ResultEchoSuppressor,
   shouldExposeAltGraph,
@@ -679,30 +680,18 @@ export class Win32InputController {
   }
 
   #layoutHasAltGraph(layout: Deno.PointerValue): boolean {
-    if (layout === null) return false;
-    const layoutId = Deno.UnsafePointer.value(layout);
+    const layoutId = this.#keyboardLayoutAddress(layout);
+    if (layoutId === undefined) return false;
     const cached = this.#altGraphLayouts.get(layoutId);
     if (cached !== undefined) return cached;
 
     const adapter = this.#toUnicodeAdapter(layout);
-    const plainState = new Uint8Array(256);
-    const altGraphState = new Uint8Array(256);
-    for (const virtualKey of [VK.CONTROL, VK.LCONTROL, VK.MENU, VK.RMENU]) altGraphState[virtualKey] = 0x80;
-
-    let hasAltGraph = false;
-    for (let virtualKey = 0x20; virtualKey <= 0xfe; virtualKey++) {
-      const plain = adapter.toUnicode(virtualKey, 0, plainState, TU_NO_STATE_CHANGE);
-      const alternate = adapter.toUnicode(virtualKey, 0, altGraphState, TU_NO_STATE_CHANGE);
-      if (alternate.result <= 0) continue;
-      const alternateText = alternate.text.slice(0, alternate.result);
-      const plainText = plain.result > 0 ? plain.text.slice(0, plain.result) : "";
-      if (isCommitText(alternateText) && alternateText !== plainText) {
-        hasAltGraph = true;
-        break;
-      }
-    }
-    this.#altGraphLayouts.set(layoutId, hasAltGraph);
-    return hasAltGraph;
+    const probed = probeWin32AltGraphLayout({
+      ...adapter,
+      mapVirtualKey: (virtualKey) => this.#user32.symbols.MapVirtualKeyExW(virtualKey, MAPVK_VK_TO_VSC_EX, layout),
+    });
+    if (probed !== undefined) this.#altGraphLayouts.set(layoutId, probed);
+    return probed ?? false;
   }
 
   #keyMessageFromBuffer(buffer: ArrayBuffer): NativeKeyMessage | undefined {

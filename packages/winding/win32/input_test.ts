@@ -2,6 +2,7 @@ import { assert, assertEquals, assertThrows } from "jsr:@std/assert@^1.0.19";
 import type { KeyDownEvent, UIEvent } from "../types.ts";
 import {
   AltGraphControlFilter,
+  classifyWin32ProbeTranslation,
   completeWin32MouseMessage,
   CsInsertCharAssembler,
   decodeKeyLParam,
@@ -14,6 +15,7 @@ import {
   keyboardStateForTranslation,
   logicalKeyFromVirtualKey,
   matchesWin32KeyMessage,
+  probeWin32AltGraphLayout,
   repeatedWmCharText,
   ResultEchoSuppressor,
   shouldExposeAltGraph,
@@ -30,6 +32,7 @@ import {
   Win32MessageQueueGate,
   Win32MouseCaptureState,
   Win32MouseTrackingState,
+  win32ProbeLevelShowsAltGraph,
   win32QuitExitCode,
   WmCharDecoder,
 } from "./input.ts";
@@ -61,6 +64,7 @@ import {
   IMR_QUERYCHARPOSITION,
   ISC_SHOWUICOMPOSITIONWINDOW,
   kernel32functions,
+  MAPVK_VK_TO_VSC_EX,
   user32functions,
   win32IntegerResourceAddress,
   win32WndProcDefinition,
@@ -107,6 +111,11 @@ Deno.test("Win32 FFI preserves opaque handles and signed pointer-width message v
   assertEquals(user32functions.CreateWindowExW.parameters.slice(4, 8), ["i32", "i32", "i32", "i32"]);
   assertEquals(user32functions.CreateWindowExW.parameters.at(-1), "pointer");
   assertEquals(user32functions.DispatchMessageW.result, "isize");
+  assertEquals(user32functions.MapVirtualKeyExW, {
+    parameters: ["u32", "u32", "pointer"],
+    result: "u32",
+  });
+  assertEquals(MAPVK_VK_TO_VSC_EX, 4);
   assertEquals(user32functions.DefWindowProcW, {
     parameters: ["pointer", "u32", "usize", "isize"],
     result: "isize",
@@ -1311,6 +1320,192 @@ Deno.test("VK_PACKET surrogate transitions suppress defaults and assemble one sc
   assertEquals(textImeEvents(harness.events), [{ kind: "commit", text: "🙂" }]);
 });
 
+Deno.test("Win32 AltGr probe classification compares complete translation kind and text", () => {
+  const none = classifyWin32ProbeTranslation({ result: 0, text: "ignored" });
+  const text = classifyWin32ProbeTranslation({ result: 1, text: "ab" });
+  const dead = classifyWin32ProbeTranslation({ result: -1, text: "´" });
+  const failed = classifyWin32ProbeTranslation(undefined);
+  assertEquals(none, { kind: "none", text: "" });
+  assertEquals(text, { kind: "text", text: "a" });
+  assertEquals(dead, { kind: "dead", text: "´" });
+  assertEquals(classifyWin32ProbeTranslation({ result: -1, text: "´x" }), { kind: "dead", text: "´x" });
+  assertEquals(failed, { kind: "failed", text: "" });
+  assertEquals(win32ProbeLevelShowsAltGraph(text, text), false);
+  assertEquals(win32ProbeLevelShowsAltGraph(text, dead), true);
+  assertEquals(win32ProbeLevelShowsAltGraph(none, { kind: "text", text: "\u001f" }), false);
+  assertEquals(win32ProbeLevelShowsAltGraph(none, failed), false);
+});
+
+Deno.test("Win32 AltGr probing covers text, dead, shifted, scan-sensitive, and failed levels", () => {
+  type Level = "plain" | "alternate" | "shiftedPlain" | "shiftedAlternate";
+  type ProbeValue = { result: number; text: string } | Error;
+  type Matrix = Partial<Record<Level, ProbeValue>>;
+  const virtualKey = 0x51;
+
+  function runProbe(matrix: Matrix, mappedScan = 0x10) {
+    const calls: Array<{ level: Level; scanCode: number; flags: number }> = [];
+    const mappedKeys: number[] = [];
+    const result = probeWin32AltGraphLayout({
+      mapVirtualKey(candidate) {
+        mappedKeys.push(candidate);
+        return candidate === virtualKey ? mappedScan : 0;
+      },
+      toUnicode(candidate, scanCode, state, flags) {
+        assertEquals(candidate, virtualKey);
+        const shifted = (state[VK.SHIFT] & 0x80) !== 0;
+        const alternate = (state[VK.RMENU] & 0x80) !== 0;
+        assertEquals((state[VK.LSHIFT] & 0x80) !== 0, shifted);
+        for (const modifier of [VK.CONTROL, VK.LCONTROL, VK.MENU, VK.RMENU]) {
+          assertEquals((state[modifier] & 0x80) !== 0, alternate);
+        }
+        assertEquals(state[VK.RCONTROL] & 0x80, 0);
+        assertEquals(state[VK.LMENU] & 0x80, 0);
+        assertEquals(state[VK.RSHIFT] & 0x80, 0);
+        const level: Level = shifted
+          ? (alternate ? "shiftedAlternate" : "shiftedPlain")
+          : (alternate ? "alternate" : "plain");
+        calls.push({ level, scanCode, flags });
+        const value = matrix[level] ?? { result: 0, text: "" };
+        if (value instanceof Error) throw value;
+        return value;
+      },
+    });
+    return { calls, mappedKeys, result };
+  }
+
+  assertEquals(
+    runProbe({
+      plain: { result: 1, text: "q" },
+      alternate: { result: 1, text: "@" },
+    }).result,
+    true,
+  );
+  assertEquals(
+    runProbe({ alternate: { result: -1, text: "´" } }).result,
+    true,
+  );
+
+  const shiftedOnly = runProbe({
+    plain: { result: 1, text: "q" },
+    alternate: { result: 1, text: "q" },
+    shiftedPlain: { result: 1, text: "Q" },
+    shiftedAlternate: { result: 1, text: "Ω" },
+  });
+  assertEquals(shiftedOnly.result, true);
+  assertEquals(shiftedOnly.calls.map((call) => call.level), [
+    "plain",
+    "alternate",
+    "shiftedPlain",
+    "shiftedAlternate",
+  ]);
+
+  assertEquals(
+    runProbe({
+      plain: { result: -1, text: "´" },
+      alternate: { result: -1, text: "´" },
+    }).result,
+    false,
+  );
+
+  const scanSensitive = runProbe({ alternate: { result: 1, text: "@" } }, 0xe038);
+  assertEquals(scanSensitive.result, true);
+  assert(scanSensitive.calls.every((call) => call.scanCode === 0x38));
+  assert(scanSensitive.calls.every((call) => call.flags === TO_UNICODE_NO_STATE_CHANGE));
+  assertEquals(scanSensitive.mappedKeys.includes(VK.PACKET), false);
+
+  assertEquals(runProbe({}).result, false);
+  assertEquals(
+    runProbe({
+      plain: new Error("layout changed"),
+      alternate: { result: 1, text: "@" },
+    }).result,
+    undefined,
+  );
+  assertEquals(
+    probeWin32AltGraphLayout({
+      mapVirtualKey: () => {
+        throw new Error("layout disappeared");
+      },
+      toUnicode: () => ({ result: 0, text: "" }),
+    }),
+    undefined,
+  );
+
+  let failedOnce = false;
+  assertEquals(
+    probeWin32AltGraphLayout({
+      mapVirtualKey(candidate) {
+        if (candidate === 0x40 && !failedOnce) {
+          failedOnce = true;
+          throw new Error("transient mapping failure");
+        }
+        return candidate === virtualKey ? 0x10 : 0;
+      },
+      toUnicode(_candidate, _scanCode, state) {
+        return (state[VK.RMENU] & 0x80) !== 0 ? { result: 1, text: "@" } : { result: 1, text: "q" };
+      },
+    }),
+    true,
+  );
+});
+
+Deno.test("Win32 caches complete AltGr probes by HKL and retries after language change", () => {
+  let mapCalls = 0;
+  const observedLayouts: Deno.PointerValue[] = [];
+  const behavior: FakeImmBehavior = {
+    keyboardLayout: 0x0409n,
+    mapVirtualKey(virtualKey, mapType, layout) {
+      assertEquals(mapType, MAPVK_VK_TO_VSC_EX);
+      observedLayouts.push(layout);
+      mapCalls++;
+      return virtualKey === 0x51 ? 0x10 : 0;
+    },
+    toUnicode(virtualKey, scanCode, state, flags, layout) {
+      assertEquals(flags, TO_UNICODE_NO_STATE_CHANGE);
+      observedLayouts.push(layout);
+      if (virtualKey !== 0x51) return { result: 0, text: "" };
+      assertEquals(scanCode, 0x10);
+      return (state[VK.RMENU] & 0x80) !== 0 ? { result: 1, text: "@" } : { result: 1, text: "q" };
+    },
+  };
+  const harness = createInputControllerHarness(behavior);
+  harness.controller.attach(harness.window);
+  harness.controller.handleMessage(harness.window, WM.KEYDOWN, 0x41, makeKeyLParam(0x1e));
+  const firstProbeCalls = mapCalls;
+  assert(firstProbeCalls > 0);
+  assert(observedLayouts.every((layout) => layout === harness.keyboardLayout));
+
+  harness.controller.handleMessage(harness.window, WM.KEYUP, 0x41, makeKeyLParam(0x1e));
+  harness.controller.handleMessage(harness.window, WM.KEYDOWN, 0x42, makeKeyLParam(0x30));
+  assertEquals(mapCalls, firstProbeCalls);
+
+  harness.controller.handleMessage(harness.window, WM.INPUTLANGCHANGE, 0n, 0n);
+  harness.controller.handleMessage(harness.window, WM.KEYDOWN, 0x43, makeKeyLParam(0x2e));
+  assertEquals(mapCalls, firstProbeCalls * 2);
+
+  let incompleteProbeStarts = 0;
+  let transientTranslationFailures = 1;
+  const incomplete = createInputControllerHarness({
+    keyboardLayout: 0x0410n,
+    mapVirtualKey(virtualKey) {
+      if (virtualKey === 0x20) incompleteProbeStarts++;
+      return virtualKey === 0x51 ? 0x10 : 0;
+    },
+    toUnicode() {
+      if (transientTranslationFailures > 0) {
+        transientTranslationFailures--;
+        throw new Error("transient layout race");
+      }
+      return { result: 1, text: "q" };
+    },
+  });
+  incomplete.controller.attach(incomplete.window);
+  incomplete.controller.handleMessage(incomplete.window, WM.KEYDOWN, 0x41, makeKeyLParam(0x1e));
+  incomplete.controller.handleMessage(incomplete.window, WM.KEYDOWN, 0x42, makeKeyLParam(0x30));
+  incomplete.controller.handleMessage(incomplete.window, WM.KEYDOWN, 0x43, makeKeyLParam(0x2e));
+  assertEquals(incompleteProbeStarts, 2);
+});
+
 Deno.test("injected ToUnicode translation follows the active layout and uses the non-mutating flag", () => {
   const state = new Uint8Array(256);
   const translated = translateLogicalKey(0x59, makeKeyLParam(0x15), state, {
@@ -1945,6 +2140,14 @@ interface FakeImmBehavior {
   releaseResult?: number;
   keyText?: ReadonlyMap<number, string>;
   translateKey?: (virtualKey: number) => string | undefined;
+  mapVirtualKey?: (virtualKey: number, mapType: number, layout: Deno.PointerValue) => number;
+  toUnicode?: (
+    virtualKey: number,
+    scanCode: number,
+    keyboardState: Uint8Array,
+    flags: number,
+    layout: Deno.PointerValue,
+  ) => { result: number; text: string };
   keyboardState?: ReadonlyArray<readonly [virtualKey: number, state: number]>;
   compositionData?: ReadonlyMap<number, Uint8Array | number>;
   onNotifyIme?: () => void;
@@ -1956,6 +2159,7 @@ interface FakeImmBehavior {
 function createInputControllerHarness(behavior: FakeImmBehavior = {}) {
   const hwnd = {} as Deno.PointerObject;
   const context = {} as Deno.PointerObject;
+  const keyboardLayout = {} as Deno.PointerObject;
   const calls = {
     associationFlags: [] as number[],
     candidatePlacements: 0,
@@ -1978,15 +2182,28 @@ function createInputControllerHarness(behavior: FakeImmBehavior = {}) {
         for (const [virtualKey, state] of behavior.keyboardState ?? []) target[virtualKey] = state;
         return 1;
       },
-      GetKeyboardLayout: () => null,
+      GetKeyboardLayout: () => behavior.keyboardLayout === undefined ? null : keyboardLayout,
+      MapVirtualKeyExW(virtualKey: number, mapType: number, layout: Deno.PointerValue) {
+        return behavior.mapVirtualKey?.(virtualKey, mapType, layout) ?? 0;
+      },
       GetKeyState: () => 0,
       PeekMessageW: () => 0,
       ToUnicodeEx(
         virtualKey: number,
-        _scanCode: number,
-        _keyboardState: Uint8Array,
+        scanCode: number,
+        keyboardState: Uint8Array,
         output: Uint16Array,
+        _outputLength: number,
+        flags: number,
+        layout: Deno.PointerValue,
       ) {
+        const translation = behavior.toUnicode?.(virtualKey, scanCode, keyboardState, flags, layout);
+        if (translation !== undefined) {
+          for (let index = 0; index < translation.text.length; index++) {
+            output[index] = translation.text.charCodeAt(index);
+          }
+          return translation.result;
+        }
         const text = behavior.translateKey === undefined
           ? behavior.keyText?.get(virtualKey)
           : behavior.translateKey(virtualKey);
@@ -2060,7 +2277,7 @@ function createInputControllerHarness(behavior: FakeImmBehavior = {}) {
     }),
     () => behavior.keyboardLayout,
   );
-  return { calls, controller, events, window };
+  return { calls, controller, events, keyboardLayout, window };
 }
 
 type TextImeEvent =

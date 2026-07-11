@@ -598,6 +598,113 @@ export interface ToUnicodeAdapter {
   ): ToUnicodeResult;
 }
 
+export type Win32ProbeTranslation =
+  | { kind: "none"; text: "" }
+  | { kind: "text" | "dead"; text: string }
+  | { kind: "failed"; text: "" };
+
+/** Retain both ToUnicodeEx's translation kind and all reported UTF-16 text. */
+export function classifyWin32ProbeTranslation(
+  translation: ToUnicodeResult | undefined,
+): Win32ProbeTranslation {
+  if (translation === undefined) return { kind: "failed", text: "" };
+  if (translation.result === 0) return { kind: "none", text: "" };
+  if (translation.result < 0) return { kind: "dead", text: translation.text };
+  return { kind: "text", text: translation.text.slice(0, translation.result) };
+}
+
+/** Whether one AltGr level exposes a meaningful result distinct from its matching plain level. */
+export function win32ProbeLevelShowsAltGraph(
+  plain: Win32ProbeTranslation,
+  alternate: Win32ProbeTranslation,
+): boolean {
+  if (
+    plain.kind === "failed" || alternate.kind === "failed" || alternate.kind === "none" ||
+    (alternate.kind === "text" && !isCommitText(alternate.text))
+  ) return false;
+  return plain.kind !== alternate.kind || plain.text !== alternate.text;
+}
+
+export interface Win32AltGraphProbeAdapter extends ToUnicodeAdapter {
+  mapVirtualKey(virtualKey: number): number;
+}
+
+function win32ProbeKeyboardState(shifted: boolean, altGraph: boolean): Uint8Array {
+  const state = new Uint8Array(256);
+  if (shifted) {
+    state[VK.SHIFT] = 0x80;
+    state[VK.LSHIFT] = 0x80;
+  }
+  if (altGraph) {
+    for (const virtualKey of [VK.CONTROL, VK.LCONTROL, VK.MENU, VK.RMENU]) state[virtualKey] = 0x80;
+  }
+  return state;
+}
+
+function readWin32ProbeTranslation(
+  adapter: ToUnicodeAdapter,
+  virtualKey: number,
+  scanCode: number,
+  keyboardState: Uint8Array,
+): Win32ProbeTranslation {
+  try {
+    return classifyWin32ProbeTranslation(
+      adapter.toUnicode(virtualKey, scanCode, keyboardState, TO_UNICODE_NO_STATE_CHANGE),
+    );
+  } catch {
+    return classifyWin32ProbeTranslation(undefined);
+  }
+}
+
+/** Probe unshifted and shifted AltGr levels without mutating Windows' keyboard buffer. */
+export function probeWin32AltGraphLayout(adapter: Win32AltGraphProbeAdapter): boolean | undefined {
+  const levels = [
+    {
+      plain: win32ProbeKeyboardState(false, false),
+      alternate: win32ProbeKeyboardState(false, true),
+    },
+    {
+      plain: win32ProbeKeyboardState(true, false),
+      alternate: win32ProbeKeyboardState(true, true),
+    },
+  ];
+  let incomplete = false;
+  for (let virtualKey = 0x20; virtualKey <= 0xfe; virtualKey++) {
+    if (virtualKey === VK.PACKET) continue;
+    let mapped: number;
+    try {
+      mapped = adapter.mapVirtualKey(virtualKey);
+    } catch {
+      incomplete = true;
+      continue;
+    }
+    if (!Number.isInteger(mapped) || mapped < 0 || mapped > 0xffffffff) {
+      incomplete = true;
+      continue;
+    }
+    const prefix = mapped >>> 8;
+    if (prefix !== 0 && prefix !== 0xe0 && prefix !== 0xe1) {
+      incomplete = true;
+      continue;
+    }
+    // MAPVK_VK_TO_VSC_EX preserves E0/E1 in the high byte, but bit 15 of
+    // ToUnicodeEx's scan parameter instead means key-up. Supply only the
+    // physical make-code byte needed for layout translation.
+    const scanCode = mapped & 0xff;
+    if (scanCode === 0) continue;
+    for (const level of levels) {
+      const plain = readWin32ProbeTranslation(adapter, virtualKey, scanCode, level.plain);
+      const alternate = readWin32ProbeTranslation(adapter, virtualKey, scanCode, level.alternate);
+      if (plain.kind === "failed" || alternate.kind === "failed") {
+        incomplete = true;
+        continue;
+      }
+      if (win32ProbeLevelShowsAltGraph(plain, alternate)) return true;
+    }
+  }
+  return incomplete ? undefined : false;
+}
+
 export interface LogicalKeyTranslation {
   key: string;
   /** Printable layout text returned by ToUnicodeEx for this transition. */

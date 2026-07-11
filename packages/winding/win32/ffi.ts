@@ -41,6 +41,7 @@ export const user32functions = {
   GetMessageTime: { parameters: [], result: "i32" },
   GetKeyboardState: { parameters: ["buffer"], result: "i32" },
   GetKeyboardLayout: { parameters: ["u32"], result: "pointer" },
+  MapVirtualKeyExW: { parameters: ["u32", "u32", "pointer"], result: "u32" },
   GetThreadDpiAwarenessContext: { parameters: [], result: "pointer" },
   GetWindowDpiAwarenessContext: { parameters: ["pointer"], result: "pointer" },
   GetAwarenessFromDpiAwarenessContext: { parameters: ["pointer"], result: "i32" },
@@ -211,6 +212,9 @@ export enum WM {
 
 /** `ToUnicodeEx` flag that prevents mutation of the kernel keyboard buffer. */
 export const TU_NO_STATE_CHANGE = 0x0004;
+
+/** Preserve E0/E1 prefixes while mapping a virtual key through an exact HKL. */
+export const MAPVK_VK_TO_VSC_EX = 4;
 
 /** `WM_UNICHAR` capability probe value. */
 export const UNICODE_NOCHAR = 0xFFFF;
