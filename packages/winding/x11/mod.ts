@@ -1,4 +1,4 @@
-import type { KeyDownEvent, KeyModifiers, KeyUpEvent, Library, LoadLibrary, UIEvent, Window } from "../types.ts";
+import type { KeyDownEvent, KeyUpEvent, Library, LoadLibrary, UIEvent, Window } from "../types.ts";
 import {
   createImeActivationEvent,
   createImeCommitEvent,
@@ -17,8 +17,10 @@ import { libcFunctions, NotifyNormal, x11functions, XEventMask, XEventType } fro
 import {
   isAutoRepeatPair,
   isTopLevelFocusTransition,
+  type X11ModifierMapping,
   x11CommittedText,
   x11KeyEditDisposition,
+  x11ModifierSnapshot,
 } from "./input.ts";
 import { NativeXImage } from "./native_image.ts";
 import { XimContext, XimManager } from "./xim.ts";
@@ -53,27 +55,17 @@ const APPLICATION_X_EVENT_MASKS = BigInt(
     XEventMask.OwnerGrabButtonMask,
 );
 const X_SHIFT_MASK = 1 << 0;
-const X_LOCK_MASK = 1 << 1;
 const X_CONTROL_MASK = 1 << 2;
-const X_MOD1_MASK = 1 << 3;
-const X_MOD4_MASK = 1 << 6;
+const XK_CAPS_LOCK = 0xffe5n;
+const XK_ALT_L = 0xffe9n;
+const XK_ALT_R = 0xffean;
+const XK_META_L = 0xffe7n;
+const XK_META_R = 0xffe8n;
+const XK_SUPER_L = 0xffebn;
+const XK_SUPER_R = 0xffecn;
 const XK_MODE_SWITCH = 0xff7en;
 const XK_ISO_LEVEL3_SHIFT = 0xfe03n;
 const XK_ISO_LEVEL5_SHIFT = 0xfe11n;
-
-function getModifiers(state: number, altGraphMask: number): KeyModifiers {
-  const ctrlKey = (state & X_CONTROL_MASK) !== 0;
-  const altGraphKey = (state & altGraphMask) !== 0;
-  return {
-    shiftKey: (state & X_SHIFT_MASK) !== 0,
-    ctrlKey,
-    altKey: (state & X_MOD1_MASK) !== 0,
-    metaKey: (state & X_MOD4_MASK) !== 0,
-    accelKey: ctrlKey && !altGraphKey,
-    capsLock: (state & X_LOCK_MASK) !== 0,
-    altGraphKey,
-  };
-}
 
 class X11Window implements Window {
   readonly id: bigint;
@@ -305,7 +297,16 @@ class X11Library implements Library {
   readonly utf8String: bigint;
   readonly input: XimManager;
   readonly #events = new EventQueue<UIEvent>();
-  #altGraphMask = 0;
+  #modifierMapping: X11ModifierMapping = {
+    shiftMask: X_SHIFT_MASK,
+    controlMask: X_CONTROL_MASK,
+    altMask: 0,
+    metaMask: 0,
+    capsLockMask: 0,
+    altGraphMask: 0,
+    maskByKeycode: new Map(),
+    toggleKeycodes: new Set(),
+  };
   #closed = false;
   constructor() {
     this.X11 = openX11Library();
@@ -336,7 +337,7 @@ class X11Library implements Library {
     );
     this.netWmName = BigInt(this.X11.symbols.XInternAtom(display, cString("_NET_WM_NAME"), 0));
     this.utf8String = BigInt(this.X11.symbols.XInternAtom(display, cString("UTF8_STRING"), 0));
-    this.#refreshAltGraphMask();
+    this.#refreshModifierMapping();
     try {
       this.input = new XimManager(
         this.X11,
@@ -428,7 +429,7 @@ class X11Library implements Library {
 
       if (type === XEventType.MappingNotify) {
         this.X11.symbols.XRefreshKeyboardMapping(eventPointer);
-        this.#refreshAltGraphMask();
+        this.#refreshModifierMapping();
         continue;
       }
 
@@ -436,7 +437,12 @@ class X11Library implements Library {
         const state = view.getUint32(80, true);
         const keycode = view.getUint32(84, true);
         const code = domCodeFromX11(keycode);
-        const modifiers = getModifiers(state, this.#altGraphMask);
+        const modifiers = x11ModifierSnapshot(
+          state,
+          keycode,
+          type === XEventType.KeyPress,
+          this.#modifierMapping,
+        );
         const wasComposing = window.input.composing;
         let lookupStaged = type === XEventType.KeyPress;
         if (lookupStaged) window.input.beginLookup();
@@ -620,12 +626,61 @@ class X11Library implements Library {
     }
   }
 
-  #refreshAltGraphMask(): void {
-    this.#altGraphMask = Number(
-      this.X11.symbols.XkbKeysymToModifiers(this.display, XK_MODE_SWITCH) |
-        this.X11.symbols.XkbKeysymToModifiers(this.display, XK_ISO_LEVEL3_SHIFT) |
-        this.X11.symbols.XkbKeysymToModifiers(this.display, XK_ISO_LEVEL5_SHIFT),
-    );
+  #refreshModifierMapping(): void {
+    const native = this.X11.symbols.XGetModifierMapping(this.display);
+    if (native === null) return;
+    try {
+      const view = new Deno.UnsafePointerView(native);
+      const keysPerModifier = view.getInt32(0);
+      const keycodesAddress = view.getBigUint64(8);
+      const keycodes = keycodesAddress === 0n
+        ? undefined
+        : new Deno.UnsafePointerView(Deno.UnsafePointer.create(keycodesAddress));
+      if (keysPerModifier <= 0 || keycodes === undefined) return;
+
+      let altMask = 0;
+      let metaMask = 0;
+      let capsLockMask = 0;
+      let altGraphMask = 0;
+      const maskByKeycode = new Map<number, number>();
+      const toggleKeycodes = new Set<number>();
+      for (let modifier = 0; modifier < 8; modifier++) {
+        const mask = 1 << modifier;
+        for (let slot = 0; slot < keysPerModifier; slot++) {
+          const keycode = keycodes.getUint8(modifier * keysPerModifier + slot);
+          if (keycode === 0) continue;
+          maskByKeycode.set(keycode, (maskByKeycode.get(keycode) ?? 0) | mask);
+          for (const level of [0, 1]) {
+            const keysym = BigInt(this.X11.symbols.XKeycodeToKeysym(this.display, keycode, level));
+            if (keysym === XK_ALT_L || keysym === XK_ALT_R) altMask |= mask;
+            if (
+              keysym === XK_META_L || keysym === XK_META_R ||
+              keysym === XK_SUPER_L || keysym === XK_SUPER_R
+            ) metaMask |= mask;
+            if (keysym === XK_CAPS_LOCK) {
+              capsLockMask |= mask;
+              toggleKeycodes.add(keycode);
+            }
+            if (
+              keysym === XK_MODE_SWITCH || keysym === XK_ISO_LEVEL3_SHIFT ||
+              keysym === XK_ISO_LEVEL5_SHIFT
+            ) altGraphMask |= mask;
+          }
+        }
+      }
+      this.#modifierMapping = {
+        shiftMask: X_SHIFT_MASK,
+        controlMask: X_CONTROL_MASK,
+        altMask,
+        metaMask,
+        capsLockMask,
+        altGraphMask,
+        maskByKeycode,
+        toggleKeycodes,
+      };
+    } finally {
+      this.X11.symbols.XFreeModifiermap(native);
+    }
   }
 
   #isAutoRepeatRelease(release: DataView<ArrayBuffer>): boolean {

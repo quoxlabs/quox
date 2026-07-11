@@ -7,6 +7,7 @@ import {
   isTopLevelFocusTransition,
   x11CommittedText,
   x11KeyEditDisposition,
+  x11ModifierSnapshot,
 } from "./input.ts";
 import {
   applyPreeditChange,
@@ -139,6 +140,23 @@ Deno.test("X11 focus includes grabbed moves but excludes descendants", () => {
   assertEquals(isTopLevelFocusTransition(3, 0), true);
   assertEquals(isTopLevelFocusTransition(1, 0), false);
   assertEquals(isTopLevelFocusTransition(0, 2), false);
+});
+
+Deno.test("X11 modifier snapshots apply the reported transition", () => {
+  const mapping = {
+    shiftMask: 1,
+    controlMask: 4,
+    altMask: 8,
+    metaMask: 64,
+    capsLockMask: 2,
+    altGraphMask: 128,
+    maskByKeycode: new Map([[50, 1], [66, 2]]),
+    toggleKeycodes: new Set([66]),
+  };
+  assertEquals(x11ModifierSnapshot(0, 50, true, mapping).shiftKey, true);
+  assertEquals(x11ModifierSnapshot(1, 50, false, mapping).shiftKey, false);
+  assertEquals(x11ModifierSnapshot(0, 66, true, mapping).capsLock, true);
+  assertEquals(x11ModifierSnapshot(2, 66, false, mapping).capsLock, true);
 });
 
 Deno.test("X11 pixels follow the server visual masks and byte order", () => {

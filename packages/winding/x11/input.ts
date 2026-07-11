@@ -2,6 +2,45 @@ import type { KeyEditDisposition, KeyModifiers } from "../types.ts";
 import { normalizeCommittedText } from "../input/mod.ts";
 import { NotifyInferior, NotifyNormal, NotifyWhileGrabbed, XEventType } from "./ffi.ts";
 
+export interface X11ModifierMapping {
+  readonly shiftMask: number;
+  readonly controlMask: number;
+  readonly altMask: number;
+  readonly metaMask: number;
+  readonly capsLockMask: number;
+  readonly altGraphMask: number;
+  readonly maskByKeycode: ReadonlyMap<number, number>;
+  readonly toggleKeycodes: ReadonlySet<number>;
+}
+
+/** Convert XKeyEvent's pre-transition state to a DOM-style current snapshot. */
+export function x11ModifierSnapshot(
+  state: number,
+  keycode: number,
+  pressed: boolean,
+  mapping: X11ModifierMapping,
+): KeyModifiers {
+  const ownMask = mapping.maskByKeycode.get(keycode) ?? 0;
+  if (mapping.toggleKeycodes.has(keycode)) {
+    if (pressed) state ^= ownMask;
+  } else if (pressed) {
+    state |= ownMask;
+  } else {
+    state &= ~ownMask;
+  }
+  const ctrlKey = (state & mapping.controlMask) !== 0;
+  const altGraphKey = (state & mapping.altGraphMask) !== 0;
+  return {
+    shiftKey: (state & mapping.shiftMask) !== 0,
+    ctrlKey,
+    altKey: (state & mapping.altMask) !== 0,
+    metaKey: (state & mapping.metaMask) !== 0,
+    accelKey: ctrlKey && !altGraphKey,
+    capsLock: (state & mapping.capsLockMask) !== 0,
+    altGraphKey,
+  };
+}
+
 /** Decode XLookupString output without turning a control byte back into printable keysym text. */
 export function fallbackLookupText(bytes: Uint8Array, keysymText: string): string | undefined {
   if (bytes.length > 0) {
