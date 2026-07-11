@@ -230,6 +230,12 @@ enum PlannedWork {
         flavor: PointerFlavor,
         metadata: EventMetadata,
     },
+    Wheel {
+        default_target: GuardedRawNode,
+        author_target: GuardedNode,
+        data: BlitzWheelEvent,
+        metadata: EventMetadata,
+    },
     DefaultOnly {
         target: PlannedTarget,
         data: DomEventData,
@@ -292,6 +298,7 @@ enum DispatchRequest {
     Wheel {
         event: BlitzWheelEvent,
         metadata: EventMetadata,
+        occurrence_target: Option<usize>,
     },
     Key {
         event: blitz_traits::events::BlitzKeyEvent,
@@ -420,6 +427,7 @@ impl<'a> ResolvedInputLayout<'a> {
             scroll.y,
         )
         .map_or(DispatchRequest::Empty, |(page_x, page_y)| {
+            let occurrence_target = self.document.hit(page_x, page_y).map(|hit| hit.node_id);
             DispatchRequest::Wheel {
                 event: BlitzWheelEvent {
                     delta: BlitzWheelDelta::Pixels(input.blitz_delta_x, input.blitz_delta_y),
@@ -428,6 +436,7 @@ impl<'a> ResolvedInputLayout<'a> {
                     mods: super::build_pointer_modifiers(input.modifier_bits),
                 },
                 metadata,
+                occurrence_target,
             }
         })
     }
@@ -736,14 +745,18 @@ impl DispatchStack {
             } => {
                 plan_pointer(document, handles, planned, &event, flavor, metadata)?;
             }
-            DispatchRequest::Wheel { event, metadata } => {
-                let target =
-                    guarded_target_or_root(document, handles, document.get_hover_node_id())?;
-                planned.push_back(PlannedWork::Enqueue {
-                    target: PlannedTarget::Guarded(target),
-                    data: DomEventData::Wheel(event),
+            DispatchRequest::Wheel {
+                event,
+                metadata,
+                occurrence_target,
+            } => {
+                let (default_target, author_target) =
+                    guarded_hit_target_or_root(document, handles, occurrence_target)?;
+                planned.push_back(PlannedWork::Wheel {
+                    default_target,
+                    author_target,
+                    data: event,
                     metadata,
-                    suppress_default: false,
                 });
             }
             DispatchRequest::Key {
@@ -913,6 +926,36 @@ impl DispatchStack {
                         },
                     );
                 }
+                PlannedWork::Wheel {
+                    default_target,
+                    author_target,
+                    data,
+                    metadata,
+                } => {
+                    if !raw_node_is_live(default_target, document, handles)
+                        || !node_is_live(author_target, document, handles)
+                    {
+                        continue;
+                    }
+                    let Some(event) = guard_event_with_targets(
+                        document,
+                        handles,
+                        default_target,
+                        author_target,
+                        DomEventData::Wheel(data),
+                        metadata,
+                    )?
+                    else {
+                        continue;
+                    };
+                    return self.stage(
+                        redraw,
+                        event,
+                        ResumeAction::Normal {
+                            suppress_default: false,
+                        },
+                    );
+                }
                 PlannedWork::DefaultOnly {
                     target,
                     data,
@@ -991,7 +1034,18 @@ impl DispatchStack {
         let old_focus = actual_focus_node_id(document);
         let source_metadata = guarded.metadata.clone();
         let mut generated = Vec::new();
-        document.handle_dom_event(&mut guarded.event, |event| generated.push(event));
+        if matches!(&guarded.event.data, DomEventData::Wheel(_))
+            && wheel_target_forwards_default(document, guarded.default_target.raw)
+        {
+            // Blitz's event path maps coordinates and forwards wheel input to embedded documents
+            // and custom widgets. Those targets consume the event directly rather than consulting
+            // the outer document's hover state, so retain that specialized behavior.
+            document.handle_dom_event(&mut guarded.event, |event| generated.push(event));
+        } else if let DomEventData::Wheel(event) = &guarded.event.data {
+            run_wheel_default(document, guarded.default_target.raw, event, &mut generated);
+        } else {
+            document.handle_dom_event(&mut guarded.event, |event| generated.push(event));
+        }
         let new_focus = actual_focus_node_id(document);
         let (old_focus, new_focus) = if generated.iter().any(|event| is_focus_event(&event.data)) {
             let old_focus = old_focus
@@ -1097,6 +1151,36 @@ impl DispatchStack {
                 redraw.store(true, Ordering::Relaxed);
             }
         }
+    }
+}
+
+fn wheel_target_forwards_default(document: &BaseDocument, target: usize) -> bool {
+    document.get_node(target).is_some_and(|node| {
+        node.subdoc().is_some()
+            || node
+                .element_data()
+                .is_some_and(|element| element.custom_widget_data().is_some())
+    })
+}
+
+fn run_wheel_default(
+    document: &mut BaseDocument,
+    occurrence_target: usize,
+    event: &BlitzWheelEvent,
+    generated: &mut Vec<DomEvent>,
+) {
+    let (scroll_x, scroll_y) = match &event.delta {
+        BlitzWheelDelta::Lines(x, y) => (x * 20.0, y * 20.0),
+        BlitzWheelDelta::Pixels(x, y) => (*x, *y),
+    };
+
+    // Pinned Blitz targets wheel scrolling through mutable hover state even though the event
+    // already has a target. Preserve its delta/default behavior, but anchor the scroll at the
+    // raw node hit by this native occurrence without manufacturing a hover transition.
+    if document.scroll_by(Some(occurrence_target), scroll_x, scroll_y, &mut |event| {
+        generated.push(event);
+    }) {
+        document.shell_provider.request_redraw();
     }
 }
 
@@ -1498,6 +1582,23 @@ fn guarded_target_or_root(
         .ok_or_else(|| DispatchError::new("quox: the DOM event target disappeared before dispatch"))
 }
 
+fn guarded_hit_target_or_root(
+    document: &BaseDocument,
+    handles: &mut NodeHandles,
+    target: Option<usize>,
+) -> Result<(GuardedRawNode, GuardedNode), DispatchError> {
+    if let Some(raw) = target
+        && let Some(default_target) = guard_raw_node(document, handles, raw)?
+        && let Some(author_raw) = pointer_author_target_id(document, raw)
+        && let Some(author_target) = guard_node(document, handles, author_raw)?
+    {
+        return Ok((default_target, author_target));
+    }
+
+    let root = guarded_target_or_root(document, handles, None)?;
+    Ok((GuardedRawNode::from_public(root), root))
+}
+
 fn guard_node(
     document: &BaseDocument,
     handles: &mut NodeHandles,
@@ -1567,6 +1668,7 @@ fn event_has_element_target(data: &DomEventData) -> bool {
             | DomEventData::Click(_)
             | DomEventData::ContextMenu(_)
             | DomEventData::DoubleClick(_)
+            | DomEventData::Wheel(_)
     )
 }
 
@@ -2989,6 +3091,133 @@ mod tests {
                 .abs()
                 < f64::EPSILON
         );
+    }
+
+    #[test]
+    fn first_trusted_wheel_uses_its_occurrence_hit_without_hover() {
+        let mut context = TestContext::new(
+            "<div id='scroller' style='overflow:auto;width:120px;height:60px'>\
+               <div id='target' style='display:block;width:100px;padding:4px'>\
+                 <span>inline text</span><div style='display:block;height:20px'>block</div>\
+               </div>\
+               <div style='height:300px'></div>\
+             </div>",
+        );
+        let scroller = context.element("scroller");
+        let target = context.element("target");
+        let (raw_target, point) = context
+            .document
+            .tree()
+            .iter()
+            .filter(|(_, node)| {
+                node.parent == Some(target) && matches!(node.data, NodeData::AnonymousBlock(_))
+            })
+            .find_map(|(node_id, _)| context.point_hitting(node_id).map(|point| (node_id, point)))
+            .expect("mixed inline/block children should create a hittable anonymous wrapper");
+        let raw_hit = context
+            .document
+            .hit(point.0, point.1)
+            .expect("wheel point should hit the anonymous wrapper");
+        assert_eq!(raw_hit.node_id, raw_target);
+        assert_eq!(
+            public_dom_node_id(&context.document, raw_target),
+            Some(target)
+        );
+        assert_eq!(context.document.get_hover_node_id(), None);
+
+        let wheel = event(context.begin_trusted_wheel(point.0, point.1));
+        assert_eq!(wheel.event_type, "wheel");
+        assert_eq!(context.handles.resolve(wheel.target), Some(target));
+        let occurrence_raw = context
+            .stack
+            .frames
+            .last()
+            .and_then(|frame| frame.pending.as_ref())
+            .map(|pending| pending.guarded.default_target.raw)
+            .expect("wheel should retain its raw occurrence hit");
+        assert_ne!(occurrence_raw, target);
+        assert_eq!(
+            context
+                .document
+                .hit(point.0, point.1)
+                .map(|hit| hit.node_id),
+            Some(occurrence_raw)
+        );
+        assert_eq!(
+            public_dom_node_id(&context.document, occurrence_raw),
+            Some(target)
+        );
+        assert_eq!(context.document.get_hover_node_id(), None);
+        let remainder = context.resume(&wheel, false);
+        let _ = drain(&mut context, remainder);
+
+        assert!(
+            (context
+                .document
+                .get_node(scroller)
+                .expect("scroller should exist")
+                .scroll_offset
+                .y
+                - 40.0)
+                .abs()
+                < f64::EPSILON
+        );
+        assert_eq!(context.document.get_hover_node_id(), None);
+    }
+
+    #[test]
+    fn trusted_wheel_ignores_stale_hover_at_another_node() {
+        let mut context = TestContext::new(
+            "<div id='left' style='position:absolute;left:0;top:0;overflow:auto;width:120px;height:60px'>\
+               <div id='left-target' style='height:300px'></div>\
+             </div>\
+             <div id='right' style='position:absolute;left:200px;top:0;overflow:auto;width:120px;height:60px'>\
+               <div id='right-target' style='height:300px'></div>\
+             </div>",
+        );
+        let left = context.element("left");
+        let left_target = context.element("left-target");
+        let right = context.element("right");
+        let right_target = context.element("right-target");
+        let left_point = context
+            .point_hitting(left_target)
+            .expect("left target should be hittable");
+        let right_point = context
+            .point_hitting(right_target)
+            .expect("right target should be hittable");
+        assert!(context.document.set_hover_to(left_point.0, left_point.1));
+        assert_eq!(context.document.get_hover_node_id(), Some(left_target));
+        let _ = context.redraw.swap(false, Ordering::Relaxed);
+
+        let wheel = event(context.begin_trusted_wheel(right_point.0, right_point.1));
+        assert_eq!(wheel.event_type, "wheel");
+        assert_eq!(context.handles.resolve(wheel.target), Some(right_target));
+        assert_eq!(context.document.get_hover_node_id(), Some(left_target));
+        let remainder = context.resume(&wheel, false);
+        let _ = drain(&mut context, remainder);
+
+        assert!(
+            context
+                .document
+                .get_node(left)
+                .expect("left scroller should exist")
+                .scroll_offset
+                .y
+                .abs()
+                < f64::EPSILON
+        );
+        assert!(
+            (context
+                .document
+                .get_node(right)
+                .expect("right scroller should exist")
+                .scroll_offset
+                .y
+                - 40.0)
+                .abs()
+                < f64::EPSILON
+        );
+        assert_eq!(context.document.get_hover_node_id(), Some(left_target));
     }
 
     #[test]
