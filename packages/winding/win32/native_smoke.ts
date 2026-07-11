@@ -1,5 +1,5 @@
 import type { ImeEvent, Library, ResizeEvent, UIEvent, VisibilityEvent, Window } from "../types.ts";
-import { PM_REMOVE, SIZE_MINIMIZED, UNICODE_NOCHAR, WM } from "./ffi.ts";
+import { IMECHARPOSITION_SIZE, IMR_QUERYCHARPOSITION, PM_REMOVE, SIZE_MINIMIZED, UNICODE_NOCHAR, WM } from "./ffi.ts";
 import { decodeWin32ClientRect, decodeWin32QueuedMessage, win32QuitExitCode } from "./input.ts";
 import { load } from "./mod.ts";
 
@@ -77,7 +77,18 @@ const testGdi32Functions = {
 } as const satisfies Deno.ForeignLibraryInterface;
 
 interface NativeWin32Window extends Window {
+  readonly id: bigint;
   readonly hwnd: Deno.PointerObject;
+  readonly lib: {
+    readonly input: {
+      handleMessage(
+        window: NativeWin32Window | undefined,
+        message: number,
+        wParam: number | bigint,
+        lParam: number | bigint,
+      ): bigint | undefined;
+    };
+  };
 }
 
 Deno.test({
@@ -131,6 +142,7 @@ function runLifecycle(
       window.setImeEnabled(true);
       window.setImeEnabled(false);
       drainEvents(library);
+      assertImeCharacterPositionDelegated(window);
 
       const probe = user32.symbols.SendMessageW(
         window.hwnd,
@@ -161,6 +173,35 @@ function runLifecycle(
     }
   } finally {
     library.close();
+  }
+}
+
+function assertImeCharacterPositionDelegated(window: NativeWin32Window): void {
+  const target = new Uint8Array(IMECHARPOSITION_SIZE);
+  const pointer = Deno.UnsafePointer.of(target);
+  const address = BigInt(Deno.UnsafePointer.value(pointer));
+  for (
+    const request of [
+      { name: "earlier", offset: 0 },
+      { name: "caret", offset: 3 },
+      { name: "later", offset: 8 },
+    ]
+  ) {
+    target.fill(0xa5);
+    const view = new DataView(target.buffer);
+    view.setUint32(0, IMECHARPOSITION_SIZE, true);
+    view.setUint32(4, request.offset, true);
+    const before = target.slice();
+    const result = window.lib.input.handleMessage(
+      window,
+      WM.IME_REQUEST,
+      IMR_QUERYCHARPOSITION,
+      address,
+    );
+    if (result !== undefined) throw new Error(`Winding falsely answered the ${request.name} character request`);
+    if (target.some((value, index) => value !== before[index])) {
+      throw new Error(`Winding modified the declined ${request.name} character-position buffer`);
+    }
   }
 }
 

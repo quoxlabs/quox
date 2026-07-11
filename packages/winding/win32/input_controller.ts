@@ -31,9 +31,7 @@ import {
   GCS_RESULTREADSTR,
   GCS_RESULTSTR,
   IACE_DEFAULT,
-  IMECHARPOSITION_SIZE,
   type imm32functions,
-  IMR_QUERYCHARPOSITION,
   ISC_SHOWUICOMPOSITIONWINDOW,
   NI_COMPOSITIONSTR,
   PM_NOREMOVE,
@@ -64,7 +62,6 @@ import {
 import {
   encodeCandidateForm,
   encodeCompositionForm,
-  encodeImeCharPosition,
   type ImeCompositionUpdate,
   insertCompositionCharacter,
   readImmUtf16,
@@ -420,10 +417,12 @@ export class Win32InputController {
         }
         return undefined;
       case WM.IME_REQUEST:
-        if (
-          window !== undefined && state !== undefined && Number(wParam) === IMR_QUERYCHARPOSITION &&
-          this.#answerImeCharPosition(window, state, lParam)
-        ) return 1n;
+        // IMR_QUERYCHARPOSITION requires geometry for its requested UTF-16
+        // composition offset and the editor's actual document rectangle.
+        // Winding receives only one candidate/caret anchor, so even a request
+        // that appears to name the caret cannot be proven current or complete.
+        // Leave the structure untouched and delegate every request to
+        // DefWindowProcW until the shared synchronous contract supplies both.
         return undefined;
       default:
         return undefined;
@@ -956,63 +955,6 @@ export class Win32InputController {
       return true;
     });
     if (applied !== true) throw new Error("winding(win32): no HIMC was available for IME placement");
-  }
-
-  #clientPointToScreen(window: Win32InputWindow, x: number, y: number): { x: number; y: number } | undefined {
-    const buffer = new ArrayBuffer(8);
-    const view = new DataView(buffer);
-    view.setInt32(0, x, true);
-    view.setInt32(4, y, true);
-    if (this.#user32.symbols.ClientToScreen(window.hwnd, buffer) === 0) return undefined;
-    return { x: view.getInt32(0, true), y: view.getInt32(4, true) };
-  }
-
-  #clientRectToScreen(window: Win32InputWindow, rectangle: ImeCursorArea): ImeCursorArea | undefined {
-    const topLeft = this.#clientPointToScreen(window, rectangle.x, rectangle.y);
-    const bottomRight = this.#clientPointToScreen(
-      window,
-      rectangle.x + rectangle.width,
-      rectangle.y + rectangle.height,
-    );
-    if (topLeft === undefined || bottomRight === undefined) return undefined;
-    return {
-      x: topLeft.x,
-      y: topLeft.y,
-      width: Math.max(0, bottomRight.x - topLeft.x),
-      height: Math.max(0, bottomRight.y - topLeft.y),
-    };
-  }
-
-  #screenDocumentRectangle(window: Win32InputWindow): ImeCursorArea | undefined {
-    const buffer = new ArrayBuffer(16);
-    if (this.#user32.symbols.GetClientRect(window.hwnd, buffer) === 0) return undefined;
-    const view = new DataView(buffer);
-    return this.#clientRectToScreen(window, {
-      x: view.getInt32(0, true),
-      y: view.getInt32(4, true),
-      width: Math.max(0, view.getInt32(8, true) - view.getInt32(0, true)),
-      height: Math.max(0, view.getInt32(12, true) - view.getInt32(4, true)),
-    });
-  }
-
-  #answerImeCharPosition(
-    window: Win32InputWindow,
-    state: WindowInputState,
-    lParam: number | bigint,
-  ): boolean {
-    const address = BigInt(lParam);
-    if (address === 0n || state.cursorArea === undefined) return false;
-    const pointer = Deno.UnsafePointer.create(address);
-    if (pointer === null) return false;
-    const target = new Deno.UnsafePointerView(pointer).getArrayBuffer(IMECHARPOSITION_SIZE);
-    const targetView = new DataView(target);
-    if (targetView.getUint32(0, true) < IMECHARPOSITION_SIZE) return false;
-    const caret = this.#clientRectToScreen(window, state.cursorArea);
-    const document = this.#screenDocumentRectangle(window);
-    if (caret === undefined || document === undefined) return false;
-    const response = encodeImeCharPosition(targetView.getUint32(4, true), caret, document);
-    new Uint8Array(target).set(new Uint8Array(response));
-    return true;
   }
 }
 

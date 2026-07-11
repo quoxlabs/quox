@@ -40,7 +40,7 @@ import {
   utf16CursorRangeToUtf8,
   withImeContext,
 } from "./imm.ts";
-import { imm32functions, user32functions, WM } from "./ffi.ts";
+import { imm32functions, IMR_QUERYCHARPOSITION, user32functions, WM } from "./ffi.ts";
 import { Win32InputController, type Win32InputWindow } from "./input_controller.ts";
 import {
   ImeActivationState,
@@ -364,6 +364,23 @@ Deno.test("Win32 input reports context release failure", () => {
   assertEquals(harness.controller.handleMessage(harness.window, WM.IME_STARTCOMPOSITION, 0n, 0n), 0n);
   assertThrows(() => harness.controller.setImeEnabled(harness.window, false), Error, "ImmReleaseContext failed");
   assertEquals(harness.calls.releases, 1);
+});
+
+Deno.test("Win32 leaves character-position requests unhandled when inactive, active, or unfocused", () => {
+  const harness = createInputControllerHarness();
+  harness.controller.attach(harness.window);
+  harness.controller.setImeCursorArea(harness.window, 10, 20, 2, 18);
+  const request = (pointer: bigint) =>
+    harness.controller.handleMessage(harness.window, WM.IME_REQUEST, IMR_QUERYCHARPOSITION, pointer);
+
+  // A cached candidate anchor is not requested-character geometry.
+  assertEquals(request(0x1000n), undefined);
+  harness.controller.observeNativeFocus(harness.window, true);
+  harness.controller.setImeEnabled(harness.window, true);
+  harness.controller.handleMessage(harness.window, WM.IME_STARTCOMPOSITION, 0n, 0n);
+  assertEquals(request(0x2000n), undefined);
+  harness.controller.observeNativeFocus(harness.window, false);
+  assertEquals(request(0x3000n), undefined);
 });
 
 Deno.test("prepared Win32 keys match the complete native message identity", () => {
