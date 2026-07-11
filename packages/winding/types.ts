@@ -178,6 +178,13 @@ export interface Window {
 
 export interface Library {
   [Symbol.dispose](): void;
+  /**
+   * Open a top-level window. `x` and `y` locate its outer frame's top-left
+   * relative to the primary display's top-left, and `w` and `h` are outer
+   * frame dimensions. All four values use platform logical screen units;
+   * displays above or left of the primary display use negative coordinates.
+   * A window manager or compositor may constrain or ignore the requested frame.
+   */
   openWindow(): Window;
   openWindow(x: number, y: number): Window;
   openWindow(x: number, y: number, w: number, h: number): Window;
