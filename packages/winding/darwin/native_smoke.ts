@@ -2,6 +2,7 @@ import { load } from "./mod.ts";
 import type { ImeEvent, Library, Window } from "../types.ts";
 import {
   APPKIT,
+  cfSymbols,
   classConformsToProtocol,
   CORE_FOUNDATION,
   CORE_GRAPHICS,
@@ -14,6 +15,7 @@ import {
   NSPOINT,
   NSRANGE,
   openNSRectMsgSend,
+  readCFString,
   readNSRange,
   readStructF64,
   runtimeSymbols,
@@ -406,6 +408,8 @@ function testProtocolAndStructAbis(): void {
     try {
       const runtime = Deno.dlopen(LIBOBJC, runtimeSymbols);
       handles.push(runtime);
+      const cf = Deno.dlopen(CORE_FOUNDATION, cfSymbols);
+      handles.push(cf);
       const viewClass = getClass(runtime, "WindingContentView");
       assert(
         classConformsToProtocol(runtime, viewClass, getProtocol(runtime, "NSTextInputClient")),
@@ -456,6 +460,31 @@ function testProtocolAndStructAbis(): void {
       );
       assertEquals(marked, { location: NS_NOT_FOUND, length: 0n });
 
+      window.setImeSurroundingText("A🙂B", 1, 5);
+      const documentSelection = readNSRange(
+        rangeSend.symbols.objc_msgSend(window.contentView, sel(runtime, "selectedRange")) as Uint8Array,
+      );
+      assertEquals(documentSelection, { location: 1n, length: 2n });
+
+      const sendId = openMessage(handles, ["pointer", "pointer"], "pointer");
+      const attributedSubstring = openMessage(
+        handles,
+        ["pointer", "pointer", NSRANGE, "pointer"],
+        "pointer",
+      );
+      const substringActualRange = makeNSRange(0, 0);
+      const attributed = attributedSubstring(
+        window.contentView,
+        sel(runtime, "attributedSubstringForProposedRange:actualRange:"),
+        makeNSRange(1, 2),
+        Deno.UnsafePointer.of(substringActualRange),
+      );
+      assert(attributed !== null, "expected attributed surrounding-text substring");
+      const plainString = sendId(attributed, sel(runtime, "string"));
+      assert(plainString !== null, "attributed substring has no plain string");
+      assertEquals(readCFString(cf, plainString), "🙂");
+      assertEquals(readNSRange(substringActualRange), { location: 1n, length: 2n });
+
       const rectSend = openNSRectMsgSend(handles);
       const frame = rectSend.noArgs(window.contentView, sel(runtime, "frame"));
       assertEquals(readStructF64(frame, 16), 64);
@@ -481,6 +510,19 @@ function testProtocolAndStructAbis(): void {
         );
       }
       assertEquals(readNSRange(actualRange).location, NS_NOT_FOUND);
+
+      const caretActualRange = makeNSRange(0, 0);
+      const caretRect = rectSend.rangePointerArgs(
+        window.contentView,
+        sel(runtime, "firstRectForCharacterRange:actualRange:"),
+        makeNSRange(3, 0),
+        Deno.UnsafePointer.of(caretActualRange),
+      );
+      assertClose(readStructF64(caretRect, 0), readStructF64(expectedScreenRect, 0));
+      assertClose(readStructF64(caretRect, 8), readStructF64(expectedScreenRect, 8));
+      assertEquals(readStructF64(caretRect, 16), 0);
+      assertClose(readStructF64(caretRect, 24), readStructF64(expectedScreenRect, 24));
+      assertEquals(readNSRange(caretActualRange), { location: 3n, length: 0n });
     } finally {
       closeAll(handles);
     }

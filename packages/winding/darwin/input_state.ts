@@ -64,6 +64,8 @@ export class DarwinInputState {
   readonly #composition = new CompositionState();
   #markedText = "";
   #markedSelection: Utf16Range | null = null;
+  #markedDocumentStartUtf16 = 0;
+  #markedDocumentEndUtf16 = 0;
   #surrounding: SurroundingText | null = null;
   #cursorArea: ImeCursorArea = { x: 0, y: 0, width: 0, height: 0 };
   #modifierFlags = 0n;
@@ -102,12 +104,59 @@ export class DarwinInputState {
 
   get markedRange(): Utf16Range {
     return this.hasMarkedText
-      ? { location: 0n, length: BigInt(this.#markedText.length) }
+      ? {
+        location: BigInt(this.#markedDocumentStartUtf16),
+        length: BigInt(this.#markedText.length),
+      }
       : { location: NS_NOT_FOUND, length: 0n };
   }
 
   get selectedRange(): Utf16Range {
-    return { location: NS_NOT_FOUND, length: 0n };
+    if (this.hasMarkedText && this.#markedSelection !== null) {
+      return {
+        location: BigInt(this.#markedDocumentStartUtf16 + Number(this.#markedSelection.location)),
+        length: BigInt(this.#markedSelection.length),
+      };
+    }
+    const surrounding = this.#surrounding;
+    return surrounding === null
+      ? { location: NS_NOT_FOUND, length: 0n }
+      : {
+        location: BigInt(surrounding.selectionStartUtf16),
+        length: BigInt(surrounding.selectionEndUtf16 - surrounding.selectionStartUtf16),
+      };
+  }
+
+  /** Application text with the active marked string overlaid at its document range. */
+  get documentText(): string {
+    const surrounding = this.#surrounding;
+    if (surrounding === null) return this.#markedText;
+    if (!this.hasMarkedText) return surrounding.text;
+    return surrounding.text.slice(0, this.#markedDocumentStartUtf16) +
+      this.#markedText +
+      surrounding.text.slice(this.#markedDocumentEndUtf16);
+  }
+
+  substringForRange(location: number | bigint, length: number | bigint): {
+    text: string;
+    actualRange: Utf16Range;
+  } | null {
+    const range = validUtf16Range(this.documentText, location, length);
+    if (range === null) return null;
+    return {
+      text: this.documentText.slice(range.start, range.end),
+      actualRange: { location: BigInt(range.start), length: BigInt(range.end - range.start) },
+    };
+  }
+
+  actualCaretRange(location: number | bigint, length: number | bigint): Utf16Range | null {
+    const range = validUtf16Range(this.documentText, location, length);
+    if (range === null || range.start !== range.end) return null;
+    const selection = this.selectedRange;
+    if (selection.location === NS_NOT_FOUND) return null;
+    const selectedCaret = Number(selection.location) + Number(selection.length);
+    if (range.start !== selectedCaret) return null;
+    return { location: BigInt(range.start), length: 0n };
   }
 
   get cursorArea(): Readonly<ImeCursorArea> {
@@ -213,6 +262,7 @@ export class DarwinInputState {
     replacementLocation: number | bigint = NS_NOT_FOUND,
     replacementLength: number | bigint = 0,
   ): void {
+    const hadMarkedText = this.hasMarkedText;
     const hasConcreteReplacement = !(
       replacementLocation === NS_NOT_FOUND || replacementLocation === -1 || replacementLocation === -1n
     );
@@ -220,10 +270,27 @@ export class DarwinInputState {
     // that exact application-owned range first; the following preedit then
     // starts at the replacement insertion point. Once a mark exists, the same
     // argument is relative to the existing marked string instead.
-    if (!this.hasMarkedText && hasConcreteReplacement) {
+    if (!hadMarkedText) {
+      const surrounding = this.#surrounding;
+      if (hasConcreteReplacement) {
+        const range = validUtf16Range(surrounding?.text ?? "", replacementLocation, replacementLength);
+        if (range === null) {
+          throw new RangeError("winding(darwin): marked replacementRange is outside surrounding text");
+        }
+        this.#markedDocumentStartUtf16 = range.start;
+        this.#markedDocumentEndUtf16 = range.start;
+      } else if (surrounding !== null) {
+        this.#markedDocumentStartUtf16 = surrounding.selectionStartUtf16;
+        this.#markedDocumentEndUtf16 = surrounding.selectionEndUtf16;
+      } else {
+        this.#markedDocumentStartUtf16 = 0;
+        this.#markedDocumentEndUtf16 = 0;
+      }
+    }
+    if (!hadMarkedText && hasConcreteReplacement) {
       this.#emitDocumentReplacement(replacementLocation, replacementLength, "");
     }
-    const replacement = this.hasMarkedText
+    const replacement = hadMarkedText
       ? this.#markedReplacement(replacementLocation, replacementLength)
       : null;
     const text = replacement === null
@@ -249,6 +316,7 @@ export class DarwinInputState {
     if (update !== undefined) {
       this.#emit(createImePreeditEvent(this.window, update.text, update.cursorRange));
     }
+    if (text.length === 0) this.#resetMarkedDocumentRange();
   }
 
   insertText(
@@ -323,6 +391,12 @@ export class DarwinInputState {
   #clearMarkedText(): void {
     this.#markedText = "";
     this.#markedSelection = null;
+    this.#resetMarkedDocumentRange();
+  }
+
+  #resetMarkedDocumentRange(): void {
+    this.#markedDocumentStartUtf16 = 0;
+    this.#markedDocumentEndUtf16 = 0;
   }
 
   #emit(event: DarwinTextInputEvent): void {
@@ -396,4 +470,18 @@ export class DarwinInputState {
     if (transition === undefined) return;
     this.#emit(createImeActivationEvent(this.window, transition));
   }
+}
+
+function validUtf16Range(
+  text: string,
+  location: number | bigint,
+  length: number | bigint,
+): { start: number; end: number } | null {
+  if (location === NS_NOT_FOUND || location === -1 || location === -1n) return null;
+  const start = typeof location === "bigint" ? Number(location) : location;
+  const size = typeof length === "bigint" ? Number(length) : length;
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(size) || start < 0 || size < 0) return null;
+  const end = start + size;
+  if (!Number.isSafeInteger(end) || end > text.length) return null;
+  return utf16RangeToUtf8Range(text, start, size) === null ? null : { start, end };
 }

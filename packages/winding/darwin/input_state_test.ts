@@ -256,6 +256,32 @@ Deno.test("Darwin input state remains isolated per window", () => {
   assertEquals(second.drainEvents(), []);
 });
 
+Deno.test("Darwin text-client queries share one document-relative UTF-16 model", () => {
+  const state = inputState();
+  state.setSurroundingText("A🙂BC", 1, 6);
+  assertEquals(state.documentText, "A🙂BC");
+  assertEquals(state.markedRange, { location: NS_NOT_FOUND, length: 0n });
+  assertEquals(state.selectedRange, { location: 1n, length: 3n });
+  assertEquals(state.substringForRange(1, 3), {
+    text: "🙂B",
+    actualRange: { location: 1n, length: 3n },
+  });
+  assertEquals(state.substringForRange(2, 1), null);
+  assertEquals(state.actualCaretRange(4, 0), { location: 4n, length: 0n });
+  assertEquals(state.actualCaretRange(1, 0), null);
+  assertEquals(state.actualCaretRange(1, 3), null);
+
+  state.setMarkedText("候", 1, 0);
+  assertEquals(state.documentText, "A候C");
+  assertEquals(state.markedRange, { location: 1n, length: 1n });
+  assertEquals(state.selectedRange, { location: 2n, length: 0n });
+  assertEquals(state.substringForRange(0, 3), {
+    text: "A候C",
+    actualRange: { location: 0n, length: 3n },
+  });
+  assertEquals(state.actualCaretRange(2, 0), { location: 2n, length: 0n });
+});
+
 Deno.test("Darwin cursor geometry preserves subpixels and ignores invalid updates", () => {
   const state = inputState();
   state.setCursorArea(1.25, 2.5, 3.75, 4.5);

@@ -61,7 +61,14 @@ export interface DarwinNativeResponder {
   readonly nativeMarkedRange: NativeRange;
   readonly nativeSelectedRange: NativeRange;
   nativeValidAttributes(): Deno.PointerValue;
-  nativeFirstRectForCharacterRange(): Uint8Array;
+  nativeAttributedSubstring(
+    location: bigint,
+    length: bigint,
+  ): { value: Deno.PointerValue; actualRange: NativeRange } | null;
+  nativeFirstRectForCharacterRange(
+    location: bigint,
+    length: bigint,
+  ): { rect: Uint8Array; actualRange: NativeRange };
 }
 
 /** Only the Objective-C registration operations needed by this module. */
@@ -341,13 +348,22 @@ export class DarwinNativeClasses {
       guardNativeCallback(
         this.#errors,
         (
-          _self: Deno.PointerValue,
+          self: Deno.PointerValue,
           _cmd: Deno.PointerValue,
-          _range: Uint8Array,
+          proposedRange: Uint8Array,
           actualRange: Deno.PointerValue,
         ) => {
-          writeRangePointer(actualRange, NS_NOT_FOUND, 0n);
-          return null;
+          const proposed = readNSRange(proposedRange);
+          const result = this.#view(self)?.nativeAttributedSubstring(
+            proposed.location,
+            proposed.length,
+          ) ?? null;
+          writeRangePointer(
+            actualRange,
+            BigInt(result?.actualRange.location ?? NS_NOT_FOUND),
+            BigInt(result?.actualRange.length ?? 0),
+          );
+          return result?.value ?? null;
         },
         () => null,
       ),
@@ -363,11 +379,23 @@ export class DarwinNativeClasses {
         (
           self: Deno.PointerValue,
           _cmd: Deno.PointerValue,
-          _range: Uint8Array,
+          requestedRange: Uint8Array,
           actualRange: Deno.PointerValue,
         ) => {
-          writeRangePointer(actualRange, NS_NOT_FOUND, 0n);
-          return this.#view(self)?.nativeFirstRectForCharacterRange() ?? new Uint8Array(32);
+          const requested = readNSRange(requestedRange);
+          const result = this.#view(self)?.nativeFirstRectForCharacterRange(
+            requested.location,
+            requested.length,
+          ) ?? {
+            rect: new Uint8Array(32),
+            actualRange: { location: NS_NOT_FOUND, length: 0n },
+          };
+          writeRangePointer(
+            actualRange,
+            BigInt(result.actualRange.location),
+            BigInt(result.actualRange.length),
+          );
+          return result.rect;
         },
         () => new Uint8Array(32),
       ),

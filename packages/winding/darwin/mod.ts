@@ -493,8 +493,43 @@ class DarwinWindow implements Window, DarwinNativeResponder {
     return this.emptyArray();
   }
 
-  nativeFirstRectForCharacterRange(): Uint8Array {
-    return this.firstRectForCharacterRange();
+  nativeAttributedSubstring(
+    location: bigint,
+    length: bigint,
+  ): { value: Deno.PointerValue; actualRange: NativeRange } | null {
+    const substring = this.inputState.substringForRange(location, length);
+    if (substring === null) return null;
+    const { getClass, sel, send } = this.lib.ffi;
+    const string = makeNSString(this.lib.ffi, substring.text);
+    if (string === null) throw new Error("winding(darwin): failed to create substring NSString");
+    let attributed: Deno.PointerValue = null;
+    try {
+      const alloc = send.id(getClass("NSAttributedString"), sel("alloc"));
+      attributed = send.id_id(alloc, sel("initWithString:"), string);
+      if (attributed === null) {
+        throw new Error("winding(darwin): failed to create attributed substring");
+      }
+      return {
+        value: send.id(attributed, sel("autorelease")),
+        actualRange: substring.actualRange,
+      };
+    } finally {
+      send.void(string, sel("release"));
+    }
+  }
+
+  nativeFirstRectForCharacterRange(
+    location: bigint,
+    length: bigint,
+  ): { rect: Uint8Array; actualRange: NativeRange } {
+    const actualRange = this.inputState.actualCaretRange(location, length) ?? {
+      location: NS_NOT_FOUND,
+      length: 0n,
+    };
+    return {
+      rect: this.firstRectForCharacterRange(actualRange.location !== NS_NOT_FOUND),
+      actualRange,
+    };
   }
 
   handleResize(): void {
@@ -673,11 +708,12 @@ class DarwinWindow implements Window, DarwinNativeResponder {
     return send.id(getClass("NSArray"), sel("array"));
   }
 
-  firstRectForCharacterRange(): Uint8Array {
+  firstRectForCharacterRange(zeroWidthCaret = false): Uint8Array {
     const { nsrect, sel } = this.lib.ffi;
     const bounds = nsrect.noArgs(this.contentView, sel("bounds"));
     const viewHeight = readStructF64(bounds, 24);
     const local = cocoaRectFromClient(this.inputState.cursorArea, viewHeight);
+    if (zeroWidthCaret) local.width = 0;
     return nsrect.rectArg(
       this.nsWindow,
       sel("convertRectToScreen:"),
