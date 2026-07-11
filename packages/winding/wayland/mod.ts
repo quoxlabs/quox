@@ -1225,4 +1225,17 @@ function mouseButtonMask(button: MouseButton): number {
   return button === "left" ? 1 : button === "right" ? 2 : button === "middle" ? 4 : button === "back" ? 8 : 16;
 }
 
-export const load: LoadLibrary = () => new WaylandLibrary();
+export function validateWaylandNativeLayout(os: string, arch: string, littleEndian: boolean): void {
+  if (os === "linux" && (arch === "x86_64" || arch === "aarch64") && littleEndian) return;
+  throw new Error("winding Wayland bindings require 64-bit little-endian Linux on x86-64 or AArch64");
+}
+
+function validateLiveWaylandNativeLayout(): void {
+  const littleEndian = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
+  validateWaylandNativeLayout(Deno.build.os, Deno.build.arch, littleEndian);
+}
+
+export const load: LoadLibrary = () => {
+  validateLiveWaylandNativeLayout();
+  return new WaylandLibrary();
+};

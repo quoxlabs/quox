@@ -58,7 +58,27 @@ import {
   WaylandPointerFrameAccumulator,
   WaylandPointerPosition,
 } from "./pointer.ts";
+import { validateWaylandNativeLayout } from "./mod.ts";
 import type { KeyModifiers } from "../types.ts";
+
+Deno.test("Wayland rejects native layouts its hand-packed bindings cannot represent", () => {
+  validateWaylandNativeLayout("linux", "x86_64", true);
+  validateWaylandNativeLayout("linux", "aarch64", true);
+
+  const unsupported = [
+    ["linux", "x86", true],
+    ["linux", "riscv64", true],
+    ["linux", "unknown", true],
+    ["freebsd", "x86_64", true],
+    ["linux", "x86_64", false],
+  ] as const;
+  for (const [os, arch, littleEndian] of unsupported) {
+    assertThrowsMessage(
+      () => validateWaylandNativeLayout(os, arch, littleEndian),
+      "winding Wayland bindings require 64-bit little-endian Linux on x86-64 or AArch64",
+    );
+  }
+});
 
 Deno.test("Wayland globals keep one owner and promote a deterministic replacement", () => {
   const actions: string[] = [];
