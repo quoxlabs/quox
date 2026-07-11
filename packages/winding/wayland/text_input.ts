@@ -1,7 +1,7 @@
 /** Double-buffered semantic state for the Wayland text-input-v3 protocol. */
 
 import type { ImeCursorRange } from "../types.ts";
-import { normalizeCommittedText, validateImeCursorRange } from "../input/mod.ts";
+import { validateImeCursorRange } from "../input/mod.ts";
 
 const UINT32_MAX = 0xffffffff;
 
@@ -21,9 +21,13 @@ interface PendingPreedit {
   readonly cursorRange: ImeCursorRange | null;
 }
 
+interface PendingCommit {
+  readonly text: string | null;
+}
+
 export class TextInputV3Batch {
   #pendingPreedit: PendingPreedit | undefined;
-  #pendingCommit: string | undefined;
+  #pendingCommit: PendingCommit | undefined;
   #pendingDelete: { beforeBytes: number; afterBytes: number } | undefined;
   #visiblePreedit = false;
   #clientCommitSerial = 0;
@@ -43,14 +47,16 @@ export class TextInputV3Batch {
 
   setPreedit(text: string | null, cursorBegin: number, cursorEnd: number): void {
     const resolvedText = text ?? "";
+    const rangeStart = Math.min(cursorBegin, cursorEnd);
+    const rangeEnd = Math.max(cursorBegin, cursorEnd);
     this.#pendingPreedit = {
       text: resolvedText,
-      cursorRange: validateImeCursorRange(resolvedText, cursorBegin, cursorEnd),
+      cursorRange: validateImeCursorRange(resolvedText, rangeStart, rangeEnd),
     };
   }
 
   setCommit(text: string | null): void {
-    this.#pendingCommit = text === null ? undefined : normalizeCommittedText(text);
+    this.#pendingCommit = { text };
   }
 
   setDeleteSurrounding(beforeBytes: number, afterBytes: number): void {
@@ -59,21 +65,21 @@ export class TextInputV3Batch {
 
   done(serial: number): TextInputDoneResult {
     const edits: TextInputEdit[] = [];
-    if (
-      this.#visiblePreedit && this.#pendingCommit === undefined &&
-      this.#pendingPreedit?.text.length === 0
-    ) edits.push({ type: "preedit", text: "", cursorRange: null });
-    if (
-      this.#pendingDelete !== undefined &&
-      (this.#pendingDelete.beforeBytes !== 0 || this.#pendingDelete.afterBytes !== 0)
-    ) edits.push({ type: "deleteSurrounding", ...this.#pendingDelete });
-    if (this.#pendingCommit !== undefined) edits.push({ type: "commit", text: this.#pendingCommit });
+    const hasDeletion = this.#pendingDelete !== undefined &&
+      (this.#pendingDelete.beforeBytes !== 0 || this.#pendingDelete.afterBytes !== 0);
+    const commitText = this.#pendingCommit?.text ?? "";
+    // A nonempty public commit atomically ends preedit. Deletion still needs an
+    // explicit clear first so consumers observe the protocol-mandated order.
+    if (this.#visiblePreedit && (commitText.length === 0 || hasDeletion)) {
+      edits.push({ type: "preedit", text: "", cursorRange: null });
+    }
+    if (hasDeletion) edits.push({ type: "deleteSurrounding", ...this.#pendingDelete! });
+    if (commitText.length > 0) edits.push({ type: "commit", text: commitText });
     if (this.#pendingPreedit !== undefined && this.#pendingPreedit.text.length > 0) {
       edits.push({ type: "preedit", ...this.#pendingPreedit });
     }
 
-    if (this.#pendingPreedit !== undefined) this.#visiblePreedit = this.#pendingPreedit.text.length > 0;
-    else if (this.#pendingCommit !== undefined) this.#visiblePreedit = false;
+    this.#visiblePreedit = (this.#pendingPreedit?.text.length ?? 0) > 0;
     this.#resetPending();
 
     const normalizedSerial = toUint32(serial);

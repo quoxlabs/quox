@@ -359,6 +359,7 @@ Deno.test("text-input done flushes edits in protocol order and reports serial ma
     serial: 0,
     serialMatches: false,
     edits: [
+      { type: "preedit", text: "", cursorRange: null },
       { type: "deleteSurrounding", beforeBytes: 4, afterBytes: 2 },
       { type: "commit", text: "好" },
       { type: "preedit", text: "next", cursorRange: [1, 3] },
@@ -366,25 +367,55 @@ Deno.test("text-input done flushes edits in protocol order and reports serial ma
   });
 });
 
-Deno.test("text-input pending fields reset after every done and invalid cursors are hidden", () => {
+Deno.test("text-input pending fields reset and reverse cursor endpoints are normalized", () => {
   const batch = new TextInputV3Batch();
   batch.setDeleteSurrounding(-10, Number.POSITIVE_INFINITY);
-  batch.setCommit(null);
-  batch.setCommit("\u0003");
-  batch.setPreedit("é", 1, 2);
+  batch.setPreedit("é日", 5, 2);
 
   assertEquals(batch.done(0).edits, [
-    { type: "preedit", text: "é", cursorRange: null },
+    { type: "preedit", text: "é日", cursorRange: [2, 5] },
   ]);
-  assertEquals(batch.done(0).edits, []);
-  assertEquals(batch.hasVisiblePreedit, true);
+  assertEquals(batch.done(0).edits, [
+    { type: "preedit", text: "", cursorRange: null },
+  ]);
+  assertEquals(batch.hasVisiblePreedit, false);
 });
 
-Deno.test("text-input commits atomically end preedit without a separate clear", () => {
+Deno.test("text-input preserves exact nonempty native commit strings", () => {
   const batch = new TextInputV3Batch();
-  batch.setCommit("committed");
+  batch.setPreedit("visible", 0, 7);
+  batch.done(0);
+  batch.setCommit("line one\nline two\u0003");
 
-  assertEquals(batch.done(0).edits, [{ type: "commit", text: "committed" }]);
+  // The commit itself atomically removes old preedit in the public API.
+  assertEquals(batch.done(0).edits, [{ type: "commit", text: "line one\nline two\u0003" }]);
+});
+
+Deno.test("bare, delete-only, null, and empty batches all clear old preedit", () => {
+  const batch = new TextInputV3Batch();
+  const showPreedit = () => {
+    batch.setPreedit("visible", 0, 7);
+    batch.done(0);
+  };
+
+  showPreedit();
+  assertEquals(batch.done(0).edits, [{ type: "preedit", text: "", cursorRange: null }]);
+
+  showPreedit();
+  batch.setDeleteSurrounding(2, 1);
+  assertEquals(batch.done(0).edits, [
+    { type: "preedit", text: "", cursorRange: null },
+    { type: "deleteSurrounding", beforeBytes: 2, afterBytes: 1 },
+  ]);
+
+  showPreedit();
+  batch.setCommit(null);
+  assertEquals(batch.done(0).edits, [{ type: "preedit", text: "", cursorRange: null }]);
+
+  showPreedit();
+  batch.setCommit("");
+  assertEquals(batch.done(0).edits, [{ type: "preedit", text: "", cursorRange: null }]);
+  assertEquals(batch.hasVisiblePreedit, false);
 });
 
 Deno.test("resetEdits clears both visible and uncommitted text-input state", () => {
