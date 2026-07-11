@@ -806,13 +806,15 @@ function importEvent(
       const btn = view.getInt32(84, true);
       if (btn === 4) return { type: "wheel", deltaX: 0, deltaY: -1, window };
       if (btn === 5) return { type: "wheel", deltaX: 0, deltaY: 1, window };
+      if (btn === 6) return { type: "wheel", deltaX: -1, deltaY: 0, window };
+      if (btn === 7) return { type: "wheel", deltaX: 1, deltaY: 0, window };
       const button = BUTTONS[btn];
       if (button === undefined) return undefined;
       return { type: "mousedown", button, window };
     }
     case XEventType.ButtonRelease: {
       const btn = view.getInt32(84, true);
-      if (btn === 4 || btn === 5) return undefined; // wheel has no release
+      if (btn >= 4 && btn <= 7) return undefined; // wheel has no release
       const button = BUTTONS[btn];
       if (button === undefined) return undefined;
       return { type: "mouseup", button, window };
