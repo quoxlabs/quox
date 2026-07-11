@@ -1080,6 +1080,10 @@ Deno.test("logical virtual-key mapping covers named, function, translated, and u
   assertEquals(logicalKeyFromVirtualKey(0x59, "z"), "z");
   assertEquals(logicalKeyFromVirtualKey(0xba, "ö"), "ö");
   assertEquals(logicalKeyFromVirtualKey(VK.PACKET), "Unidentified");
+  assertEquals(logicalKeyFromVirtualKey(VK.PACKET, "λ"), "λ");
+  assertEquals(logicalKeyFromVirtualKey(VK.PACKET, "🙂"), "🙂");
+  assertEquals(logicalKeyFromVirtualKey(VK.PACKET, "ab"), "Unidentified");
+  assertEquals(logicalKeyFromVirtualKey(VK.PACKET, "\ud83d"), "Unidentified");
 });
 
 Deno.test("Win32 language-mode keys use the active HKL LANGID without guessing unknown aliases", () => {
@@ -1198,6 +1202,78 @@ Deno.test("Win32 emits corrected Cancel and media logical keys with physical cod
       { key: "LaunchMediaPlayer", code: "MediaSelect", location: 0 },
     ],
   );
+});
+
+Deno.test("VK_PACKET exposes translated scalar keys and retains them through release", () => {
+  const harness = createInputControllerHarness({ translateKey: () => "λ" });
+  harness.controller.attach(harness.window);
+  const down = makeKeyLParam(0xbb);
+  const up = makeKeyLParam(0xbb, { previous: true, transition: true });
+
+  dispatchKeyDown(harness, VK.PACKET, down);
+  harness.controller.handleMessage(harness.window, WM.CHAR, 0x03bb, down);
+  harness.controller.handleMessage(harness.window, WM.KEYUP, VK.PACKET, up);
+
+  const transitions = harness.events.filter((event) => event.type === "keydown" || event.type === "keyup");
+  assertEquals(
+    transitions.map((event) => ({
+      type: event.type,
+      key: event.key,
+      editDisposition: event.type === "keydown" ? event.editDisposition : undefined,
+    })),
+    [
+      { type: "keydown", key: "λ", editDisposition: "text-input" },
+      { type: "keyup", key: "λ", editDisposition: undefined },
+    ],
+  );
+  assertEquals(textImeEvents(harness.events), [{ kind: "commit", text: "λ" }]);
+});
+
+Deno.test("VK_PACKET surrogate transitions suppress defaults and assemble one scalar commit", () => {
+  let translationCalls = 0;
+  const harness = createInputControllerHarness({
+    translateKey(virtualKey) {
+      assertEquals(virtualKey, VK.PACKET);
+      translationCalls++;
+      if (translationCalls === 1) return undefined;
+      throw new Error("injected packet translation failure");
+    },
+  });
+  harness.controller.attach(harness.window);
+  const highDown = makeKeyLParam(0x3d);
+  const highUp = makeKeyLParam(0x3d, { previous: true, transition: true });
+  const lowDown = makeKeyLParam(0x42);
+  const lowUp = makeKeyLParam(0x42, { previous: true, transition: true });
+
+  dispatchKeyDown(harness, VK.PACKET, highDown);
+  harness.controller.handleMessage(harness.window, WM.CHAR, 0xd83d, highDown);
+  harness.controller.handleMessage(harness.window, WM.KEYUP, VK.PACKET, highUp);
+  dispatchKeyDown(harness, VK.PACKET, lowDown);
+  harness.controller.handleMessage(harness.window, WM.CHAR, 0xde42, lowDown);
+  harness.controller.handleMessage(harness.window, WM.KEYUP, VK.PACKET, lowUp);
+
+  assertEquals(translationCalls, 2);
+  const transitions = harness.events.filter((event) => event.type === "keydown" || event.type === "keyup");
+  assertEquals(
+    transitions.map((event) => ({
+      type: event.type,
+      key: event.key,
+      editDisposition: event.type === "keydown" ? event.editDisposition : undefined,
+    })),
+    [
+      { type: "keydown", key: "Unidentified", editDisposition: "text-input" },
+      { type: "keyup", key: "Unidentified", editDisposition: undefined },
+      { type: "keydown", key: "Unidentified", editDisposition: "text-input" },
+      { type: "keyup", key: "Unidentified", editDisposition: undefined },
+    ],
+  );
+  assertEquals(
+    transitions.filter((event): event is KeyDownEvent =>
+      event.type === "keydown" && event.editDisposition === "key-default"
+    ).length,
+    0,
+  );
+  assertEquals(textImeEvents(harness.events), [{ kind: "commit", text: "🙂" }]);
 });
 
 Deno.test("injected ToUnicode translation follows the active layout and uses the non-mutating flag", () => {
@@ -1319,7 +1395,7 @@ Deno.test("printable physical Ctrl+Alt layout levels use browser AltGraph owners
   };
   assertEquals(browserModifiers.altGraphKey, true);
   assertEquals(browserModifiers.accelKey, false);
-  assertEquals(win32KeyEditDisposition("@", false, browserModifiers, "@", true), "text-input");
+  assertEquals(win32KeyEditDisposition(0x51, "@", false, browserModifiers, "@", true), "text-input");
 });
 
 Deno.test("non-text Ctrl+Alt shortcuts keep their plain key and platform ownership", () => {
@@ -1343,7 +1419,7 @@ Deno.test("non-text Ctrl+Alt shortcuts keep their plain key and platform ownersh
   assertEquals(translated.key, "c");
   assertEquals(translated.text, undefined);
   assertEquals(shouldExposeAltGraph(translated.modifiers, true, false), false);
-  assertEquals(win32KeyEditDisposition("c", false, translated.modifiers, undefined, true), "platform");
+  assertEquals(win32KeyEditDisposition(0x43, "c", false, translated.modifiers, undefined, true), "platform");
 });
 
 Deno.test("Win32 edit ownership follows WM_SYSKEYDOWN rather than inferred Alt state", () => {
@@ -1356,12 +1432,16 @@ Deno.test("Win32 edit ownership follows WM_SYSKEYDOWN rather than inferred Alt s
     capsLock: false,
     altGraphKey: false,
   };
-  assertEquals(win32KeyEditDisposition("F10", false, ordinary, undefined, true), "platform");
-  assertEquals(win32KeyEditDisposition("ArrowLeft", false, ordinary, undefined, false), "key-default");
-  assertEquals(win32KeyEditDisposition("x", false, ordinary, "x", false), "text-input");
+  assertEquals(win32KeyEditDisposition(VK.F1 + 9, "F10", false, ordinary, undefined, true), "platform");
+  assertEquals(win32KeyEditDisposition(VK.LEFT, "ArrowLeft", false, ordinary, undefined, false), "key-default");
+  assertEquals(win32KeyEditDisposition(0x58, "x", false, ordinary, "x", false), "text-input");
 
   const altGraph = { ...ordinary, ctrlKey: true, altGraphKey: true };
-  assertEquals(win32KeyEditDisposition("@", false, altGraph, "@", true), "text-input");
+  assertEquals(win32KeyEditDisposition(0x51, "@", false, altGraph, "@", true), "text-input");
+  assertEquals(
+    win32KeyEditDisposition(VK.PACKET, "Unidentified", false, ordinary, undefined, true),
+    "text-input",
+  );
 });
 
 Deno.test("AltGr's paired fake Control transitions are suppressed", () => {
@@ -1829,6 +1909,7 @@ interface FakeImmBehavior {
   notifyResult?: number;
   releaseResult?: number;
   keyText?: ReadonlyMap<number, string>;
+  translateKey?: (virtualKey: number) => string | undefined;
   keyboardState?: ReadonlyArray<readonly [virtualKey: number, state: number]>;
   compositionData?: ReadonlyMap<number, Uint8Array | number>;
   onNotifyIme?: () => void;
@@ -1871,7 +1952,9 @@ function createInputControllerHarness(behavior: FakeImmBehavior = {}) {
         _keyboardState: Uint8Array,
         output: Uint16Array,
       ) {
-        const text = behavior.keyText?.get(virtualKey);
+        const text = behavior.translateKey === undefined
+          ? behavior.keyText?.get(virtualKey)
+          : behavior.translateKey(virtualKey);
         if (text === undefined) return 0;
         for (let index = 0; index < text.length; index++) output[index] = text.charCodeAt(index);
         return text.length;

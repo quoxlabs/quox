@@ -1175,7 +1175,7 @@ function createWin32KeyEvent(
     ? createKeyDownEvent({
       ...init,
       repeat,
-      editDisposition: win32KeyEditDisposition(key, isComposing, modifiers, text, systemMessage),
+      editDisposition: win32KeyEditDisposition(keycode, key, isComposing, modifiers, text, systemMessage),
     })
     : createKeyUpEvent(init);
 }

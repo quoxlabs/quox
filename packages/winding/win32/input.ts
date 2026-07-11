@@ -506,12 +506,17 @@ export function shouldExposeAltGraph(
 
 /** Classify one Win32 keydown using its actual native message ownership. */
 export function win32KeyEditDisposition(
+  virtualKey: number,
   key: string,
   isComposing: boolean,
   modifiers: Win32KeyboardModifiers,
   text: string | undefined,
   systemMessage: boolean,
 ): KeyEditDisposition {
+  // KEYEVENTF_UNICODE produces VK_PACKET followed by the authoritative
+  // WM_CHAR. The packet transition never owns an ordinary editor default,
+  // even when ToUnicodeEx cannot expose the generated character early.
+  if (virtualKey === VK.PACKET) return "text-input";
   // AltGr may arrive through WM_SYSKEYDOWN, but winding consumes the matching
   // WM_SYSCHAR as text instead of leaving it to DefWindowProcW.
   if (systemMessage && !modifiers.altGraphKey) return "platform";
@@ -730,6 +735,13 @@ export function logicalKeyFromVirtualKey(
     if (primaryLanguage === 0x11) return virtualKey === VK.KANA ? "KanaMode" : "KanjiMode";
     if (primaryLanguage === 0x12) return virtualKey === VK.KANA ? "HangulMode" : "HanjaMode";
     return "Unidentified";
+  }
+  if (virtualKey === VK.PACKET) {
+    if (translatedText === undefined || !isCommitText(translatedText)) return "Unidentified";
+    const scalars = [...translatedText];
+    if (scalars.length !== 1) return "Unidentified";
+    const codePoint = scalars[0].codePointAt(0)!;
+    return codePoint >= 0xd800 && codePoint <= 0xdfff ? "Unidentified" : translatedText;
   }
   const named = NAMED_VIRTUAL_KEYS.get(virtualKey);
   if (named !== undefined) return named;
