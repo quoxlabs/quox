@@ -16,12 +16,21 @@ import {
   XimCaretDirection,
 } from "./xim_preedit.ts";
 import { packRgbaPixels } from "./native_image.ts";
+import { supportsX11Abi } from "./mod.ts";
 import { selectXimStyles } from "./xim.ts";
 
 Deno.test("X11 logical keys prefer layout-aware printable text", () => {
   assertEquals(logicalKeyFromKeysym(0x7a, "z"), "z");
   assertEquals(logicalKeyFromKeysym(0x010000e4, "ä"), "ä");
   assertEquals(logicalKeyFromKeysym(0x010020ac, "€"), "€");
+});
+
+Deno.test("X11 rejects layouts its native structure decoder cannot represent", () => {
+  assertEquals(supportsX11Abi("linux", "x86_64", true), true);
+  assertEquals(supportsX11Abi("linux", "aarch64", true), true);
+  assertEquals(supportsX11Abi("linux", "x86_64", false), false);
+  assertEquals(supportsX11Abi("linux", "x86", true), false);
+  assertEquals(supportsX11Abi("freebsd", "x86_64", true), false);
 });
 
 Deno.test("X11 logical keys use KeySym names for controls and named keys", () => {

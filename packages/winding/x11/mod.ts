@@ -332,6 +332,17 @@ function openX11Library(): Deno.DynamicLibrary<typeof x11functions> {
 
 let libraryActive = false;
 
+export function supportsX11Abi(os: string, arch: string, littleEndian: boolean): boolean {
+  return os === "linux" && (arch === "x86_64" || arch === "aarch64") && littleEndian;
+}
+
+function assertSupportedX11Abi(): void {
+  const littleEndian = new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
+  if (!supportsX11Abi(Deno.build.os, Deno.build.arch, littleEndian)) {
+    throw new Error("winding(x11): requires 64-bit little-endian Linux on x86-64 or AArch64");
+  }
+}
+
 function assertMainIsolate(): void {
   const constructorName = (globalThis as { constructor?: { name?: string } }).constructor?.name ?? "";
   if (constructorName.includes("Worker")) {
@@ -369,7 +380,7 @@ class X11Library implements Library {
       this.libc = Deno.dlopen("libc.so.6", libcFunctions);
     } catch (error) {
       this.X11.close();
-      throw error;
+      throw new Error("winding(x11): this build requires glibc (libc.so.6)", { cause: error });
     }
     const display = this.X11.symbols.XOpenDisplay(null);
     if (display == null) {
@@ -894,6 +905,7 @@ function importEvent(
 }
 
 export const load: LoadLibrary = () => {
+  assertSupportedX11Abi();
   assertMainIsolate();
   if (libraryActive) throw new Error("winding(x11): only one library instance may be active");
   libraryActive = true;
