@@ -43,11 +43,17 @@ export interface DarwinNativeResponder {
     event: Deno.PointerValue,
   ): void;
   handleNativePointerEvent(event: Deno.PointerValue): void;
-  handleNativeInsertText(text: Deno.PointerValue): void;
+  handleNativeInsertText(
+    text: Deno.PointerValue,
+    replacementLocation: bigint,
+    replacementLength: bigint,
+  ): void;
   handleNativeSetMarkedText(
     text: Deno.PointerValue,
     selectionLocation: bigint,
     selectionLength: bigint,
+    replacementLocation: bigint,
+    replacementLength: bigint,
   ): void;
   handleNativeUnmarkText(): void;
   handleNativeCommand(command: Deno.PointerValue): void;
@@ -239,8 +245,15 @@ export class DarwinNativeClasses {
       { parameters: ["pointer", "pointer", "pointer", NSRANGE], result: "void" },
       guardNativeCallback(
         this.#errors,
-        (self: Deno.PointerValue, _cmd: Deno.PointerValue, text: Deno.PointerValue) =>
-          this.#view(self)?.handleNativeInsertText(text),
+        (
+          self: Deno.PointerValue,
+          _cmd: Deno.PointerValue,
+          text: Deno.PointerValue,
+          replacement: Uint8Array,
+        ) => {
+          const range = readNSRange(replacement);
+          this.#view(self)?.handleNativeInsertText(text, range.location, range.length);
+        },
         () => undefined,
       ),
     );
@@ -256,10 +269,17 @@ export class DarwinNativeClasses {
           _cmd: Deno.PointerValue,
           text: Deno.PointerValue,
           selection: Uint8Array,
-          _replacement: Uint8Array,
+          replacement: Uint8Array,
         ) => {
-          const range = readNSRange(selection);
-          this.#view(self)?.handleNativeSetMarkedText(text, range.location, range.length);
+          const selectedRange = readNSRange(selection);
+          const replacementRange = readNSRange(replacement);
+          this.#view(self)?.handleNativeSetMarkedText(
+            text,
+            selectedRange.location,
+            selectedRange.length,
+            replacementRange.location,
+            replacementRange.length,
+          );
         },
         () => undefined,
       ),

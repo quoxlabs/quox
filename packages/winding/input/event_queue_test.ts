@@ -13,6 +13,7 @@ function testWindow(): Window {
     setTitle() {},
     blit() {},
     setImeEnabled() {},
+    setImeSurroundingText() {},
     setImeCursorArea() {},
   };
 }

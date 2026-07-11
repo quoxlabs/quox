@@ -3,6 +3,7 @@ import {
   createImeCommitEvent,
   createImeDeleteSurroundingEvent,
   createImePreeditEvent,
+  createImeReplaceEvent,
   createKeyDownEvent,
   createKeyUpEvent,
   type KeyEventInit,
@@ -120,6 +121,16 @@ Deno.test("IME builders enforce canonical cursor, commit, and deletion shapes", 
     beforeBytes: 4,
     afterBytes: 2,
   });
+  assertEquals(createImeReplaceEvent(window, "A🙂B", 1, 5, "x"), {
+    type: "ime",
+    kind: "replace",
+    window,
+    startBytes: 1,
+    endBytes: 5,
+    text: "x",
+  });
+  assertEquals(createImeReplaceEvent(window, "A🙂B", 2, 5, "x"), undefined);
+  assertEquals(createImeReplaceEvent(window, "A🙂B", 5, 1, "x"), undefined);
 });
 
 function assertEquals(actual: unknown, expected: unknown): void {

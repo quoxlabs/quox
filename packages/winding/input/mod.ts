@@ -19,6 +19,7 @@ export {
   createImeCommitEvent,
   createImeDeleteSurroundingEvent,
   createImePreeditEvent,
+  createImeReplaceEvent,
   createKeyDownEvent,
   createKeyUpEvent,
   type KeyDownEventInit,

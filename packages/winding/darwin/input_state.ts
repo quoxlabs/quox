@@ -4,10 +4,12 @@ import {
   createImeActivationEvent,
   createImeCommitEvent,
   createImePreeditEvent,
+  createImeReplaceEvent,
   discardTrailingPreeditClear,
   ImeActivationState,
   type ImeCursorArea,
   utf16RangeToUtf8Range,
+  utf8OffsetToUtf16Index,
   validateImeCursorArea,
 } from "../input/mod.ts";
 import { NS_NOT_FOUND } from "./ffi.ts";
@@ -48,12 +50,21 @@ interface KeyBatch {
   following: DarwinTextInputEvent[];
 }
 
+interface SurroundingText {
+  text: string;
+  selectionStartBytes: number;
+  selectionEndBytes: number;
+  selectionStartUtf16: number;
+  selectionEndUtf16: number;
+}
+
 /** Pure per-view state used by the AppKit NSTextInputClient callbacks. */
 export class DarwinInputState {
   readonly #activation = new ImeActivationState();
   readonly #composition = new CompositionState();
   #markedText = "";
   #markedSelection: Utf16Range | null = null;
+  #surrounding: SurroundingText | null = null;
   #cursorArea: ImeCursorArea = { x: 0, y: 0, width: 0, height: 0 };
   #modifierFlags = 0n;
   readonly #pressedModifierCodes = new Set<string>();
@@ -106,6 +117,24 @@ export class DarwinInputState {
   setCursorArea(x: number, y: number, width: number, height: number): void {
     const area = validateImeCursorArea(x, y, width, height);
     if (area !== undefined) this.#cursorArea = area;
+  }
+
+  setSurroundingText(text: string, selectionStartBytes: number, selectionEndBytes: number): void {
+    const selectionStartUtf16 = utf8OffsetToUtf16Index(text, selectionStartBytes);
+    const selectionEndUtf16 = utf8OffsetToUtf16Index(text, selectionEndBytes);
+    if (
+      selectionStartUtf16 === undefined || selectionEndUtf16 === undefined ||
+      selectionStartBytes > selectionEndBytes
+    ) {
+      throw new RangeError("winding(darwin): IME surrounding selection must be ordered UTF-8 boundaries");
+    }
+    this.#surrounding = {
+      text,
+      selectionStartBytes,
+      selectionEndBytes,
+      selectionStartUtf16,
+      selectionEndUtf16,
+    };
   }
 
   get modifierFlags(): bigint {
@@ -177,33 +206,66 @@ export class DarwinInputState {
     return [key, ...batch.following];
   }
 
-  setMarkedText(text: string, selectionLocation: number | bigint, selectionLength: number | bigint): void {
+  setMarkedText(
+    insertedText: string,
+    selectionLocation: number | bigint,
+    selectionLength: number | bigint,
+    replacementLocation: number | bigint = NS_NOT_FOUND,
+    replacementLength: number | bigint = 0,
+  ): void {
+    const hasConcreteReplacement = !(
+      replacementLocation === NS_NOT_FOUND || replacementLocation === -1 || replacementLocation === -1n
+    );
+    // With no existing mark, AppKit's replacement is document-wide. Delete
+    // that exact application-owned range first; the following preedit then
+    // starts at the replacement insertion point. Once a mark exists, the same
+    // argument is relative to the existing marked string instead.
+    if (!this.hasMarkedText && hasConcreteReplacement) {
+      this.#emitDocumentReplacement(replacementLocation, replacementLength, "");
+    }
+    const replacement = this.hasMarkedText
+      ? this.#markedReplacement(replacementLocation, replacementLength)
+      : null;
+    const text = replacement === null
+      ? insertedText
+      : this.#markedText.slice(0, replacement.start) + insertedText + this.#markedText.slice(replacement.end);
+    const selectionBase = replacement?.start ?? 0;
     this.#markedText = text;
-    const location = clampedUtf16Offset(selectionLocation, text.length);
+    const relativeLocation = clampedUtf16Offset(selectionLocation, insertedText.length);
+    const location = Math.min(selectionBase + relativeLocation, text.length);
     this.#markedSelection = text.length === 0 ||
         selectionLocation === NS_NOT_FOUND || selectionLocation === -1 || selectionLocation === -1n
       ? null
       : {
         location,
-        length: clampedUtf16Offset(selectionLength, text.length - location),
+        length: clampedUtf16Offset(selectionLength, insertedText.length - relativeLocation),
       };
     const update = text.length === 0 ? this.#composition.cancel() : this.#composition.update(
       text,
-      utf16RangeToUtf8(text, selectionLocation, selectionLength),
+      this.#markedSelection === null
+        ? null
+        : utf16RangeToUtf8(text, location, this.#markedSelection.length),
     );
     if (update !== undefined) {
       this.#emit(createImePreeditEvent(this.window, update.text, update.cursorRange));
     }
   }
 
-  insertText(text: string): string | undefined {
+  insertText(
+    text: string,
+    replacementLocation: number | bigint = NS_NOT_FOUND,
+    replacementLength: number | bigint = 0,
+  ): string | undefined {
     const committed = printableText(text);
     if (committed === undefined) return undefined;
     this.#removeTrailingPreeditClear();
+    const replaced = this.#emitDocumentReplacement(replacementLocation, replacementLength, committed);
     this.#clearMarkedText();
     this.#composition.commit();
-    const event = createImeCommitEvent(this.window, committed);
-    if (event !== undefined) this.#emit(event);
+    if (!replaced) {
+      const event = createImeCommitEvent(this.window, committed);
+      if (event !== undefined) this.#emit(event);
+    }
     return committed;
   }
 
@@ -253,6 +315,7 @@ export class DarwinInputState {
     this.#batch = null;
     this.#pending = [];
     this.#clearMarkedText();
+    this.#surrounding = null;
     this.#composition.reset();
     this.#activation.reset();
   }
@@ -271,6 +334,58 @@ export class DarwinInputState {
   #removeTrailingPreeditClear(): void {
     const events = this.#batch?.following ?? this.#pending;
     discardTrailingPreeditClear(events);
+  }
+
+  #markedReplacement(
+    location: number | bigint,
+    length: number | bigint,
+  ): { start: number; end: number } | null {
+    if (location === NS_NOT_FOUND || location === -1 || location === -1n) return null;
+    const rawLocation = typeof location === "bigint" ? Number(location) : location;
+    const rawLength = typeof length === "bigint" ? Number(length) : length;
+    const range = utf16RangeToUtf8Range(this.#markedText, rawLocation, rawLength);
+    if (range === null) {
+      throw new RangeError("winding(darwin): marked-text replacementRange is outside marked text");
+    }
+    return { start: rawLocation, end: rawLocation + rawLength };
+  }
+
+  #emitDocumentReplacement(
+    location: number | bigint,
+    length: number | bigint,
+    committed: string,
+  ): boolean {
+    if (location === NS_NOT_FOUND || location === -1 || location === -1n) return false;
+    const surrounding = this.#surrounding;
+    if (surrounding === null) {
+      throw new Error(
+        "winding(darwin): concrete replacementRange requires setImeSurroundingText() state",
+      );
+    }
+    const rawLocation = typeof location === "bigint" ? Number(location) : location;
+    const rawLength = typeof length === "bigint" ? Number(length) : length;
+    const range = utf16RangeToUtf8Range(surrounding.text, rawLocation, rawLength);
+    if (range === null) {
+      throw new RangeError("winding(darwin): replacementRange is outside IME surrounding text");
+    }
+    const replacement = createImeReplaceEvent(
+      this.window,
+      surrounding.text,
+      range[0],
+      range[1],
+      committed,
+    );
+    if (replacement === undefined) {
+      throw new RangeError("winding(darwin): replacementRange does not map to UTF-8 boundaries");
+    }
+    this.#emit(replacement);
+
+    const startUtf16 = rawLocation;
+    const endUtf16 = rawLocation + rawLength;
+    const updated = surrounding.text.slice(0, startUtf16) + committed + surrounding.text.slice(endUtf16);
+    const cursorBytes = range[0] + new TextEncoder().encode(committed).byteLength;
+    this.setSurroundingText(updated, cursorBytes, cursorBytes);
+    return true;
   }
 
   #syncActivation(): void {

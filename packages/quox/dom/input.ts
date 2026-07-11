@@ -188,6 +188,14 @@ export function mapWindingEvent(event: WindingUIEvent): QuoxInputEvent {
             beforeBytes: event.beforeBytes,
             afterBytes: event.afterBytes,
           };
+        case "replace":
+          return {
+            type: "ime",
+            kind: "replace",
+            startBytes: event.startBytes,
+            endBytes: event.endBytes,
+            text: event.text,
+          };
       }
       return assertNever(event);
     }

@@ -98,6 +98,14 @@ export type ImeEvent =
     beforeBytes: number;
     /** Number of UTF-8 bytes to delete after the cursor. */
     afterBytes: number;
+  })
+  | (WindowEvent<"ime"> & {
+    kind: "replace";
+    /** Absolute UTF-8 byte range in the application's last surrounding-text snapshot. */
+    startBytes: number;
+    endBytes: number;
+    /** Replacement text; an empty string performs an atomic deletion. */
+    text: string;
   });
 export interface AppleStandardKeybindingEvent extends WindowEvent<"apple-standard-keybinding"> {
   /** Original AppKit action selector, for example `deleteBackward:`. */
@@ -148,6 +156,12 @@ export interface Window {
   blit(rgba: Uint8Array, width: number, height: number): void;
   /** Set whether native composition is desired for this window. */
   setImeEnabled(enabled: boolean): void;
+  /**
+   * Give the native text service the application's current editable text and
+   * ordered selection. Offsets are UTF-8 byte boundaries; the application
+   * remains authoritative and must refresh this state after edits.
+   */
+  setImeSurroundingText(text: string, selectionStartBytes: number, selectionEndBytes: number): void;
   /**
    * Set the IME candidate-window anchor in top-left-origin logical client coordinates.
    */

@@ -61,6 +61,75 @@ Deno.test("Darwin composition updates and completion preserve callback ordering"
   assertEquals(state.hasMarkedText, false);
 });
 
+Deno.test("Darwin applies marked replacement ranges in marked-text UTF-16 coordinates", () => {
+  const state = inputState();
+  state.setMarkedText("ab🙂cd", 1, 0);
+  state.drainEvents();
+
+  state.setMarkedText("Z", 1, 0, 1, 3);
+  assertEquals(state.markedText, "aZcd");
+  assertEquals(state.markedSelection, { location: 2, length: 0 });
+  assertEquals(state.drainEvents(), [{
+    type: "ime",
+    kind: "preedit",
+    text: "aZcd",
+    cursorRange: [2, 2],
+    window: TEST_WINDOW,
+  }]);
+
+  assertThrows(
+    () => state.setMarkedText("bad", 0, 0, 99, 1),
+    "marked-text replacementRange is outside marked text",
+  );
+});
+
+Deno.test("Darwin turns document replacement ranges into atomic application edits", () => {
+  const state = inputState();
+  // The replacement is deliberately away from the cursor; it cannot be
+  // represented by a relative delete-surrounding event without over-deleting.
+  state.setSurroundingText("A🙂BC", 7, 7);
+  state.insertText("x", 1, 3);
+  assertEquals(state.drainEvents(), [
+    {
+      type: "ime",
+      kind: "replace",
+      startBytes: 1,
+      endBytes: 6,
+      text: "x",
+      window: TEST_WINDOW,
+    },
+  ]);
+
+  const withoutContext = inputState();
+  assertThrows(
+    () => withoutContext.insertText("x", 0, 1),
+    "concrete replacementRange requires setImeSurroundingText() state",
+  );
+});
+
+Deno.test("Darwin starts marked text at an arbitrary document replacement range", () => {
+  const state = inputState();
+  state.setSurroundingText("A🙂BC", 7, 7);
+  state.setMarkedText("候", 1, 0, 1, 3);
+  assertEquals(state.drainEvents(), [
+    {
+      type: "ime",
+      kind: "replace",
+      startBytes: 1,
+      endBytes: 6,
+      text: "",
+      window: TEST_WINDOW,
+    },
+    {
+      type: "ime",
+      kind: "preedit",
+      text: "候",
+      cursorRange: [3, 3],
+      window: TEST_WINDOW,
+    },
+  ]);
+});
+
 Deno.test("Darwin commit retracts a synchronous marked-text clear", () => {
   const state = inputState();
   state.setMarkedText("é", 1, 0);
@@ -230,6 +299,18 @@ function assertEquals(actual: unknown, expected: unknown): void {
   const expectedJson = encode(expected);
   if (actualJson !== expectedJson) {
     throw new Error(`Expected ${expectedJson}, got ${actualJson}`);
+  }
+}
+
+function assertThrows(fn: () => void, message: string): void {
+  let thrown: unknown;
+  try {
+    fn();
+  } catch (error) {
+    thrown = error;
+  }
+  if (!(thrown instanceof Error) || !thrown.message.includes(message)) {
+    throw new Error(`Expected error containing ${JSON.stringify(message)}, got ${String(thrown)}`);
   }
 }
 

@@ -139,7 +139,7 @@ Deno.test("keyup has no text or default-cancellation policy", () => {
   assertEquals("text" in mapped, false);
 });
 
-Deno.test("IME adapter preserves nullable UTF-8 ranges and byte-counted deletion", () => {
+Deno.test("IME adapter preserves nullable UTF-8 ranges and byte-counted edits", () => {
   assertEquals(
     mapWindingEvent({
       type: "ime",
@@ -159,6 +159,17 @@ Deno.test("IME adapter preserves nullable UTF-8 ranges and byte-counted deletion
       afterBytes: 2,
     }),
     { type: "ime", kind: "deleteSurrounding", beforeBytes: 4, afterBytes: 2 },
+  );
+  assertEquals(
+    mapWindingEvent({
+      type: "ime",
+      kind: "replace",
+      window,
+      startBytes: 1,
+      endBytes: 5,
+      text: "x",
+    }),
+    { type: "ime", kind: "replace", startBytes: 1, endBytes: 5, text: "x" },
   );
 });
 

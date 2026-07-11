@@ -168,6 +168,8 @@ export class QuoxDocument {
           this.#renderer.dispatch_ime_delete_surrounding(event.beforeBytes, event.afterBytes)
         );
         break;
+      case "replace":
+        throw new Error("quox: atomic IME replacement is not connected to Blitz yet");
       default:
         return assertNever(event);
     }

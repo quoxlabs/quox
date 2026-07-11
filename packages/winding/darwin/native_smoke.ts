@@ -93,6 +93,12 @@ function testTextCallbacks(): void {
           sendIdId(attributedAlloc, sel(runtime, "initWithString:"), string),
           "NSAttributedString",
         );
+        const replacementAlloc = sendId(getClass(runtime, "NSString"), sel(runtime, "alloc"));
+        const replacement = own(
+          owned,
+          sendIdBuffer(replacementAlloc, sel(runtime, "initWithUTF8String:"), cStr("x")),
+          "marked-text replacement",
+        );
         drainEvents(library);
         establishNativeFocus(library, window);
         window.setImeEnabled(true);
@@ -109,6 +115,17 @@ function testTextCallbacks(): void {
         assertEquals(preedit.text, "🙂e");
         assertEquals(preedit.cursorRange, [4, 5]);
 
+        sendVoidIdRangeRange(
+          window.contentView,
+          sel(runtime, "setMarkedText:selectedRange:replacementRange:"),
+          replacement,
+          makeNSRange(1, 0),
+          makeNSRange(2, 1),
+        );
+        const replacedPreedit = assertIme(library.event(), "preedit");
+        assertEquals(replacedPreedit.text, "🙂x");
+        assertEquals(replacedPreedit.cursorRange, [5, 5]);
+
         sendVoidIdRange(
           window.contentView,
           sel(runtime, "insertText:replacementRange:"),
@@ -117,6 +134,18 @@ function testTextCallbacks(): void {
         );
         const commit = assertIme(library.event(), "commit");
         assertEquals(commit.text, "🙂e");
+
+        window.setImeSurroundingText("A🙂BC", 7, 7);
+        sendVoidIdRange(
+          window.contentView,
+          sel(runtime, "insertText:replacementRange:"),
+          replacement,
+          makeNSRange(1, 3),
+        );
+        const absoluteReplacement = assertIme(library.event(), "replace");
+        assertEquals(absoluteReplacement.startBytes, 1);
+        assertEquals(absoluteReplacement.endBytes, 6);
+        assertEquals(absoluteReplacement.text, "x");
 
         sendVoidId(
           window.contentView,

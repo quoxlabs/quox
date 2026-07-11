@@ -103,6 +103,26 @@ export function createImeDeleteSurroundingEvent(
   return { type: "ime", kind: "deleteSurrounding", window, beforeBytes, afterBytes };
 }
 
+/** Build an atomic absolute replacement against an application-owned text snapshot. */
+export function createImeReplaceEvent(
+  window: Window,
+  surroundingText: string,
+  startBytes: number,
+  endBytes: number,
+  text: string,
+): ImeEvent | undefined {
+  const range = validateImeCursorRange(surroundingText, startBytes, endBytes);
+  if (range === null) return undefined;
+  return {
+    type: "ime",
+    kind: "replace",
+    window,
+    startBytes: range[0],
+    endBytes: range[1],
+    text,
+  };
+}
+
 function modifiers(value: KeyModifiers): KeyModifiers {
   return {
     shiftKey: value.shiftKey,

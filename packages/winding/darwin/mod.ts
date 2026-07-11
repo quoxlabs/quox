@@ -32,6 +32,7 @@ import {
   getProtocol as runtimeGetProtocol,
   LIBOBJC,
   LIBSYSTEM,
+  NS_NOT_FOUND,
   NSPOINT,
   NSRECT,
   type ObjcRuntime,
@@ -444,16 +445,28 @@ class DarwinWindow implements Window, DarwinNativeResponder {
     if (translated !== undefined) this.lib.pushEvent(translated);
   }
 
-  handleNativeInsertText(text: Deno.PointerValue): void {
-    this.handleInsertText(text);
+  handleNativeInsertText(
+    text: Deno.PointerValue,
+    replacementLocation: bigint,
+    replacementLength: bigint,
+  ): void {
+    this.handleInsertText(text, replacementLocation, replacementLength);
   }
 
   handleNativeSetMarkedText(
     text: Deno.PointerValue,
     selectionLocation: bigint,
     selectionLength: bigint,
+    replacementLocation: bigint,
+    replacementLength: bigint,
   ): void {
-    this.handleSetMarkedText(text, selectionLocation, selectionLength);
+    this.handleSetMarkedText(
+      text,
+      selectionLocation,
+      selectionLength,
+      replacementLocation,
+      replacementLength,
+    );
   }
 
   handleNativeUnmarkText(): void {
@@ -611,10 +624,14 @@ class DarwinWindow implements Window, DarwinNativeResponder {
     this.inputState.resetModifiers();
   }
 
-  handleInsertText(value: Deno.PointerValue): void {
+  handleInsertText(
+    value: Deno.PointerValue,
+    replacementLocation = NS_NOT_FOUND,
+    replacementLength = 0n,
+  ): void {
     if (this.#closed || this.#discardingMarkedText || !this.inputState.active) return;
     const text = readInputString(value, this.lib.ffi);
-    const committed = this.inputState.insertText(text);
+    const committed = this.inputState.insertText(text, replacementLocation, replacementLength);
     if (this.#keyDispatchActive) this.#producedText = committed;
     this.#flushInputState();
   }
@@ -623,6 +640,8 @@ class DarwinWindow implements Window, DarwinNativeResponder {
     value: Deno.PointerValue,
     selectionLocation: bigint,
     selectionLength: bigint,
+    replacementLocation = NS_NOT_FOUND,
+    replacementLength = 0n,
   ): void {
     if (this.#closed || this.#discardingMarkedText || !this.inputState.active) return;
     if (this.#keyDispatchActive) this.#producedPreedit = true;
@@ -630,6 +649,8 @@ class DarwinWindow implements Window, DarwinNativeResponder {
       readInputString(value, this.lib.ffi),
       selectionLocation,
       selectionLength,
+      replacementLocation,
+      replacementLength,
     );
     this.#flushInputState();
   }
@@ -679,6 +700,12 @@ class DarwinWindow implements Window, DarwinNativeResponder {
     const { sel, send } = this.lib.ffi;
     const inputContext = send.id(this.contentView, sel("inputContext"));
     if (inputContext !== null) send.void(inputContext, sel("invalidateCharacterCoordinates"));
+  }
+
+  setImeSurroundingText(text: string, selectionStartBytes: number, selectionEndBytes: number): void {
+    this.lib.assertMainThread();
+    if (this.#closed) return;
+    this.inputState.setSurroundingText(text, selectionStartBytes, selectionEndBytes);
   }
 
   cancelComposition(): void {
