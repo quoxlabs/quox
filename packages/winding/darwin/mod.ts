@@ -916,10 +916,13 @@ class DarwinLibrary implements Library {
           this.nativeClasses.throwIfCallbackFailed();
         }
 
-        if (this.#queue.length) return this.#queue.shift();
         const translated = importEvent(event, this);
         this.nativeClasses.throwIfCallbackFailed();
-        if (translated !== undefined) return translated;
+        // sendEvent: may synchronously enqueue focus, resize, or text events.
+        // Classify the already-dequeued event before returning any of those
+        // callbacks, otherwise the causative native event is gone forever.
+        if (translated !== undefined) this.#queue.prepend(translated);
+        if (this.#queue.length) return this.#queue.shift();
       } finally {
         if (pool !== null) send.void(pool, sel("drain"));
         this.nativeClasses.throwIfCallbackFailed();
