@@ -1,5 +1,6 @@
 import type { QuoxRenderer as WasmRenderer } from "../lib/quox.js";
-import { getElementFunctionProps } from "./handlers.ts";
+import { eventDispatchInternals, QuoxEvent } from "./event.ts";
+import { invokeEventListeners, QuoxEventTarget } from "./event_target.ts";
 import {
   encodeKeyEvent,
   type QuoxAppleStandardKeybindingEvent,
@@ -18,26 +19,18 @@ import { runWithImeSynchronization } from "./ime_requests.ts";
 import { type AssertActive, attachDocumentInternals, type RequestRender } from "./internals.ts";
 import { ELEMENT_NODE, QuoxNodeCache, TEXT_NODE } from "./node_cache.ts";
 import type { QuoxElement, QuoxNode, QuoxText } from "./node.ts";
+import {
+  type DomDispatchEventStep,
+  DomDispatchInitialStepError,
+  DomDispatchRendererPort,
+  type DomDispatchStep,
+} from "./renderer_port.ts";
 
 type SetNativeTitle = (title: string) => void;
 type SyncNativeImeRequests = () => void;
 type NodeKindRenderer = WasmRenderer & { node_kind(nodeHandle: number): number };
-type InvalidatingTitleRenderer = WasmRenderer & { set_title(title: string): Uint32Array };
-
-/**
- * Maps the DOM event kinds quox can invoke a JS handler for to their JSX prop name.
- * `dblclick`'s prop deliberately doesn't match the raw event name — it mirrors React's
- * actual `onDoubleClick` convention instead.
- */
-const EVENT_KIND_TO_PROP = {
-  click: "onClick",
-  dblclick: "onDoubleClick",
-  contextmenu: "onContextMenu",
-  input: "onInput",
-  focus: "onFocus",
-  blur: "onBlur",
-  scroll: "onScroll",
-} as const;
+type InvalidatingTitleRenderer = { set_title(title: string): Uint32Array };
+type LegacyHoverRenderer = { clear_hover(): boolean };
 
 const POINTER_BUTTONS_MASK = 0x1f;
 const POINTER_MODIFIER_MASK = 0x0f;
@@ -47,14 +40,18 @@ const KEY_EVENT_REPEAT = 0x02;
 const KEY_EVENT_PREVENT_DEFAULT = 0x08;
 const KEY_EVENT_MASK = 0x0f;
 
-export class QuoxDocument {
+export class QuoxDocument extends QuoxEventTarget {
   readonly #renderer: WasmRenderer;
+  readonly #dispatchPort: DomDispatchRendererPort;
   readonly #requestRender: RequestRender;
   readonly #assertActive: AssertActive;
   readonly #setNativeTitle: SetNativeTitle;
   readonly #syncNativeImeRequests: SyncNativeImeRequests;
+  readonly #defaultView: QuoxEventTarget | null;
+  readonly #onDispatchIdle: () => void;
   readonly #nodes: QuoxNodeCache;
   #lastNativeTitle: string;
+  #dispatchDepth = 0;
 
   constructor(
     renderer: WasmRenderer,
@@ -62,12 +59,18 @@ export class QuoxDocument {
     assertActive: AssertActive,
     setNativeTitle: SetNativeTitle = () => undefined,
     syncNativeImeRequests: SyncNativeImeRequests = () => undefined,
+    defaultView: QuoxEventTarget | null = null,
+    onDispatchIdle: () => void = () => undefined,
   ) {
+    super();
     this.#renderer = renderer;
+    this.#dispatchPort = new DomDispatchRendererPort(renderer);
     this.#requestRender = requestRender;
     this.#assertActive = assertActive;
     this.#setNativeTitle = setNativeTitle;
     this.#syncNativeImeRequests = syncNativeImeRequests;
+    this.#defaultView = defaultView;
+    this.#onDispatchIdle = onDispatchIdle;
     this.#nodes = new QuoxNodeCache(this);
     this.#lastNativeTitle = renderer.title();
     attachDocumentInternals(this, {
@@ -75,7 +78,12 @@ export class QuoxDocument {
       requestRender,
       assertActive,
       invalidateNodeHandles: (nodeHandles) => this.#nodes.invalidate(nodeHandles),
+      isDispatching: () => this.#dispatchDepth !== 0,
     });
+  }
+
+  get defaultView(): QuoxEventTarget | null {
+    return this.#defaultView;
   }
 
   get title(): string {
@@ -143,7 +151,7 @@ export class QuoxDocument {
     y = assertFloat32(y, "y");
     buttons = assertKnownMask(buttons, POINTER_BUTTONS_MASK, "buttons");
     modifierBits = assertKnownMask(modifierBits, POINTER_MODIFIER_MASK, "modifierBits");
-    this.#dispatchInputEvent(() => this.#renderer.dispatch_pointer_move(x, y, buttons, modifierBits));
+    this.#dispatchInputEvent(() => this.#dispatchPort.beginPointerMove(x, y, buttons, modifierBits));
   }
 
   /** Feed a pointer-down event into Blitz. Drives `:active`, click timing, and focus. */
@@ -154,7 +162,7 @@ export class QuoxDocument {
     button = assertIntegerRange(button, 0, 4, "button");
     buttons = assertKnownMask(buttons, POINTER_BUTTONS_MASK, "buttons");
     modifierBits = assertKnownMask(modifierBits, POINTER_MODIFIER_MASK, "modifierBits");
-    this.#dispatchInputEvent(() => this.#renderer.dispatch_pointer_down(x, y, button, buttons, modifierBits));
+    this.#dispatchInputEvent(() => this.#dispatchPort.beginPointerDown(x, y, button, buttons, modifierBits));
   }
 
   /** Feed a pointer-up event into Blitz. Synthesizes `click`/`dblclick`/`contextmenu`. */
@@ -165,7 +173,7 @@ export class QuoxDocument {
     button = assertIntegerRange(button, 0, 4, "button");
     buttons = assertKnownMask(buttons, POINTER_BUTTONS_MASK, "buttons");
     modifierBits = assertKnownMask(modifierBits, POINTER_MODIFIER_MASK, "modifierBits");
-    this.#dispatchInputEvent(() => this.#renderer.dispatch_pointer_up(x, y, button, buttons, modifierBits));
+    this.#dispatchInputEvent(() => this.#dispatchPort.beginPointerUp(x, y, button, buttons, modifierBits));
   }
 
   /** Feed a wheel event into Blitz, scrolling whatever's hovered (not just the viewport). */
@@ -177,7 +185,7 @@ export class QuoxDocument {
     deltaY = assertFiniteNumber(deltaY, "deltaY");
     buttons = assertKnownMask(buttons, POINTER_BUTTONS_MASK, "buttons");
     modifierBits = assertKnownMask(modifierBits, POINTER_MODIFIER_MASK, "modifierBits");
-    this.#dispatchInputEvent(() => this.#renderer.dispatch_wheel(x, y, deltaX, deltaY, buttons, modifierBits));
+    this.#dispatchInputEvent(() => this.#dispatchPort.beginWheel(x, y, deltaX, deltaY, buttons, modifierBits));
   }
 
   /** Feed a canonical native key event into Blitz. Character insertion remains a later Commit. */
@@ -194,7 +202,7 @@ export class QuoxDocument {
       throw new RangeError("quox: key release flags cannot repeat or suppress a keydown default");
     }
     this.#dispatchInputEvent(() =>
-      this.#renderer.dispatch_key_event(
+      this.#dispatchPort.beginKeyEvent(
         encoded.code,
         encoded.key,
         encoded.modifierBits,
@@ -206,34 +214,34 @@ export class QuoxDocument {
 
   /** Apply an AppKit editing selector through Blitz's platform-command adapter. */
   dispatchAppleStandardKeybinding(event: QuoxAppleStandardKeybindingEvent): void {
-    this.#dispatchInputEvent(() => this.#renderer.dispatch_apple_standard_keybinding(event.command));
+    this.#dispatchInputEvent(() => this.#dispatchPort.beginAppleStandardKeybinding(event.command));
   }
 
   /** Feed native IME lifecycle and edit events into Blitz. */
   dispatchIme(event: QuoxImeEvent): void {
     switch (event.kind) {
       case "enabled":
-        this.#dispatchInputEvent(() => this.#renderer.dispatch_ime_enabled());
+        this.#dispatchInputEvent(() => this.#dispatchPort.beginImeEnabled());
         break;
       case "disabled":
-        this.#dispatchInputEvent(() => this.#renderer.dispatch_ime_disabled());
+        this.#dispatchInputEvent(() => this.#dispatchPort.beginImeDisabled());
         break;
       case "preedit": {
         this.#assertActive();
         const range = assertUtf8ByteRange(event.text, event.cursorRange);
         const start = range?.[0] ?? undefined;
         const end = range?.[1] ?? undefined;
-        this.#dispatchInputEvent(() => this.#renderer.dispatch_ime_preedit(event.text, start, end));
+        this.#dispatchInputEvent(() => this.#dispatchPort.beginImePreedit(event.text, start, end));
         break;
       }
       case "commit":
-        this.#dispatchInputEvent(() => this.#renderer.dispatch_ime_commit(event.text));
+        this.#dispatchInputEvent(() => this.#dispatchPort.beginImeCommit(event.text));
         break;
       case "deleteSurrounding": {
         this.#assertActive();
         const beforeBytes = assertUint32(event.beforeBytes, "beforeBytes");
         const afterBytes = assertUint32(event.afterBytes, "afterBytes");
-        this.#dispatchInputEvent(() => this.#renderer.dispatch_ime_delete_surrounding(beforeBytes, afterBytes));
+        this.#dispatchInputEvent(() => this.#dispatchPort.beginImeDeleteSurrounding(beforeBytes, afterBytes));
         break;
       }
       case "replace":
@@ -245,36 +253,158 @@ export class QuoxDocument {
 
   /** Clear Blitz's hover state, e.g. when the pointer leaves the window entirely. */
   clearHover(): void {
-    this.#dispatchInputEvent(() => this.#renderer.clear_hover(), false);
-  }
-
-  #dispatchInputEvent(dispatch: () => boolean, drainFiredEvents = true): void {
     this.#assertActive();
     runWithImeSynchronization(() => {
-      if (dispatch()) this.#requestRender();
-      if (drainFiredEvents) this.#drainFiredEvents();
+      if ((this.#renderer as unknown as LegacyHoverRenderer).clear_hover()) this.#requestRender();
     }, () => this.#syncNativeImeRequests());
   }
 
-  /**
-   * After a dispatch call, check which (if any) of the JS-handler-relevant DOM events fired
-   * and invoke the matching JSX `onXxx` prop registered on the exact target node. This is
-   * target-only — it does not bubble to ancestors the way native DOM event dispatch would.
-   */
-  #drainFiredEvents(): void {
-    this.#invokeHandler(this.#renderer.take_click_node(), "click");
-    this.#invokeHandler(this.#renderer.take_double_click_node(), "dblclick");
-    this.#invokeHandler(this.#renderer.take_context_menu_node(), "contextmenu");
-    this.#invokeHandler(this.#renderer.take_input_node(), "input");
-    this.#invokeHandler(this.#renderer.take_focus_node(), "focus");
-    this.#invokeHandler(this.#renderer.take_blur_node(), "blur");
-    this.#invokeHandler(this.#renderer.take_scroll_node(), "scroll");
+  #dispatchInputEvent(begin: () => DomDispatchStep): void {
+    this.#assertActive();
+    this.#dispatchDepth += 1;
+    let failed = false;
+    let failure: unknown;
+    let idleFailed = false;
+    let idleFailure: unknown;
+    try {
+      runWithImeSynchronization(
+        () => this.#beginAndPumpDispatchFrame(begin),
+        () => this.#syncNativeImeRequests(),
+      );
+    } catch (error) {
+      failed = true;
+      failure = error;
+    } finally {
+      this.#dispatchDepth -= 1;
+      if (this.#dispatchDepth === 0) {
+        try {
+          this.#onDispatchIdle();
+        } catch (idleError) {
+          idleFailed = true;
+          idleFailure = idleError;
+        }
+      }
+    }
+    if (failed && idleFailed) {
+      throw new AggregateError(
+        [failure, idleFailure],
+        "Quox DOM dispatch and dispatch cleanup both failed",
+      );
+    }
+    if (failed) throw failure;
+    if (idleFailed) throw idleFailure;
   }
 
-  #invokeHandler(nodeHandle: number | undefined, kind: keyof typeof EVENT_KIND_TO_PROP): void {
-    if (nodeHandle === undefined) return;
-    const handlers = getElementFunctionProps(this.#nodeForHandle(nodeHandle));
-    handlers?.get(EVENT_KIND_TO_PROP[kind])?.();
+  #beginAndPumpDispatchFrame(begin: () => DomDispatchStep): void {
+    try {
+      this.#pumpDispatchFrame(begin());
+    } catch (error) {
+      if (!(error instanceof DomDispatchInitialStepError)) throw error;
+      this.#abortDispatchFrame(error.frameId, error.validationError);
+    }
+  }
+
+  #pumpDispatchFrame(initialStep: DomDispatchStep): void {
+    const frameId = initialStep.frameId;
+    let step = initialStep;
+
+    for (;;) {
+      if (step.frameId !== frameId) {
+        this.#abortDispatchFrame(frameId, new RangeError("quox: DOM dispatch step changed frame"));
+      }
+
+      if (step.kind === "complete") {
+        if (step.redrawRequested) this.#requestRender();
+        return;
+      }
+
+      let defaultPrevented: boolean;
+      try {
+        defaultPrevented = this.#dispatchTrustedEvent(step);
+      } catch (error) {
+        this.#resumePreventedThenAbort(step, error);
+      }
+
+      try {
+        step = this.#dispatchPort.resumeDomDispatch(frameId, step.eventId, defaultPrevented!);
+      } catch (error) {
+        this.#abortDispatchFrame(frameId, error);
+      }
+    }
+  }
+
+  #dispatchTrustedEvent(step: DomDispatchEventStep): boolean {
+    // Resolve every handle before listener 1. Mutations during dispatch may invalidate the cache,
+    // but this event retains the exact wrapper path with which it began.
+    const path: QuoxEventTarget[] = step.path.map((nodeHandle) => this.#nodeForHandle(nodeHandle));
+    path.push(this);
+    if (this.#defaultView !== null) path.push(this.#defaultView);
+
+    const target = path[0];
+    const event = new QuoxEvent(step.type, {
+      bubbles: step.bubbles,
+      cancelable: step.cancelable,
+      composed: step.composed,
+    });
+    const dispatch = event[eventDispatchInternals];
+    dispatch.begin(target, path, true, step.timeStamp);
+    try {
+      for (let index = path.length - 1; index > 0; index -= 1) {
+        path[index][invokeEventListeners](event, "capturing", QuoxEvent.CAPTURING_PHASE);
+        if (dispatch.propagationStopped) return dispatch.canceled;
+      }
+
+      target[invokeEventListeners](event, "at-target", QuoxEvent.AT_TARGET);
+      if (event.bubbles && !dispatch.propagationStopped) {
+        for (let index = 1; index < path.length; index += 1) {
+          path[index][invokeEventListeners](event, "bubbling", QuoxEvent.BUBBLING_PHASE);
+          if (dispatch.propagationStopped) break;
+        }
+      }
+      return dispatch.canceled;
+    } finally {
+      dispatch.end();
+    }
+  }
+
+  #resumePreventedThenAbort(step: DomDispatchEventStep, primaryError: unknown): never {
+    const errors = [primaryError];
+    let redrawRequested = false;
+    try {
+      const recoveryStep = this.#dispatchPort.resumeDomDispatch(step.frameId, step.eventId, true);
+      redrawRequested = recoveryStep.kind === "complete" && recoveryStep.redrawRequested;
+    } catch (error) {
+      errors.push(error);
+    }
+    try {
+      redrawRequested = this.#dispatchPort.abortDomDispatch(step.frameId) || redrawRequested;
+    } catch (error) {
+      errors.push(error);
+    }
+    if (redrawRequested) {
+      try {
+        this.#requestRender();
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    throw dispatchFailure(errors);
+  }
+
+  #abortDispatchFrame(frameId: number, primaryError: unknown): never {
+    const errors = [primaryError];
+    try {
+      if (this.#dispatchPort.abortDomDispatch(frameId)) {
+        try {
+          this.#requestRender();
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+    } catch (error) {
+      errors.push(error);
+    }
+    throw dispatchFailure(errors);
   }
 
   #nodeForHandle(nodeHandle: number): QuoxNode {
@@ -296,4 +426,10 @@ export class QuoxDocument {
 
 function assertNever(_value: never): never {
   throw new TypeError("Unsupported Quox IME event");
+}
+
+function dispatchFailure(errors: unknown[]): unknown {
+  return errors.length === 1
+    ? errors[0]
+    : new AggregateError(errors, "Quox DOM dispatch and renderer recovery both failed");
 }

@@ -10,6 +10,9 @@ class FakeInputRenderer {
   inputNode: number | undefined;
   throwOnPointerMove = false;
   pointerMoveError: unknown;
+  #nextFrameId = 1;
+  #nextEventId = 1;
+  readonly #pendingFrames = new Map<number, unknown>();
 
   title(): string {
     return "";
@@ -19,79 +22,106 @@ class FakeInputRenderer {
     return 42;
   }
 
-  dispatch_pointer_move(x: number, y: number, buttons: number, modifierBits: number): boolean {
+  begin_pointer_move(x: number, y: number, buttons: number, modifierBits: number): unknown {
     this.calls.push({ method: "pointerMove", args: [x, y, buttons, modifierBits] });
     if (this.throwOnPointerMove) throw this.pointerMoveError ?? new Error("pointer dispatch failed");
-    return false;
+    return this.#complete(false);
   }
 
-  dispatch_key_event(...args: unknown[]): boolean {
+  begin_pointer_down(..._args: unknown[]): unknown {
+    return this.#complete(false);
+  }
+
+  begin_pointer_up(..._args: unknown[]): unknown {
+    return this.#complete(false);
+  }
+
+  begin_wheel(..._args: unknown[]): unknown {
+    return this.#complete(false);
+  }
+
+  begin_key_event(...args: unknown[]): unknown {
     this.calls.push({ method: "keyEvent", args });
-    return true;
+    return this.#complete(true);
   }
 
-  dispatch_apple_standard_keybinding(command: string): boolean {
+  begin_apple_standard_keybinding(command: string): unknown {
     this.calls.push({ method: "appleCommand", args: [command] });
-    return false;
+    return this.#complete(false);
   }
 
-  dispatch_ime_enabled(): boolean {
+  begin_ime_enabled(): unknown {
     this.calls.push({ method: "imeEnabled", args: [] });
-    return false;
+    return this.#complete(false);
   }
 
-  dispatch_ime_disabled(): boolean {
+  begin_ime_disabled(): unknown {
     this.calls.push({ method: "imeDisabled", args: [] });
-    return false;
+    return this.#complete(false);
   }
 
-  dispatch_ime_preedit(text: string, start?: number, end?: number): boolean {
+  begin_ime_preedit(text: string, start?: number, end?: number): unknown {
     this.calls.push({ method: "imePreedit", args: [text, start, end] });
-    return false;
+    return this.#complete(false);
   }
 
-  dispatch_ime_commit(text: string): boolean {
+  begin_ime_commit(text: string): unknown {
     this.calls.push({ method: "imeCommit", args: [text] });
-    return false;
+    return this.#inputOrComplete();
   }
 
-  dispatch_ime_delete_surrounding(beforeBytes: number, afterBytes: number): boolean {
+  begin_ime_delete_surrounding(beforeBytes: number, afterBytes: number): unknown {
     this.calls.push({ method: "imeDeleteSurrounding", args: [beforeBytes, afterBytes] });
+    return this.#inputOrComplete();
+  }
+
+  resume_dom_dispatch(frameId: number, _eventId: number, _defaultPrevented: boolean): unknown {
+    const next = this.#pendingFrames.get(frameId);
+    if (next === undefined) throw new Error("missing pending fake frame");
+    this.#pendingFrames.delete(frameId);
+    return next;
+  }
+
+  abort_dom_dispatch(frameId: number): boolean {
+    this.#pendingFrames.delete(frameId);
     return false;
-  }
-
-  take_click_node(): number | undefined {
-    return undefined;
-  }
-
-  take_double_click_node(): number | undefined {
-    return undefined;
-  }
-
-  take_context_menu_node(): number | undefined {
-    return undefined;
-  }
-
-  take_input_node(): number | undefined {
-    const node = this.inputNode;
-    this.inputNode = undefined;
-    return node;
-  }
-
-  take_focus_node(): number | undefined {
-    return undefined;
-  }
-
-  take_blur_node(): number | undefined {
-    return undefined;
-  }
-
-  take_scroll_node(): number | undefined {
-    return undefined;
   }
 
   node_kind(_nodeHandle: number): number {
     return 1;
+  }
+
+  #complete(redrawRequested: boolean): unknown {
+    return {
+      kind: "complete",
+      frameId: this.#nextFrameId++,
+      redrawRequested,
+    };
+  }
+
+  #inputOrComplete(): unknown {
+    const target = this.inputNode;
+    this.inputNode = undefined;
+    if (target === undefined) return this.#complete(false);
+
+    const frameId = this.#nextFrameId++;
+    this.#pendingFrames.set(frameId, {
+      kind: "complete",
+      frameId,
+      redrawRequested: false,
+    });
+    return {
+      kind: "event",
+      frameId,
+      eventId: this.#nextEventId++,
+      type: "input",
+      target,
+      path: [target],
+      bubbles: true,
+      cancelable: false,
+      composed: true,
+      timeStamp: 1,
+    };
   }
 }
 

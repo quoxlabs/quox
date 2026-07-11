@@ -14,7 +14,12 @@ export interface QuoxEventDispatchInternals {
   readonly immediatePropagationStopped: boolean;
   readonly canceled: boolean;
 
-  begin(target: QuoxEventTarget, path: readonly QuoxEventTarget[], trusted?: boolean): void;
+  begin(
+    target: QuoxEventTarget,
+    path: readonly QuoxEventTarget[],
+    trusted?: boolean,
+    timeStamp?: number,
+  ): void;
   enter(currentTarget: QuoxEventTarget, phase: Exclude<QuoxEventPhase, 0>): void;
   setPassiveListener(passive: boolean): void;
   end(): boolean;
@@ -52,7 +57,7 @@ export class QuoxEvent {
   #immediatePropagationStopped = false;
   #inPassiveListener = false;
   #canceled = false;
-  readonly #timeStamp = timestamp();
+  #timeStamp = timestamp();
 
   readonly #dispatchInternals: QuoxEventDispatchInternals;
 
@@ -78,12 +83,18 @@ export class QuoxEvent {
       get canceled() {
         return canceled();
       },
-      begin: (target, path, trusted = false) => {
+      begin: (target, path, trusted = false, dispatchTimeStamp) => {
         if (this.#dispatching) {
           throw new DOMException("The event is already being dispatched.", "InvalidStateError");
         }
         if (path.length === 0 || path[0] !== target) {
           throw new TypeError("an event path must start with its target");
+        }
+        if (dispatchTimeStamp !== undefined) {
+          if (!Number.isFinite(dispatchTimeStamp) || dispatchTimeStamp < 0) {
+            throw new RangeError("an event timestamp must be a finite nonnegative number");
+          }
+          this.#timeStamp = dispatchTimeStamp;
         }
 
         this.#target = target;

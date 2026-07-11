@@ -1,6 +1,16 @@
 import { openWindow } from "./dom/window.ts";
 
 export * from "./dom/document.ts";
+export { QuoxEvent, type QuoxEventInit, type QuoxEventPhase } from "./dom/event.ts";
+export {
+  type QuoxAddEventListenerOptions,
+  type QuoxEventHandler,
+  type QuoxEventListener,
+  type QuoxEventListenerObject,
+  type QuoxEventListenerOptions,
+  type QuoxEventListenerOrEventListenerObject,
+  QuoxEventTarget,
+} from "./dom/event_target.ts";
 export * from "./dom/handlers.ts";
 export * from "./dom/mount.ts";
 export * from "./dom/node.ts";

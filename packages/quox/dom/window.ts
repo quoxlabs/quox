@@ -3,6 +3,7 @@ import { QuoxRenderer as WasmRenderer } from "../lib/quox.js";
 import { load as windingLoad } from "@quoxlabs/winding";
 import type { Library as WindingLibrary, UIEvent as WindingUIEvent, Window as WindingWindow } from "@quoxlabs/winding";
 import { QuoxDocument } from "./document.ts";
+import { QuoxEventTarget } from "./event_target.ts";
 import {
   mapWindingEvent,
   notifyInputListeners,
@@ -23,6 +24,7 @@ import {
   InitializationEventPump,
   WindowStartupGate,
 } from "./initialization_pump.ts";
+import { documentHasActiveDispatch, releaseStoppedRenderer } from "./internals.ts";
 
 export type {
   QuoxAppleStandardKeybindingEvent,
@@ -72,7 +74,7 @@ async function mountWindowContent(parent: QuoxElement, value: QuoxWindowContent 
   await mount(parent, value);
 }
 
-export class QuoxWindow implements Disposable {
+export class QuoxWindow extends QuoxEventTarget implements Disposable {
   readonly #lib: WindingLibrary;
   readonly #win: WindingWindow;
   #width: number;
@@ -102,6 +104,7 @@ export class QuoxWindow implements Disposable {
     height: number,
     renderer: WasmRenderer,
   ) {
+    super();
     this.#lib = lib;
     this.#win = win;
     this.#width = width;
@@ -115,6 +118,8 @@ export class QuoxWindow implements Disposable {
       () => this.#assertActiveDocument(),
       (title) => this.#win.setTitle(title),
       () => this.#syncNativeImeRequests(),
+      this,
+      () => this.#releaseRenderer(),
     );
     this.#inputRouter = new QuoxInputRouter(
       {
@@ -380,9 +385,14 @@ export class QuoxWindow implements Disposable {
   }
 
   #releaseRenderer(): void {
-    if (this.#rendererFreed) return;
-    this.#renderer.free();
-    this.#rendererFreed = true;
+    if (
+      releaseStoppedRenderer(
+        this.#stopped,
+        documentHasActiveDispatch(this.document),
+        this.#rendererFreed,
+        () => this.#renderer.free(),
+      )
+    ) this.#rendererFreed = true;
   }
 
   [Symbol.dispose](): void {

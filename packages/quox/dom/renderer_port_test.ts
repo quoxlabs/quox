@@ -1,6 +1,7 @@
 import { assert, assertEquals, assertStrictEquals, assertThrows } from "@std/assert";
 import {
   DOM_DISPATCH_EVENT_TYPES,
+  DomDispatchInitialStepError,
   DomDispatchRendererPort,
   type DomDispatchRendererSource,
   validateDomDispatchStep,
@@ -218,8 +219,9 @@ class FakeRenderer implements DomDispatchRendererSource {
     return this.#call("resume_dom_dispatch", frameId, eventId, defaultPrevented);
   }
 
-  abort_dom_dispatch(frameId: number): void {
+  abort_dom_dispatch(frameId: number): boolean {
     this.#call("abort_dom_dispatch", frameId);
+    return false;
   }
 }
 
@@ -278,4 +280,29 @@ Deno.test("renderer port validates continuation arguments and frame ownership", 
   port.abortDomDispatch(9);
   assertEquals(renderer.calls.at(-1), ["abort_dom_dispatch", 9]);
   assertThrows(() => port.abortDomDispatch(0), RangeError);
+});
+
+Deno.test("renderer port preserves a valid frame ID on malformed initial steps", () => {
+  const renderer = new FakeRenderer();
+  const port = new DomDispatchRendererPort(renderer);
+  renderer.nextStep = eventStep({ frameId: 17, path: [] });
+
+  const error = assertThrows(() => port.beginImeEnabled(), DomDispatchInitialStepError);
+  assertEquals(error.frameId, 17);
+  assert(error.validationError instanceof RangeError);
+
+  renderer.nextStep = eventStep({ frameId: 0, path: [] });
+  assertThrows(() => port.beginImeEnabled(), RangeError);
+
+  let getterCalls = 0;
+  const accessorFrame = eventStep({ path: [] });
+  Object.defineProperty(accessorFrame, "frameId", {
+    get() {
+      getterCalls += 1;
+      return 17;
+    },
+  });
+  renderer.nextStep = accessorFrame;
+  assertThrows(() => port.beginImeEnabled(), TypeError);
+  assertEquals(getterCalls, 0);
 });
