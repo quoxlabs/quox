@@ -165,6 +165,29 @@ Deno.test("IME dispatch preserves UTF-8 preedit ranges and emits DOM input for c
   assertEquals(syncs.count, 6);
 });
 
+Deno.test("IME replacement dispatches surrounding deletion before commit and drains both inputs", () => {
+  const { document, renderer, syncs } = createDocument();
+  let inputs = 0;
+  setElementFunctionProp(new QuoxElement(document, 42), "onInput", () => inputs++);
+
+  renderer.inputNode = 42;
+  document.dispatchIme({
+    type: "ime",
+    kind: "deleteSurrounding",
+    beforeBytes: 3,
+    afterBytes: 1,
+  });
+  renderer.inputNode = 42;
+  document.dispatchIme({ type: "ime", kind: "commit", text: "好" });
+
+  assertEquals(renderer.calls, [
+    { method: "imeDeleteSurrounding", args: [3, 1] },
+    { method: "imeCommit", args: ["好"] },
+  ]);
+  assertEquals(inputs, 2);
+  assertEquals(syncs.count, 2);
+});
+
 Deno.test("AppKit selectors use the dedicated renderer entry point", () => {
   const { document, renderer, syncs } = createDocument();
 

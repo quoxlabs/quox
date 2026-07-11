@@ -1,11 +1,13 @@
 use super::{QuoxRenderer, QuoxRendererState};
-use blitz_dom::{Document, EventDriver, EventHandler};
+use blitz_dom::{BaseDocument, Document, EventDriver, EventHandler};
 use blitz_traits::events::{
-    BlitzImeEvent, BlitzKeyEvent, BlitzPointerEvent, BlitzPointerId, BlitzWheelDelta,
-    BlitzWheelEvent, DomEvent, DomEventData, EventState, KeyState, MouseEventButton,
-    MouseEventButtons, Point as ElementPoint, PointerCoords, PointerDetails, UiEvent,
+    BlitzImeEvent, BlitzInputEvent, BlitzKeyEvent, BlitzPointerEvent, BlitzPointerId,
+    BlitzWheelDelta, BlitzWheelEvent, DomEvent, DomEventData, EventState, KeyState,
+    MouseEventButton, MouseEventButtons, Point as ElementPoint, PointerCoords, PointerDetails,
+    UiEvent,
 };
 use keyboard_types::{Code, Key, Location, Modifiers};
+use std::num::NonZeroUsize;
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use wasm_bindgen::prelude::*;
@@ -400,6 +402,56 @@ fn drive_ime_commit<Handler: EventHandler>(driver: &mut EventDriver<'_, Handler>
     driver.handle_ui_event(UiEvent::Ime(BlitzImeEvent::Commit(text.to_owned())));
 }
 
+/// Apply the UTF-8 byte counts from an IME delete-surrounding edit to the focused text input.
+/// Parley's individual deletion methods intentionally no-op at invalid character boundaries;
+/// validate both sides first so one valid half cannot be applied without the other.
+fn apply_ime_delete_surrounding(
+    document: &mut BaseDocument,
+    before_bytes: usize,
+    after_bytes: usize,
+) -> Option<DomEvent> {
+    let target = document.get_focussed_node_id()?;
+    let mut value = None;
+
+    document.with_text_input(target, |mut driver| {
+        // Wayland's batch bridge clears preedit before delivering this edit. Refuse callers that
+        // skip that step because deleting around Parley's preedit buffer would corrupt the IME's
+        // model of the surrounding application text.
+        if driver.editor.raw_compose().is_some() {
+            return;
+        }
+
+        let (before_start, selection_start, selection_end, after_end) = {
+            let selection = driver.editor.raw_selection().text_range();
+            let text = driver.editor.raw_text();
+            let before_start = selection.start.saturating_sub(before_bytes);
+            let after_end = selection.end.saturating_add(after_bytes).min(text.len());
+
+            if !text.is_char_boundary(before_start) || !text.is_char_boundary(after_end) {
+                return;
+            }
+
+            (before_start, selection.start, selection.end, after_end)
+        };
+
+        if before_start == selection_start && selection_end == after_end {
+            return;
+        }
+
+        // Delete after the selection first so the byte positions on its left remain unchanged.
+        if let Some(bytes) = NonZeroUsize::new(after_bytes) {
+            driver.delete_bytes_after_selection(bytes);
+        }
+        if let Some(bytes) = NonZeroUsize::new(before_bytes) {
+            driver.delete_bytes_before_selection(bytes);
+        }
+
+        value = Some(driver.editor.raw_text().to_owned());
+    });
+
+    value.map(|value| DomEvent::new(target, DomEventData::Input(BlitzInputEvent { value })))
+}
+
 #[wasm_bindgen]
 impl QuoxRenderer {
     /// Return the id of the topmost DOM node at the given viewport-pixel coordinates
@@ -578,16 +630,21 @@ impl QuoxRenderer {
             .dispatch_apple_standard_keybinding(command)
     }
 
-    /// Forward byte-counted surrounding-text deletion. Pinned Blitz currently accepts but does
-    /// not apply this event; keeping the ABI wired avoids another host-boundary change once its
-    /// editor implementation lands.
+    /// Apply byte-counted surrounding-text deletion to the focused Blitz editor.
     pub fn dispatch_ime_delete_surrounding(&self, before_bytes: u32, after_bytes: u32) -> bool {
-        self.state
-            .borrow_mut()
-            .dispatch(UiEvent::Ime(BlitzImeEvent::DeleteSurrounding {
-                before_bytes: before_bytes as usize,
-                after_bytes: after_bytes as usize,
-            }))
+        let mut state = self.state.borrow_mut();
+        let Some(event) = apply_ime_delete_surrounding(
+            &mut state.document,
+            before_bytes as usize,
+            after_bytes as usize,
+        ) else {
+            return false;
+        };
+
+        // The pinned Blitz event handler leaves delete-surrounding as a TODO, so this direct
+        // editor operation must request the paint that Blitz normally requests for IME edits.
+        state.redraw_requested.store(true, Ordering::Relaxed);
+        state.with_event_driver(false, |driver| driver.handle_dom_event(event))
     }
 
     /// Clear Blitz's hover state (and reset the cursor), e.g. when the pointer leaves the
@@ -640,12 +697,13 @@ mod tests {
     use super::{
         KEY_EVENT_COMPOSING, KEY_EVENT_PRESSED, KEY_EVENT_REPEAT, KEY_MOD_ACCEL, KEY_MOD_ALT,
         KEY_MOD_ALT_GRAPH, KEY_MOD_META, KEY_MOD_SHIFT, RecordedEvents, RecordingEventHandler,
-        build_editor_modifiers, build_pointer_modifiers, drive_ime_commit, is_insertable_text,
-        key_event, preedit_cursor, validate_key_abi, viewport_point_to_page,
+        apply_ime_delete_surrounding, build_editor_modifiers, build_pointer_modifiers,
+        drive_ime_commit, is_insertable_text, key_event, preedit_cursor, validate_key_abi,
+        viewport_point_to_page,
     };
     use blitz_dom::{BaseDocument, DocumentConfig, EventDriver};
     use blitz_html::HtmlDocument;
-    use blitz_traits::events::{BlitzImeEvent, DomEvent, DomEventData, UiEvent};
+    use blitz_traits::events::{BlitzImeEvent, BlitzInputEvent, DomEvent, DomEventData, UiEvent};
     use blitz_traits::shell::{ColorScheme, Viewport};
     use keyboard_types::{Key, Location, Modifiers};
 
@@ -979,5 +1037,60 @@ mod tests {
         assert_eq!(input_raw_text(&mut document, input_id), "");
         assert_eq!(input_compose_range(&mut document, input_id), None);
         assert_eq!(recorded.input, None);
+    }
+
+    #[test]
+    fn ime_delete_surrounding_applies_utf8_bytes_before_replacement_commit() {
+        let (mut document, input_id) = focused_input_document();
+        let mut recorded = RecordedEvents::default();
+        dispatch_to_document(
+            &mut document,
+            &mut recorded,
+            UiEvent::Ime(BlitzImeEvent::Commit("Aé日BC".to_owned())),
+            false,
+        );
+        document.with_text_input(input_id, |mut driver| driver.move_to_byte(6));
+
+        recorded = RecordedEvents::default();
+        let event = apply_ime_delete_surrounding(&mut document, 3, 1)
+            .expect("valid surrounding byte ranges should produce an input event");
+        assert!(matches!(
+            &event.data,
+            DomEventData::Input(BlitzInputEvent { value }) if value == "AéC"
+        ));
+        dispatch_dom_to_document(&mut document, &mut recorded, event);
+
+        assert_eq!(input_raw_text(&mut document, input_id), "AéC");
+        assert_eq!(recorded.input, Some(input_id));
+        assert_eq!(recorded.input_count, 1);
+
+        recorded = RecordedEvents::default();
+        dispatch_to_document(
+            &mut document,
+            &mut recorded,
+            UiEvent::Ime(BlitzImeEvent::Commit("好".to_owned())),
+            false,
+        );
+        assert_eq!(input_raw_text(&mut document, input_id), "Aé好C");
+        assert_eq!(recorded.input, Some(input_id));
+        assert_eq!(recorded.input_count, 1);
+    }
+
+    #[test]
+    fn ime_delete_surrounding_rejects_a_partial_utf8_edit_atomically() {
+        let (mut document, input_id) = focused_input_document();
+        let mut recorded = RecordedEvents::default();
+        dispatch_to_document(
+            &mut document,
+            &mut recorded,
+            UiEvent::Ime(BlitzImeEvent::Commit("Aé日BC".to_owned())),
+            false,
+        );
+        document.with_text_input(input_id, |mut driver| driver.move_to_byte(6));
+
+        // Two bytes before the caret lands inside the three-byte `日`. Although the one-byte
+        // deletion after the caret is valid, neither half may be applied on its own.
+        assert!(apply_ime_delete_surrounding(&mut document, 2, 1).is_none());
+        assert_eq!(input_raw_text(&mut document, input_id), "Aé日BC");
     }
 }
