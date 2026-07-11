@@ -597,10 +597,15 @@ export class Win32InputController {
     wParam: number | bigint,
     lParam: number | bigint,
   ): bigint {
-    const forwardedLParam = state.activation.desired
-      ? BigInt.asUintN(64, BigInt(lParam)) & ~BigInt(ISC_SHOWUICOMPOSITIONWINDOW)
-      : BigInt(lParam);
-    return this.#user32.symbols.DefWindowProcW(window.hwnd, message, BigInt(wParam), forwardedLParam);
+    const rawLParam = BigInt.asUintN(64, BigInt(lParam));
+    const forwardedBits = state.activation.desired ? rawLParam & ~BigInt(ISC_SHOWUICOMPOSITIONWINDOW) : rawLParam;
+    const forwardedLParam = BigInt.asIntN(64, forwardedBits);
+    return this.#user32.symbols.DefWindowProcW(
+      window.hwnd,
+      message,
+      BigInt.asUintN(64, BigInt(wParam)),
+      forwardedLParam,
+    );
   }
 
   #snapshotKeyboardState(): Uint8Array<ArrayBuffer> {
@@ -660,7 +665,7 @@ export class Win32InputController {
 
   #layoutHasAltGraph(layout: Deno.PointerValue): boolean {
     if (layout === null) return false;
-    const layoutId = BigInt(Deno.UnsafePointer.value(layout));
+    const layoutId = Deno.UnsafePointer.value(layout);
     const cached = this.#altGraphLayouts.get(layoutId);
     if (cached !== undefined) return cached;
 
@@ -695,7 +700,7 @@ export class Win32InputController {
       windowId: view.getBigUint64(0, true),
       message,
       virtualKey: Number(view.getBigUint64(16, true)),
-      lParam: view.getBigUint64(24, true),
+      lParam: view.getBigInt64(24, true),
       timestamp: view.getUint32(32, true),
     };
   }
@@ -723,7 +728,7 @@ export class Win32InputController {
         windowId: window.id,
         message: expectedMessage,
         virtualKey: Number(wParam),
-        lParam: BigInt.asUintN(64, BigInt(lParam)),
+        lParam: BigInt.asIntN(64, BigInt(lParam)),
       })
     ) {
       this.#preparedKey = undefined;

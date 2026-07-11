@@ -53,7 +53,11 @@ import {
   GCS_RESULTSTR,
   imm32functions,
   IMR_QUERYCHARPOSITION,
+  ISC_SHOWUICOMPOSITIONWINDOW,
+  kernel32functions,
   user32functions,
+  win32IntegerResourceAddress,
+  win32WndProcDefinition,
   WM,
 } from "./ffi.ts";
 import { Win32InputController, type Win32InputWindow } from "./input_controller.ts";
@@ -88,6 +92,43 @@ Deno.test("Win32 key lParam decoding preserves repeat, scan, extended, context, 
     isRepeat: true,
   });
   assertEquals(decodeKeyLParam(makeKeyLParam(0x1e)).isRepeat, false);
+});
+
+Deno.test("Win32 FFI preserves opaque handles and signed pointer-width message values", () => {
+  assertEquals(kernel32functions.GetModuleHandleW.result, "pointer");
+  assertEquals(user32functions.LoadCursorW, { parameters: ["pointer", "pointer"], result: "pointer" });
+  assertEquals(user32functions.UnregisterClassW.parameters, ["buffer", "pointer"]);
+  assertEquals(user32functions.CreateWindowExW.parameters.slice(4, 8), ["i32", "i32", "i32", "i32"]);
+  assertEquals(user32functions.CreateWindowExW.parameters.at(-1), "pointer");
+  assertEquals(user32functions.DispatchMessageW.result, "isize");
+  assertEquals(user32functions.DefWindowProcW, {
+    parameters: ["pointer", "u32", "usize", "isize"],
+    result: "isize",
+  });
+  assertEquals(win32WndProcDefinition, {
+    parameters: ["pointer", "u32", "usize", "isize"],
+    result: "isize",
+  });
+
+  assertEquals(win32IntegerResourceAddress(32512), 32512n);
+  for (const invalid of [0, -1, 1.5, 0x10000]) {
+    assertThrows(() => win32IntegerResourceAddress(invalid), RangeError);
+  }
+});
+
+Deno.test("Win32 forwards IME context LPARAM bits and LRESULT through signed pointer-width values", () => {
+  const harness = createInputControllerHarness({ defaultWindowResult: -77n });
+  harness.controller.attach(harness.window);
+  harness.controller.setImeEnabled(harness.window, true);
+  const rawBits = (1n << 63n) | BigInt(ISC_SHOWUICOMPOSITIONWINDOW) | 0x1234n;
+  const lParam = BigInt.asIntN(64, rawBits);
+
+  assertEquals(harness.controller.handleMessage(harness.window, WM.IME_SETCONTEXT, 1n, lParam), -77n);
+  assertEquals(harness.calls.defaultMessages.at(-1), {
+    message: WM.IME_SETCONTEXT,
+    wParam: 1n,
+    lParam: BigInt.asIntN(64, rawBits & ~BigInt(ISC_SHOWUICOMPOSITIONWINDOW)),
+  });
 });
 
 Deno.test("Win32 system errors suppress inserts and retain the numeric code when formatting fails", () => {
@@ -1449,6 +1490,7 @@ interface FakeImmBehavior {
   compositionData?: ReadonlyMap<number, Uint8Array | number>;
   onNotifyIme?: () => void;
   devicePixelRatio?: number;
+  defaultWindowResult?: bigint;
 }
 
 function createInputControllerHarness(behavior: FakeImmBehavior = {}) {
@@ -1462,11 +1504,15 @@ function createInputControllerHarness(behavior: FakeImmBehavior = {}) {
     releases: 0,
     candidateForms: [] as ArrayBuffer[],
     compositionForms: [] as ArrayBuffer[],
+    defaultMessages: [] as Array<{ message: number; wParam: bigint; lParam: bigint }>,
   };
   const events: UIEvent[] = [];
   const user32 = {
     symbols: {
-      DefWindowProcW: () => 0n,
+      DefWindowProcW(_window: Deno.PointerValue, message: number, wParam: bigint, lParam: bigint) {
+        calls.defaultMessages.push({ message, wParam, lParam });
+        return behavior.defaultWindowResult ?? 0n;
+      },
       GetKeyboardState(target: Uint8Array) {
         target.fill(0);
         for (const [virtualKey, state] of behavior.keyboardState ?? []) target[virtualKey] = state;

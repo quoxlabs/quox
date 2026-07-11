@@ -1,5 +1,5 @@
 export const kernel32functions = {
-  GetModuleHandleW: { parameters: ["pointer"], result: "usize" },
+  GetModuleHandleW: { parameters: ["pointer"], result: "pointer" },
   GetLastError: { parameters: [], result: "u32" },
   FormatMessageW: {
     parameters: ["u32", "pointer", "u32", "u32", "pointer", "u32", "pointer"],
@@ -65,14 +65,14 @@ export const user32functions = {
     parameters: ["pointer", "pointer", "i32", "i32", "i32", "i32", "u32"],
     result: "i32",
   },
-  LoadCursorW: { parameters: ["pointer", "usize"], result: "usize" },
+  LoadCursorW: { parameters: ["pointer", "pointer"], result: "pointer" },
   TrackMouseEvent: { parameters: ["buffer"], result: "i32" },
   RegisterClassExW: {
     parameters: ["buffer"],
     result: "u16",
   },
   UnregisterClassW: {
-    parameters: ["buffer", "usize"],
+    parameters: ["buffer", "pointer"],
     result: "i32",
   },
   CreateWindowExW: {
@@ -88,7 +88,7 @@ export const user32functions = {
       "pointer",
       "pointer",
       "pointer",
-      "usize",
+      "pointer",
     ],
     result: "pointer",
   },
@@ -100,13 +100,37 @@ export const user32functions = {
   TranslateMessage: { parameters: ["pointer"], result: "i32" },
   DispatchMessageW: {
     parameters: ["pointer"],
-    result: "usize",
+    result: "isize",
   },
   DefWindowProcW: {
-    parameters: ["pointer", "u32", "usize", "usize"],
-    result: "usize",
+    parameters: ["pointer", "u32", "usize", "isize"],
+    result: "isize",
   },
 } as const satisfies Deno.ForeignLibraryInterface;
+
+/** Exact 64-bit WNDPROC callback ABI used by Deno's supported Windows targets. */
+export const win32WndProcDefinition = {
+  parameters: ["pointer", "u32", "usize", "isize"],
+  result: "isize",
+} as const satisfies Deno.ForeignFunction;
+
+/**
+ * Encode MAKEINTRESOURCEW's low-word resource ID as its nominal LPCWSTR.
+ * The returned pointer is an integer tag and must never be dereferenced.
+ */
+export function win32IntegerResource(id: number): Deno.PointerObject {
+  const pointer = Deno.UnsafePointer.create(win32IntegerResourceAddress(id));
+  if (pointer === null) throw new Error("winding(win32): failed to encode integer resource");
+  return pointer;
+}
+
+/** Validate MAKEINTRESOURCEW and expose its exact low-word bit pattern for tests. */
+export function win32IntegerResourceAddress(id: number): bigint {
+  if (!Number.isSafeInteger(id) || id <= 0 || id > 0xffff) {
+    throw new RangeError("winding(win32): integer resource ID must fit a nonzero WORD");
+  }
+  return BigInt(id);
+}
 
 export const imm32functions = {
   ImmGetContext: { parameters: ["pointer"], result: "pointer" },

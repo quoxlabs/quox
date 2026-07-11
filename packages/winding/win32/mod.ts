@@ -21,6 +21,8 @@ import {
   SIZE_MINIMIZED,
   user32functions,
   WHEEL_DELTA,
+  win32IntegerResource,
+  win32WndProcDefinition,
   WM,
 } from "./ffi.ts";
 import {
@@ -80,6 +82,11 @@ function wideStringBuffer(value: string): ArrayBuffer {
   return buffer;
 }
 
+/** Serialize one rooted opaque pointer into the x64 WNDCLASSEXW buffer. */
+function writePointerField(view: DataView, offset: number, pointer: Deno.PointerValue): void {
+  view.setBigUint64(offset, pointer === null ? 0n : Deno.UnsafePointer.value(pointer), true);
+}
+
 /**
  * Arm a one-shot `WM_MOUSELEAVE` for `hWnd`. Tracking stays active until the requested leave,
  * so each window arms it once when the pointer enters and re-arms only after a real crossing.
@@ -89,7 +96,7 @@ function trackMouseLeave(lib: Win32Library, hWnd: Deno.PointerObject): void {
   const dv = new DataView(buf);
   dv.setUint32(0, TRACKMOUSEEVENT_SIZE, true); // cbSize
   dv.setUint32(4, TME_LEAVE, true); // dwFlags
-  dv.setBigUint64(8, BigInt(Deno.UnsafePointer.value(hWnd)), true); // hwndTrack
+  dv.setBigUint64(8, Deno.UnsafePointer.value(hWnd), true); // hwndTrack
   dv.setUint32(16, 0, true); // dwHoverTime (unused without TME_HOVER)
   if (lib.user32.symbols.TrackMouseEvent(buf) === 0) {
     throw new Error(lib.getLastError());
@@ -138,11 +145,11 @@ class Win32Window implements Window {
       null,
       null,
       lib.instance,
-      0n,
+      null,
     );
     if (window == null) throw new Error(lib.getLastError());
     this.#hwnd = window;
-    this.id = BigInt(Deno.UnsafePointer.value(window));
+    this.id = Deno.UnsafePointer.value(window);
     try {
       this.dpiState = lib.dpiStateForWindow(window);
       let appliedGeometry = provisionalGeometry;
@@ -309,16 +316,12 @@ class Win32Library implements Library {
   #classNameBuffer = (() => {
     return wideStringBuffer("Winding");
   })();
-  #wndProc: Deno.UnsafeCallback<{
-    parameters: ["pointer", "u32", "usize", "usize"];
-    result: "usize";
-  }>;
+  #wndProc: Deno.UnsafeCallback<typeof win32WndProcDefinition>;
   readonly #events = new EventQueue<UIEvent>();
   readonly #callbackErrors = new DeferredNativeError();
   readonly #translateMessageGuard = new TranslateMessageReentrancyGuard();
   readonly input: Win32InputController;
   readonly instance: Deno.PointerObject;
-  readonly #instance: bigint;
   readonly #mouseCapture = new Win32MouseCaptureState();
   readonly #eventClock = new NativeEventClock(2 ** 32);
   readonly #clickCounter = new ClickCounter<MouseButton>();
@@ -343,12 +346,9 @@ class Win32Library implements Library {
 
     // lpfnWndProc
     this.#wndProc = new Deno.UnsafeCallback(
-      {
-        parameters: ["pointer", "u32", "usize", "usize"],
-        result: "usize",
-      },
+      win32WndProcDefinition,
       guardNativeCallback(this.#callbackErrors, (hWnd, uMsg, wParam, lParam) => {
-        const win = this.windows.get(BigInt(Deno.UnsafePointer.value(hWnd)));
+        const win = this.windows.get(Deno.UnsafePointer.value(hWnd));
         let inputResult: bigint | undefined;
         const inSendMessageFlags = this.#translateMessageGuard.translating
           ? this.user32.symbols.InSendMessageEx(null)
@@ -412,7 +412,7 @@ class Win32Library implements Library {
           }
           case WM.DPICHANGED: {
             if (win === undefined || !win.dpiState.handlesDpiChanges) break;
-            const rectanglePointer = Deno.UnsafePointer.create(BigInt(lParam));
+            const rectanglePointer = Deno.UnsafePointer.create(BigInt.asUintN(64, BigInt(lParam)));
             if (rectanglePointer === null) throw new Error("winding(win32): WM_DPICHANGED omitted its rectangle");
             const rectangle = new Uint8Array(16);
             new Deno.UnsafePointerView(rectanglePointer).copyInto(rectangle);
@@ -582,11 +582,7 @@ class Win32Library implements Library {
         ),
       (input) => input.close(),
     );
-    wndClassDv.setBigUint64(
-      off,
-      BigInt(Deno.UnsafePointer.value(this.#wndProc.pointer)),
-      true,
-    );
+    writePointerField(wndClassDv, off, this.#wndProc.pointer);
     off += 8;
 
     // cbClsExtra
@@ -597,22 +593,22 @@ class Win32Library implements Library {
 
     // hInstance
     const instance = rollback.run(() => this.kernel32.symbols.GetModuleHandleW(null));
-    if (BigInt(instance) == 0n) rollback.fail(new Error(rollback.run(() => this.getLastError())));
-    this.#instance = BigInt(instance);
-    const instancePointer = rollback.run(() => Deno.UnsafePointer.create(this.#instance));
-    if (instancePointer === null) rollback.fail(new Error("winding(win32): invalid module handle"));
+    const instancePointer = instance === null
+      ? rollback.fail(new Error(rollback.run(() => this.getLastError())))
+      : instance;
     this.instance = instancePointer;
-    wndClassDv.setBigUint64(off, this.#instance, true);
+    writePointerField(wndClassDv, off, instancePointer);
     off += 8;
 
     // hIcon
     off += 8;
 
     // hCursor
-    const cursor = rollback.run(() => this.user32.symbols.LoadCursorW(null, 32512n));
-    // (IDC_ARROW - https://learn.microsoft.com/en-us/windows/win32/menurc/about-cursors)
-    if (BigInt(cursor) === 0n) rollback.fail(new Error(rollback.run(() => this.getLastError())));
-    wndClassDv.setBigUint64(off, BigInt(cursor), true);
+    // IDC_ARROW uses MAKEINTRESOURCEW's tagged LPCWSTR representation.
+    const cursorName = rollback.run(() => win32IntegerResource(32512));
+    const cursor = rollback.run(() => this.user32.symbols.LoadCursorW(null, cursorName));
+    const cursorPointer = cursor === null ? rollback.fail(new Error(rollback.run(() => this.getLastError()))) : cursor;
+    writePointerField(wndClassDv, off, cursorPointer);
     off += 8;
 
     // hbrBackground
@@ -622,13 +618,7 @@ class Win32Library implements Library {
     off += 8;
 
     // lpszClassName
-    wndClassDv.setBigUint64(
-      off,
-      BigInt(Deno.UnsafePointer.value(
-        Deno.UnsafePointer.of(this.#classNameBuffer),
-      )),
-      true,
-    );
+    writePointerField(wndClassDv, off, Deno.UnsafePointer.of(this.#classNameBuffer));
     off += 8;
 
     // hIconSm
@@ -701,7 +691,7 @@ class Win32Library implements Library {
 
   #nativeCaptureOwner(): bigint | undefined {
     const capture = this.user32.symbols.GetCapture();
-    return capture === null ? undefined : BigInt(Deno.UnsafePointer.value(capture));
+    return capture === null ? undefined : Deno.UnsafePointer.value(capture);
   }
 
   #messageTimeStamp(): number {
@@ -803,7 +793,7 @@ class Win32Library implements Library {
     this.#publishClientState(window, false);
 
     const focus = this.user32.symbols.GetFocus();
-    const focused = focus !== null && BigInt(Deno.UnsafePointer.value(focus)) === window.id;
+    const focused = focus !== null && Deno.UnsafePointer.value(focus) === window.id;
     this.input.observeNativeFocus(window, focused);
   }
 
@@ -949,7 +939,7 @@ class Win32Library implements Library {
 
     if (this.#classRegistered) {
       try {
-        if (this.user32.symbols.UnregisterClassW(this.#classNameBuffer, this.#instance) !== 0) {
+        if (this.user32.symbols.UnregisterClassW(this.#classNameBuffer, this.instance) !== 0) {
           this.#classRegistered = false;
         } else {
           const code = this.kernel32.symbols.GetLastError();

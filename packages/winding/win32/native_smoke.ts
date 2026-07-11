@@ -92,8 +92,8 @@ interface NativeWin32Window extends Window {
       handleMessage(
         window: NativeWin32Window | undefined,
         message: number,
-        wParam: number | bigint,
-        lParam: number | bigint,
+        wParam: bigint,
+        lParam: bigint,
       ): bigint | undefined;
     };
   };
@@ -190,7 +190,7 @@ function runLifecycle(
 function assertImeCharacterPositionDelegated(window: NativeWin32Window): void {
   const target = new Uint8Array(IMECHARPOSITION_SIZE);
   const pointer = Deno.UnsafePointer.of(target);
-  const address = BigInt(Deno.UnsafePointer.value(pointer));
+  const address = BigInt.asIntN(64, Deno.UnsafePointer.value(pointer));
   for (
     const request of [
       { name: "earlier", offset: 0 },
@@ -206,7 +206,7 @@ function assertImeCharacterPositionDelegated(window: NativeWin32Window): void {
     const result = window.lib.input.handleMessage(
       window,
       WM.IME_REQUEST,
-      IMR_QUERYCHARPOSITION,
+      BigInt(IMR_QUERYCHARPOSITION),
       address,
     );
     if (result !== undefined) throw new Error(`Winding falsely answered the ${request.name} character request`);
