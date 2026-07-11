@@ -642,6 +642,10 @@ function testProtocolAndStructAbis(): void {
       assertEquals(documentSelection, { location: 1n, length: 2n });
 
       const sendId = openMessage(handles, ["pointer", "pointer"], "pointer");
+      window.setTitle("left\0🙂right");
+      const exactTitle = sendId(window.nsWindow, sel(runtime, "title"));
+      assert(exactTitle !== null, "NSWindow returned a nil title");
+      assertEquals(readCFString(cf, exactTitle), "left\0🙂right");
       const attributedSubstring = openMessage(
         handles,
         ["pointer", "pointer", NSRANGE, "pointer"],

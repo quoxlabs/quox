@@ -27,7 +27,6 @@ import {
   cgSymbols,
   CORE_FOUNDATION,
   CORE_GRAPHICS,
-  cStr,
   getClass as runtimeGetClass,
   getProtocol as runtimeGetProtocol,
   HITOOLBOX,
@@ -117,7 +116,11 @@ function openMsgSendSymbols(libraries: Closeable[]) {
   // (receiver, selector, ...args); extra unused argument slots are never passed.
   return {
     id: openMsgSend(libraries, ["pointer", "pointer"], "pointer"),
-    id_cstr: openMsgSend(libraries, ["pointer", "pointer", "buffer"], "pointer"),
+    id_bufUsizeU64: openMsgSend(
+      libraries,
+      ["pointer", "pointer", "buffer", "usize", "u64"],
+      "pointer",
+    ),
     id_id: openMsgSend(libraries, ["pointer", "pointer", "pointer"], "pointer"),
     id_u64: openMsgSend(libraries, ["pointer", "pointer", "u64"], "pointer"),
     id_rect: openMsgSend(libraries, ["pointer", "pointer", NSRECT], "pointer"),
@@ -248,10 +251,20 @@ const NSEventType = {
   OtherMouseDragged: 27n,
 } as const;
 
-function makeNSString(ffi: DarwinFfi, s: string): Deno.PointerValue {
+function makeNSString(ffi: DarwinFfi, s: string): Deno.PointerObject {
   const { getClass, sel, send } = ffi;
   const alloc = send.id(getClass("NSString"), sel("alloc"));
-  return send.id_cstr(alloc, sel("initWithUTF8String:"), cStr(s));
+  if (alloc === null) throw new Error("winding(darwin): failed to allocate NSString");
+  const bytes = new TextEncoder().encode(s);
+  const string = send.id_bufUsizeU64(
+    alloc,
+    sel("initWithBytes:length:encoding:"),
+    bytes,
+    BigInt(bytes.byteLength),
+    4n, // NSUTF8StringEncoding
+  );
+  if (string === null) throw new Error("winding(darwin): failed to initialize UTF-8 NSString");
+  return string;
 }
 
 function pointerId(p: Deno.PointerValue): bigint {
@@ -577,7 +590,6 @@ class DarwinWindow implements Window, DarwinNativeResponder {
     if (substring === null) return null;
     const { getClass, sel, send } = this.lib.ffi;
     const string = makeNSString(this.lib.ffi, substring.text);
-    if (string === null) throw new Error("winding(darwin): failed to create substring NSString");
     let attributed: Deno.PointerValue = null;
     try {
       const alloc = send.id(getClass("NSAttributedString"), sel("alloc"));
@@ -950,8 +962,11 @@ class DarwinWindow implements Window, DarwinNativeResponder {
     this.lib.withAutoreleasePool(() => {
       const { sel, send } = this.lib.ffi;
       const titleString = makeNSString(this.lib.ffi, title);
-      send.void_id(this.nsWindow, sel("setTitle:"), titleString);
-      send.void(titleString, sel("release"));
+      try {
+        send.void_id(this.nsWindow, sel("setTitle:"), titleString);
+      } finally {
+        send.void(titleString, sel("release"));
+      }
     });
   }
 
@@ -1116,7 +1131,6 @@ class DarwinLibrary implements Library {
         distantPast = send.id(send.id(getClass("NSDate"), sel("distantPast")), sel("retain"));
         if (distantPast === null) throw new Error("winding(darwin): failed to retain NSDate.distantPast");
         runLoopMode = makeNSString(this.ffi, "kCFRunLoopDefaultMode");
-        if (runLoopMode === null) throw new Error("winding(darwin): failed to create run-loop mode");
         colorSpace = cg.symbols.CGColorSpaceCreateDeviceRGB();
         if (colorSpace === null) throw new Error("winding(darwin): CGColorSpaceCreateDeviceRGB failed");
         return { nativeClasses, nsApp, distantPast, runLoopMode, colorSpace };
