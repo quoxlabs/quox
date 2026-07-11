@@ -53,12 +53,13 @@ withAutoreleasePool(() => {
   runCase("windows opt into ordinary mouse-move delivery", testMouseMoveDeliveryEnabled);
   runCase("closed windows and libraries reject every native operation", testClosedMethodGuards);
   runCase("only one library owns the process-wide AppKit queue", testSingleLibraryOwnership);
+  runCase("activation messages use their declared BOOL and object call shapes", testActivationCallShapes);
   runCase(
     "NSTextInputClient protocol and struct-return ABIs work through Objective-C dispatch",
     testProtocolAndStructAbis,
   );
   runCase("text input survives repeated library and window lifecycles", testRepeatedLifecycles);
-  console.log("Darwin native smoke: 9 passed");
+  console.log("Darwin native smoke: 10 passed");
 });
 
 function testTextCallbacks(): void {
@@ -443,6 +444,33 @@ function testSingleLibraryOwnership(): void {
 
   const replacement = load();
   replacement.close();
+}
+
+function testActivationCallShapes(): void {
+  withNativeWindow(64, 48, (library, window) => {
+    const handles: Closeable[] = [];
+    try {
+      const runtime = Deno.dlopen(LIBOBJC, runtimeSymbols);
+      handles.push(runtime);
+      const sendId = openMessage(handles, ["pointer", "pointer"], "pointer");
+      const setPolicy = openMessage(handles, ["pointer", "pointer", "i64"], "bool");
+      const orderFront = openMessage(
+        handles,
+        ["pointer", "pointer", "pointer"],
+        "void",
+      );
+      const nsApp = sendId(getClass(runtime, "NSApplication"), sel(runtime, "sharedApplication"));
+      assert(nsApp !== null, "NSApplication.sharedApplication returned nil");
+      assert(
+        setPolicy(nsApp, sel(runtime, "setActivationPolicy:"), 0n),
+        "NSApplication rejected its existing activation policy",
+      );
+      orderFront(window.nsWindow, sel(runtime, "makeKeyAndOrderFront:"), null);
+      drainEvents(library);
+    } finally {
+      closeAll(handles);
+    }
+  });
 }
 
 function testProtocolAndStructAbis(): void {

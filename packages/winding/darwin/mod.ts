@@ -133,7 +133,7 @@ function openMsgSendSymbols(libraries: Closeable[]) {
     bool: openMsgSend(libraries, ["pointer", "pointer"], "bool"),
     bool_id: openMsgSend(libraries, ["pointer", "pointer", "pointer"], "bool"),
     void_bool: openMsgSend(libraries, ["pointer", "pointer", "bool"], "void"),
-    void_i64: openMsgSend(libraries, ["pointer", "pointer", "i64"], "void"),
+    bool_i64: openMsgSend(libraries, ["pointer", "pointer", "i64"], "bool"),
     point: openMsgSend(libraries, ["pointer", "pointer"], NSPOINT),
     f64: openMsgSend(libraries, ["pointer", "pointer"], "f64"),
     u16: openMsgSend(libraries, ["pointer", "pointer"], "u16"),
@@ -372,8 +372,13 @@ class DarwinWindow implements Window, DarwinNativeResponder {
       // A window cannot reliably become key while its application is inactive.
       // Activate first so AppKit delivers windowDidBecomeKey: synchronously when
       // the desktop session permits foreground activation.
-      send.void_bool(lib.nsApp, sel("activateIgnoringOtherApps:"), true);
-      send.void_bool(win, sel("makeKeyAndOrderFront:"), false);
+      const modernActivate = sel("activate");
+      if (send.bool_id(lib.nsApp, sel("respondsToSelector:"), modernActivate)) {
+        send.void(lib.nsApp, modernActivate);
+      } else {
+        send.void_bool(lib.nsApp, sel("activateIgnoringOtherApps:"), true);
+      }
+      send.void_id(win, sel("makeKeyAndOrderFront:"), null);
       if (!send.bool_id(win, sel("makeFirstResponder:"), contentView)) {
         throw new Error("winding(darwin): failed to make content view first responder");
       }
@@ -996,7 +1001,9 @@ class DarwinLibrary implements Library {
     const { cg, getClass, sel, send } = this.ffi;
     this.nativeClasses = ensureNativeClasses(this.ffi);
     this.nsApp = send.id(getClass("NSApplication"), sel("sharedApplication"));
-    send.void_i64(this.nsApp, sel("setActivationPolicy:"), NS_APPLICATION_ACTIVATION_POLICY_REGULAR);
+    if (!send.bool_i64(this.nsApp, sel("setActivationPolicy:"), NS_APPLICATION_ACTIVATION_POLICY_REGULAR)) {
+      throw new Error("winding(darwin): NSApplication rejected the regular activation policy");
+    }
     send.void(this.nsApp, sel("finishLaunching"));
     this.#distantPast = send.id(getClass("NSDate"), sel("distantPast"));
     this.#runLoopMode = makeNSString(this.ffi, "kCFRunLoopDefaultMode");
