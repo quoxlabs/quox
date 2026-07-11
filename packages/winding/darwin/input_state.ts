@@ -117,12 +117,10 @@ export class DarwinInputState {
       };
     }
     const surrounding = this.#surrounding;
-    return surrounding === null
-      ? { location: NS_NOT_FOUND, length: 0n }
-      : {
-        location: BigInt(surrounding.selectionStartUtf16),
-        length: BigInt(surrounding.selectionEndUtf16 - surrounding.selectionStartUtf16),
-      };
+    return surrounding === null ? { location: NS_NOT_FOUND, length: 0n } : {
+      location: BigInt(surrounding.selectionStartUtf16),
+      length: BigInt(surrounding.selectionEndUtf16 - surrounding.selectionStartUtf16),
+    };
   }
 
   /** Application text with the active marked string overlaid at its document range. */
@@ -292,9 +290,7 @@ export class DarwinInputState {
     if (!hadMarkedText && hasConcreteReplacement) {
       this.#emitDocumentReplacement(replacementLocation, replacementLength, "");
     }
-    const replacement = hadMarkedText
-      ? this.#markedReplacement(replacementLocation, replacementLength)
-      : null;
+    const replacement = hadMarkedText ? this.#markedReplacement(replacementLocation, replacementLength) : null;
     const text = replacement === null
       ? insertedText
       : this.#markedText.slice(0, replacement.start) + insertedText + this.#markedText.slice(replacement.end);
@@ -311,9 +307,7 @@ export class DarwinInputState {
       };
     const update = text.length === 0 ? this.#composition.cancel() : this.#composition.update(
       text,
-      this.#markedSelection === null
-        ? null
-        : utf16RangeToUtf8(text, location, this.#markedSelection.length),
+      this.#markedSelection === null ? null : utf16RangeToUtf8(text, location, this.#markedSelection.length),
     );
     if (update !== undefined) {
       this.#emit(createImePreeditEvent(this.window, update.text, update.cursorRange));
@@ -459,7 +453,6 @@ export class DarwinInputState {
     this.setSurroundingText(updated, cursorBytes, cursorBytes);
     return true;
   }
-
 }
 
 function validUtf16Range(

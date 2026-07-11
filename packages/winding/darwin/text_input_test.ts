@@ -148,19 +148,24 @@ Deno.test("logical key resolution covers interpreted text, dead keys, and named 
 });
 
 Deno.test("Darwin resolves JIS and macOS special keys before misleading characters", () => {
-  for (const [keycode, code, key] of [
-    [0x66, "Lang2", "Eisu"],
-    [0x68, "Lang1", "KanjiMode"],
-    [0x3f, "Fn", "Fn"],
-    [0x47, "NumLock", "Clear"],
-    [0x72, "Insert", "Help"],
-  ] as const) {
-    assertEquals(logicalKeyForEvent({
-      keycode,
-      code,
-      characters: " ",
-      charactersIgnoringModifiers: " ",
-    }), key);
+  for (
+    const [keycode, code, key] of [
+      [0x66, "Lang2", "Eisu"],
+      [0x68, "Lang1", "KanjiMode"],
+      [0x3f, "Fn", "Fn"],
+      [0x47, "NumLock", "Clear"],
+      [0x72, "Insert", "Help"],
+    ] as const
+  ) {
+    assertEquals(
+      logicalKeyForEvent({
+        keycode,
+        code,
+        characters: " ",
+        charactersIgnoringModifiers: " ",
+      }),
+      key,
+    );
   }
 });
 

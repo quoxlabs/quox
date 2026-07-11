@@ -128,12 +128,6 @@ const KEYCODE_TO_DOM_CODE: Record<number, string> = {
 
 export function getDomCode(keycode: number, isoKeyboard = false): string {
   // AppKit swaps the ANSI grave and ISO section positions on ISO hardware.
-  const physicalKeycode = isoKeyboard
-    ? keycode === 0x000a
-      ? 0x0032
-      : keycode === 0x0032
-      ? 0x000a
-      : keycode
-    : keycode;
+  const physicalKeycode = isoKeyboard ? keycode === 0x000a ? 0x0032 : keycode === 0x0032 ? 0x000a : keycode : keycode;
   return KEYCODE_TO_DOM_CODE[physicalKeycode] ?? "Unidentified";
 }
