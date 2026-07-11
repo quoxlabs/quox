@@ -314,6 +314,9 @@ class DarwinWindow implements Window, DarwinNativeResponder {
       lib.nativeClasses.registerView(contentView, this);
       viewRegistered = true;
       send.void_id(win, sel("setContentView:"), contentView);
+      // NSWindow defaults this to false, which suppresses ordinary unpressed
+      // mouse motion even though drag events continue to arrive.
+      send.void_bool(win, sel("setAcceptsMouseMovedEvents:"), true);
       send.void_bool(contentView, sel("setWantsLayer:"), true);
       const layer = send.id(contentView, sel("layer"));
       if (layer === null) throw new Error("winding(darwin): failed to create content layer");

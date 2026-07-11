@@ -45,12 +45,13 @@ withAutoreleasePool(() => {
   );
   runCase("modifier transitions never query key-only character properties", testModifierTransitions);
   runCase("blit copies pixels into storage retained by Core Graphics", testBlitStorageLifetime);
+  runCase("windows opt into ordinary mouse-move delivery", testMouseMoveDeliveryEnabled);
   runCase(
     "NSTextInputClient protocol and struct-return ABIs work through Objective-C dispatch",
     testProtocolAndStructAbis,
   );
   runCase("text input survives repeated library and window lifecycles", testRepeatedLifecycles);
-  console.log("Darwin native smoke: 6 passed");
+  console.log("Darwin native smoke: 7 passed");
 });
 
 function testTextCallbacks(): void {
@@ -346,6 +347,23 @@ function testBlitStorageLifetime(): void {
       } finally {
         cf.symbols.CFRelease(data);
       }
+    } finally {
+      closeAll(handles);
+    }
+  });
+}
+
+function testMouseMoveDeliveryEnabled(): void {
+  withNativeWindow(64, 48, (_library, window) => {
+    const handles: Closeable[] = [];
+    try {
+      const runtime = Deno.dlopen(LIBOBJC, runtimeSymbols);
+      handles.push(runtime);
+      const sendBool = openMessage(handles, ["pointer", "pointer"], "bool");
+      assert(
+        sendBool(window.nsWindow, sel(runtime, "acceptsMouseMovedEvents")),
+        "NSWindow did not enable ordinary mouse-move delivery",
+      );
     } finally {
       closeAll(handles);
     }
