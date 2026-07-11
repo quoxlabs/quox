@@ -123,6 +123,11 @@ class Win32Window implements Window {
     this.lib.input.setImeCursorArea(this, x, y, width, height);
   }
 
+  setImeSurroundingText(text: string, selectionStartBytes: number, selectionEndBytes: number): void {
+    if (this.#destroyed) return;
+    this.lib.input.setImeSurroundingText(this, text, selectionStartBytes, selectionEndBytes);
+  }
+
   /**
    * Copy an RGBA pixel buffer to the window's client area via GDI. Converts
    * to a top-down 32bpp BGRA DIB (matching the BGRX reordering used by the

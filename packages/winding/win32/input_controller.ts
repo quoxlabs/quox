@@ -11,7 +11,7 @@ import {
   ImeActivationState,
   type PreeditUpdate,
 } from "../input/mod.ts";
-import { type ImeCursorArea, normalizeImeCursorArea } from "../input/ime.ts";
+import { type ImeCursorArea, normalizeImeCursorArea, validateImeCursorRange } from "../input/ime.ts";
 import { PressedLogicalKeyCache } from "../input/pressed_keys.ts";
 import { getDomCode } from "./dom_code.ts";
 import {
@@ -82,6 +82,11 @@ interface WindowInputState {
   readonly activation: ImeActivationState;
   readonly composition: CompositionState;
   cursorArea?: ImeCursorArea;
+  surroundingText?: {
+    text: string;
+    selectionStartBytes: number;
+    selectionEndBytes: number;
+  };
   readonly logicalKeys: PressedLogicalKeyCache<string>;
   readonly altGraphControlFilter: AltGraphControlFilter;
   readonly charDecoder: WmCharDecoder;
@@ -192,6 +197,23 @@ export class Win32InputController {
     const state = this.#state(window);
     state.cursorArea = rectangle;
     if (state.activation.active) this.#applyImeCursorArea(window, state);
+  }
+
+  setImeSurroundingText(
+    window: Win32InputWindow,
+    text: string,
+    selectionStartBytes: number,
+    selectionEndBytes: number,
+  ): void {
+    const selection = validateImeCursorRange(text, selectionStartBytes, selectionEndBytes);
+    if (selection === null) {
+      throw new RangeError("winding(win32): invalid UTF-8 surrounding-text selection");
+    }
+    this.#state(window).surroundingText = {
+      text,
+      selectionStartBytes: selection[0],
+      selectionEndBytes: selection[1],
+    };
   }
 
   /** Process input-owned WndProc messages; undefined means continue with DefWindowProcW. */
