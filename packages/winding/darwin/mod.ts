@@ -324,6 +324,7 @@ class DarwinWindow implements Window, DarwinNativeResponder {
   #producedText: string | undefined;
   #producedPreedit = false;
   readonly #pressedKeys = new PressedLogicalKeyCache<number>();
+  #ready = false;
   #closed = false;
 
   constructor(readonly lib: DarwinLibrary, x = 0, y = 0, w = 800, h = 600) {
@@ -408,7 +409,10 @@ class DarwinWindow implements Window, DarwinNativeResponder {
       if (!send.bool_id(win, sel("makeFirstResponder:"), contentView)) {
         throw new Error("winding(darwin): failed to make content view first responder");
       }
+      lib.nativeClasses.throwIfCallbackFailed();
       lib.registerWindow(this);
+      this.#ready = true;
+      if (send.bool(win, sel("isKeyWindow"))) this.handleFocusGained();
     } catch (error) {
       const errors = [error];
       const cleanup = (operation: () => void): void => {
@@ -418,6 +422,7 @@ class DarwinWindow implements Window, DarwinNativeResponder {
           errors.push(cleanupError);
         }
       };
+      cleanup(() => lib.unregisterWindow(this));
       if (viewRegistered) cleanup(() => lib.nativeClasses.unregisterView(contentView));
       if (delegateRegistered) cleanup(() => lib.nativeClasses.unregisterDelegate(delegate));
       cleanup(() => this.inputState.close());
@@ -454,6 +459,7 @@ class DarwinWindow implements Window, DarwinNativeResponder {
       | "hidden"
       | "visible",
   ): void {
+    if (!this.#ready || this.#closed) return;
     switch (kind) {
       case "close":
         this.lib.pushEvent({ type: "close", window: this });
@@ -1016,6 +1022,7 @@ class DarwinWindow implements Window, DarwinNativeResponder {
 
   #closeNative(): void {
     this.#closed = true;
+    this.#ready = false;
     const errors: unknown[] = [];
     const cleanup = (operation: () => void): void => {
       try {
@@ -1085,23 +1092,52 @@ class DarwinLibrary implements Library {
 
   constructor() {
     this.ffi = openDarwinFfi();
-    const initialized = withAutoreleasePool(this.ffi, () => {
-      const { cg, getClass, sel, send } = this.ffi;
-      const nativeClasses = ensureNativeClasses(this.ffi);
-      const nsApp = send.id(getClass("NSApplication"), sel("sharedApplication"));
-      if (nsApp === null) throw new Error("winding(darwin): NSApplication.sharedApplication returned nil");
-      if (!send.bool_i64(nsApp, sel("setActivationPolicy:"), NS_APPLICATION_ACTIVATION_POLICY_REGULAR)) {
-        throw new Error("winding(darwin): NSApplication rejected the regular activation policy");
-      }
-      send.void(nsApp, sel("finishLaunching"));
-      const distantPast = send.id(send.id(getClass("NSDate"), sel("distantPast")), sel("retain"));
-      if (distantPast === null) throw new Error("winding(darwin): failed to retain NSDate.distantPast");
-      const runLoopMode = makeNSString(this.ffi, "kCFRunLoopDefaultMode");
-      if (runLoopMode === null) throw new Error("winding(darwin): failed to create run-loop mode");
-      const colorSpace = cg.symbols.CGColorSpaceCreateDeviceRGB();
-      if (colorSpace === null) throw new Error("winding(darwin): CGColorSpaceCreateDeviceRGB failed");
-      return { nativeClasses, nsApp, distantPast, runLoopMode, colorSpace };
-    });
+    let distantPast: Deno.PointerValue = null;
+    let runLoopMode: Deno.PointerValue = null;
+    let colorSpace: Deno.PointerValue = null;
+    let initialized: {
+      nativeClasses: DarwinNativeClasses;
+      nsApp: Deno.PointerObject;
+      distantPast: Deno.PointerObject;
+      runLoopMode: Deno.PointerObject;
+      colorSpace: Deno.PointerObject;
+    };
+    try {
+      initialized = withAutoreleasePool(this.ffi, () => {
+        const { cg, getClass, sel, send } = this.ffi;
+        const nativeClasses = ensureNativeClasses(this.ffi);
+        const nsApp = send.id(getClass("NSApplication"), sel("sharedApplication"));
+        if (nsApp === null) throw new Error("winding(darwin): NSApplication.sharedApplication returned nil");
+        if (!send.bool_i64(nsApp, sel("setActivationPolicy:"), NS_APPLICATION_ACTIVATION_POLICY_REGULAR)) {
+          throw new Error("winding(darwin): NSApplication rejected the regular activation policy");
+        }
+        send.void(nsApp, sel("finishLaunching"));
+        distantPast = send.id(send.id(getClass("NSDate"), sel("distantPast")), sel("retain"));
+        if (distantPast === null) throw new Error("winding(darwin): failed to retain NSDate.distantPast");
+        runLoopMode = makeNSString(this.ffi, "kCFRunLoopDefaultMode");
+        if (runLoopMode === null) throw new Error("winding(darwin): failed to create run-loop mode");
+        colorSpace = cg.symbols.CGColorSpaceCreateDeviceRGB();
+        if (colorSpace === null) throw new Error("winding(darwin): CGColorSpaceCreateDeviceRGB failed");
+        return { nativeClasses, nsApp, distantPast, runLoopMode, colorSpace };
+      });
+    } catch (error) {
+      const errors = [error];
+      const cleanup = (operation: () => void): void => {
+        try {
+          operation();
+        } catch (cleanupError) {
+          errors.push(cleanupError);
+        }
+      };
+      const { cf, sel, send } = this.ffi;
+      if (colorSpace !== null) cleanup(() => cf.symbols.CFRelease(colorSpace));
+      if (runLoopMode !== null) cleanup(() => send.void(runLoopMode, sel("release")));
+      if (distantPast !== null) cleanup(() => send.void(distantPast, sel("release")));
+      cleanup(() => this.ffi.close());
+      throw errors.length === 1
+        ? errors[0]
+        : new AggregateError(errors, "winding(darwin): errors while unwinding library creation");
+    }
     this.nativeClasses = initialized.nativeClasses;
     this.nsApp = initialized.nsApp;
     this.#distantPast = initialized.distantPast;
