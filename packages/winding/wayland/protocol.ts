@@ -50,6 +50,20 @@ export const SHM_EVENT_SIGNATURES = [
 export const BUFFER_EVENT_SIGNATURES = [
   ["pointer", "pointer"],
 ] as const satisfies readonly WaylandEventSignature[];
+export const OUTPUT_EVENT_SIGNATURES = [
+  ["pointer", "pointer", "i32", "i32", "i32", "i32", "i32", "pointer", "pointer", "i32"],
+  ["pointer", "pointer", "u32", "i32", "i32", "i32"],
+  ["pointer", "pointer"],
+  ["pointer", "pointer", "i32"],
+  ["pointer", "pointer", "pointer"],
+  ["pointer", "pointer", "pointer"],
+] as const satisfies readonly WaylandEventSignature[];
+export const SURFACE_EVENT_SIGNATURES = [
+  ["pointer", "pointer", "pointer"],
+  ["pointer", "pointer", "pointer"],
+  ["pointer", "pointer", "i32"],
+  ["pointer", "pointer", "u32"],
+] as const satisfies readonly WaylandEventSignature[];
 export const SEAT_EVENT_SIGNATURES = [
   ["pointer", "pointer", "u32"],
   ["pointer", "pointer", "pointer"],
@@ -169,6 +183,31 @@ export function dlsymRequired(
   const pointer = libdl.symbols.dlsym(handle, cStr(name));
   if (!pointer) throw new Error(`winding failed to resolve symbol ${name}`);
   return pointer;
+}
+
+/** Read `wl_interface.version` from the validated 64-bit native layout. */
+export function readWaylandInterfaceVersion(iface: Deno.PointerObject): number {
+  const view = new Deno.UnsafePointerView(iface);
+  return decodeWaylandInterfaceVersion((offset) => view.getInt32(offset));
+}
+
+/** Pure seam that fixes the native `version` field at byte offset 8. */
+export function decodeWaylandInterfaceVersion(readInt32: (offset: number) => number): number {
+  return readInt32(8);
+}
+
+/** Never bind a core interface above either our code or the local libwayland metadata. */
+export function clampWaylandBindVersion(
+  offeredVersion: number,
+  supportedVersion: number,
+  runtimeInterfaceVersion: number,
+): number {
+  if (
+    !Number.isSafeInteger(offeredVersion) || offeredVersion < 1 ||
+    !Number.isSafeInteger(supportedVersion) || supportedVersion < 1 ||
+    !Number.isSafeInteger(runtimeInterfaceVersion) || runtimeInterfaceVersion < 1
+  ) return 0;
+  return Math.min(offeredVersion, supportedVersion, runtimeInterfaceVersion);
 }
 
 export function hasXdgToplevelState(statesPointer: Deno.PointerValue, state: number): boolean {

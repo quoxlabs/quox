@@ -5,6 +5,7 @@ import { buildXdgIfaces, libdlSymbols, waylandSymbols, WlCursorShape, WlOp, WlSe
 import {
   type AnyCallback,
   args,
+  clampWaylandBindVersion,
   collectCleanupError,
   createDefaultCursorPixels,
   DEFAULT_CURSOR_HEIGHT,
@@ -18,10 +19,12 @@ import {
   LIBXKBCOMMON_SO,
   makeVtable,
   NativeInitializationCleanup,
+  OUTPUT_EVENT_SIGNATURES,
   POINTER_EVENT_SIGNATURES,
   pointerCapabilityAction,
   POLLIN,
   POLLOUT,
+  readWaylandInterfaceVersion,
   REGISTRY_EVENT_SIGNATURES,
   RTLD_NOLOAD,
   RTLD_NOW,
@@ -46,6 +49,14 @@ import {
 } from "./global_registry.ts";
 import { WaylandPointerFrameAccumulator, WaylandPointerPosition } from "./pointer.ts";
 import { type WaylandDecorationManagerBinding, WaylandDecorationManagerState } from "./decoration.ts";
+import {
+  outputReleaseStrategy,
+  type WaylandOutputBinding,
+  type WaylandOutputGeneration,
+  WaylandOutputRegistry,
+  type WaylandOutputScaleSnapshot,
+  WaylandOutputScaleState,
+} from "./output.ts";
 
 const LIBC_SO = "libc.so.6";
 const LIBDL_SO = "libdl.so.2";
@@ -69,6 +80,15 @@ export function openRequiredWaylandDependency<Value>(
   } catch (cause) {
     throw new Error(WAYLAND_DEPENDENCY_ERRORS[dependency], { cause });
   }
+}
+
+interface NativeWaylandOutput {
+  readonly proxy: Deno.PointerObject;
+  readonly version: number;
+  readonly generation: WaylandOutputGeneration;
+  readonly scale: WaylandOutputScaleState;
+  readonly callbacks: readonly AnyCallback[];
+  readonly vtable: BigUint64Array<ArrayBuffer>;
 }
 
 // WaylandLibrary coordinates globals and the extracted native controllers.
@@ -138,6 +158,8 @@ class WaylandLibrary implements Library {
   #pointerVtable: BigUint64Array<ArrayBuffer> | undefined;
   readonly #textInputController!: WaylandTextInputController;
   readonly #globals!: WaylandGlobalRegistry<Deno.PointerObject>;
+  readonly #outputs!: WaylandOutputRegistry<NativeWaylandOutput>;
+  readonly #outputsByProxy = new Map<bigint, NativeWaylandOutput>();
   #xdgWmBaseListener: AnyCallback | null = null;
   #xdgWmBaseVtable: BigUint64Array<ArrayBuffer> | undefined;
   // Event queue filled by listener callbacks, drained by event()
@@ -256,6 +278,10 @@ class WaylandLibrary implements Library {
         (offer) => this.#bindGlobal(offer),
         (global) => this.#releaseGlobal(global),
       );
+      this.#outputs = new WaylandOutputRegistry(
+        (name, offeredVersion) => this.#bindOutput(name, offeredVersion),
+        (output) => this.#releaseOutput(output),
+      );
       cleanup.defer(() => this.#closeProtocolInitialization());
 
       // Set up pollfd for display fd
@@ -306,6 +332,10 @@ class WaylandLibrary implements Library {
         if (this.#registry !== registry) return;
         if (!ifacePtr || !reg) return;
         const iface = new Deno.UnsafePointerView(ifacePtr).getCString();
+        if (iface === "wl_output") {
+          this.#outputs.announce(name, version);
+          return;
+        }
         if (!isWaylandGlobalInterface(iface)) return;
         this.#globals.announce({ name, interface: iface, offeredVersion: version });
       }),
@@ -315,6 +345,7 @@ class WaylandLibrary implements Library {
       { parameters: ["pointer", "pointer", "u32"], result: "void" },
       this.guardCallback((_data, _registry, name) => {
         if (this.#registry !== registry) return;
+        this.#outputs.remove(name);
         this.#globals.remove(name);
       }),
     );
@@ -329,6 +360,110 @@ class WaylandLibrary implements Library {
     this.roundtripDisplay("registry initialization");
   }
 
+  #bindOutput(name: number, offeredVersion: number): NativeWaylandOutput | null {
+    const registry = this.#registry;
+    if (!registry || offeredVersion < 1) return null;
+    const version = clampWaylandBindVersion(
+      offeredVersion,
+      4,
+      readWaylandInterfaceVersion(this.ifaces.output),
+    );
+    if (version < 1) return null;
+    const ifaceName = cStr("wl_output");
+    const proxy = this.wl.symbols.wl_proxy_marshal_array_flags(
+      registry,
+      WlOp.REGISTRY_BIND,
+      this.ifaces.output,
+      version,
+      0,
+      args(
+        BigInt(name),
+        Deno.UnsafePointer.value(Deno.UnsafePointer.of(ifaceName)),
+        BigInt(version),
+        0n,
+      ),
+    );
+    if (!proxy) return null;
+
+    const generation = Symbol(`Wayland output ${name}`);
+    const scaleState = new WaylandOutputScaleState(generation, version);
+    const done = new Deno.UnsafeCallback(
+      { parameters: ["pointer", "pointer"], result: "void" },
+      this.guardCallback(() => {
+        const current = this.#outputs.get(name)?.binding;
+        if (current?.generation !== generation) return;
+        const scale = scaleState.done(generation);
+        if (scale === undefined) return;
+        for (const window of this.windows) window.updateOutputScale(generation, scale);
+      }),
+    );
+    const scale = new Deno.UnsafeCallback(
+      { parameters: ["pointer", "pointer", "i32"], result: "void" },
+      this.guardCallback((_data, _proxy, factor) => {
+        const current = this.#outputs.get(name)?.binding;
+        if (current?.generation !== generation) return;
+        scaleState.stage(generation, factor);
+      }),
+    );
+    const callbacks = [done, scale];
+    const vtable = makeVtable([null, null, done, scale], OUTPUT_EVENT_SIGNATURES, this.noops);
+    const output: NativeWaylandOutput = { proxy, version, generation, scale: scaleState, callbacks, vtable };
+    if (this.wl.symbols.wl_proxy_add_listener(proxy, Deno.UnsafePointer.of(vtable), null) !== 0) {
+      try {
+        this.#destroyOutputProxy(proxy, version);
+      } catch {
+        // The optional output remains inert without an installed listener.
+      }
+      for (const callback of callbacks) {
+        try {
+          callback.close();
+        } catch {
+          // Output scaling is optional, so callback cleanup failure degrades to scale 1.
+        }
+      }
+      return null;
+    }
+    this.#outputsByProxy.set(Deno.UnsafePointer.value(proxy), output);
+    return output;
+  }
+
+  #releaseOutput(output: WaylandOutputBinding<NativeWaylandOutput>): void {
+    const native = output.binding;
+    const key = Deno.UnsafePointer.value(native.proxy);
+    if (this.#outputsByProxy.get(key)?.generation === native.generation) this.#outputsByProxy.delete(key);
+    for (const window of this.windows) window.removeOutput(native.generation);
+
+    try {
+      this.#destroyOutputProxy(native.proxy, native.version);
+    } catch {
+      for (const callback of native.callbacks) this.retainNativeCallbackRoot(callback);
+      this.retainNativeResourceRoot(native);
+      return;
+    }
+    for (const callback of native.callbacks) {
+      try {
+        callback.close();
+      } catch {
+        // The proxy is gone, so callback cleanup failure cannot corrupt protocol state.
+      }
+    }
+  }
+
+  #destroyOutputProxy(proxy: Deno.PointerObject, version: number): void {
+    if (outputReleaseStrategy(version) === "release") {
+      this.wl.symbols.wl_proxy_marshal_array_flags(
+        proxy,
+        WlOp.OUTPUT_RELEASE,
+        null,
+        version,
+        WL_MARSHAL_FLAG_DESTROY,
+        args(),
+      );
+      return;
+    }
+    this.wl.symbols.wl_proxy_destroy(proxy);
+  }
+
   #bindGlobal(offer: WaylandGlobalOffer): Deno.PointerObject | null {
     const sym = this.wl.symbols;
     const registry = this.#registry;
@@ -339,7 +474,12 @@ class WaylandLibrary implements Library {
 
     if (offer.interface === "wl_compositor") {
       ifacePtr = this.ifaces.compositor;
-      version = Math.min(offer.offeredVersion, 4);
+      version = clampWaylandBindVersion(
+        offer.offeredVersion,
+        6,
+        readWaylandInterfaceVersion(ifacePtr),
+      );
+      if (version < 1) return null;
     } else if (offer.interface === "wl_shm") {
       ifacePtr = this.ifaces.shm;
       version = Math.min(offer.offeredVersion, 1);
@@ -1029,6 +1169,12 @@ class WaylandLibrary implements Library {
     return surface ? this.#windowsBySurface.get(Deno.UnsafePointer.value(surface)) ?? null : null;
   }
 
+  outputScale(output: Deno.PointerValue): WaylandOutputScaleSnapshot | undefined {
+    if (!output) return undefined;
+    const binding = this.#outputsByProxy.get(Deno.UnsafePointer.value(output));
+    return binding === undefined ? undefined : { generation: binding.generation, scale: binding.scale.scale };
+  }
+
   registerWindow(surface: Deno.PointerObject, window: WaylandWindow): void {
     this.#windowsBySurface.set(Deno.UnsafePointer.value(surface), window);
     this.windows.add(window);
@@ -1240,6 +1386,8 @@ class WaylandLibrary implements Library {
       });
     }
 
+    collectCleanupError(errors, () => this.#outputs.close());
+    this.#outputsByProxy.clear();
     collectCleanupError(errors, () => this.#globals.close());
     const registry = this.#registry;
     this.#registry = null;

@@ -20,7 +20,9 @@ import { emitWaylandTextInputEdits } from "./text_input_controller.ts";
 import type { WaylandWindow } from "./window.ts";
 import {
   BUFFER_EVENT_SIGNATURES,
+  clampWaylandBindVersion,
   createDefaultCursorPixels,
+  decodeWaylandInterfaceVersion,
   decodeWlArrayU32,
   DEFAULT_CURSOR_HEIGHT,
   DEFAULT_CURSOR_HOTSPOT_X,
@@ -30,6 +32,7 @@ import {
   KEYBOARD_EVENT_SIGNATURES,
   libcSymbols,
   NativeInitializationCleanup,
+  OUTPUT_EVENT_SIGNATURES,
   POINTER_EVENT_SIGNATURES,
   pointerCapabilityAction,
   POLLERR,
@@ -41,6 +44,7 @@ import {
   resolveVtableCallbacks,
   SEAT_EVENT_SIGNATURES,
   SHM_EVENT_SIGNATURES,
+  SURFACE_EVENT_SIGNATURES,
   TEXT_INPUT_V3_EVENT_SIGNATURES,
   waylandConnectionError,
   WaylandNoopCallbacks,
@@ -56,6 +60,7 @@ import {
   DEFAULT_WAYLAND_APP_ID,
   frameMatchesConfiguration,
   setDefaultWaylandAppIdBeforeInitialCommit,
+  tryDestroyWaylandSurfaceWithListeners,
   WaylandConfigureState,
 } from "./window.ts";
 import { isWaylandGlobalInterface, type WaylandGlobalInterface, WaylandGlobalRegistry } from "./global_registry.ts";
@@ -73,6 +78,15 @@ import {
   WaylandDecorationManagerState,
   WaylandDecorationMode,
 } from "./decoration.ts";
+import {
+  isValidWaylandScale,
+  outputReleaseStrategy,
+  planWaylandSurfaceFrame,
+  WaylandConfigureAckState,
+  WaylandOutputRegistry,
+  WaylandOutputScaleState,
+  WaylandSurfaceOutputScaleState,
+} from "./output.ts";
 import type { KeyModifiers } from "../types.ts";
 
 Deno.test("required Wayland dependency failures identify the support boundary", () => {
@@ -123,6 +137,37 @@ Deno.test("Wayland rejects native layouts its hand-packed bindings cannot repres
       "winding Wayland bindings require 64-bit little-endian Linux on x86-64 or AArch64",
     );
   }
+});
+
+Deno.test("Wayland core bind versions respect server, backend, and runtime metadata", () => {
+  const iface = new Uint8Array(40) as Uint8Array<ArrayBuffer>;
+  new DataView(iface.buffer).setInt32(8, 5, true);
+  const offsets: number[] = [];
+  const view = new DataView(iface.buffer);
+  assertEquals(
+    decodeWaylandInterfaceVersion((offset) => {
+      offsets.push(offset);
+      return view.getInt32(offset, true);
+    }),
+    5,
+  );
+  assertEquals(offsets, [8]);
+
+  assertEquals(clampWaylandBindVersion(9, 6, 5), 5);
+  assertEquals(clampWaylandBindVersion(4, 6, 5), 4);
+  assertEquals(clampWaylandBindVersion(9, 4, 5), 4);
+  for (const invalid of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assertEquals(clampWaylandBindVersion(invalid, 6, 6), 0);
+    assertEquals(clampWaylandBindVersion(6, invalid, 6), 0);
+    assertEquals(clampWaylandBindVersion(6, 6, invalid), 0);
+  }
+
+  const runtimeV5Surface = new WaylandSurfaceOutputScaleState(clampWaylandBindVersion(6, 6, 5));
+  runtimeV5Surface.enter(Symbol("output"), 3);
+  assertEquals(runtimeV5Surface.effectiveScale(), 3);
+  const runtimeV6Surface = new WaylandSurfaceOutputScaleState(clampWaylandBindVersion(6, 6, 6));
+  runtimeV6Surface.enter(Symbol("output"), 3);
+  assertEquals(runtimeV6Surface.effectiveScale(), 1);
 });
 
 Deno.test("xdg-decoration metadata is complete through protocol version 2", () => {
@@ -459,6 +504,8 @@ Deno.test("Wayland listener metadata preserves every protocol callback shape", (
     registry: REGISTRY_EVENT_SIGNATURES,
     shm: SHM_EVENT_SIGNATURES,
     buffer: BUFFER_EVENT_SIGNATURES,
+    output: OUTPUT_EVENT_SIGNATURES,
+    surface: SURFACE_EVENT_SIGNATURES,
     seat: SEAT_EVENT_SIGNATURES,
     pointer: POINTER_EVENT_SIGNATURES,
     keyboard: KEYBOARD_EVENT_SIGNATURES,
@@ -474,6 +521,20 @@ Deno.test("Wayland listener metadata preserves every protocol callback shape", (
     ],
     shm: [["pointer", "pointer", "u32"]],
     buffer: [["pointer", "pointer"]],
+    output: [
+      ["pointer", "pointer", "i32", "i32", "i32", "i32", "i32", "pointer", "pointer", "i32"],
+      ["pointer", "pointer", "u32", "i32", "i32", "i32"],
+      ["pointer", "pointer"],
+      ["pointer", "pointer", "i32"],
+      ["pointer", "pointer", "pointer"],
+      ["pointer", "pointer", "pointer"],
+    ],
+    surface: [
+      ["pointer", "pointer", "pointer"],
+      ["pointer", "pointer", "pointer"],
+      ["pointer", "pointer", "i32"],
+      ["pointer", "pointer", "u32"],
+    ],
     seat: [
       ["pointer", "pointer", "u32"],
       ["pointer", "pointer", "pointer"],
@@ -543,6 +604,8 @@ Deno.test("Wayland vtables fill only unused slots with their exact signature", (
       REGISTRY_EVENT_SIGNATURES,
       SHM_EVENT_SIGNATURES,
       BUFFER_EVENT_SIGNATURES,
+      OUTPUT_EVENT_SIGNATURES,
+      SURFACE_EVENT_SIGNATURES,
       SEAT_EVENT_SIGNATURES,
       KEYBOARD_EVENT_SIGNATURES,
       XDG_WM_BASE_EVENT_SIGNATURES,
@@ -603,6 +666,260 @@ Deno.test("Wayland surface damage uses only requests supported by the bound vers
   assertEquals(damageOpcodeForSurfaceVersion(3), WlOp.SURFACE_DAMAGE);
   assertEquals(damageOpcodeForSurfaceVersion(4), WlOp.SURFACE_DAMAGE_BUFFER);
   assertEquals(damageOpcodeForSurfaceVersion(6), WlOp.SURFACE_DAMAGE_BUFFER);
+});
+
+Deno.test("Wayland output globals are owned independently across removal and replacement", () => {
+  let nextBinding = 0;
+  const released: Array<{ name: number; offeredVersion: number; binding: number }> = [];
+  const outputs = new WaylandOutputRegistry(
+    (_name, offeredVersion) => offeredVersion < 1 ? null : ++nextBinding,
+    (output) => released.push(output),
+  );
+
+  const first = outputs.announce(10, 4)!;
+  const second = outputs.announce(20, 2)!;
+  assert(outputs.announce(10, 99) === first);
+  assertEquals(outputs.announce(30, 0), undefined);
+
+  outputs.remove(10);
+  outputs.remove(10);
+  const replacement = outputs.announce(10, 3)!;
+  assert(replacement.binding !== first.binding);
+  assert(outputs.get(10) === replacement);
+  assert(outputs.get(20) === second);
+
+  outputs.close();
+  assertEquals(released, [
+    first,
+    replacement,
+    second,
+  ]);
+});
+
+Deno.test("Wayland output scale changes are versioned, validated, and batched by done", () => {
+  const v1Generation = Symbol("v1 output");
+  const v1 = new WaylandOutputScaleState(v1Generation, 1);
+  assertEquals(v1.stage(v1Generation, 2), false);
+  assertEquals(v1.done(v1Generation), undefined);
+  assertEquals(v1.scale, 1);
+
+  const generation = Symbol("current output");
+  const staleGeneration = Symbol("removed output");
+  const output = new WaylandOutputScaleState(generation, 4);
+  assertEquals(output.stage(staleGeneration, 2), false);
+  assertEquals(output.stage(generation, 0), false);
+  assertEquals(output.stage(generation, 2), true);
+  assertEquals(output.scale, 1);
+  assertEquals(output.stage(generation, 3), true);
+  assertEquals(output.done(staleGeneration), undefined);
+  assertEquals(output.done(generation), 3);
+  assertEquals(output.scale, 3);
+  assertEquals(output.done(generation), undefined);
+  assertEquals(output.stage(generation, 3), true);
+  assertEquals(output.done(generation), undefined);
+
+  assertEquals(isValidWaylandScale(1), true);
+  assertEquals(isValidWaylandScale(0x7fff_ffff), true);
+  for (const invalid of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 0x8000_0000]) {
+    assertEquals(isValidWaylandScale(invalid), false);
+  }
+  assertEquals(outputReleaseStrategy(1), "proxy-destroy");
+  assertEquals(outputReleaseStrategy(2), "proxy-destroy");
+  assertEquals(outputReleaseStrategy(3), "release");
+  assertEquals(outputReleaseStrategy(4), "release");
+});
+
+Deno.test("Wayland surfaces select scales from their supported core protocol generation", () => {
+  const first = Symbol("first output");
+  const second = Symbol("second output");
+  const removed = Symbol("removed output");
+
+  const legacy = new WaylandSurfaceOutputScaleState(2);
+  assertEquals(legacy.enter(first, 3), true);
+  assertEquals(legacy.effectiveScale(), 1);
+  assertEquals(legacy.prefer(2), false);
+
+  const fallback = new WaylandSurfaceOutputScaleState(5);
+  assertEquals(fallback.enter(first, 2), true);
+  assertEquals(fallback.enter(first, 2), false);
+  assertEquals(fallback.enter(second, 3), true);
+  assertEquals(fallback.effectiveScale(), 3);
+  assertEquals(fallback.update(first, 4), true);
+  assertEquals(fallback.update(removed, 5), false);
+  assertEquals(fallback.effectiveScale(), 4);
+  assertEquals(fallback.effectiveScale((scale) => scale < 4), 3);
+  assertEquals(fallback.leave(second), true);
+  assertEquals(fallback.leave(second), false);
+  assertEquals(fallback.effectiveScale(), 4);
+  assertEquals(fallback.leave(first), true);
+  assertEquals(fallback.effectiveScale(), 1);
+
+  const preferred = new WaylandSurfaceOutputScaleState(6);
+  preferred.enter(first, 4);
+  assertEquals(preferred.effectiveScale(), 1);
+  assertEquals(preferred.prefer(2), true);
+  assertEquals(preferred.prefer(2), false);
+  assertEquals(preferred.prefer(0), false);
+  assertEquals(preferred.effectiveScale(), 2);
+  assertEquals(preferred.effectiveScale((scale) => scale !== 2), 1);
+});
+
+Deno.test("Wayland scale selection falls back before SHM dimensions overflow", () => {
+  const output = Symbol("large output");
+  const surface = new WaylandSurfaceOutputScaleState(5);
+  surface.enter(output, 2);
+
+  const canAllocate = (scale: number): boolean => {
+    try {
+      validateWaylandShmLayout(20_000 * scale, 20_000 * scale);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  assertEquals(canAllocate(1), true);
+  assertEquals(canAllocate(2), false);
+  assertEquals(surface.effectiveScale(canAllocate), 1);
+});
+
+Deno.test("Wayland integer scaling preserves logical size and invalidates stale frames", () => {
+  const state = new WaylandConfigureState(640, 480);
+  state.stageToplevel(800, 600, false);
+  const logical = state.complete(42).configuration;
+  const scaled = state.applyScale(logical, 2, true);
+
+  assertEquals(scaled, {
+    serial: 42,
+    width: 800,
+    height: 600,
+    framebufferWidth: 1600,
+    framebufferHeight: 1200,
+    devicePixelRatio: 2,
+    suspended: false,
+    frameToken: 2,
+  });
+  assert(state.applyScale(scaled, 2, true) === scaled);
+  assertEquals(frameMatchesConfiguration(scaled, 800, 600, 2), false);
+  assertEquals(frameMatchesConfiguration(scaled, 1600, 1200, 1), false);
+  assertEquals(frameMatchesConfiguration(scaled, 1600, 1200, 2), true);
+  assertEquals(frameMatchesConfiguration(scaled, 1600, 1200, undefined), true);
+
+  state.stageToplevel(900, 700, false);
+  assertEquals(state.complete(43).configuration.frameToken, 3);
+});
+
+Deno.test("Wayland configure serials are acknowledged once despite scale-only generations", () => {
+  const acknowledgements: number[] = [];
+  const state = new WaylandConfigureAckState();
+  assertEquals(state.ack(17, (serial) => acknowledgements.push(serial)), true);
+  assertEquals(state.ack(17, (serial) => acknowledgements.push(serial)), false);
+  assertEquals(state.ack(0x1_0000_0011, (serial) => acknowledgements.push(serial)), false);
+  assertEquals(acknowledgements, [17]);
+
+  assertThrowsMessage(
+    () =>
+      state.ack(18, () => {
+        throw new Error("native send failed");
+      }),
+    "native send failed",
+  );
+  assertEquals(state.ack(18, (serial) => acknowledgements.push(serial)), true);
+  assertEquals(acknowledgements, [17, 18]);
+});
+
+Deno.test("Wayland frame requests scale before attach and damage in supported coordinates", () => {
+  assertEquals(planWaylandSurfaceFrame(4, 2, 800, 600, 1600, 1200), [
+    { kind: "set-buffer-scale", scale: 2 },
+    { kind: "attach" },
+    { kind: "damage-buffer", width: 1600, height: 1200 },
+    { kind: "commit" },
+  ]);
+  assertEquals(planWaylandSurfaceFrame(3, 2, 800, 600, 1600, 1200), [
+    { kind: "set-buffer-scale", scale: 2 },
+    { kind: "attach" },
+    { kind: "damage-surface", width: 800, height: 600 },
+    { kind: "commit" },
+  ]);
+  assertEquals(planWaylandSurfaceFrame(2, 2, 800, 600, 800, 600), [
+    { kind: "attach" },
+    { kind: "damage-surface", width: 800, height: 600 },
+    { kind: "commit" },
+  ]);
+  assertEquals(planWaylandSurfaceFrame(6, 0, 800, 600, 800, 600), [
+    { kind: "set-buffer-scale", scale: 1 },
+    { kind: "attach" },
+    { kind: "damage-buffer", width: 800, height: 600 },
+    { kind: "commit" },
+  ]);
+  assertEquals(WlOp.SURFACE_SET_BUFFER_SCALE, 8);
+  assertEquals(WlOp.SURFACE_DAMAGE_BUFFER, 9);
+  assertEquals(WlOp.OUTPUT_RELEASE, 0);
+});
+
+Deno.test("failed Wayland surface destruction retains proxy listener ownership in order", () => {
+  const proxy = { name: "wl_surface" };
+  const vtable = { name: "surface listener vtable" };
+  const owner = { closed: true, proxy, vtable };
+  const callbacks = ["enter", "leave", "preferred-scale"];
+  const actions: string[] = [];
+  const retainedCallbacks: string[] = [];
+  const retainedOwners: typeof owner[] = [];
+  const destroyError = new Error("surface destroy failed");
+  const errors: unknown[] = [];
+
+  assertEquals(
+    tryDestroyWaylandSurfaceWithListeners(
+      proxy,
+      callbacks,
+      owner,
+      (candidate) => {
+        assert(candidate === owner.proxy);
+        actions.push("destroy");
+        throw destroyError;
+      },
+      (callback) => {
+        actions.push(`retain-callback:${callback}`);
+        retainedCallbacks.push(callback);
+      },
+      (candidate) => {
+        actions.push("retain-owner");
+        retainedOwners.push(candidate);
+      },
+      (error) => {
+        actions.push("report-error");
+        errors.push(error);
+      },
+    ),
+    false,
+  );
+  assertEquals(actions, [
+    "destroy",
+    "retain-callback:enter",
+    "retain-callback:leave",
+    "retain-callback:preferred-scale",
+    "retain-owner",
+    "report-error",
+  ]);
+  assertEquals(retainedCallbacks, callbacks);
+  assertEquals(retainedOwners, [owner]);
+  assert(retainedOwners[0].proxy === proxy);
+  assert(retainedOwners[0].vtable === vtable);
+  assertEquals(errors, [destroyError]);
+
+  const successActions: string[] = [];
+  assertEquals(
+    tryDestroyWaylandSurfaceWithListeners(
+      proxy,
+      callbacks,
+      owner,
+      () => successActions.push("destroy"),
+      () => successActions.push("retain-callback"),
+      () => successActions.push("retain-owner"),
+      () => successActions.push("report-error"),
+    ),
+    true,
+  );
+  assertEquals(successActions, ["destroy"]);
 });
 
 Deno.test("Wayland initial window frames are opaque black", () => {
@@ -1014,6 +1331,9 @@ Deno.test("Wayland configurations latch role state and serial as one generation"
       serial: 17,
       width: 800,
       height: 600,
+      framebufferWidth: 800,
+      framebufferHeight: 600,
+      devicePixelRatio: 1,
       suspended: false,
       frameToken: 1,
     },
@@ -1024,6 +1344,9 @@ Deno.test("Wayland configurations latch role state and serial as one generation"
       serial: 18,
       width: 1920,
       height: 1080,
+      framebufferWidth: 1920,
+      framebufferHeight: 1080,
+      devicePixelRatio: 1,
       suspended: true,
       frameToken: 2,
     },
@@ -1042,6 +1365,9 @@ Deno.test("zero configure dimensions retain each client-selected axis independen
     serial: 0,
     width: 1200,
     height: 480,
+    framebufferWidth: 1200,
+    framebufferHeight: 480,
+    devicePixelRatio: 1,
     suspended: false,
     frameToken: 1,
   });
@@ -1051,6 +1377,9 @@ Deno.test("zero configure dimensions retain each client-selected axis independen
     serial: 1,
     width: 1200,
     height: 900,
+    framebufferWidth: 1200,
+    framebufferHeight: 900,
+    devicePixelRatio: 1,
     suspended: false,
     frameToken: 2,
   });

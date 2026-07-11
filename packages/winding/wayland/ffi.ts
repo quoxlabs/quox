@@ -446,7 +446,10 @@ export const WlOp = {
   SURFACE_ATTACH: 1,
   SURFACE_DAMAGE: 2,
   SURFACE_COMMIT: 6,
+  SURFACE_SET_BUFFER_SCALE: 8,
   SURFACE_DAMAGE_BUFFER: 9,
+  // wl_output requests
+  OUTPUT_RELEASE: 0,
   // wl_seat requests
   SEAT_GET_POINTER: 0,
   SEAT_GET_KEYBOARD: 1,

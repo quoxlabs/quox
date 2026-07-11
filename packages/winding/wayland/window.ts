@@ -10,6 +10,7 @@ import {
   hasXdgToplevelState,
   makeVtable,
   type NativeCallbackHost,
+  SURFACE_EVENT_SIGNATURES,
   SUSPENDED_TOPLEVEL_STATE,
   throwCleanupErrors,
   WL_MARSHAL_FLAG_DESTROY,
@@ -17,7 +18,12 @@ import {
   XDG_TOPLEVEL_DECORATION_EVENT_SIGNATURES,
   XDG_TOPLEVEL_EVENT_SIGNATURES,
 } from "./protocol.ts";
-import { createOpaqueBlackFrame, WaylandShmBuffer, type WaylandShmHost } from "./shm_buffer.ts";
+import {
+  createOpaqueBlackFrame,
+  validateWaylandShmLayout,
+  WaylandShmBuffer,
+  type WaylandShmHost,
+} from "./shm_buffer.ts";
 import {
   setupServerSideDecorationBeforeInitialCommit,
   tryDestroyWaylandDecoration,
@@ -26,6 +32,13 @@ import {
   type WaylandDecorationManagerBinding,
   WaylandDecorationMode,
 } from "./decoration.ts";
+import {
+  planWaylandSurfaceFrame,
+  WaylandConfigureAckState,
+  type WaylandOutputGeneration,
+  type WaylandOutputScaleSnapshot,
+  WaylandSurfaceOutputScaleState,
+} from "./output.ts";
 
 export const DEFAULT_WAYLAND_APP_ID = "winding";
 
@@ -41,10 +54,34 @@ export function damageOpcodeForSurfaceVersion(version: number): number {
   return version >= 4 ? WlOp.SURFACE_DAMAGE_BUFFER : WlOp.SURFACE_DAMAGE;
 }
 
+/** Preserve listener ownership when a local wl_surface destroy cannot be confirmed. */
+export function tryDestroyWaylandSurfaceWithListeners<Proxy, Callback, Owner extends object>(
+  proxy: Proxy,
+  callbacks: readonly Callback[],
+  owner: Owner,
+  destroy: (proxy: Proxy) => void,
+  retainCallback: (callback: Callback) => void,
+  retainOwner: (owner: Owner) => void,
+  reportError: (error: unknown) => void,
+): boolean {
+  try {
+    destroy(proxy);
+    return true;
+  } catch (error) {
+    for (const callback of callbacks) retainCallback(callback);
+    retainOwner(owner);
+    reportError(error);
+    return false;
+  }
+}
+
 export interface WaylandConfiguration {
   readonly serial: number;
   readonly width: number;
   readonly height: number;
+  readonly framebufferWidth: number;
+  readonly framebufferHeight: number;
+  readonly devicePixelRatio: number;
   readonly suspended: boolean;
   readonly frameToken: number;
 }
@@ -66,8 +103,8 @@ export function frameMatchesConfiguration(
   height: number,
   frameToken: number | undefined,
 ): boolean {
-  return width === configuration.width &&
-    height === configuration.height &&
+  return width === configuration.framebufferWidth &&
+    height === configuration.framebufferHeight &&
     (frameToken === undefined || frameToken === configuration.frameToken);
 }
 
@@ -103,10 +140,35 @@ export class WaylandConfigureState {
         serial: serial >>> 0,
         width: this.#width,
         height: this.#height,
+        framebufferWidth: this.#width,
+        framebufferHeight: this.#height,
+        devicePixelRatio: 1,
         suspended: this.#suspended,
         frameToken: this.#nextFrameToken,
       },
       visibilityChanged: previousSuspended !== this.#suspended,
+    };
+  }
+
+  applyScale(
+    configuration: WaylandConfiguration,
+    scale: number,
+    advanceFrameToken: boolean,
+  ): WaylandConfiguration {
+    const framebufferWidth = configuration.width * scale;
+    const framebufferHeight = configuration.height * scale;
+    if (
+      configuration.devicePixelRatio === scale &&
+      configuration.framebufferWidth === framebufferWidth &&
+      configuration.framebufferHeight === framebufferHeight
+    ) return configuration;
+    if (advanceFrameToken) this.#nextFrameToken++;
+    return {
+      ...configuration,
+      framebufferWidth,
+      framebufferHeight,
+      devicePixelRatio: scale,
+      frameToken: advanceFrameToken ? this.#nextFrameToken : configuration.frameToken,
     };
   }
 }
@@ -131,6 +193,7 @@ export interface WaylandWindowHost extends NativeCallbackHost, WaylandShmHost {
   throwCallbackError(): void;
   roundtripDisplay(context: string): void;
   flushDisplay(context: string): void;
+  outputScale(output: Deno.PointerValue): WaylandOutputScaleSnapshot | undefined;
   retainNativeCallbackRoot(callback: AnyCallback): void;
   releaseNativeCallbackRoot(callback: AnyCallback): void;
   retainNativeResourceRoot(resource: object): void;
@@ -142,6 +205,10 @@ export class WaylandWindow implements Window {
   #xdgSurface: Deno.PointerObject | null = null;
   #xdgToplevel: Deno.PointerObject | null = null;
   #surfaceVtable: BigUint64Array<ArrayBuffer> | undefined;
+  #wlSurfaceVtable: BigUint64Array<ArrayBuffer> | undefined;
+  #surfaceEnter: AnyCallback | null = null;
+  #surfaceLeave: AnyCallback | null = null;
+  #surfacePreferredScale: AnyCallback | null = null;
   #toplevelVtable: BigUint64Array<ArrayBuffer> | undefined;
   #xdgSurfaceConfigure: AnyCallback | null = null;
   #toplevelConfigure: AnyCallback | null = null;
@@ -153,8 +220,9 @@ export class WaylandWindow implements Window {
   readonly #decorationLifecycle = new WaylandDecorationLifecycle();
   readonly #shmBuffer: WaylandShmBuffer;
   readonly #configureState: WaylandConfigureState;
+  #surfaceOutputScale: WaylandSurfaceOutputScaleState | undefined;
   #configuration: WaylandConfiguration | undefined;
-  #acknowledgedFrameToken: number | undefined;
+  readonly #configureAcks = new WaylandConfigureAckState();
   #registered = false;
   #closed = false;
   readonly imeActivation = new ImeActivationState();
@@ -177,6 +245,9 @@ export class WaylandWindow implements Window {
         args(0n),
       );
       if (!this.#surface) throw new Error("winding failed to create wl_surface");
+      this.#surfaceOutputScale = new WaylandSurfaceOutputScaleState(
+        symbols.wl_proxy_get_version(this.#surface),
+      );
 
       this.#xdgSurface = symbols.wl_proxy_marshal_array_flags(
         lib.xdgWmBase!,
@@ -229,9 +300,9 @@ export class WaylandWindow implements Window {
       if (!configuration) throw new Error("winding Wayland compositor did not send an initial configure");
       this.#abandonUnconfiguredInitialDecoration();
       this.#present(
-        createOpaqueBlackFrame(configuration.width, configuration.height),
-        configuration.width,
-        configuration.height,
+        createOpaqueBlackFrame(configuration.framebufferWidth, configuration.framebufferHeight),
+        configuration.framebufferWidth,
+        configuration.framebufferHeight,
         configuration,
       );
       return;
@@ -305,27 +376,107 @@ export class WaylandWindow implements Window {
     }
   }
 
+  updateOutputScale(generation: WaylandOutputGeneration, scale: number): void {
+    if (this.#closed) return;
+    if (!this.#surfaceOutputScale?.update(generation, scale)) return;
+    this.#reconcileOutputScale();
+  }
+
+  removeOutput(generation: WaylandOutputGeneration): void {
+    if (this.#closed) return;
+    if (!this.#surfaceOutputScale?.leave(generation)) return;
+    this.#reconcileOutputScale();
+  }
+
+  #reconcileOutputScale(): void {
+    const configuration = this.#configuration;
+    if (configuration === undefined) return;
+    const updated = this.#configurationWithCurrentScale(configuration, true);
+    if (updated === configuration) return;
+    this.#configuration = updated;
+    this.#emitResize(updated);
+  }
+
+  #configurationWithCurrentScale(
+    configuration: WaylandConfiguration,
+    advanceFrameToken: boolean,
+  ): WaylandConfiguration {
+    const scale = this.#surfaceOutputScale?.effectiveScale((candidate) => {
+      try {
+        validateWaylandShmLayout(configuration.width * candidate, configuration.height * candidate);
+        return true;
+      } catch {
+        return false;
+      }
+    }) ?? 1;
+    return this.#configureState.applyScale(configuration, scale, advanceFrameToken);
+  }
+
+  #emitResize(configuration: WaylandConfiguration): void {
+    this.lib.pushEvent({
+      type: "resize",
+      width: configuration.width,
+      height: configuration.height,
+      framebufferWidth: configuration.framebufferWidth,
+      framebufferHeight: configuration.framebufferHeight,
+      devicePixelRatio: configuration.devicePixelRatio,
+      frameToken: configuration.frameToken,
+      window: this,
+    });
+  }
+
   #setupListeners(): void {
     const symbols = this.lib.wl.symbols;
+    this.#surfaceEnter = new Deno.UnsafeCallback(
+      { parameters: ["pointer", "pointer", "pointer"], result: "void" },
+      this.lib.guardCallback((_data, _surface, output) => {
+        if (this.#closed) return;
+        const snapshot = this.lib.outputScale(output);
+        if (snapshot === undefined || !this.#surfaceOutputScale?.enter(snapshot.generation, snapshot.scale)) return;
+        this.#reconcileOutputScale();
+      }),
+    );
+    this.#surfaceLeave = new Deno.UnsafeCallback(
+      { parameters: ["pointer", "pointer", "pointer"], result: "void" },
+      this.lib.guardCallback((_data, _surface, output) => {
+        if (this.#closed) return;
+        const snapshot = this.lib.outputScale(output);
+        if (snapshot === undefined || !this.#surfaceOutputScale?.leave(snapshot.generation)) return;
+        this.#reconcileOutputScale();
+      }),
+    );
+    this.#surfacePreferredScale = new Deno.UnsafeCallback(
+      { parameters: ["pointer", "pointer", "i32"], result: "void" },
+      this.lib.guardCallback((_data, _surface, factor) => {
+        if (this.#closed) return;
+        if (!this.#surfaceOutputScale?.prefer(factor)) return;
+        this.#reconcileOutputScale();
+      }),
+    );
+    this.#wlSurfaceVtable = makeVtable(
+      [this.#surfaceEnter, this.#surfaceLeave, this.#surfacePreferredScale, null],
+      SURFACE_EVENT_SIGNATURES,
+      this.lib.noops,
+    );
+    if (
+      symbols.wl_proxy_add_listener(
+        this.#surface!,
+        Deno.UnsafePointer.of(this.#wlSurfaceVtable),
+        null,
+      ) !== 0
+    ) throw new Error("winding failed to listen to the Wayland core surface");
+
     this.#xdgSurfaceConfigure = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer", "u32"], result: "void" },
       this.lib.guardCallback((_data, _surface, serial) => {
         const completed = this.#configureState.complete(serial);
-        this.#configuration = completed.configuration;
-        this.lib.pushEvent({
-          type: "resize",
-          width: completed.configuration.width,
-          height: completed.configuration.height,
-          framebufferWidth: completed.configuration.width,
-          framebufferHeight: completed.configuration.height,
-          devicePixelRatio: 1,
-          frameToken: completed.configuration.frameToken,
-          window: this,
-        });
+        const configuration = this.#configurationWithCurrentScale(completed.configuration, false);
+        this.#configuration = configuration;
+        this.#emitResize(configuration);
         if (completed.visibilityChanged) {
           this.lib.pushEvent({
             type: "visibilitychange",
-            visible: !completed.configuration.suspended,
+            visible: !configuration.suspended,
             window: this,
           });
         }
@@ -370,17 +521,18 @@ export class WaylandWindow implements Window {
   }
 
   #ackConfiguration(configuration: WaylandConfiguration): void {
-    if (!this.#xdgSurface || this.#acknowledgedFrameToken === configuration.frameToken) return;
+    if (!this.#xdgSurface) return;
     const symbols = this.lib.wl.symbols;
-    symbols.wl_proxy_marshal_array_flags(
-      this.#xdgSurface,
-      WlOp.XDG_SURFACE_ACK_CONFIGURE,
-      null,
-      symbols.wl_proxy_get_version(this.#xdgSurface),
-      0,
-      args(BigInt(configuration.serial)),
-    );
-    this.#acknowledgedFrameToken = configuration.frameToken;
+    this.#configureAcks.ack(configuration.serial, (serial) => {
+      symbols.wl_proxy_marshal_array_flags(
+        this.#xdgSurface,
+        WlOp.XDG_SURFACE_ACK_CONFIGURE,
+        null,
+        symbols.wl_proxy_get_version(this.#xdgSurface),
+        0,
+        args(BigInt(serial)),
+      );
+    });
   }
 
   #setAppId(appId: string): void {
@@ -458,31 +610,60 @@ export class WaylandWindow implements Window {
     this.#ackConfiguration(configuration);
     const symbols = this.lib.wl.symbols;
     const version = symbols.wl_proxy_get_version(this.#surface);
-    symbols.wl_proxy_marshal_array_flags(
-      this.#surface,
-      WlOp.SURFACE_ATTACH,
-      null,
+    const requests = planWaylandSurfaceFrame(
       version,
-      0,
-      args(Deno.UnsafePointer.value(attachment.buffer), 0n, 0n),
+      configuration.devicePixelRatio,
+      configuration.width,
+      configuration.height,
+      configuration.framebufferWidth,
+      configuration.framebufferHeight,
     );
-    symbols.wl_proxy_marshal_array_flags(
-      this.#surface,
-      damageOpcodeForSurfaceVersion(version),
-      null,
-      version,
-      0,
-      args(0n, 0n, BigInt(attachment.layout.width), BigInt(attachment.layout.height)),
-    );
-    symbols.wl_proxy_marshal_array_flags(
-      this.#surface,
-      WlOp.SURFACE_COMMIT,
-      null,
-      version,
-      0,
-      args(),
-    );
-    this.#decorationLifecycle.markBufferCommit();
+    for (const request of requests) {
+      switch (request.kind) {
+        case "set-buffer-scale":
+          symbols.wl_proxy_marshal_array_flags(
+            this.#surface,
+            WlOp.SURFACE_SET_BUFFER_SCALE,
+            null,
+            version,
+            0,
+            args(BigInt(request.scale)),
+          );
+          break;
+        case "attach":
+          symbols.wl_proxy_marshal_array_flags(
+            this.#surface,
+            WlOp.SURFACE_ATTACH,
+            null,
+            version,
+            0,
+            args(Deno.UnsafePointer.value(attachment.buffer), 0n, 0n),
+          );
+          break;
+        case "damage-buffer":
+        case "damage-surface":
+          symbols.wl_proxy_marshal_array_flags(
+            this.#surface,
+            request.kind === "damage-buffer" ? WlOp.SURFACE_DAMAGE_BUFFER : WlOp.SURFACE_DAMAGE,
+            null,
+            version,
+            0,
+            args(0n, 0n, BigInt(request.width), BigInt(request.height)),
+          );
+          break;
+        case "commit":
+          symbols.wl_proxy_marshal_array_flags(
+            this.#surface,
+            WlOp.SURFACE_COMMIT,
+            null,
+            version,
+            0,
+            args(),
+          );
+          this.#decorationLifecycle.markBufferCommit();
+          break;
+      }
+    }
     this.lib.flushDisplay("presenting a window frame");
   }
 
@@ -577,18 +758,38 @@ export class WaylandWindow implements Window {
         );
       });
     }
-    this.#surface = null;
+    const surfaceCallbacks = [this.#surfaceEnter, this.#surfaceLeave, this.#surfacePreferredScale].filter(
+      (callback): callback is AnyCallback => callback !== null,
+    );
+    let surfaceDestroyed = surface === null;
     if (surface) {
-      collectCleanupError(errors, () => {
-        symbols.wl_proxy_marshal_array_flags(
-          surface,
-          WlOp.SURFACE_DESTROY,
-          null,
-          1,
-          WL_MARSHAL_FLAG_DESTROY,
-          args(),
-        );
-      });
+      surfaceDestroyed = tryDestroyWaylandSurfaceWithListeners(
+        surface,
+        surfaceCallbacks,
+        this,
+        (proxy) => {
+          symbols.wl_proxy_marshal_array_flags(
+            proxy,
+            WlOp.SURFACE_DESTROY,
+            null,
+            1,
+            WL_MARSHAL_FLAG_DESTROY,
+            args(),
+          );
+        },
+        (callback) => this.lib.retainNativeCallbackRoot(callback),
+        (owner) => this.lib.retainNativeResourceRoot(owner),
+        (error) => errors.push(error),
+      );
+      if (surfaceDestroyed) this.#surface = null;
+    }
+    if (surfaceDestroyed) {
+      for (const callback of surfaceCallbacks) collectCleanupError(errors, () => callback.close());
+      this.#surfaceEnter = null;
+      this.#surfaceLeave = null;
+      this.#surfacePreferredScale = null;
+      this.#wlSurfaceVtable = undefined;
+      this.#surfaceOutputScale = undefined;
     }
     for (const callback of [this.#xdgSurfaceConfigure, this.#toplevelConfigure, this.#toplevelClose]) {
       if (callback) collectCleanupError(errors, () => callback.close());
