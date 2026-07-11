@@ -18,8 +18,17 @@ fn attr_name(local_name: &str) -> QualName {
     QualName {
         prefix: None,
         ns: ns!(),
-        local: LocalName::from(local_name),
+        local: LocalName::from(local_name.to_ascii_lowercase()),
     }
+}
+
+fn attribute_value(document: &BaseDocument, node_id: usize, name: &str) -> Option<String> {
+    let name = attr_name(name);
+    document
+        .get_node(node_id)?
+        .element_data()?
+        .attr(name.local)
+        .map(str::to_owned)
 }
 
 fn invalid_node_handle(node_handle: u32) -> JsValue {
@@ -262,6 +271,15 @@ impl QuoxRenderer {
         })
     }
 
+    /// Return an element attribute, preserving the distinction between absent and empty values.
+    pub fn get_attribute(&self, node_handle: f64, name: &str) -> Result<Option<String>, JsValue> {
+        let node_handle =
+            uint32(node_handle, "nodeHandle").map_err(NumericArgumentError::into_js)?;
+        let mut state = self.state.borrow_mut();
+        let node_id = state.resolve_element(node_handle)?;
+        Ok(attribute_value(&state.document, node_id, name))
+    }
+
     /// Create an element node and return its opaque, non-reused public handle.
     pub fn create_element(&self, tag_name: &str) -> Result<u32, JsValue> {
         let mut state = self.state.borrow_mut();
@@ -408,7 +426,7 @@ impl QuoxRenderer {
 
 #[cfg(test)]
 mod tests {
-    use super::dropped_descendant_ids;
+    use super::{attr_name, attribute_value, dropped_descendant_ids};
     use crate::node_handles::NodeHandles;
     use blitz_dom::{DocumentConfig, NodeData};
     use blitz_html::{HtmlDocument, HtmlProvider};
@@ -501,5 +519,34 @@ mod tests {
 
         document.mutate().append_children(body_id, &[paragraph_id]);
         assert_eq!(handles.expose(paragraph_id), Ok(handle));
+    }
+
+    #[test]
+    fn html_attribute_names_are_case_insensitive_without_losing_empty_values() {
+        let mut document = HtmlDocument::from_html(
+            "<!doctype html><html><body><div data-empty=\"\"></div></body></html>",
+            DocumentConfig::default(),
+        )
+        .into_inner();
+        let div_id = element_by_tag(&document, "div");
+
+        assert_eq!(
+            attribute_value(&document, div_id, "DATA-EMPTY"),
+            Some(String::new())
+        );
+        assert_eq!(attribute_value(&document, div_id, "data-missing"), None);
+
+        document
+            .mutate()
+            .set_attribute(div_id, attr_name("DaTa-LaBeL"), "present");
+        assert_eq!(
+            attribute_value(&document, div_id, "data-label"),
+            Some("present".into())
+        );
+
+        document
+            .mutate()
+            .clear_attribute(div_id, attr_name("DATA-LABEL"));
+        assert_eq!(attribute_value(&document, div_id, "data-label"), None);
     }
 }

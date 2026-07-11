@@ -10,6 +10,10 @@ type InvalidatingNodeRenderer = {
   set_inner_html(nodeHandle: number, html: string): Uint32Array;
 };
 
+type AttributeRenderer = {
+  get_attribute(nodeHandle: number, name: string): string | undefined;
+};
+
 export class QuoxNode extends QuoxEventTarget {
   readonly ownerDocument: QuoxDocument;
   readonly #nodeId: number;
@@ -67,6 +71,15 @@ export class QuoxElement extends QuoxNode {
     const { renderer, requestRender } = documentInternals(this.ownerDocument);
     renderer.set_attribute(this.nodeId, name, value);
     requestRender();
+  }
+
+  getAttribute(name: string): string | null {
+    const { renderer } = documentInternals(this.ownerDocument);
+    return (renderer as unknown as AttributeRenderer).get_attribute(this.nodeId, name) ?? null;
+  }
+
+  hasAttribute(name: string): boolean {
+    return this.getAttribute(name) !== null;
   }
 
   removeAttribute(name: string): void {
