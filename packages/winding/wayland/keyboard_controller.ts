@@ -9,12 +9,13 @@ import {
   type AnyCallback,
   args,
   collectCleanupError,
+  KEYBOARD_EVENT_SIGNATURES,
   type LibcLibrary,
   makeVtable,
-  readEventCount,
   readWlArrayU32,
   throwCleanupErrors,
   type WaylandNativeLibrary,
+  type WaylandNoopCallbacks,
   WL_MARSHAL_FLAG_DESTROY,
 } from "./protocol.ts";
 import type { WaylandWindow } from "./window.ts";
@@ -25,7 +26,7 @@ export interface WaylandKeyboardHost {
   readonly xkb: Deno.DynamicLibrary<typeof xkbSymbols>;
   readonly libc: LibcLibrary;
   readonly keyboardIface: Deno.PointerObject;
-  readonly noop: AnyCallback;
+  readonly noops: WaylandNoopCallbacks;
   guardCallback<Arguments extends unknown[]>(
     callback: (...args: Arguments) => void,
   ): (...args: Arguments) => void;
@@ -248,8 +249,8 @@ export class WaylandKeyboardController {
     this.#listeners.push(repeatInfo);
     this.#vtable = makeVtable(
       this.#listeners,
-      readEventCount(Deno.UnsafePointer.value(this.host.keyboardIface)),
-      this.host.noop,
+      KEYBOARD_EVENT_SIGNATURES,
+      this.host.noops,
     );
     if (this.host.wl.symbols.wl_proxy_add_listener(keyboard, Deno.UnsafePointer.of(this.#vtable), null) !== 0) {
       throw new Error("winding failed to listen to the Wayland keyboard");

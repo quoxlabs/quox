@@ -3,8 +3,10 @@ import { WlOp, WlShmFormat } from "./ffi.ts";
 import {
   type AnyCallback,
   args,
+  BUFFER_EVENT_SIGNATURES,
   collectCleanupError,
   type LibcLibrary,
+  makeVtable,
   MAP_FAILED,
   MAP_SHARED,
   MFD_CLOEXEC,
@@ -12,6 +14,7 @@ import {
   PROT_WRITE,
   throwCleanupErrors,
   type WaylandNativeLibrary,
+  type WaylandNoopCallbacks,
   WL_MARSHAL_FLAG_DESTROY,
 } from "./protocol.ts";
 
@@ -23,6 +26,7 @@ export interface WaylandShmHost {
     readonly shmPool: Deno.PointerObject;
     readonly buffer: Deno.PointerObject;
   };
+  readonly noops: WaylandNoopCallbacks;
   requireArgb8888ShmFormat(): void;
 }
 
@@ -233,7 +237,7 @@ class WaylandShmBufferSlot {
           this.#busy = false;
         },
       );
-      const vtable = new BigUint64Array([Deno.UnsafePointer.value(release.pointer)]);
+      const vtable = makeVtable([release], BUFFER_EVENT_SIGNATURES, host.noops);
       if (symbols.wl_proxy_add_listener(buffer, Deno.UnsafePointer.of(vtable), null) !== 0) {
         release.close();
         throw new Error("winding failed to listen for Wayland SHM buffer release");

@@ -18,15 +18,20 @@ import {
   LIBXKBCOMMON_SO,
   makeVtable,
   NativeInitializationCleanup,
+  POINTER_EVENT_SIGNATURES,
   pointerCapabilityAction,
   POLLIN,
   POLLOUT,
-  readEventCount,
+  REGISTRY_EVENT_SIGNATURES,
   RTLD_NOLOAD,
   RTLD_NOW,
+  SEAT_EVENT_SIGNATURES,
+  SHM_EVENT_SIGNATURES,
   throwCleanupErrors,
   waylandConnectionError,
+  WaylandNoopCallbacks,
   WL_MARSHAL_FLAG_DESTROY,
+  XDG_WM_BASE_EVENT_SIGNATURES,
 } from "./protocol.ts";
 import { WaylandWindow } from "./window.ts";
 import { WaylandTextInputController } from "./text_input_controller.ts";
@@ -110,8 +115,7 @@ class WaylandLibrary implements Library {
   // Event queue filled by listener callbacks, drained by event()
   readonly #events = new EventQueue<UIEvent>();
   readonly #callbackErrors = new DeferredNativeError();
-  // Shared no-op callback for unused vtable slots
-  readonly noop!: Deno.UnsafeCallback;
+  readonly noops!: WaylandNoopCallbacks;
   // All listeners kept alive to prevent GC
   #listeners: AnyCallback[] = [];
   #vtables: BigUint64Array<ArrayBuffer>[] = [];
@@ -181,14 +185,14 @@ class WaylandLibrary implements Library {
       this.display = display;
       cleanup.defer(() => this.wl.symbols.wl_display_disconnect(display));
 
-      this.noop = new Deno.UnsafeCallback({ parameters: [], result: "void" }, () => {});
-      cleanup.defer(() => this.noop.close());
+      this.noops = new WaylandNoopCallbacks();
+      cleanup.defer(() => this.noops.close());
       this.#keyboardController = new WaylandKeyboardController({
         wl: this.wl,
         xkb: this.xkb,
         libc: this.libc,
         keyboardIface: this.ifaces.keyboard,
-        noop: this.noop,
+        noops: this.noops,
         guardCallback: (callback) => this.guardCallback(callback),
         pushEvent: (event) => this.pushEvent(event),
         windowForSurface: (surface) => this.#windowForSurface(surface),
@@ -198,7 +202,7 @@ class WaylandLibrary implements Library {
       this.#textInputController = new WaylandTextInputController({
         wl: this.wl,
         zwpTextInputIface: this.zwpTextInputIface,
-        noop: this.noop,
+        noops: this.noops,
         guardCallback: (callback) => this.guardCallback(callback),
         pushEvent: (event) => this.pushEvent(event),
         windowForSurface: (surface) => this.#windowForSurface(surface),
@@ -272,7 +276,7 @@ class WaylandLibrary implements Library {
     );
     this.#listeners.push(globalRemoveCb);
 
-    const regVtable = makeVtable([globalCb, globalRemoveCb], 2, this.noop);
+    const regVtable = makeVtable([globalCb, globalRemoveCb], REGISTRY_EVENT_SIGNATURES, this.noops);
     this.#vtables.push(regVtable);
     if (sym.wl_proxy_add_listener(registry, Deno.UnsafePointer.of(regVtable), null) !== 0) {
       throw new Error("winding failed to listen to the Wayland global registry");
@@ -449,7 +453,7 @@ class WaylandLibrary implements Library {
       }),
     );
     this.#shmFormatListener = listener;
-    const vtable = makeVtable([listener], 1, this.noop);
+    const vtable = makeVtable([listener], SHM_EVENT_SIGNATURES, this.noops);
     this.#shmFormatVtable = vtable;
     if (this.wl.symbols.wl_proxy_add_listener(proxy, Deno.UnsafePointer.of(vtable), null) !== 0) {
       throw new Error("winding failed to listen for Wayland shared-memory formats");
@@ -610,7 +614,7 @@ class WaylandLibrary implements Library {
           );
         }),
       );
-      const vtable = makeVtable([pingCb], 1, this.noop);
+      const vtable = makeVtable([pingCb], XDG_WM_BASE_EVENT_SIGNATURES, this.noops);
       if (sym.wl_proxy_add_listener(wmBase, Deno.UnsafePointer.of(vtable), null) !== 0) {
         throw new Error("winding failed to listen to the Wayland window factory");
       }
@@ -661,8 +665,8 @@ class WaylandLibrary implements Library {
       callbacks.push(nameCb);
       const seatVtable = makeVtable(
         callbacks,
-        readEventCount(Deno.UnsafePointer.value(this.ifaces.seat)),
-        this.noop,
+        SEAT_EVENT_SIGNATURES,
+        this.noops,
       );
       if (sym.wl_proxy_add_listener(seat, Deno.UnsafePointer.of(seatVtable), null) !== 0) {
         throw new Error("winding failed to listen to the selected Wayland seat");
@@ -831,11 +835,10 @@ class WaylandLibrary implements Library {
       }),
     );
     this.#pointerListeners.push(axisDiscreteCb);
-    const ptrEventCount = readEventCount(Deno.UnsafePointer.value(this.ifaces.pointer));
     const pointerVtable = makeVtable(
       this.#pointerListeners,
-      ptrEventCount,
-      this.noop,
+      POINTER_EVENT_SIGNATURES,
+      this.noops,
     );
     this.#pointerVtable = pointerVtable;
     if (sym.wl_proxy_add_listener(pointer, Deno.UnsafePointer.of(pointerVtable), null) !== 0) {
@@ -1189,7 +1192,7 @@ class WaylandLibrary implements Library {
     collectCleanupError(errors, () => this.#closeProtocolInitialization());
     collectCleanupError(errors, () => this.#textInputController.close());
     collectCleanupError(errors, () => this.#keyboardController.close());
-    collectCleanupError(errors, () => this.noop.close());
+    collectCleanupError(errors, () => this.noops.close());
     collectCleanupError(errors, () => this.xkb.close());
     collectCleanupError(errors, () => this.wl.symbols.wl_display_disconnect(this.display));
     collectCleanupError(errors, () => this.wl.close());

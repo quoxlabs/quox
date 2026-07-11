@@ -19,6 +19,7 @@ import { logicalKeyFromKeysym } from "../linux/mod.ts";
 import { emitWaylandTextInputEdits } from "./text_input_controller.ts";
 import type { WaylandWindow } from "./window.ts";
 import {
+  BUFFER_EVENT_SIGNATURES,
   createDefaultCursorPixels,
   decodeWlArrayU32,
   DEFAULT_CURSOR_HEIGHT,
@@ -26,15 +27,26 @@ import {
   DEFAULT_CURSOR_HOTSPOT_Y,
   DEFAULT_CURSOR_WIDTH,
   hasFatalPollEvent,
+  KEYBOARD_EVENT_SIGNATURES,
   libcSymbols,
   NativeInitializationCleanup,
+  POINTER_EVENT_SIGNATURES,
   pointerCapabilityAction,
   POLLERR,
   POLLHUP,
   POLLIN,
   POLLNVAL,
   readWlArrayU32,
+  REGISTRY_EVENT_SIGNATURES,
+  resolveVtableCallbacks,
+  SEAT_EVENT_SIGNATURES,
+  SHM_EVENT_SIGNATURES,
+  TEXT_INPUT_V3_EVENT_SIGNATURES,
   waylandConnectionError,
+  WaylandNoopCallbacks,
+  XDG_SURFACE_EVENT_SIGNATURES,
+  XDG_TOPLEVEL_EVENT_SIGNATURES,
+  XDG_WM_BASE_EVENT_SIGNATURES,
 } from "./protocol.ts";
 import { createOpaqueBlackFrame, validateWaylandShmFrame, validateWaylandShmLayout } from "./shm_buffer.ts";
 import { MISSING_ARGB8888_SHM_FORMAT, type WaylandShmFormatGeneration, WaylandShmFormatState } from "./shm_format.ts";
@@ -206,6 +218,126 @@ Deno.test("cursor-shape manager metadata includes the version-1 tablet request",
     { name: "get_tablet_tool_v2", signature: "no", objectTypes: ["cursorShapeDevice", "tabletToolV2"] },
   ]);
   assertEquals(WlOp.WP_CURSOR_SHAPE_MANAGER_GET_TABLET_TOOL_V2, 2);
+});
+
+Deno.test("Wayland listener metadata preserves every protocol callback shape", () => {
+  assertEquals({
+    registry: REGISTRY_EVENT_SIGNATURES,
+    shm: SHM_EVENT_SIGNATURES,
+    buffer: BUFFER_EVENT_SIGNATURES,
+    seat: SEAT_EVENT_SIGNATURES,
+    pointer: POINTER_EVENT_SIGNATURES,
+    keyboard: KEYBOARD_EVENT_SIGNATURES,
+    xdgWmBase: XDG_WM_BASE_EVENT_SIGNATURES,
+    xdgSurface: XDG_SURFACE_EVENT_SIGNATURES,
+    xdgToplevel: XDG_TOPLEVEL_EVENT_SIGNATURES,
+    textInputV3: TEXT_INPUT_V3_EVENT_SIGNATURES,
+  }, {
+    registry: [
+      ["pointer", "pointer", "u32", "pointer", "u32"],
+      ["pointer", "pointer", "u32"],
+    ],
+    shm: [["pointer", "pointer", "u32"]],
+    buffer: [["pointer", "pointer"]],
+    seat: [
+      ["pointer", "pointer", "u32"],
+      ["pointer", "pointer", "pointer"],
+    ],
+    pointer: [
+      ["pointer", "pointer", "u32", "pointer", "i32", "i32"],
+      ["pointer", "pointer", "u32", "pointer"],
+      ["pointer", "pointer", "u32", "i32", "i32"],
+      ["pointer", "pointer", "u32", "u32", "u32", "u32"],
+      ["pointer", "pointer", "u32", "u32", "i32"],
+      ["pointer", "pointer"],
+      ["pointer", "pointer", "u32"],
+      ["pointer", "pointer", "u32", "u32"],
+      ["pointer", "pointer", "u32", "i32"],
+      ["pointer", "pointer", "u32", "i32"],
+      ["pointer", "pointer", "u32", "u32"],
+    ],
+    keyboard: [
+      ["pointer", "pointer", "u32", "i32", "u32"],
+      ["pointer", "pointer", "u32", "pointer", "pointer"],
+      ["pointer", "pointer", "u32", "pointer"],
+      ["pointer", "pointer", "u32", "u32", "u32", "u32"],
+      ["pointer", "pointer", "u32", "u32", "u32", "u32", "u32"],
+      ["pointer", "pointer", "i32", "i32"],
+    ],
+    xdgWmBase: [["pointer", "pointer", "u32"]],
+    xdgSurface: [["pointer", "pointer", "u32"]],
+    xdgToplevel: [
+      ["pointer", "pointer", "i32", "i32", "pointer"],
+      ["pointer", "pointer"],
+      ["pointer", "pointer", "i32", "i32"],
+      ["pointer", "pointer", "pointer"],
+    ],
+    textInputV3: [
+      ["pointer", "pointer", "pointer"],
+      ["pointer", "pointer", "pointer"],
+      ["pointer", "pointer", "pointer", "i32", "i32"],
+      ["pointer", "pointer", "pointer"],
+      ["pointer", "pointer", "u32", "u32"],
+      ["pointer", "pointer", "u32"],
+    ],
+  });
+});
+
+Deno.test("Wayland vtables fill only unused slots with their exact signature", () => {
+  const provider = {
+    callback: (parameters: readonly string[]) => `noop:${parameters.join(",")}`,
+  };
+  const pointerHandlers = POINTER_EVENT_SIGNATURES.slice(0, 9).map((_signature, index) => `pointer:${index}`);
+  assertEquals(resolveVtableCallbacks(pointerHandlers, POINTER_EVENT_SIGNATURES, provider), [
+    ...pointerHandlers,
+    "noop:pointer,pointer,u32,i32",
+    "noop:pointer,pointer,u32,u32",
+  ]);
+
+  const toplevelHandlers = ["configure", "close"];
+  assertEquals(resolveVtableCallbacks(toplevelHandlers, XDG_TOPLEVEL_EVENT_SIGNATURES, provider), [
+    "configure",
+    "close",
+    "noop:pointer,pointer,i32,i32",
+    "noop:pointer,pointer,pointer",
+  ]);
+
+  for (
+    const signatures of [
+      REGISTRY_EVENT_SIGNATURES,
+      SHM_EVENT_SIGNATURES,
+      BUFFER_EVENT_SIGNATURES,
+      SEAT_EVENT_SIGNATURES,
+      KEYBOARD_EVENT_SIGNATURES,
+      XDG_WM_BASE_EVENT_SIGNATURES,
+      XDG_SURFACE_EVENT_SIGNATURES,
+      TEXT_INPUT_V3_EVENT_SIGNATURES,
+    ]
+  ) {
+    const handlers = signatures.map((_signature, index) => `handler:${index}`);
+    assertEquals(resolveVtableCallbacks(handlers, signatures, provider), handlers);
+  }
+});
+
+Deno.test("exact Wayland no-op callbacks share signatures and close in reverse", () => {
+  const created: string[] = [];
+  const closed: string[] = [];
+  const noops = new WaylandNoopCallbacks((parameters) => {
+    const signature = parameters.join(",");
+    created.push(signature);
+    return {
+      pointer: null as unknown as Deno.PointerObject,
+      close: () => closed.push(signature),
+    };
+  });
+
+  const first = noops.callback(["pointer", "pointer", "i32", "i32"]);
+  assert(first === noops.callback(["pointer", "pointer", "i32", "i32"]));
+  noops.callback(["pointer", "pointer", "pointer"]);
+  assertEquals(created, ["pointer,pointer,i32,i32", "pointer,pointer,pointer"]);
+  noops.close();
+  assertEquals(closed, ["pointer,pointer,pointer", "pointer,pointer,i32,i32"]);
+  assertThrowsMessage(() => noops.callback(["pointer", "pointer"]), "no-op callbacks are closed");
 });
 
 Deno.test("Wayland core cursor fallback has a visible in-bounds hotspot", () => {

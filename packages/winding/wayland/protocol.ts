@@ -37,6 +37,64 @@ export const DEFAULT_CURSOR_HOTSPOT_Y = 1;
 const MAX_WL_ARRAY_U32_ENTRIES = 4096;
 
 export type AnyCallback = { pointer: Deno.PointerObject; close(): void };
+export type WaylandCallbackParameter = "pointer" | "u32" | "i32";
+export type WaylandEventSignature = readonly WaylandCallbackParameter[];
+
+export const REGISTRY_EVENT_SIGNATURES = [
+  ["pointer", "pointer", "u32", "pointer", "u32"],
+  ["pointer", "pointer", "u32"],
+] as const satisfies readonly WaylandEventSignature[];
+export const SHM_EVENT_SIGNATURES = [
+  ["pointer", "pointer", "u32"],
+] as const satisfies readonly WaylandEventSignature[];
+export const BUFFER_EVENT_SIGNATURES = [
+  ["pointer", "pointer"],
+] as const satisfies readonly WaylandEventSignature[];
+export const SEAT_EVENT_SIGNATURES = [
+  ["pointer", "pointer", "u32"],
+  ["pointer", "pointer", "pointer"],
+] as const satisfies readonly WaylandEventSignature[];
+export const POINTER_EVENT_SIGNATURES = [
+  ["pointer", "pointer", "u32", "pointer", "i32", "i32"],
+  ["pointer", "pointer", "u32", "pointer"],
+  ["pointer", "pointer", "u32", "i32", "i32"],
+  ["pointer", "pointer", "u32", "u32", "u32", "u32"],
+  ["pointer", "pointer", "u32", "u32", "i32"],
+  ["pointer", "pointer"],
+  ["pointer", "pointer", "u32"],
+  ["pointer", "pointer", "u32", "u32"],
+  ["pointer", "pointer", "u32", "i32"],
+  ["pointer", "pointer", "u32", "i32"],
+  ["pointer", "pointer", "u32", "u32"],
+] as const satisfies readonly WaylandEventSignature[];
+export const KEYBOARD_EVENT_SIGNATURES = [
+  ["pointer", "pointer", "u32", "i32", "u32"],
+  ["pointer", "pointer", "u32", "pointer", "pointer"],
+  ["pointer", "pointer", "u32", "pointer"],
+  ["pointer", "pointer", "u32", "u32", "u32", "u32"],
+  ["pointer", "pointer", "u32", "u32", "u32", "u32", "u32"],
+  ["pointer", "pointer", "i32", "i32"],
+] as const satisfies readonly WaylandEventSignature[];
+export const XDG_WM_BASE_EVENT_SIGNATURES = [
+  ["pointer", "pointer", "u32"],
+] as const satisfies readonly WaylandEventSignature[];
+export const XDG_SURFACE_EVENT_SIGNATURES = [
+  ["pointer", "pointer", "u32"],
+] as const satisfies readonly WaylandEventSignature[];
+export const XDG_TOPLEVEL_EVENT_SIGNATURES = [
+  ["pointer", "pointer", "i32", "i32", "pointer"],
+  ["pointer", "pointer"],
+  ["pointer", "pointer", "i32", "i32"],
+  ["pointer", "pointer", "pointer"],
+] as const satisfies readonly WaylandEventSignature[];
+export const TEXT_INPUT_V3_EVENT_SIGNATURES = [
+  ["pointer", "pointer", "pointer"],
+  ["pointer", "pointer", "pointer"],
+  ["pointer", "pointer", "pointer", "i32", "i32"],
+  ["pointer", "pointer", "pointer"],
+  ["pointer", "pointer", "u32", "u32"],
+  ["pointer", "pointer", "u32"],
+] as const satisfies readonly WaylandEventSignature[];
 
 export function args(...values: bigint[]): BigUint64Array<ArrayBuffer> {
   return new BigUint64Array(values.length === 0 ? [0n] : values);
@@ -143,18 +201,64 @@ export function decodeWlArrayU32(
   return result;
 }
 
-export function makeVtable(
-  handlers: Array<AnyCallback | null>,
-  totalSlots: number,
-  noop: AnyCallback,
-): BigUint64Array<ArrayBuffer> {
-  const vtable = new BigUint64Array(Math.max(handlers.length, totalSlots));
-  const noopPointer = Deno.UnsafePointer.value(noop.pointer);
-  for (let index = 0; index < vtable.length; index++) {
-    const callback = index < handlers.length ? handlers[index] : null;
-    vtable[index] = callback ? Deno.UnsafePointer.value(callback.pointer) : noopPointer;
+export interface WaylandNoopProvider<Callback = AnyCallback> {
+  callback(parameters: WaylandEventSignature): Callback;
+}
+
+export function resolveVtableCallbacks<Callback>(
+  handlers: readonly (Callback | null)[],
+  signatures: readonly WaylandEventSignature[],
+  noops: WaylandNoopProvider<Callback>,
+): Callback[] {
+  if (handlers.length > signatures.length) {
+    throw new RangeError("winding Wayland listener has more handlers than protocol events");
   }
-  return vtable;
+  return signatures.map((signature, index) => handlers[index] ?? noops.callback(signature));
+}
+
+export class WaylandNoopCallbacks implements WaylandNoopProvider {
+  readonly #callbacks = new Map<string, AnyCallback>();
+  readonly #owned: AnyCallback[] = [];
+  #closed = false;
+
+  constructor(
+    readonly create: (parameters: WaylandEventSignature) => AnyCallback = (parameters) =>
+      new Deno.UnsafeCallback(
+        { parameters: [...parameters], result: "void" },
+        () => {},
+      ),
+  ) {}
+
+  callback(parameters: WaylandEventSignature): AnyCallback {
+    if (this.#closed) throw new Error("winding Wayland no-op callbacks are closed");
+    const key = parameters.join(",");
+    const existing = this.#callbacks.get(key);
+    if (existing) return existing;
+    const callback = this.create(parameters);
+    this.#callbacks.set(key, callback);
+    this.#owned.push(callback);
+    return callback;
+  }
+
+  close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#callbacks.clear();
+    const errors: unknown[] = [];
+    for (const callback of this.#owned.splice(0).reverse()) {
+      collectCleanupError(errors, () => callback.close());
+    }
+    throwCleanupErrors("winding failed to close exact Wayland no-op callbacks", errors);
+  }
+}
+
+export function makeVtable(
+  handlers: readonly (AnyCallback | null)[],
+  signatures: readonly WaylandEventSignature[],
+  noops: WaylandNoopProvider,
+): BigUint64Array<ArrayBuffer> {
+  const callbacks = resolveVtableCallbacks(handlers, signatures, noops);
+  return new BigUint64Array(callbacks.map((callback) => Deno.UnsafePointer.value(callback.pointer)));
 }
 
 export function collectCleanupError(errors: unknown[], action: () => void): void {
@@ -191,6 +295,7 @@ export function throwCleanupErrors(message: string, errors: unknown[]): void {
 /** Structural callback host shared by native resource controllers. */
 export interface NativeCallbackHost {
   readonly wl: WaylandNativeLibrary;
+  readonly noops: WaylandNoopCallbacks;
   guardCallback<Arguments extends unknown[]>(
     callback: (...args: Arguments) => void,
   ): (...args: Arguments) => void;

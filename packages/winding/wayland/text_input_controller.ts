@@ -15,9 +15,10 @@ import {
   collectCleanupError,
   makeVtable,
   nullableCString,
-  readEventCount,
+  TEXT_INPUT_V3_EVENT_SIGNATURES,
   throwCleanupErrors,
   type WaylandNativeLibrary,
+  type WaylandNoopCallbacks,
   WL_MARSHAL_FLAG_DESTROY,
 } from "./protocol.ts";
 import {
@@ -31,7 +32,7 @@ import type { WaylandWindow } from "./window.ts";
 export interface WaylandTextInputHost {
   readonly wl: WaylandNativeLibrary;
   readonly zwpTextInputIface: Deno.PointerObject;
-  readonly noop: AnyCallback;
+  readonly noops: WaylandNoopCallbacks;
   guardCallback<Arguments extends unknown[]>(
     callback: (...args: Arguments) => void,
   ): (...args: Arguments) => void;
@@ -331,8 +332,8 @@ export class WaylandTextInputController {
     this.#listeners.push(done);
     this.#vtable = makeVtable(
       [enter, leave, preedit, commit, deletion, done],
-      readEventCount(Deno.UnsafePointer.value(this.host.zwpTextInputIface)),
-      this.host.noop,
+      TEXT_INPUT_V3_EVENT_SIGNATURES,
+      this.host.noops,
     );
     if (this.host.wl.symbols.wl_proxy_add_listener(input, Deno.UnsafePointer.of(this.#vtable), null) !== 0) {
       throw new Error("winding failed to listen to Wayland text input");

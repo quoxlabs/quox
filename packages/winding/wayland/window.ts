@@ -13,6 +13,8 @@ import {
   SUSPENDED_TOPLEVEL_STATE,
   throwCleanupErrors,
   WL_MARSHAL_FLAG_DESTROY,
+  XDG_SURFACE_EVENT_SIGNATURES,
+  XDG_TOPLEVEL_EVENT_SIGNATURES,
 } from "./protocol.ts";
 import { createOpaqueBlackFrame, WaylandShmBuffer, type WaylandShmHost } from "./shm_buffer.ts";
 
@@ -100,7 +102,6 @@ export interface WaylandWindowHost extends NativeCallbackHost, WaylandShmHost {
     readonly shmPool: Deno.PointerObject;
     readonly buffer: Deno.PointerObject;
   };
-  readonly noop: AnyCallback;
   registerWindow(surface: Deno.PointerObject, window: WaylandWindow): void;
   unregisterWindow(surface: Deno.PointerObject, window: WaylandWindow): void;
   updateWindowImeState(window: WaylandWindow): void;
@@ -236,7 +237,11 @@ export class WaylandWindow implements Window {
         }
       }),
     );
-    this.#surfaceVtable = makeVtable([this.#xdgSurfaceConfigure], 1, this.lib.noop);
+    this.#surfaceVtable = makeVtable(
+      [this.#xdgSurfaceConfigure],
+      XDG_SURFACE_EVENT_SIGNATURES,
+      this.lib.noops,
+    );
     if (
       symbols.wl_proxy_add_listener(
         this.#xdgSurface!,
@@ -258,8 +263,8 @@ export class WaylandWindow implements Window {
     );
     this.#toplevelVtable = makeVtable(
       [this.#toplevelConfigure, this.#toplevelClose],
-      4,
-      this.lib.noop,
+      XDG_TOPLEVEL_EVENT_SIGNATURES,
+      this.lib.noops,
     );
     if (
       symbols.wl_proxy_add_listener(
