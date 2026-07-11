@@ -722,6 +722,7 @@ const x11FunctionDeclarations = {
 // wider audit catalogue above must not raise the runtime's minimum libX11
 // version merely because a new, unused function is absent.
 export const x11functions = {
+  XBlackPixelOfScreen: x11FunctionDeclarations.XBlackPixelOfScreen,
   XChangeProperty: x11FunctionDeclarations.XChangeProperty,
   XChangeWindowAttributes: x11FunctionDeclarations.XChangeWindowAttributes,
   XCloseDisplay: x11FunctionDeclarations.XCloseDisplay,
@@ -764,6 +765,7 @@ export const x11functions = {
   XPutImage: x11FunctionDeclarations.XPutImage,
   XRefreshKeyboardMapping: x11FunctionDeclarations.XRefreshKeyboardMapping,
   XRegisterIMInstantiateCallback: x11FunctionDeclarations.XRegisterIMInstantiateCallback,
+  XRootWindowOfScreen: x11FunctionDeclarations.XRootWindowOfScreen,
   XSelectInput: x11FunctionDeclarations.XSelectInput,
   XSendEvent: x11FunctionDeclarations.XSendEvent,
   XSetICFocus: x11FunctionDeclarations.XSetICFocus,
@@ -786,4 +788,5 @@ export const x11functions = {
   XkbQueryExtension: x11FunctionDeclarations.XkbQueryExtension,
   Xutf8LookupString: x11FunctionDeclarations.Xutf8LookupString,
   Xutf8ResetIC: x11FunctionDeclarations.Xutf8ResetIC,
+  XWhitePixelOfScreen: x11FunctionDeclarations.XWhitePixelOfScreen,
 } as const satisfies Deno.ForeignLibraryInterface;

@@ -80,10 +80,9 @@ class X11Window implements Window {
   #closed = false;
 
   constructor(readonly lib: X11Library, x = 0, y = 0, w = 800, h = 600) {
-    const view = new Deno.UnsafePointerView(lib.screen);
-    const parent = view.getBigUint64(16);
-    const white_pixel = view.getBigUint64(88);
-    const black_pixel = view.getBigUint64(96);
+    const parent = BigInt(lib.X11.symbols.XRootWindowOfScreen(lib.screen));
+    const white_pixel = BigInt(lib.X11.symbols.XWhitePixelOfScreen(lib.screen));
+    const black_pixel = BigInt(lib.X11.symbols.XBlackPixelOfScreen(lib.screen));
 
     const window = lib.X11.symbols.XCreateSimpleWindow(
       lib.display,
