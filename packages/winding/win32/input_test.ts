@@ -46,6 +46,7 @@ import {
 import {
   ATTR_TARGET_CONVERTED,
   ATTR_TARGET_NOTCONVERTED,
+  CS_INSERTCHAR,
   GCS_COMPATTR,
   GCS_COMPCLAUSE,
   GCS_COMPSTR,
@@ -617,6 +618,87 @@ Deno.test("Win32 input reports context release failure", () => {
   assertEquals(harness.controller.handleMessage(harness.window, WM.IME_STARTCOMPOSITION, 0n, 0n), 0n);
   assertThrows(() => harness.controller.setImeEnabled(harness.window, false), Error, "ImmReleaseContext failed");
   assertEquals(harness.calls.releases, 1);
+});
+
+Deno.test("Win32 composition restart clears stale session state without duplicate clears or splices", () => {
+  const compositionData = new Map<number, Uint8Array | number>([
+    [GCS_COMPSTR, utf16Le("old")],
+    [GCS_CURSORPOS, 3],
+  ]);
+  const harness = createInputControllerHarness({ compositionData });
+  startImeComposition(harness);
+  harness.controller.handleMessage(harness.window, WM.IME_COMPOSITION, 0n, GCS_COMPSTR | GCS_CURSORPOS);
+
+  harness.controller.handleMessage(harness.window, WM.IME_STARTCOMPOSITION, 0n, 0n);
+  harness.controller.handleMessage(harness.window, WM.IME_STARTCOMPOSITION, 0n, 0n);
+  harness.controller.handleMessage(harness.window, WM.IME_COMPOSITION, 0n, GCS_COMPSTR | GCS_CURSORPOS);
+  harness.controller.handleMessage(harness.window, WM.IME_STARTCOMPOSITION, 0n, 0n);
+  harness.controller.handleMessage(harness.window, WM.IME_COMPOSITION, "X".charCodeAt(0), CS_INSERTCHAR);
+
+  assertEquals(textImeEvents(harness.events), [
+    { kind: "preedit", text: "old", cursorRange: [3, 3] },
+    { kind: "preedit", text: "", cursorRange: null },
+    { kind: "preedit", text: "old", cursorRange: [3, 3] },
+    { kind: "preedit", text: "", cursorRange: null },
+    { kind: "preedit", text: "X", cursorRange: [1, 1] },
+  ]);
+});
+
+Deno.test("Win32 composition restart discards fallback commits and stale result-echo suppression", () => {
+  const fallback = createInputControllerHarness();
+  startImeComposition(fallback);
+  fallback.controller.handleMessage(fallback.window, WM.CHAR, "가".charCodeAt(0), 1n);
+  fallback.controller.handleMessage(fallback.window, WM.IME_STARTCOMPOSITION, 0n, 0n);
+  fallback.controller.handleMessage(fallback.window, WM.IME_ENDCOMPOSITION, 0n, 0n);
+  assertEquals(textImeEvents(fallback.events), [
+    { kind: "preedit", text: "가", cursorRange: [3, 3] },
+    { kind: "preedit", text: "", cursorRange: null },
+  ]);
+
+  const compositionData = new Map<number, Uint8Array | number>([
+    [GCS_RESULTSTR, utf16Le("가")],
+  ]);
+  const echo = createInputControllerHarness({ compositionData });
+  startImeComposition(echo);
+  echo.controller.handleMessage(echo.window, WM.IME_COMPOSITION, 0n, GCS_RESULTSTR);
+  echo.controller.handleMessage(echo.window, WM.IME_STARTCOMPOSITION, 0n, 0n);
+  echo.controller.handleMessage(echo.window, WM.CHAR, "가".charCodeAt(0), 1n);
+  assertEquals(textImeEvents(echo.events), [
+    { kind: "commit", text: "가" },
+    { kind: "preedit", text: "가", cursorRange: [3, 3] },
+  ]);
+});
+
+Deno.test("Win32 ignores direct and deferred composition traffic while blurred or natively inactive", () => {
+  const blurred = createInputControllerHarness();
+  blurred.controller.attach(blurred.window);
+  blurred.controller.setImeEnabled(blurred.window, true);
+  assertCompositionTrafficDelegated(blurred);
+
+  const inactive = createInputControllerHarness();
+  inactive.controller.attach(inactive.window);
+  inactive.controller.observeNativeFocus(inactive.window, true);
+  inactive.controller.setImeEnabled(inactive.window, true);
+  assertEquals(inactive.controller.handleMessage(inactive.window, WM.IME_SETCONTEXT, 0n, 0n), 0n);
+  const before = inactive.events.length;
+  assertCompositionTrafficDelegated(inactive);
+  assertEquals(inactive.events.length, before);
+
+  const delayed = createInputControllerHarness();
+  delayed.controller.attach(delayed.window);
+  delayed.controller.observeNativeFocus(delayed.window, true);
+  delayed.controller.setImeEnabled(delayed.window, true);
+  let replay: (() => void) | undefined;
+  assertEquals(
+    delayed.controller.deferImeMessage(delayed.window, WM.IME_STARTCOMPOSITION, 0n, 0n, (operation) => {
+      replay = operation;
+    }),
+    { result: 0n },
+  );
+  delayed.controller.observeNativeFocus(delayed.window, false);
+  const afterBlur = delayed.events.length;
+  replay?.();
+  assertEquals(delayed.events.length, afterBlur);
 });
 
 Deno.test({
@@ -1615,6 +1697,28 @@ function textImeEvents(events: readonly UIEvent[]): TextImeEvent[] {
     }
   }
   return result;
+}
+
+function assertCompositionTrafficDelegated(harness: ReturnType<typeof createInputControllerHarness>): void {
+  const before = harness.events.length;
+  const scheduled: Array<() => void> = [];
+  for (
+    const [message, wParam, lParam] of [
+      [WM.IME_STARTCOMPOSITION, 0n, 0n],
+      [WM.IME_COMPOSITION, BigInt("X".charCodeAt(0)), BigInt(CS_INSERTCHAR)],
+      [WM.IME_ENDCOMPOSITION, 0n, 0n],
+    ] as const
+  ) {
+    assertEquals(harness.controller.handleMessage(harness.window, message, wParam, lParam), undefined);
+    assertEquals(
+      harness.controller.deferImeMessage(harness.window, message, wParam, lParam, (operation) => {
+        scheduled.push(operation);
+      }),
+      undefined,
+    );
+  }
+  assertEquals(scheduled.length, 0);
+  assertEquals(harness.events.length, before);
 }
 
 function startImeComposition(harness: ReturnType<typeof createInputControllerHarness>): void {

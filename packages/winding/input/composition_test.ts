@@ -12,6 +12,24 @@ Deno.test("composition state exposes pre-transition activity and deduplicates pr
   assertEquals(state.cursorRange, null);
 });
 
+Deno.test("composition restart clears visible preedit once and resets session-local deduplication", () => {
+  const state = new CompositionState();
+  state.start();
+  assertEquals(state.restart(), undefined);
+  assertEquals(state.update("old", [3, 3]), { text: "old", cursorRange: [3, 3] });
+  assertEquals(state.restart(), { text: "", cursorRange: null });
+  assertEquals(state.active, true);
+  assertEquals(state.text, "");
+  assertEquals(state.cursorRange, null);
+  assertEquals(state.restart(), undefined);
+  assertEquals(state.update("old", [3, 3]), { text: "old", cursorRange: [3, 3] });
+
+  state.update("", null);
+  assertEquals(state.restart(), undefined);
+  assertEquals(state.restart(), undefined);
+  assertEquals(state.cancel(), undefined);
+});
+
 Deno.test("commit ends composition without a manufactured preedit clear", () => {
   const state = new CompositionState();
   state.update("日本", [3, 3]);

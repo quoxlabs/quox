@@ -43,6 +43,18 @@ export class CompositionState {
     this.#active = true;
   }
 
+  /** Begin a distinct native session and clear only a still-visible preedit. */
+  restart(): PreeditUpdate | undefined {
+    const hadPublishedPreedit = this.#hasEmittedPreedit;
+    const shouldClear = hadPublishedPreedit && this.#text.length > 0;
+    this.#reset();
+    this.#active = true;
+    // A returned clear (or an already-empty preedit) remains the canonical
+    // public state, so an immediate END/restart cannot emit it again.
+    this.#hasEmittedPreedit = hadPublishedPreedit;
+    return shouldClear ? { text: "", cursorRange: null } : undefined;
+  }
+
   /** Replace the complete public preedit and suppress identical updates. */
   update(text: string, cursorRange: ImeCursorRange | null): PreeditUpdate | undefined {
     this.#active = true;

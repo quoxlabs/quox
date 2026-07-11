@@ -307,7 +307,7 @@ export class Win32InputController {
       case WM.IME_STARTCOMPOSITION:
       case WM.IME_COMPOSITION:
       case WM.IME_ENDCOMPOSITION:
-        if (!state.activation.desired) return undefined;
+        if (!this.#acceptsNativeComposition(state)) return undefined;
         result = 0n;
         break;
       case WM.IME_SETCONTEXT:
@@ -403,50 +403,45 @@ export class Win32InputController {
         }
         return undefined;
       case WM.IME_STARTCOMPOSITION:
-        if (window !== undefined && state?.activation.desired) {
-          if (state.cancelingComposition) return 0n;
-          this.#flushCharDecoder(window, state);
-          this.#flushImeCharDecoder(window, state);
-          state.composition.start();
-          state.insertOnType.start();
-          this.#clearCompositionMetadata(state);
-          state.resultEcho.clear();
-          if (!state.activation.active) this.#setImeActive(window, state, true);
-          this.#applyImeCursorArea(window, state);
-          return 0n;
-        }
-        return undefined;
+        if (window === undefined || state === undefined || !this.#acceptsNativeComposition(state)) return undefined;
+        if (state.cancelingComposition) return 0n;
+        // START names a new native session. Drop incomplete character units
+        // instead of flushing stale data into the new session.
+        state.charDecoder.reset();
+        state.imeCharDecoder.reset();
+        this.#queuePreedit(window, state.composition.restart());
+        state.insertOnType.start();
+        this.#clearCompositionMetadata(state);
+        state.resultEcho.clear();
+        this.#applyImeCursorArea(window, state);
+        return 0n;
       case WM.IME_COMPOSITION:
-        if (state?.cancelingComposition) return 0n;
-        if (
-          window !== undefined && state?.activation.desired &&
-          this.#handleImeComposition(window, state, wParam, lParam)
-        ) return 0n;
-        return undefined;
-      case WM.IME_ENDCOMPOSITION:
-        if (window !== undefined && state?.activation.desired) {
-          if (state.cancelingComposition) {
-            state.charDecoder.reset();
-            state.imeCharDecoder.reset();
-            state.insertOnType.cancel();
-            this.#queuePreedit(window, state.composition.cancel());
-            this.#clearCompositionMetadata(state);
-            return 0n;
-          }
-          this.#flushCharDecoder(window, state);
-          this.#flushImeCharDecoder(window, state);
-          const compatibilityResult = state.insertOnType.finish();
-          if (compatibilityResult === undefined) {
-            this.#queuePreedit(window, state.composition.cancel());
-          } else {
-            // END does not say whether composition was accepted or canceled.
-            // Explicit cancellation paths discard this fallback beforehand.
-            this.#applyImeUpdate(window, state, { result: compatibilityResult });
-          }
+        if (window === undefined || state === undefined || !this.#acceptsNativeComposition(state)) return undefined;
+        if (state.cancelingComposition) return 0n;
+        return this.#handleImeComposition(window, state, wParam, lParam) ? 0n : undefined;
+      case WM.IME_ENDCOMPOSITION: {
+        if (window === undefined || state === undefined || !this.#acceptsNativeComposition(state)) return undefined;
+        if (state.cancelingComposition) {
+          state.charDecoder.reset();
+          state.imeCharDecoder.reset();
+          state.insertOnType.cancel();
+          this.#queuePreedit(window, state.composition.cancel());
           this.#clearCompositionMetadata(state);
           return 0n;
         }
-        return undefined;
+        this.#flushCharDecoder(window, state);
+        this.#flushImeCharDecoder(window, state);
+        const compatibilityResult = state.insertOnType.finish();
+        if (compatibilityResult === undefined) {
+          this.#queuePreedit(window, state.composition.cancel());
+        } else {
+          // END does not say whether composition was accepted or canceled.
+          // Explicit cancellation paths discard this fallback beforehand.
+          this.#applyImeUpdate(window, state, { result: compatibilityResult });
+        }
+        this.#clearCompositionMetadata(state);
+        return 0n;
+      }
       case WM.IME_CHAR:
         if (window !== undefined && state !== undefined) {
           this.#handleImeChar(window, state, wParam, lParam);
@@ -1008,6 +1003,12 @@ export class Win32InputController {
   #setImeActive(window: Win32InputWindow, state: WindowInputState, active: boolean): void {
     const transition = state.activation.markActive(active);
     if (transition !== undefined) this.#enqueue(createImeActivationEvent(window, transition));
+  }
+
+  /** START is not activation proof; delayed composition traffic must delegate. */
+  #acceptsNativeComposition(state: WindowInputState): boolean {
+    return state.activation.desired && state.activation.focused && state.activation.active &&
+      state.association.associated;
   }
 
   #reconcileIme(window: Win32InputWindow, state: WindowInputState): void {
