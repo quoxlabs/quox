@@ -21,10 +21,26 @@ import { ELEMENT_NODE, QuoxNodeCache, TEXT_NODE } from "./node_cache.ts";
 import type { QuoxElement, QuoxNode, QuoxText } from "./node.ts";
 import {
   type DomDispatchEventStep,
+  type DomDispatchFocusPayload,
   DomDispatchInitialStepError,
+  type DomDispatchInputPayload,
+  type DomDispatchKeyboardPayload,
+  type DomDispatchMousePayload,
+  type DomDispatchPointerPayload,
   DomDispatchRendererPort,
   type DomDispatchStep,
+  type DomDispatchWheelPayload,
 } from "./renderer_port.ts";
+import {
+  createTrustedMouseEventInit,
+  QuoxDOMInputEvent,
+  QuoxDOMKeyboardEvent,
+  QuoxFocusEvent,
+  QuoxMouseEvent,
+  type QuoxMouseEventInit,
+  QuoxPointerEvent,
+  QuoxWheelEvent,
+} from "./ui_event.ts";
 
 type SetNativeTitle = (title: string) => void;
 type SyncNativeImeRequests = () => void;
@@ -184,7 +200,7 @@ export class QuoxDocument extends QuoxEventTarget {
     buttons = assertKnownMask(buttons, POINTER_BUTTONS_MASK, "buttons");
     modifierBits = assertKnownMask(modifierBits, POINTER_MODIFIER_MASK, "modifierBits");
     timeStamp = assertEventTimeStamp(timeStamp);
-    detail = assertUint32(detail, "detail");
+    detail = assertIntegerRange(detail, 0, 0x7fff_ffff, "detail");
     this.#dispatchInputEvent(() =>
       this.#dispatchPort.beginPointerDown(x, y, button, buttons, modifierBits, timeStamp, detail)
     );
@@ -207,7 +223,7 @@ export class QuoxDocument extends QuoxEventTarget {
     buttons = assertKnownMask(buttons, POINTER_BUTTONS_MASK, "buttons");
     modifierBits = assertKnownMask(modifierBits, POINTER_MODIFIER_MASK, "modifierBits");
     timeStamp = assertEventTimeStamp(timeStamp);
-    detail = assertUint32(detail, "detail");
+    detail = assertIntegerRange(detail, 0, 0x7fff_ffff, "detail");
     this.#dispatchInputEvent(() =>
       this.#dispatchPort.beginPointerUp(x, y, button, buttons, modifierBits, timeStamp, detail)
     );
@@ -408,11 +424,7 @@ export class QuoxDocument extends QuoxEventTarget {
     if (this.#defaultView !== null) path.push(this.#defaultView);
 
     const target = path[0];
-    const event = new QuoxEvent(step.type, {
-      bubbles: step.bubbles,
-      cancelable: step.cancelable,
-      composed: step.composed,
-    });
+    const event = this.#createTrustedEvent(step);
     const dispatch = event[eventDispatchInternals];
     dispatch.begin(target, path, true, step.timeStamp);
     try {
@@ -432,6 +444,154 @@ export class QuoxDocument extends QuoxEventTarget {
     } finally {
       dispatch.end();
     }
+  }
+
+  #createTrustedEvent(step: DomDispatchEventStep): QuoxEvent {
+    const eventInit = {
+      bubbles: step.bubbles,
+      cancelable: step.cancelable,
+      composed: step.composed,
+    };
+
+    switch (step.type) {
+      case "pointermove":
+      case "pointerdown":
+      case "pointerup":
+      case "pointerenter":
+      case "pointerleave":
+      case "pointerover":
+      case "pointerout":
+      case "click":
+      case "contextmenu": {
+        const payload = step.payload as DomDispatchPointerPayload;
+        return new QuoxPointerEvent(
+          step.type,
+          this.#trustedMouseInit(step, payload, {
+            pointerId: payload.pointerId,
+            pointerType: payload.pointerType,
+            isPrimary: payload.isPrimary,
+            width: payload.width,
+            height: payload.height,
+            pressure: payload.pressure,
+            tangentialPressure: payload.tangentialPressure,
+            tiltX: payload.tiltX,
+            tiltY: payload.tiltY,
+            twist: payload.twist,
+            altitudeAngle: payload.altitudeAngle,
+            azimuthAngle: payload.azimuthAngle,
+            persistentDeviceId: payload.persistentDeviceId,
+          }),
+        );
+      }
+      case "mousemove":
+      case "mousedown":
+      case "mouseup":
+      case "mouseenter":
+      case "mouseleave":
+      case "mouseover":
+      case "mouseout":
+      case "dblclick":
+        return new QuoxMouseEvent(
+          step.type,
+          this.#trustedMouseInit(step, step.payload as DomDispatchMousePayload),
+        );
+      case "wheel": {
+        const payload = step.payload as DomDispatchWheelPayload;
+        return new QuoxWheelEvent(
+          step.type,
+          this.#trustedMouseInit(step, payload, {
+            deltaX: payload.deltaX,
+            deltaY: payload.deltaY,
+            deltaZ: payload.deltaZ,
+            deltaMode: payload.deltaMode,
+          }),
+        );
+      }
+      case "keypress":
+      case "keydown":
+      case "keyup": {
+        const payload = step.payload as DomDispatchKeyboardPayload;
+        return new QuoxDOMKeyboardEvent(step.type, {
+          ...eventInit,
+          view: this.#defaultView,
+          key: payload.key,
+          code: payload.code,
+          location: payload.location,
+          repeat: payload.repeat,
+          isComposing: payload.isComposing,
+          keyCode: payload.keyCode,
+          shiftKey: payload.shiftKey,
+          ctrlKey: payload.ctrlKey,
+          altKey: payload.altKey,
+          metaKey: payload.metaKey,
+          modifierCapsLock: payload.capsLock,
+          modifierAltGraph: payload.altGraphKey,
+        });
+      }
+      case "input": {
+        const payload = step.payload as DomDispatchInputPayload;
+        return new QuoxDOMInputEvent(step.type, {
+          ...eventInit,
+          view: this.#defaultView,
+          data: payload.data,
+          inputType: payload.inputType,
+          isComposing: payload.isComposing,
+        });
+      }
+      case "focus":
+      case "blur":
+      case "focusin":
+      case "focusout": {
+        const payload = step.payload as DomDispatchFocusPayload;
+        return new QuoxFocusEvent(step.type, {
+          ...eventInit,
+          view: this.#defaultView,
+          relatedTarget: this.#relatedTarget(payload.relatedTarget),
+        });
+      }
+      case "scroll":
+        return new QuoxEvent(step.type, eventInit);
+      default:
+        return assertNever(step.type);
+    }
+  }
+
+  #trustedMouseInit<Extra extends object = Record<never, never>>(
+    step: DomDispatchEventStep,
+    payload: DomDispatchMousePayload,
+    extra?: Extra,
+  ): QuoxMouseEventInit & Extra {
+    return createTrustedMouseEventInit(
+      {
+        bubbles: step.bubbles,
+        cancelable: step.cancelable,
+        composed: step.composed,
+        view: this.#defaultView,
+        screenX: payload.screenX,
+        screenY: payload.screenY,
+        clientX: payload.clientX,
+        clientY: payload.clientY,
+        button: payload.button,
+        buttons: payload.buttons,
+        detail: payload.detail,
+        shiftKey: payload.shiftKey,
+        ctrlKey: payload.ctrlKey,
+        altKey: payload.altKey,
+        metaKey: payload.metaKey,
+        relatedTarget: this.#relatedTarget(payload.relatedTarget),
+        ...extra,
+      },
+      {
+        pageX: payload.pageX,
+        pageY: payload.pageY,
+        offsetX: payload.offsetX,
+        offsetY: payload.offsetY,
+      },
+    ) as QuoxMouseEventInit & Extra;
+  }
+
+  #relatedTarget(nodeHandle: number | null): QuoxEventTarget | null {
+    return nodeHandle === null ? null : this.#nodeForHandle(nodeHandle);
   }
 
   #resumePreventedThenAbort(step: DomDispatchEventStep, primaryError: unknown): never {

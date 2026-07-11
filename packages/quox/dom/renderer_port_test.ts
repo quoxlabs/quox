@@ -1,26 +1,144 @@
-import { assert, assertEquals, assertStrictEquals, assertThrows } from "@std/assert";
+import { assert, assertEquals, assertThrows } from "@std/assert";
 import {
   DOM_DISPATCH_EVENT_TYPES,
+  type DomDispatchEventType,
   DomDispatchInitialStepError,
   DomDispatchRendererPort,
   type DomDispatchRendererSource,
   validateDomDispatchStep,
 } from "./renderer_port.ts";
 
-function eventStep(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+function mousePayload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
+    clientX: 11.25,
+    clientY: -2.5,
+    pageX: 14.75,
+    pageY: 4,
+    screenX: 0,
+    screenY: 0,
+    offsetX: 1.5,
+    offsetY: 2.25,
+    button: 0,
+    buttons: 1,
+    detail: 2,
+    shiftKey: true,
+    ctrlKey: false,
+    altKey: true,
+    metaKey: false,
+    relatedTarget: null,
+    ...overrides,
+  };
+}
+
+function pointerPayload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    ...mousePayload(),
+    pointerId: 1,
+    pointerType: "mouse",
+    isPrimary: true,
+    width: 1,
+    height: 1,
+    pressure: 0.5,
+    tangentialPressure: 0,
+    tiltX: 0,
+    tiltY: 0,
+    twist: 0,
+    altitudeAngle: Math.PI / 2,
+    azimuthAngle: 0,
+    persistentDeviceId: 0,
+    ...overrides,
+  };
+}
+
+function wheelPayload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    ...mousePayload({ button: 0, detail: 0 }),
+    deltaX: 1.25,
+    deltaY: -2.5,
+    deltaZ: 0.125,
+    deltaMode: 1,
+    ...overrides,
+  };
+}
+
+function keyboardPayload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    key: "A",
+    code: "KeyA",
+    location: 2,
+    repeat: true,
+    isComposing: false,
+    keyCode: 65,
+    shiftKey: true,
+    ctrlKey: false,
+    altKey: false,
+    metaKey: true,
+    capsLock: true,
+    altGraphKey: false,
+    ...overrides,
+  };
+}
+
+function payloadForType(type: DomDispatchEventType): Record<string, unknown> | undefined {
+  switch (type) {
+    case "pointermove":
+    case "pointerdown":
+    case "pointerup":
+    case "pointerenter":
+    case "pointerleave":
+    case "pointerover":
+    case "pointerout":
+    case "click":
+    case "contextmenu":
+      return pointerPayload();
+    case "mousemove":
+    case "mousedown":
+    case "mouseup":
+    case "mouseenter":
+    case "mouseleave":
+    case "mouseover":
+    case "mouseout":
+    case "dblclick":
+      return mousePayload();
+    case "wheel":
+      return wheelPayload();
+    case "keypress":
+    case "keydown":
+    case "keyup":
+      return keyboardPayload();
+    case "input":
+      return { data: null, inputType: "", isComposing: false };
+    case "focus":
+    case "blur":
+    case "focusin":
+    case "focusout":
+      return { relatedTarget: null };
+    case "scroll":
+      return undefined;
+  }
+}
+
+function eventStep(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  const requestedType = overrides.type ?? "click";
+  const type = (typeof requestedType === "string" &&
+      DOM_DISPATCH_EVENT_TYPES.includes(requestedType as DomDispatchEventType))
+    ? requestedType as DomDispatchEventType
+    : "click";
+  const step: Record<string, unknown> = {
     kind: "event",
     frameId: 1,
     eventId: 2,
-    type: "click",
+    type,
     target: 7,
     path: [7, 4, 1],
     bubbles: true,
     cancelable: true,
     composed: true,
     timeStamp: 12.5,
-    ...overrides,
   };
+  const payload = payloadForType(type);
+  if (payload !== undefined) step.payload = payload;
+  return { ...step, ...overrides };
 }
 
 function completeStep(frameId = 1, redrawRequested = false): Record<string, unknown> {
@@ -29,10 +147,10 @@ function completeStep(frameId = 1, redrawRequested = false): Record<string, unkn
 
 Deno.test("DOM dispatch validator freezes a copied target-first event step", () => {
   const rawPath = [7, 4, 1];
-  const payload = { future: "event fields" };
+  const payload = pointerPayload();
   const step = validateDomDispatchStep(eventStep({ path: rawPath, payload }));
 
-  assertEquals(step, {
+  assertEquals(step as unknown, {
     kind: "event",
     frameId: 1,
     eventId: 2,
@@ -48,9 +166,12 @@ Deno.test("DOM dispatch validator freezes a copied target-first event step", () 
   assert(step.kind === "event");
   assert(Object.isFrozen(step));
   assert(Object.isFrozen(step.path));
-  assertStrictEquals(step.payload, payload);
+  assert(Object.isFrozen(step.payload));
+  assert(!Object.is(step.payload, payload));
   rawPath[0] = 99;
+  payload.clientX = 99;
   assertEquals(step.path, [7, 4, 1]);
+  assertEquals((step.payload as { clientX: number }).clientX, 11.25);
 });
 
 Deno.test("DOM dispatch validator normalizes Uint32Array paths and accepts every engine event type", () => {
@@ -68,6 +189,21 @@ Deno.test("DOM dispatch validator accepts and freezes complete steps", () => {
   const step = validateDomDispatchStep(completeStep(9, true));
   assertEquals(step, { kind: "complete", frameId: 9, redrawRequested: true });
   assert(Object.isFrozen(step));
+});
+
+Deno.test("DOM dispatch validator requires exact top-level step records", () => {
+  const eventWithExtra = eventStep({ future: true });
+  const completeWithExtra = completeStep();
+  completeWithExtra.future = true;
+  const eventWithSymbol = eventStep();
+  const completeWithSymbol = completeStep();
+  const extra = Symbol("extra");
+  Object.defineProperty(eventWithSymbol, extra, { value: true });
+  Object.defineProperty(completeWithSymbol, extra, { value: true });
+
+  for (const value of [eventWithExtra, completeWithExtra, eventWithSymbol, completeWithSymbol]) {
+    assertThrows(() => validateDomDispatchStep(value), TypeError);
+  }
 });
 
 Deno.test("DOM dispatch validator rejects malformed IDs, metadata, and paths", () => {
@@ -105,6 +241,106 @@ Deno.test("DOM dispatch validator rejects malformed IDs, metadata, and paths", (
   assertThrows(() => validateDomDispatchStep(eventStep({ path: sparsePath })), TypeError);
 });
 
+Deno.test("DOM dispatch validator requires the exact payload family and rejects payloads on scroll", () => {
+  const missingPayload = eventStep();
+  delete missingPayload.payload;
+
+  const extraPointerField = pointerPayload();
+  extraPointerField.movementX = 1;
+
+  const invalidValues = [
+    missingPayload,
+    eventStep({ type: "click", payload: mousePayload() }),
+    eventStep({ type: "dblclick", payload: pointerPayload() }),
+    eventStep({ type: "wheel", payload: mousePayload() }),
+    eventStep({ type: "keydown", payload: { ...keyboardPayload(), data: null } }),
+    eventStep({ type: "input", payload: { data: null, inputType: "" } }),
+    eventStep({ type: "focus", payload: { relatedTarget: null, detail: 0 } }),
+    eventStep({ type: "scroll", payload: undefined }),
+    eventStep({ type: "scroll", payload: {} }),
+    eventStep({ type: "click", payload: extraPointerField }),
+  ];
+
+  for (const value of invalidValues) {
+    assertThrows(() => validateDomDispatchStep(value), TypeError);
+  }
+});
+
+Deno.test("DOM dispatch validator enforces payload types, finite values, ranges, and handles", () => {
+  const invalidValues = [
+    eventStep({ payload: pointerPayload({ clientX: NaN }) }),
+    eventStep({ payload: pointerPayload({ button: 0.5 }) }),
+    eventStep({ payload: pointerPayload({ button: -2 }) }),
+    eventStep({ payload: pointerPayload({ button: 5 }) }),
+    eventStep({ payload: pointerPayload({ buttons: 0x20 }) }),
+    eventStep({ payload: pointerPayload({ buttons: 0x100 }) }),
+    eventStep({ payload: pointerPayload({ detail: -1 }) }),
+    eventStep({ payload: pointerPayload({ detail: 0x8000_0000 }) }),
+    eventStep({ payload: pointerPayload({ shiftKey: 1 }) }),
+    eventStep({ payload: pointerPayload({ relatedTarget: 0 }) }),
+    eventStep({ payload: pointerPayload({ pointerId: -2 }) }),
+    eventStep({ payload: pointerPayload({ pointerId: 0x8000_0000 }) }),
+    eventStep({ payload: pointerPayload({ width: -1 }) }),
+    eventStep({ payload: pointerPayload({ pressure: 1.01 }) }),
+    eventStep({ payload: pointerPayload({ pressure: 0.1 }) }),
+    eventStep({ payload: pointerPayload({ tangentialPressure: -1.01 }) }),
+    eventStep({ payload: pointerPayload({ tangentialPressure: 0.1 }) }),
+    eventStep({ payload: pointerPayload({ tiltX: 91 }) }),
+    eventStep({ payload: pointerPayload({ twist: 360 }) }),
+    eventStep({ payload: pointerPayload({ altitudeAngle: Math.PI }) }),
+    eventStep({ payload: pointerPayload({ persistentDeviceId: 0x8000_0000 }) }),
+    eventStep({ type: "wheel", payload: wheelPayload({ deltaY: Infinity }) }),
+    eventStep({ type: "wheel", payload: wheelPayload({ deltaMode: 3 }) }),
+    eventStep({ type: "keydown", payload: keyboardPayload({ location: 4 }) }),
+    eventStep({ type: "keydown", payload: keyboardPayload({ keyCode: 1.5 }) }),
+    eventStep({ type: "input", payload: { data: 1, inputType: "", isComposing: false } }),
+    eventStep({ type: "focus", payload: { relatedTarget: 1.5 } }),
+  ];
+
+  for (const value of invalidValues) {
+    assertThrows(() => validateDomDispatchStep(value));
+  }
+});
+
+Deno.test("DOM dispatch validator preserves accepted mouse and pointer boundaries", () => {
+  const step = validateDomDispatchStep(eventStep({
+    payload: pointerPayload({
+      button: -1,
+      buttons: 0x1f,
+      detail: 0x7fff_ffff,
+      pointerId: -1,
+      pressure: Math.fround(0.1),
+      tangentialPressure: Math.fround(-0.1),
+      azimuthAngle: Math.PI * 2,
+      persistentDeviceId: 0x7fff_ffff,
+    }),
+  }));
+  assert(step.kind === "event");
+  const payload = step.payload as unknown as Record<string, unknown>;
+  assertEquals(
+    [
+      payload.button,
+      payload.buttons,
+      payload.detail,
+      payload.pointerId,
+      payload.pressure,
+      payload.tangentialPressure,
+      payload.azimuthAngle,
+      payload.persistentDeviceId,
+    ],
+    [
+      -1,
+      0x1f,
+      0x7fff_ffff,
+      -1,
+      Math.fround(0.1),
+      Math.fround(-0.1),
+      Math.PI * 2,
+      0x7fff_ffff,
+    ],
+  );
+});
+
 Deno.test("DOM dispatch validator neither invokes accessors nor coerces hostile fields", () => {
   let getterCalls = 0;
   const accessorStep = eventStep();
@@ -132,6 +368,26 @@ Deno.test("DOM dispatch validator neither invokes accessors nor coerces hostile 
   };
   assertThrows(
     () => validateDomDispatchStep(eventStep({ target: hostileNumber })),
+    TypeError,
+  );
+  assertEquals(coercionCalls, 0);
+
+  const accessorPayload = pointerPayload();
+  Object.defineProperty(accessorPayload, "clientX", {
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      return 11.25;
+    },
+  });
+  assertThrows(
+    () => validateDomDispatchStep(eventStep({ payload: accessorPayload })),
+    TypeError,
+  );
+  assertEquals(getterCalls, 0);
+
+  assertThrows(
+    () => validateDomDispatchStep(eventStep({ payload: pointerPayload({ buttons: hostileNumber }) })),
     TypeError,
   );
   assertEquals(coercionCalls, 0);

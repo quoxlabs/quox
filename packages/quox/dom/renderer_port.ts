@@ -1,5 +1,11 @@
 import type { QuoxRenderer as WasmRenderer } from "../lib/quox.js";
-import { assertFiniteNumber, assertPositiveUint32 } from "./ffi_numbers.ts";
+import {
+  assertFiniteNumber,
+  assertIntegerRange,
+  assertKnownMask,
+  assertPositiveUint32,
+  assertUint32,
+} from "./ffi_numbers.ts";
 
 export const DOM_DISPATCH_EVENT_TYPES = Object.freeze(
   [
@@ -35,7 +41,82 @@ export const DOM_DISPATCH_EVENT_TYPES = Object.freeze(
 
 export type DomDispatchEventType = (typeof DOM_DISPATCH_EVENT_TYPES)[number];
 
-export interface DomDispatchEventStep<Payload = unknown> {
+export interface DomDispatchMousePayload {
+  readonly clientX: number;
+  readonly clientY: number;
+  readonly pageX: number;
+  readonly pageY: number;
+  readonly screenX: number;
+  readonly screenY: number;
+  readonly offsetX: number;
+  readonly offsetY: number;
+  readonly button: number;
+  readonly buttons: number;
+  readonly detail: number;
+  readonly shiftKey: boolean;
+  readonly ctrlKey: boolean;
+  readonly altKey: boolean;
+  readonly metaKey: boolean;
+  readonly relatedTarget: number | null;
+}
+
+export interface DomDispatchPointerPayload extends DomDispatchMousePayload {
+  readonly pointerId: number;
+  readonly pointerType: string;
+  readonly isPrimary: boolean;
+  readonly width: number;
+  readonly height: number;
+  readonly pressure: number;
+  readonly tangentialPressure: number;
+  readonly tiltX: number;
+  readonly tiltY: number;
+  readonly twist: number;
+  readonly altitudeAngle: number;
+  readonly azimuthAngle: number;
+  readonly persistentDeviceId: number;
+}
+
+export interface DomDispatchWheelPayload extends DomDispatchMousePayload {
+  readonly deltaX: number;
+  readonly deltaY: number;
+  readonly deltaZ: number;
+  readonly deltaMode: number;
+}
+
+export interface DomDispatchKeyboardPayload {
+  readonly key: string;
+  readonly code: string;
+  readonly location: number;
+  readonly repeat: boolean;
+  readonly isComposing: boolean;
+  readonly keyCode: number;
+  readonly shiftKey: boolean;
+  readonly ctrlKey: boolean;
+  readonly altKey: boolean;
+  readonly metaKey: boolean;
+  readonly capsLock: boolean;
+  readonly altGraphKey: boolean;
+}
+
+export interface DomDispatchInputPayload {
+  readonly data: string | null;
+  readonly inputType: string;
+  readonly isComposing: boolean;
+}
+
+export interface DomDispatchFocusPayload {
+  readonly relatedTarget: number | null;
+}
+
+export type DomDispatchEventPayload =
+  | DomDispatchMousePayload
+  | DomDispatchPointerPayload
+  | DomDispatchWheelPayload
+  | DomDispatchKeyboardPayload
+  | DomDispatchInputPayload
+  | DomDispatchFocusPayload;
+
+export interface DomDispatchEventStep<Payload = DomDispatchEventPayload> {
   readonly kind: "event";
   readonly frameId: number;
   readonly eventId: number;
@@ -47,7 +128,6 @@ export interface DomDispatchEventStep<Payload = unknown> {
   readonly cancelable: boolean;
   readonly composed: boolean;
   readonly timeStamp: number;
-  /** Reserved for the event-specific data added by D-04. */
   readonly payload?: Payload;
 }
 
@@ -57,7 +137,7 @@ export interface DomDispatchCompleteStep {
   readonly redrawRequested: boolean;
 }
 
-export type DomDispatchStep<Payload = unknown> =
+export type DomDispatchStep<Payload = DomDispatchEventPayload> =
   | DomDispatchEventStep<Payload>
   | DomDispatchCompleteStep;
 
@@ -174,6 +254,30 @@ function inspectPlainRecord(value: unknown, context: string): OwnPropertyDescrip
   return descriptors;
 }
 
+function inspectExactPlainRecord(
+  value: unknown,
+  context: string,
+  properties: readonly string[],
+): OwnPropertyDescriptors {
+  const descriptors = inspectPlainRecord(value, context);
+  assertExactProperties(descriptors, context, properties);
+  return descriptors;
+}
+
+function assertExactProperties(
+  descriptors: OwnPropertyDescriptors,
+  context: string,
+  properties: readonly string[],
+): void {
+  const expected = new Set<PropertyKey>(properties);
+  for (const property of Reflect.ownKeys(descriptors)) {
+    if (!expected.has(property)) {
+      throw new TypeError(`quox: ${context}.${String(property)} is not a supported property`);
+    }
+  }
+  for (const property of properties) requiredValue(descriptors, property, context);
+}
+
 function requiredValue(
   descriptors: OwnPropertyDescriptors,
   property: PropertyKey,
@@ -191,6 +295,348 @@ function assertBoolean(value: unknown, name: string): boolean {
     throw new TypeError(`quox: ${name} must be a boolean`);
   }
   return value;
+}
+
+function assertString(value: unknown, name: string): string {
+  if (typeof value !== "string") {
+    throw new TypeError(`quox: ${name} must be a string`);
+  }
+  return value;
+}
+
+function assertNullableNodeHandle(value: unknown, name: string): number | null {
+  return value === null ? null : assertPositiveUint32(value, name);
+}
+
+function assertFiniteRange(
+  value: unknown,
+  minimum: number,
+  maximum: number,
+  name: string,
+): number {
+  const number = assertFiniteNumber(value, name);
+  if (number < minimum || number > maximum) {
+    throw new RangeError(`quox: ${name} must be from ${minimum} through ${maximum}`);
+  }
+  return number;
+}
+
+function assertFiniteFloatRange(
+  value: unknown,
+  minimum: number,
+  maximum: number,
+  name: string,
+): number {
+  const number = assertFiniteRange(value, minimum, maximum, name);
+  if (!Object.is(Math.fround(number), number)) {
+    throw new RangeError(`quox: ${name} must be exactly representable as a 32-bit float`);
+  }
+  return number;
+}
+
+const MOUSE_PAYLOAD_PROPERTIES = Object.freeze(
+  [
+    "clientX",
+    "clientY",
+    "pageX",
+    "pageY",
+    "screenX",
+    "screenY",
+    "offsetX",
+    "offsetY",
+    "button",
+    "buttons",
+    "detail",
+    "shiftKey",
+    "ctrlKey",
+    "altKey",
+    "metaKey",
+    "relatedTarget",
+  ] as const,
+);
+
+const POINTER_PAYLOAD_PROPERTIES = Object.freeze(
+  [
+    ...MOUSE_PAYLOAD_PROPERTIES,
+    "pointerId",
+    "pointerType",
+    "isPrimary",
+    "width",
+    "height",
+    "pressure",
+    "tangentialPressure",
+    "tiltX",
+    "tiltY",
+    "twist",
+    "altitudeAngle",
+    "azimuthAngle",
+    "persistentDeviceId",
+  ] as const,
+);
+
+const WHEEL_PAYLOAD_PROPERTIES = Object.freeze(
+  [
+    ...MOUSE_PAYLOAD_PROPERTIES,
+    "deltaX",
+    "deltaY",
+    "deltaZ",
+    "deltaMode",
+  ] as const,
+);
+
+const KEYBOARD_PAYLOAD_PROPERTIES = Object.freeze(
+  [
+    "key",
+    "code",
+    "location",
+    "repeat",
+    "isComposing",
+    "keyCode",
+    "shiftKey",
+    "ctrlKey",
+    "altKey",
+    "metaKey",
+    "capsLock",
+    "altGraphKey",
+  ] as const,
+);
+
+const INPUT_PAYLOAD_PROPERTIES = Object.freeze(["data", "inputType", "isComposing"] as const);
+const FOCUS_PAYLOAD_PROPERTIES = Object.freeze(["relatedTarget"] as const);
+const COMPLETE_STEP_PROPERTIES = Object.freeze(["kind", "frameId", "redrawRequested"] as const);
+const EVENT_STEP_PROPERTIES = Object.freeze(
+  [
+    "kind",
+    "frameId",
+    "eventId",
+    "type",
+    "target",
+    "path",
+    "bubbles",
+    "cancelable",
+    "composed",
+    "timeStamp",
+  ] as const,
+);
+const PAYLOAD_EVENT_STEP_PROPERTIES = Object.freeze([...EVENT_STEP_PROPERTIES, "payload"] as const);
+
+function mousePayloadFields(descriptors: OwnPropertyDescriptors): DomDispatchMousePayload {
+  const field = (name: string) => requiredValue(descriptors, name, "DOM dispatch payload");
+  return {
+    clientX: assertFiniteNumber(field("clientX"), "DOM dispatch payload.clientX"),
+    clientY: assertFiniteNumber(field("clientY"), "DOM dispatch payload.clientY"),
+    pageX: assertFiniteNumber(field("pageX"), "DOM dispatch payload.pageX"),
+    pageY: assertFiniteNumber(field("pageY"), "DOM dispatch payload.pageY"),
+    screenX: assertFiniteNumber(field("screenX"), "DOM dispatch payload.screenX"),
+    screenY: assertFiniteNumber(field("screenY"), "DOM dispatch payload.screenY"),
+    offsetX: assertFiniteNumber(field("offsetX"), "DOM dispatch payload.offsetX"),
+    offsetY: assertFiniteNumber(field("offsetY"), "DOM dispatch payload.offsetY"),
+    button: assertIntegerRange(field("button"), -1, 4, "DOM dispatch payload.button"),
+    buttons: assertKnownMask(field("buttons"), 0x1f, "DOM dispatch payload.buttons"),
+    detail: assertIntegerRange(
+      field("detail"),
+      0,
+      0x7fff_ffff,
+      "DOM dispatch payload.detail",
+    ),
+    shiftKey: assertBoolean(field("shiftKey"), "DOM dispatch payload.shiftKey"),
+    ctrlKey: assertBoolean(field("ctrlKey"), "DOM dispatch payload.ctrlKey"),
+    altKey: assertBoolean(field("altKey"), "DOM dispatch payload.altKey"),
+    metaKey: assertBoolean(field("metaKey"), "DOM dispatch payload.metaKey"),
+    relatedTarget: assertNullableNodeHandle(
+      field("relatedTarget"),
+      "DOM dispatch payload.relatedTarget",
+    ),
+  };
+}
+
+function validateMousePayload(value: unknown): DomDispatchMousePayload {
+  const descriptors = inspectExactPlainRecord(
+    value,
+    "DOM dispatch payload",
+    MOUSE_PAYLOAD_PROPERTIES,
+  );
+  return Object.freeze(mousePayloadFields(descriptors));
+}
+
+function validatePointerPayload(value: unknown): DomDispatchPointerPayload {
+  const descriptors = inspectExactPlainRecord(
+    value,
+    "DOM dispatch payload",
+    POINTER_PAYLOAD_PROPERTIES,
+  );
+  const field = (name: string) => requiredValue(descriptors, name, "DOM dispatch payload");
+  const width = assertFiniteNumber(field("width"), "DOM dispatch payload.width");
+  const height = assertFiniteNumber(field("height"), "DOM dispatch payload.height");
+  const azimuthAngle = assertFiniteRange(
+    field("azimuthAngle"),
+    0,
+    Math.PI * 2,
+    "DOM dispatch payload.azimuthAngle",
+  );
+  if (width < 0 || height < 0) {
+    throw new RangeError("quox: DOM dispatch pointer width and height must be nonnegative");
+  }
+  return Object.freeze({
+    ...mousePayloadFields(descriptors),
+    pointerId: assertIntegerRange(
+      field("pointerId"),
+      -1,
+      0x7fff_ffff,
+      "DOM dispatch payload.pointerId",
+    ),
+    pointerType: assertString(field("pointerType"), "DOM dispatch payload.pointerType"),
+    isPrimary: assertBoolean(field("isPrimary"), "DOM dispatch payload.isPrimary"),
+    width,
+    height,
+    pressure: assertFiniteFloatRange(field("pressure"), 0, 1, "DOM dispatch payload.pressure"),
+    tangentialPressure: assertFiniteFloatRange(
+      field("tangentialPressure"),
+      -1,
+      1,
+      "DOM dispatch payload.tangentialPressure",
+    ),
+    tiltX: assertIntegerRange(field("tiltX"), -90, 90, "DOM dispatch payload.tiltX"),
+    tiltY: assertIntegerRange(field("tiltY"), -90, 90, "DOM dispatch payload.tiltY"),
+    twist: assertIntegerRange(field("twist"), 0, 359, "DOM dispatch payload.twist"),
+    altitudeAngle: assertFiniteRange(
+      field("altitudeAngle"),
+      0,
+      Math.PI / 2,
+      "DOM dispatch payload.altitudeAngle",
+    ),
+    azimuthAngle,
+    persistentDeviceId: assertIntegerRange(
+      field("persistentDeviceId"),
+      0,
+      0x7fff_ffff,
+      "DOM dispatch payload.persistentDeviceId",
+    ),
+  });
+}
+
+function validateWheelPayload(value: unknown): DomDispatchWheelPayload {
+  const descriptors = inspectExactPlainRecord(
+    value,
+    "DOM dispatch payload",
+    WHEEL_PAYLOAD_PROPERTIES,
+  );
+  const field = (name: string) => requiredValue(descriptors, name, "DOM dispatch payload");
+  return Object.freeze({
+    ...mousePayloadFields(descriptors),
+    deltaX: assertFiniteNumber(field("deltaX"), "DOM dispatch payload.deltaX"),
+    deltaY: assertFiniteNumber(field("deltaY"), "DOM dispatch payload.deltaY"),
+    deltaZ: assertFiniteNumber(field("deltaZ"), "DOM dispatch payload.deltaZ"),
+    deltaMode: assertIntegerRange(field("deltaMode"), 0, 2, "DOM dispatch payload.deltaMode"),
+  });
+}
+
+function validateKeyboardPayload(value: unknown): DomDispatchKeyboardPayload {
+  const descriptors = inspectExactPlainRecord(
+    value,
+    "DOM dispatch payload",
+    KEYBOARD_PAYLOAD_PROPERTIES,
+  );
+  const field = (name: string) => requiredValue(descriptors, name, "DOM dispatch payload");
+  return Object.freeze({
+    key: assertString(field("key"), "DOM dispatch payload.key"),
+    code: assertString(field("code"), "DOM dispatch payload.code"),
+    location: assertIntegerRange(field("location"), 0, 3, "DOM dispatch payload.location"),
+    repeat: assertBoolean(field("repeat"), "DOM dispatch payload.repeat"),
+    isComposing: assertBoolean(field("isComposing"), "DOM dispatch payload.isComposing"),
+    keyCode: assertUint32(field("keyCode"), "DOM dispatch payload.keyCode"),
+    shiftKey: assertBoolean(field("shiftKey"), "DOM dispatch payload.shiftKey"),
+    ctrlKey: assertBoolean(field("ctrlKey"), "DOM dispatch payload.ctrlKey"),
+    altKey: assertBoolean(field("altKey"), "DOM dispatch payload.altKey"),
+    metaKey: assertBoolean(field("metaKey"), "DOM dispatch payload.metaKey"),
+    capsLock: assertBoolean(field("capsLock"), "DOM dispatch payload.capsLock"),
+    altGraphKey: assertBoolean(field("altGraphKey"), "DOM dispatch payload.altGraphKey"),
+  });
+}
+
+function validateInputPayload(value: unknown): DomDispatchInputPayload {
+  const descriptors = inspectExactPlainRecord(
+    value,
+    "DOM dispatch payload",
+    INPUT_PAYLOAD_PROPERTIES,
+  );
+  const field = (name: string) => requiredValue(descriptors, name, "DOM dispatch payload");
+  const data = field("data");
+  if (data !== null && typeof data !== "string") {
+    throw new TypeError("quox: DOM dispatch payload.data must be a string or null");
+  }
+  return Object.freeze({
+    data,
+    inputType: assertString(field("inputType"), "DOM dispatch payload.inputType"),
+    isComposing: assertBoolean(field("isComposing"), "DOM dispatch payload.isComposing"),
+  });
+}
+
+function validateFocusPayload(value: unknown): DomDispatchFocusPayload {
+  const descriptors = inspectExactPlainRecord(
+    value,
+    "DOM dispatch payload",
+    FOCUS_PAYLOAD_PROPERTIES,
+  );
+  return Object.freeze({
+    relatedTarget: assertNullableNodeHandle(
+      requiredValue(descriptors, "relatedTarget", "DOM dispatch payload"),
+      "DOM dispatch payload.relatedTarget",
+    ),
+  });
+}
+
+function validateEventPayload(
+  type: DomDispatchEventType,
+  present: boolean,
+  value: unknown,
+): DomDispatchEventPayload | undefined {
+  if (type === "scroll") {
+    if (present) throw new TypeError("quox: scroll events must not carry a payload");
+    return undefined;
+  }
+  if (!present) throw new TypeError(`quox: ${type} events must carry a payload`);
+
+  switch (type) {
+    case "pointermove":
+    case "pointerdown":
+    case "pointerup":
+    case "pointerenter":
+    case "pointerleave":
+    case "pointerover":
+    case "pointerout":
+    case "click":
+    case "contextmenu":
+      return validatePointerPayload(value);
+    case "mousemove":
+    case "mousedown":
+    case "mouseup":
+    case "mouseenter":
+    case "mouseleave":
+    case "mouseover":
+    case "mouseout":
+    case "dblclick":
+      return validateMousePayload(value);
+    case "wheel":
+      return validateWheelPayload(value);
+    case "keypress":
+    case "keydown":
+    case "keyup":
+      return validateKeyboardPayload(value);
+    case "input":
+      return validateInputPayload(value);
+    case "focus":
+    case "blur":
+    case "focusin":
+    case "focusout":
+      return validateFocusPayload(value);
+    default:
+      return assertNever(type);
+  }
+}
+
+function assertNever(value: never): never {
+  throw new TypeError(`quox: unsupported DOM dispatch event type ${value}`);
 }
 
 function assertEventType(value: unknown): DomDispatchEventType {
@@ -292,6 +738,7 @@ export function validateDomDispatchStep(value: unknown): DomDispatchStep {
   );
 
   if (kind === "complete") {
+    assertExactProperties(descriptors, "DOM dispatch step", COMPLETE_STEP_PROPERTIES);
     return Object.freeze({
       kind,
       frameId,
@@ -305,6 +752,13 @@ export function validateDomDispatchStep(value: unknown): DomDispatchStep {
     throw new TypeError('quox: DOM dispatch step kind must be "event" or "complete"');
   }
 
+  const type = assertEventType(requiredValue(descriptors, "type", "DOM dispatch step"));
+  assertExactProperties(
+    descriptors,
+    "DOM dispatch step",
+    type === "scroll" ? EVENT_STEP_PROPERTIES : PAYLOAD_EVENT_STEP_PROPERTIES,
+  );
+
   const target = assertPositiveUint32(
     requiredValue(descriptors, "target", "DOM dispatch step"),
     "DOM dispatch target",
@@ -313,6 +767,13 @@ export function validateDomDispatchStep(value: unknown): DomDispatchStep {
   if (path[0] !== target) {
     throw new RangeError("quox: DOM dispatch path must begin with its target");
   }
+
+  const payloadDescriptor = Object.getOwnPropertyDescriptor(descriptors, "payload");
+  const payload = validateEventPayload(
+    type,
+    payloadDescriptor !== undefined,
+    payloadDescriptor === undefined ? undefined : requiredValue(descriptors, "payload", "DOM dispatch step"),
+  );
 
   const timeStamp = assertFiniteNumber(
     requiredValue(descriptors, "timeStamp", "DOM dispatch step"),
@@ -329,7 +790,7 @@ export function validateDomDispatchStep(value: unknown): DomDispatchStep {
       requiredValue(descriptors, "eventId", "DOM dispatch step"),
       "DOM dispatch eventId",
     ),
-    type: assertEventType(requiredValue(descriptors, "type", "DOM dispatch step")),
+    type,
     target,
     path,
     bubbles: assertBoolean(
@@ -347,15 +808,7 @@ export function validateDomDispatchStep(value: unknown): DomDispatchStep {
     timeStamp,
   };
 
-  const payloadDescriptor = Object.getOwnPropertyDescriptor(descriptors, "payload");
-  if (payloadDescriptor !== undefined) {
-    const descriptor = payloadDescriptor.value as PropertyDescriptor;
-    if (!("value" in descriptor)) {
-      throw new TypeError("quox: DOM dispatch step.payload must not be an accessor");
-    }
-    return Object.freeze({ ...step, payload: descriptor.value });
-  }
-  return Object.freeze(step);
+  return payload === undefined ? Object.freeze(step) : Object.freeze({ ...step, payload });
 }
 
 /** Typed and validated adapter over the staged methods absent from stale generated declarations. */

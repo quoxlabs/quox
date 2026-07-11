@@ -1,12 +1,20 @@
 import { assert, assertEquals, assertStrictEquals, assertThrows } from "@std/assert";
 import type { QuoxRenderer as WasmRenderer } from "../lib/quox.js";
 import { QuoxDocument } from "./document.ts";
-import type { QuoxEvent } from "./event.ts";
+import { QuoxEvent } from "./event.ts";
 import type { DomDispatchEventType } from "./renderer_port.ts";
 import { QuoxEventTarget } from "./event_target.ts";
 import { setElementFunctionProp } from "./handlers.ts";
 import { documentHasActiveDispatch, releaseStoppedRenderer } from "./internals.ts";
 import type { QuoxElement } from "./node.ts";
+import {
+  QuoxDOMInputEvent,
+  QuoxDOMKeyboardEvent,
+  QuoxFocusEvent,
+  QuoxMouseEvent,
+  QuoxPointerEvent,
+  QuoxWheelEvent,
+} from "./ui_event.ts";
 
 type EventSpec = {
   type: DomDispatchEventType;
@@ -16,6 +24,7 @@ type EventSpec = {
   cancelable?: boolean;
   composed?: boolean;
   timeStamp?: number;
+  payload?: unknown;
 };
 
 type FramePlan = {
@@ -23,6 +32,116 @@ type FramePlan = {
   redrawRequested: boolean;
   resumeValue?: unknown;
 };
+
+function mousePayload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    clientX: 11.25,
+    clientY: -2.5,
+    pageX: 14.75,
+    pageY: 4,
+    screenX: 0,
+    screenY: 0,
+    offsetX: 1.5,
+    offsetY: 2.25,
+    button: 0,
+    buttons: 1,
+    detail: 2,
+    shiftKey: true,
+    ctrlKey: false,
+    altKey: true,
+    metaKey: false,
+    relatedTarget: null,
+    ...overrides,
+  };
+}
+
+function pointerPayload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    ...mousePayload(),
+    pointerId: 1,
+    pointerType: "mouse",
+    isPrimary: true,
+    width: 1,
+    height: 1,
+    pressure: 0.5,
+    tangentialPressure: 0,
+    tiltX: 0,
+    tiltY: 0,
+    twist: 0,
+    altitudeAngle: Math.PI / 2,
+    azimuthAngle: 0,
+    persistentDeviceId: 0,
+    ...overrides,
+  };
+}
+
+function wheelPayload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    ...mousePayload({ detail: 0 }),
+    deltaX: 1.25,
+    deltaY: -2.5,
+    deltaZ: 0.125,
+    deltaMode: 1,
+    ...overrides,
+  };
+}
+
+function keyboardPayload(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    key: "A",
+    code: "KeyA",
+    location: 2,
+    repeat: true,
+    isComposing: false,
+    keyCode: 65,
+    shiftKey: true,
+    ctrlKey: false,
+    altKey: false,
+    metaKey: true,
+    capsLock: true,
+    altGraphKey: false,
+    ...overrides,
+  };
+}
+
+function payloadForType(type: DomDispatchEventType): Record<string, unknown> | undefined {
+  switch (type) {
+    case "pointermove":
+    case "pointerdown":
+    case "pointerup":
+    case "pointerenter":
+    case "pointerleave":
+    case "pointerover":
+    case "pointerout":
+    case "click":
+    case "contextmenu":
+      return pointerPayload();
+    case "mousemove":
+    case "mousedown":
+    case "mouseup":
+    case "mouseenter":
+    case "mouseleave":
+    case "mouseover":
+    case "mouseout":
+    case "dblclick":
+      return mousePayload();
+    case "wheel":
+      return wheelPayload();
+    case "keypress":
+    case "keydown":
+    case "keyup":
+      return keyboardPayload();
+    case "input":
+      return { data: null, inputType: "", isComposing: false };
+    case "focus":
+    case "blur":
+    case "focusin":
+    case "focusout":
+      return { relatedTarget: null };
+    case "scroll":
+      return undefined;
+  }
+}
 
 class FakeDispatchRenderer {
   readonly calls: Array<readonly [string, ...unknown[]]> = [];
@@ -143,18 +262,23 @@ class FakeDispatchRenderer {
     const frameId = this.#nextFrameId++;
     this.calls.push([method, frameId, ...args]);
     const plan = this.#plans.shift() ?? { events: [], redrawRequested: false };
-    const steps = plan.events.map((event) => ({
-      kind: "event",
-      frameId,
-      eventId: this.#nextEventId++,
-      type: event.type,
-      target: event.target,
-      path: event.path,
-      bubbles: event.bubbles ?? true,
-      cancelable: event.cancelable ?? true,
-      composed: event.composed ?? true,
-      timeStamp: event.timeStamp ?? 1,
-    }));
+    const steps = plan.events.map((event) => {
+      const step: Record<string, unknown> = {
+        kind: "event",
+        frameId,
+        eventId: this.#nextEventId++,
+        type: event.type,
+        target: event.target,
+        path: event.path,
+        bubbles: event.bubbles ?? true,
+        cancelable: event.cancelable ?? true,
+        composed: event.composed ?? true,
+        timeStamp: event.timeStamp ?? 1,
+      };
+      const payload = event.payload ?? payloadForType(event.type);
+      if (payload !== undefined) step.payload = payload;
+      return step;
+    });
     steps.push(
       (plan.resumeValue ?? {
         kind: "complete",
@@ -236,6 +360,228 @@ Deno.test("trusted staged events preserve multiplicity and capture, target, bubb
     renderer.calls.filter(([method]) => method === "resume").map((call) => call.slice(3)),
     [[false], [false]],
   );
+});
+
+Deno.test("trusted staged payloads create browser-style event subclasses with exact values", () => {
+  const { document, renderer, window } = createHarness();
+  const target = document.createElement("button");
+  const related = document.createElement("aside");
+  const events = new Map<string, QuoxEvent>();
+  const eventTypes: DomDispatchEventType[] = [
+    "click",
+    "contextmenu",
+    "dblclick",
+    "wheel",
+    "keydown",
+    "input",
+    "focus",
+    "blur",
+    "scroll",
+  ];
+  for (const type of eventTypes) {
+    target.addEventListener(type, (event) => events.set(type, event));
+  }
+
+  renderer.queueFrame([
+    {
+      type: "click",
+      target: target.nodeId,
+      path: [target.nodeId],
+      timeStamp: 41.5,
+      payload: pointerPayload({
+        relatedTarget: related.nodeId,
+        clientX: 123.25,
+        clientY: 45.5,
+        pageX: 130.75,
+        pageY: 55.25,
+        offsetX: 3.125,
+        offsetY: 4.875,
+        screenX: 0,
+        screenY: 0,
+        button: 0,
+        buttons: 1,
+        detail: 3,
+        pressure: 0.75,
+      }),
+    },
+    {
+      type: "contextmenu",
+      target: target.nodeId,
+      path: [target.nodeId],
+      payload: pointerPayload({ button: 2, buttons: 0, detail: 0 }),
+    },
+    {
+      type: "dblclick",
+      target: target.nodeId,
+      path: [target.nodeId],
+      payload: mousePayload({ detail: 2 }),
+    },
+    {
+      type: "wheel",
+      target: target.nodeId,
+      path: [target.nodeId],
+      payload: wheelPayload({ deltaX: 1.125, deltaY: -9.75, deltaZ: 0.5, deltaMode: 2 }),
+    },
+    {
+      type: "keydown",
+      target: target.nodeId,
+      path: [target.nodeId],
+      payload: keyboardPayload({
+        key: "FutureNamedKey",
+        code: "FuturePhysicalCode",
+        keyCode: 0x1234,
+        capsLock: true,
+        altGraphKey: true,
+      }),
+    },
+    {
+      type: "input",
+      target: target.nodeId,
+      path: [target.nodeId],
+      payload: { data: "é", inputType: "insertText", isComposing: true },
+    },
+    {
+      type: "focus",
+      target: target.nodeId,
+      path: [target.nodeId],
+      bubbles: false,
+      payload: { relatedTarget: related.nodeId },
+    },
+    {
+      type: "blur",
+      target: target.nodeId,
+      path: [target.nodeId],
+      bubbles: false,
+      payload: { relatedTarget: null },
+    },
+    { type: "scroll", target: target.nodeId, path: [target.nodeId] },
+  ]);
+
+  document.dispatchPointerMove(1, 2, 0, 0);
+
+  const click = events.get("click");
+  assert(click instanceof QuoxPointerEvent);
+  assert(click instanceof QuoxMouseEvent);
+  assertStrictEquals(click.view, window);
+  assertEquals(click.timeStamp, 41.5);
+  assertEquals(
+    {
+      clientX: click.clientX,
+      clientY: click.clientY,
+      pageX: click.pageX,
+      pageY: click.pageY,
+      offsetX: click.offsetX,
+      offsetY: click.offsetY,
+      screenX: click.screenX,
+      screenY: click.screenY,
+      movementX: click.movementX,
+      movementY: click.movementY,
+      button: click.button,
+      buttons: click.buttons,
+      detail: click.detail,
+      pressure: click.pressure,
+    },
+    {
+      clientX: 123.25,
+      clientY: 45.5,
+      pageX: 130.75,
+      pageY: 55.25,
+      offsetX: 3.125,
+      offsetY: 4.875,
+      screenX: 0,
+      screenY: 0,
+      movementX: 0,
+      movementY: 0,
+      button: 0,
+      buttons: 1,
+      detail: 3,
+      pressure: 0.75,
+    },
+  );
+  assert(click.shiftKey);
+  assert(click.altKey);
+  assertStrictEquals(click.relatedTarget, related);
+  assert(events.get("contextmenu") instanceof QuoxPointerEvent);
+  assert(events.get("dblclick") instanceof QuoxMouseEvent);
+  assert(!(events.get("dblclick") instanceof QuoxPointerEvent));
+
+  const wheel = events.get("wheel");
+  assert(wheel instanceof QuoxWheelEvent);
+  assertEquals(
+    [wheel.deltaX, wheel.deltaY, wheel.deltaZ, wheel.deltaMode],
+    [1.125, -9.75, 0.5, QuoxWheelEvent.DOM_DELTA_PAGE],
+  );
+
+  const key = events.get("keydown");
+  assert(key instanceof QuoxDOMKeyboardEvent);
+  assertEquals(
+    [key.key, key.code, key.keyCode, key.which, key.location, key.repeat, key.isComposing],
+    ["FutureNamedKey", "FuturePhysicalCode", 0x1234, 0x1234, 2, true, false],
+  );
+  assert(key.getModifierState("CapsLock"));
+  assert(key.getModifierState("AltGraph"));
+
+  const input = events.get("input");
+  assert(input instanceof QuoxDOMInputEvent);
+  assertEquals([input.data, input.inputType, input.isComposing], ["é", "insertText", true]);
+
+  const focus = events.get("focus");
+  assert(focus instanceof QuoxFocusEvent);
+  assertStrictEquals(focus.relatedTarget, related);
+  const blur = events.get("blur");
+  assert(blur instanceof QuoxFocusEvent);
+  assertStrictEquals(blur.relatedTarget, null);
+
+  const scroll = events.get("scroll");
+  assert(scroll instanceof QuoxEvent);
+  assert(!(scroll instanceof QuoxFocusEvent));
+  assert(!(scroll instanceof QuoxMouseEvent));
+});
+
+Deno.test("pointer detail stays within the signed DOM UIEvent range", () => {
+  const { document, renderer } = createHarness();
+
+  document.dispatchPointerDown(1, 2, 0, 1, 0, 3, 0x7fff_ffff);
+  document.dispatchPointerUp(1, 2, 0, 0, 0, 4, 0x7fff_ffff);
+  assertEquals(
+    renderer.calls.filter(([method]) => method === "begin_pointer_down" || method === "begin_pointer_up").map((call) =>
+      call.at(-1)
+    ),
+    [0x7fff_ffff, 0x7fff_ffff],
+  );
+
+  assertThrows(
+    () => document.dispatchPointerDown(1, 2, 0, 1, 0, 5, 0x8000_0000),
+    RangeError,
+  );
+  assertThrows(
+    () => document.dispatchPointerUp(1, 2, 0, 0, 0, 6, 0x8000_0000),
+    RangeError,
+  );
+});
+
+Deno.test("trusted focus relatedTarget is resolved before listener mutation invalidates its handle", () => {
+  const { document, renderer } = createHarness();
+  const container = document.createElement("main");
+  const target = document.createElement("input");
+  const related = document.createElement("button");
+  renderer.invalidatedByInnerHtml = new Uint32Array([related.nodeId]);
+  let observed: unknown;
+
+  target.addEventListener("focus", (event) => {
+    container.innerHTML = "replacement";
+    observed = (event as QuoxFocusEvent).relatedTarget;
+  });
+  renderer.queueFrame([{
+    type: "focus",
+    target: target.nodeId,
+    path: [target.nodeId, container.nodeId],
+    bubbles: false,
+    payload: { relatedTarget: related.nodeId },
+  }]);
+
+  document.dispatchPointerMove(1, 2, 0, 0);
+  assertStrictEquals(observed, related);
 });
 
 Deno.test("nonbubbling trusted events still capture through window and document", () => {
@@ -430,11 +776,39 @@ Deno.test("malformed initial steps abort their recoverable frame and honor abort
     cancelable: true,
     composed: true,
     timeStamp: 1,
+    payload: pointerPayload(),
   };
 
   assertThrows(() => document.dispatchPointerMove(1, 2, 0, 0), RangeError);
   assertEquals(renderer.calls.at(-1), ["abort", 9]);
   assertEquals(renders, ["render"]);
+});
+
+Deno.test("malformed trusted payloads abort before invoking a listener", () => {
+  const { document, renderer } = createHarness();
+  const target = document.createElement("button");
+  const payload = pointerPayload();
+  let getterCalls = 0;
+  let listenerCalls = 0;
+  Object.defineProperty(payload, "clientX", {
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      return 11.25;
+    },
+  });
+  target.addEventListener("click", () => listenerCalls++);
+  renderer.queueFrame([{
+    type: "click",
+    target: target.nodeId,
+    path: [target.nodeId],
+    payload,
+  }]);
+
+  assertThrows(() => document.dispatchPointerMove(1, 2, 0, 0), TypeError);
+  assertEquals(getterCalls, 0);
+  assertEquals(listenerCalls, 0);
+  assertEquals(renderer.calls.at(-1), ["abort", 1]);
 });
 
 Deno.test("malformed resumed steps abort the known frame and preserve an abort failure", () => {
