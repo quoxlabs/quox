@@ -190,7 +190,11 @@ export interface EnterLeaveEvent extends PointerEventBase<"mouseenter" | "mousel
 export interface FocusChangeEvent extends WindowEvent<"focus" | "blur"> {
   type: "focus" | "blur";
 }
-/** Fired when the window is minimized/restored. */
+/**
+ * Best-effort render-visibility or suspension change. `visible: false` may
+ * represent minimization, occlusion or another workspace, screen locking, or
+ * output suspension. Backends without equivalent native state may omit transitions.
+ */
 export interface VisibilityEvent extends WindowEvent<"visibilitychange"> {
   type: "visibilitychange";
   visible: boolean;
