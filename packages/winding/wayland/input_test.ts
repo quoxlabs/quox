@@ -7,7 +7,9 @@ import {
   toXkbKeycode,
   translateKey,
   translateWlKeyboardKey,
+  WaylandEnterKeyBatch,
   waylandKeyEditDisposition,
+  WaylandKeyTransitionState,
   type XkbKeyTranslator,
 } from "./keyboard.ts";
 import { CURSOR_SHAPE_MANAGER_V1_REQUESTS, WlOp } from "./ffi.ts";
@@ -18,6 +20,7 @@ import { emitWaylandTextInputEdits } from "./text_input_controller.ts";
 import type { WaylandWindow } from "./window.ts";
 import {
   createDefaultCursorPixels,
+  decodeWlArrayU32,
   DEFAULT_CURSOR_HEIGHT,
   DEFAULT_CURSOR_HOTSPOT_X,
   DEFAULT_CURSOR_HOTSPOT_Y,
@@ -28,6 +31,7 @@ import {
   POLLHUP,
   POLLIN,
   POLLNVAL,
+  readWlArrayU32,
   waylandConnectionError,
 } from "./protocol.ts";
 import { damageOpcodeForSurfaceVersion, frameMatchesConfiguration, WaylandConfigureState } from "./window.ts";
@@ -38,6 +42,7 @@ import {
   WaylandPointerFrameAccumulator,
   WaylandPointerPosition,
 } from "./pointer.ts";
+import type { KeyModifiers } from "../types.ts";
 
 Deno.test("Wayland globals keep one owner and promote a deterministic replacement", () => {
   const actions: string[] = [];
@@ -169,6 +174,106 @@ Deno.test("Wayland poll errors and disconnects are terminal readiness", () => {
   assertEquals(hasFatalPollEvent(POLLHUP), true);
   assertEquals(hasFatalPollEvent(POLLNVAL), true);
   assertEquals(hasFatalPollEvent(POLLIN | POLLHUP), true);
+});
+
+Deno.test("wl_array uint32 decoding is aligned, bounded, and null-safe", () => {
+  const values = [42, 54, 30];
+  const read = (offset: number) => values[offset / Uint32Array.BYTES_PER_ELEMENT];
+  assertEquals(decodeWlArrayU32(12n, 1n, read), values);
+  assertEquals(readWlArrayU32(null), []);
+  assertEquals(decodeWlArrayU32(3n, 1n, read), []);
+  assertEquals(decodeWlArrayU32(BigInt((4096 + 1) * Uint32Array.BYTES_PER_ELEMENT), 1n, read), []);
+  assertEquals(decodeWlArrayU32(4n, 0n, read), []);
+});
+
+Deno.test("keyboard enter batches intervening transitions until modifiers arrive", () => {
+  const batch = new WaylandEnterKeyBatch();
+  batch.begin([42, 30]);
+  assertEquals(batch.awaitingModifiers, true);
+  assertEquals(batch.defer({ rawKeycode: 42, pressed: false }), true);
+  assertEquals(batch.defer({ rawKeycode: 31, pressed: true }), true);
+  assertEquals(batch.complete(), {
+    heldKeys: [42, 30],
+    deferredTransitions: [
+      { rawKeycode: 42, pressed: false },
+      { rawKeycode: 31, pressed: true },
+    ],
+  });
+  assertEquals(batch.awaitingModifiers, false);
+  assertEquals(batch.complete(), undefined);
+  assertEquals(batch.defer({ rawKeycode: 32, pressed: true }), false);
+
+  batch.begin([54]);
+  batch.defer({ rawKeycode: 54, pressed: false });
+  batch.reset();
+  assertEquals(batch.complete(), undefined);
+});
+
+Deno.test("held enter keys retain their logical identity without synthetic presses", () => {
+  const state = new WaylandKeyTransitionState();
+  let layoutKey = "a";
+  state.confirmModifiers(keyModifiers());
+  state.seedHeldKeys([30], () => layoutKey);
+
+  assertEquals(state.pressedKeyCount, 1);
+  layoutKey = "q";
+  assertEquals(state.resolve(30, "repeat", layoutKey).key, "a");
+  assertEquals(state.resolve(30, "release", layoutKey).key, "a");
+  assertEquals(state.pressedKeyCount, 0);
+});
+
+Deno.test("keyboard focus generation reset drops held and provisional state", () => {
+  const state = new WaylandKeyTransitionState();
+  state.confirmModifiers(keyModifiers());
+  state.seedHeldKeys([42, 30], (rawKeycode) => rawKeycode === 42 ? "Shift" : "a");
+  assertEquals(state.resolve(54, "press", "Shift").modifiers.shiftKey, true);
+
+  state.reset();
+  assertEquals(state.pressedKeyCount, 0);
+  assertEquals(state.modifiers, keyModifiers());
+  assertEquals(state.resolve(30, "release", "q").key, "q");
+});
+
+Deno.test("left and right modifier transitions use post-transition group state", () => {
+  const cases = [
+    { key: "Shift", field: "shiftKey" },
+    { key: "Control", field: "ctrlKey" },
+    { key: "Alt", field: "altKey" },
+    { key: "Meta", field: "metaKey" },
+  ] as const;
+
+  for (const { key, field } of cases) {
+    const state = new WaylandKeyTransitionState();
+    state.confirmModifiers(keyModifiers());
+
+    assertEquals(state.resolve(10, "press", key).modifiers[field], true);
+    state.confirmModifiers(keyModifiers({ [field]: true }));
+    assertEquals(state.resolve(11, "press", key).modifiers[field], true);
+
+    const firstRelease = state.resolve(10, "release", "layout changed");
+    assertEquals(firstRelease.key, key);
+    assertEquals(firstRelease.modifiers[field], true);
+    const finalRelease = state.resolve(11, "release", "layout changed");
+    assertEquals(finalRelease.key, key);
+    assertEquals(finalRelease.modifiers[field], false);
+  }
+});
+
+Deno.test("CapsLock toggles on keydown only and AltGraph disables the accelerator", () => {
+  const caps = new WaylandKeyTransitionState();
+  caps.confirmModifiers(keyModifiers());
+  assertEquals(caps.resolve(58, "press", "CapsLock").modifiers.capsLock, true);
+  assertEquals(caps.resolve(58, "repeat", "CapsLock").modifiers.capsLock, true);
+  caps.confirmModifiers(keyModifiers({ capsLock: true }));
+  assertEquals(caps.resolve(58, "release", "layout changed").modifiers.capsLock, true);
+  assertEquals(caps.resolve(58, "press", "CapsLock").modifiers.capsLock, false);
+
+  const altGraph = new WaylandKeyTransitionState();
+  altGraph.confirmModifiers(keyModifiers({ ctrlKey: true, accelKey: true }));
+  const transition = altGraph.resolve(100, "press", "AltGraph").modifiers;
+  assertEquals(transition.ctrlKey, true);
+  assertEquals(transition.altGraphKey, true);
+  assertEquals(transition.accelKey, false);
 });
 
 Deno.test("Wayland pointer capability transitions are symmetric", () => {
@@ -957,6 +1062,21 @@ class FakeCompose implements ComposeAdapter {
   reset(): void {
     this.resetCount++;
   }
+}
+
+function keyModifiers(overrides: Partial<KeyModifiers> = {}): KeyModifiers {
+  const ctrlKey = overrides.ctrlKey ?? false;
+  const altGraphKey = overrides.altGraphKey ?? false;
+  return {
+    shiftKey: false,
+    ctrlKey,
+    altKey: false,
+    metaKey: false,
+    accelKey: ctrlKey && !altGraphKey,
+    capsLock: false,
+    altGraphKey,
+    ...overrides,
+  };
 }
 
 function assert(value: unknown, message = "Expected value to be truthy"): asserts value {

@@ -4,7 +4,7 @@ import type { KeyModifiers, UIEvent } from "../types.ts";
 import { createImeCommitEvent, createImePreeditEvent, createKeyDownEvent, createKeyUpEvent } from "../input/mod.ts";
 import { domCodeFromEvdev } from "../linux/mod.ts";
 import { WlOp, type xkbSymbols } from "./ffi.ts";
-import { waylandKeyEditDisposition } from "./keyboard.ts";
+import { WaylandEnterKeyBatch, waylandKeyEditDisposition } from "./keyboard.ts";
 import {
   type AnyCallback,
   args,
@@ -12,6 +12,7 @@ import {
   type LibcLibrary,
   makeVtable,
   readEventCount,
+  readWlArrayU32,
   throwCleanupErrors,
   type WaylandNativeLibrary,
   WL_MARSHAL_FLAG_DESTROY,
@@ -39,6 +40,7 @@ export class WaylandKeyboardController {
   #focus: WaylandWindow | null = null;
   #listeners: AnyCallback[] = [];
   #vtable: BigUint64Array<ArrayBuffer> | undefined;
+  readonly #enterKeys = new WaylandEnterKeyBatch();
   #closed = false;
 
   constructor(readonly host: WaylandKeyboardHost) {
@@ -90,6 +92,7 @@ export class WaylandKeyboardController {
   removeWindow(window: WaylandWindow): void {
     if (this.#focus !== window) return;
     this.#focus = null;
+    this.#enterKeys.reset();
     this.#input.resetTransientState();
   }
 
@@ -110,6 +113,7 @@ export class WaylandKeyboardController {
     const focusedWindow = this.#focus;
     this.#focus = null;
     const errors: unknown[] = [];
+    collectCleanupError(errors, () => this.#enterKeys.reset());
     collectCleanupError(errors, () => this.#input.setRepeatInfo(0, 0));
     collectCleanupError(errors, () => this.#input.resetTransientState());
     if (focusedWindow) {
@@ -163,13 +167,14 @@ export class WaylandKeyboardController {
           if (fd >= 0) this.host.libc.symbols.close(fd);
           return;
         }
+        this.#enterKeys.reset();
         this.#input.loadKeymap(format, fd, size);
       }),
     );
     this.#listeners.push(keymap);
     const enter = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer", "u32", "pointer", "pointer"], result: "void" },
-      this.host.guardCallback((_data, _keyboard, _serial, surface) => {
+      this.host.guardCallback((_data, _keyboard, _serial, surface, keys) => {
         if (this.#keyboard !== keyboard) return;
         const window = this.host.windowForSurface(surface);
         if (!window || this.#focus === window) return;
@@ -184,6 +189,7 @@ export class WaylandKeyboardController {
           this.host.pushEvent({ type: "blur", window: previous });
         }
         this.#input.resetTransientState();
+        this.#enterKeys.begin(readWlArrayU32(keys));
         this.#focus = window;
         this.host.pushEvent({ type: "focus", window });
         this.host.syncTextInput(window);
@@ -196,6 +202,7 @@ export class WaylandKeyboardController {
         if (this.#keyboard !== keyboard) return;
         const window = this.host.windowForSurface(surface);
         if (!window || this.#focus !== window) return;
+        this.#enterKeys.reset();
         this.#input.resetTransientState();
         this.#focus = null;
         this.host.syncTextInput(window);
@@ -211,14 +218,9 @@ export class WaylandKeyboardController {
       { parameters: ["pointer", "pointer", "u32", "u32", "u32", "u32"], result: "void" },
       this.host.guardCallback((_data, _keyboard, _serial, _time, rawKeycode, state) => {
         if (this.#keyboard !== keyboard) return;
-        if (state) {
-          if (!this.#focus) return;
-          this.#emitKey(rawKeycode, "press");
-          this.#input.pressRepeat(rawKeycode);
-        } else {
-          this.#input.releaseRepeat(rawKeycode);
-          this.#emitKey(rawKeycode, "release");
-        }
+        const transition = { rawKeycode, pressed: state !== 0 };
+        if (this.#enterKeys.defer(transition)) return;
+        this.#dispatchProtocolKey(transition.rawKeycode, transition.pressed);
       }),
     );
     this.#listeners.push(key);
@@ -227,6 +229,12 @@ export class WaylandKeyboardController {
       this.host.guardCallback((_data, _keyboard, _serial, depressed, latched, locked, group) => {
         if (this.#keyboard !== keyboard) return;
         this.#input.updateModifiers(depressed, latched, locked, group);
+        const entered = this.#enterKeys.complete();
+        if (entered === undefined) return;
+        this.#input.seedHeldKeys(entered.heldKeys);
+        for (const transition of entered.deferredTransitions) {
+          this.#dispatchProtocolKey(transition.rawKeycode, transition.pressed);
+        }
       }),
     );
     this.#listeners.push(modifiers);
@@ -248,26 +256,38 @@ export class WaylandKeyboardController {
     }
   }
 
+  #dispatchProtocolKey(rawKeycode: number, pressed: boolean): void {
+    if (pressed) {
+      if (!this.#focus) return;
+      this.#emitKey(rawKeycode, "press");
+      this.#input.pressRepeat(rawKeycode);
+      return;
+    }
+    this.#input.releaseRepeat(rawKeycode);
+    this.#emitKey(rawKeycode, "release");
+  }
+
   #emitKey(rawKeycode: number, phase: "press" | "release" | "repeat"): void {
     const window = this.#focus;
     if (!window) return;
     const wasComposing = window.composition.active;
     const translated = this.#input.translateDeliveredKey(rawKeycode, phase);
-    const modifiers = this.#input.modifiers;
+    const resolved = this.#input.resolveLogicalTransition(rawKeycode, phase, translated.key);
+    const modifiers = resolved.modifiers;
     const code = domCodeFromEvdev(rawKeycode);
     if (phase === "release") {
       this.host.pushEvent(createKeyUpEvent({
         window,
         keycode: rawKeycode,
         code,
-        key: this.#input.releaseLogical(rawKeycode, translated.key),
+        key: resolved.key,
         isComposing: wasComposing,
         ...modifiers,
       }));
       return;
     }
 
-    const key = this.#input.pressLogical(rawKeycode, translated.key);
+    const key = resolved.key;
     const disposition = waylandKeyEditDisposition(
       key,
       translated.text,

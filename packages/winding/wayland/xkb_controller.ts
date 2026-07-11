@@ -1,7 +1,6 @@
 /** Native xkbcommon ownership and keyboard transition state for Wayland. */
 
 import type { KeyModifiers } from "../types.ts";
-import { PressedLogicalKeyCache } from "../input/mod.ts";
 import { utf8CString as cStr } from "../text_encoding.ts";
 import { type xkbSymbols } from "./ffi.ts";
 import {
@@ -10,6 +9,8 @@ import {
   resolveComposeLocale,
   type TranslatedKey,
   translateWlKeyboardKey,
+  WaylandKeyTransitionState,
+  type WaylandResolvedKeyTransition,
   type XkbKeyTranslator,
 } from "./keyboard.ts";
 import {
@@ -50,9 +51,8 @@ export class WaylandXkbController {
   #composeState: Deno.PointerObject | null = null;
   #keymap: Deno.PointerObject | null = null;
   #state: Deno.PointerObject | null = null;
-  #modifiers = modifiersFromMask(0);
   readonly #repeat = new KeyRepeatController();
-  readonly #pressedKeys = new PressedLogicalKeyCache<number>();
+  readonly #keys = new WaylandKeyTransitionState();
   #closed = false;
 
   constructor(readonly xkb: XkbLibrary, readonly libc: LibcLibrary) {
@@ -63,7 +63,7 @@ export class WaylandXkbController {
   }
 
   get modifiers(): KeyModifiers {
-    return this.#modifiers;
+    return this.#keys.modifiers;
   }
 
   /**
@@ -87,12 +87,20 @@ export class WaylandXkbController {
     return translateWlKeyboardKey(rawKeycode, phase, translator, this.#composeAdapter());
   }
 
-  pressLogical(rawKeycode: number, logicalKey: string): string {
-    return this.#pressedKeys.press(rawKeycode, logicalKey);
+  resolveLogicalTransition(
+    rawKeycode: number,
+    phase: WaylandKeyPhase,
+    fallback: string,
+  ): WaylandResolvedKeyTransition {
+    return this.#keys.resolve(rawKeycode, phase, fallback);
   }
 
-  releaseLogical(rawKeycode: number, fallback: string): string {
-    return this.#pressedKeys.release(rawKeycode, fallback);
+  /** Seed release/repeat identity from wl_keyboard.enter without generating text or events. */
+  seedHeldKeys(rawKeycodes: readonly number[]): void {
+    this.#keys.seedHeldKeys(
+      rawKeycodes,
+      (rawKeycode) => this.translateDeliveredKey(rawKeycode, "release").key,
+    );
   }
 
   keyRepeats(rawKeycode: number): boolean {
@@ -117,8 +125,9 @@ export class WaylandXkbController {
 
   resetTransientState(): void {
     this.#repeat.cancel();
-    this.#pressedKeys.clear();
+    this.#keys.reset();
     this.resetCompose();
+    if (this.#state) this.xkb.symbols.xkb_state_update_mask(this.#state, 0, 0, 0, 0, 0, 0);
   }
 
   resetCompose(): void {
@@ -156,7 +165,7 @@ export class WaylandXkbController {
 
   updateModifiers(depressed: number, latched: number, locked: number, group: number): void {
     if (!this.#state) {
-      this.#modifiers = modifiersFromMask(depressed | latched | locked);
+      this.#keys.confirmModifiers(modifiersFromMask(depressed | latched | locked));
       return;
     }
     this.xkb.symbols.xkb_state_update_mask(this.#state, depressed, latched, locked, 0, 0, group);
@@ -168,7 +177,7 @@ export class WaylandXkbController {
       ) > 0;
     const ctrlKey = active(XKB_MOD_CONTROL);
     const altGraphKey = active(XKB_MOD_LEVEL_THREE) || active(XKB_MOD5);
-    this.#modifiers = {
+    this.#keys.confirmModifiers({
       shiftKey: active(XKB_MOD_SHIFT),
       ctrlKey,
       altKey: active(XKB_MOD_ALT),
@@ -176,7 +185,7 @@ export class WaylandXkbController {
       accelKey: ctrlKey && !altGraphKey,
       capsLock: active(XKB_MOD_LOCK),
       altGraphKey,
-    };
+    });
   }
 
   clearKeymap(): void {
@@ -185,7 +194,6 @@ export class WaylandXkbController {
     if (this.#keymap) this.xkb.symbols.xkb_keymap_unref(this.#keymap);
     this.#state = null;
     this.#keymap = null;
-    this.#modifiers = modifiersFromMask(0);
   }
 
   close(): void {
@@ -232,7 +240,6 @@ export class WaylandXkbController {
     if (this.#keymap) this.xkb.symbols.xkb_keymap_unref(this.#keymap);
     this.#keymap = keymap;
     this.#state = state;
-    this.#modifiers = modifiersFromMask(0);
   }
 
   #readSizedUtf8(read: (buffer: Deno.PointerValue, size: bigint) => number): string {

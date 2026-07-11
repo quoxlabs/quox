@@ -34,6 +34,7 @@ export const DEFAULT_CURSOR_WIDTH = 24;
 export const DEFAULT_CURSOR_HEIGHT = 24;
 export const DEFAULT_CURSOR_HOTSPOT_X = 1;
 export const DEFAULT_CURSOR_HOTSPOT_Y = 1;
+const MAX_WL_ARRAY_U32_ENTRIES = 4096;
 
 export type AnyCallback = { pointer: Deno.PointerObject; close(): void };
 
@@ -110,17 +111,36 @@ export function dlsymRequired(
 }
 
 export function hasXdgToplevelState(statesPointer: Deno.PointerValue, state: number): boolean {
-  if (!statesPointer) return false;
-  const array = new Deno.UnsafePointerView(statesPointer);
-  const size = Number(array.getBigUint64(0));
-  if (size <= 0) return false;
-  const dataPointer = Deno.UnsafePointer.create(array.getBigUint64(16));
-  if (!dataPointer) return false;
+  return readWlArrayU32(statesPointer).includes(state);
+}
+
+/** Decode a native wl_array of uint32 values without trusting its wire-controlled size. */
+export function readWlArrayU32(arrayPointer: Deno.PointerValue): number[] {
+  if (!arrayPointer) return [];
+  const array = new Deno.UnsafePointerView(arrayPointer);
+  const size = array.getBigUint64(0);
+  const dataAddress = array.getBigUint64(16);
+  const dataPointer = Deno.UnsafePointer.create(dataAddress);
+  if (!dataPointer) return [];
   const data = new Deno.UnsafePointerView(dataPointer);
-  for (let offset = 0; offset < size; offset += 4) {
-    if (data.getUint32(offset) === state) return true;
+  return decodeWlArrayU32(size, dataAddress, (offset) => data.getUint32(offset));
+}
+
+/** Pure validation/decoding seam for native wl_array headers. */
+export function decodeWlArrayU32(
+  size: bigint,
+  dataAddress: bigint,
+  readUint32: (offset: number) => number,
+): number[] {
+  if (
+    size === 0n || dataAddress === 0n || size % 4n !== 0n ||
+    size > BigInt(MAX_WL_ARRAY_U32_ENTRIES * Uint32Array.BYTES_PER_ELEMENT)
+  ) return [];
+  const result: number[] = [];
+  for (let offset = 0; offset < Number(size); offset += Uint32Array.BYTES_PER_ELEMENT) {
+    result.push(readUint32(offset));
   }
-  return false;
+  return result;
 }
 
 export function makeVtable(

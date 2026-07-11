@@ -1,7 +1,7 @@
 /** Pure Wayland keyboard, XKB Compose, and repeat state. */
 
 import type { KeyEditDisposition, KeyModifiers } from "../types.ts";
-import { normalizeCommittedText } from "../input/mod.ts";
+import { normalizeCommittedText, PressedLogicalKeyCache } from "../input/mod.ts";
 import { logicalKeyFromKeysym } from "../linux/mod.ts";
 
 export type EnvironmentReader = (name: "LC_ALL" | "LC_CTYPE" | "LANG") => string | undefined;
@@ -56,6 +56,191 @@ export interface TranslatedKey {
   readonly key: string;
   readonly text?: string;
   readonly isComposing: boolean;
+}
+
+export interface WaylandProtocolKeyTransition {
+  readonly rawKeycode: number;
+  readonly pressed: boolean;
+}
+
+export interface WaylandEnteredKeyBatch {
+  readonly heldKeys: readonly number[];
+  readonly deferredTransitions: readonly WaylandProtocolKeyTransition[];
+}
+
+/** Hold the enter key array until its mandatory following modifiers event supplies the layout. */
+export class WaylandEnterKeyBatch {
+  #heldKeys: number[] | undefined;
+  #deferredTransitions: WaylandProtocolKeyTransition[] = [];
+
+  get awaitingModifiers(): boolean {
+    return this.#heldKeys !== undefined;
+  }
+
+  begin(heldKeys: readonly number[]): void {
+    this.#heldKeys = [...heldKeys];
+    this.#deferredTransitions = [];
+  }
+
+  defer(transition: WaylandProtocolKeyTransition): boolean {
+    if (this.#heldKeys === undefined) return false;
+    this.#deferredTransitions.push(transition);
+    return true;
+  }
+
+  complete(): WaylandEnteredKeyBatch | undefined {
+    const heldKeys = this.#heldKeys;
+    if (heldKeys === undefined) return undefined;
+    const result = {
+      heldKeys,
+      deferredTransitions: this.#deferredTransitions,
+    };
+    this.reset();
+    return result;
+  }
+
+  reset(): void {
+    this.#heldKeys = undefined;
+    this.#deferredTransitions = [];
+  }
+}
+
+type ProvisionalModifier = "shiftKey" | "ctrlKey" | "altKey" | "metaKey" | "capsLock" | "altGraphKey";
+
+export interface WaylandResolvedKeyTransition {
+  readonly key: string;
+  readonly modifiers: KeyModifiers;
+}
+
+/**
+ * Retains pressed logical keys and overlays physical modifier transitions until the compositor's
+ * following aggregate modifiers event arrives.
+ */
+export class WaylandKeyTransitionState {
+  readonly #logicalKeys = new PressedLogicalKeyCache<number>();
+  readonly #heldModifiers = new Map<number, ProvisionalModifier>();
+  readonly #provisional = new Map<ProvisionalModifier, boolean>();
+  #authoritative = emptyModifiers();
+
+  get modifiers(): KeyModifiers {
+    const shiftKey = this.#value("shiftKey");
+    const ctrlKey = this.#value("ctrlKey");
+    const altKey = this.#value("altKey");
+    const metaKey = this.#value("metaKey");
+    const capsLock = this.#value("capsLock");
+    const altGraphKey = this.#value("altGraphKey");
+    return {
+      shiftKey,
+      ctrlKey,
+      altKey,
+      metaKey,
+      accelKey: ctrlKey && !altGraphKey,
+      capsLock,
+      altGraphKey,
+    };
+  }
+
+  get pressedKeyCount(): number {
+    return this.#logicalKeys.size;
+  }
+
+  confirmModifiers(modifiers: KeyModifiers): void {
+    this.#authoritative = { ...modifiers };
+    this.#provisional.clear();
+  }
+
+  seedHeldKeys(rawKeycodes: readonly number[], resolve: (rawKeycode: number) => string): void {
+    for (const rawKeycode of rawKeycodes) {
+      const key = this.#logicalKeys.press(rawKeycode, resolve(rawKeycode));
+      const modifier = provisionalModifierForKey(key);
+      if (modifier !== undefined) this.#heldModifiers.set(rawKeycode, modifier);
+    }
+  }
+
+  resolve(
+    rawKeycode: number,
+    phase: KeyPhase,
+    fallback: string | undefined,
+  ): WaylandResolvedKeyTransition {
+    const key = phase === "release"
+      ? this.#logicalKeys.release(rawKeycode, fallback)
+      : this.#logicalKeys.press(rawKeycode, fallback);
+    this.#applyModifierTransition(rawKeycode, phase, key);
+    return { key, modifiers: this.modifiers };
+  }
+
+  reset(): void {
+    this.#logicalKeys.clear();
+    this.#heldModifiers.clear();
+    this.#provisional.clear();
+    this.#authoritative = emptyModifiers();
+  }
+
+  #applyModifierTransition(rawKeycode: number, phase: KeyPhase, key: string): void {
+    if (phase === "repeat") return;
+    const retainedModifier = this.#heldModifiers.get(rawKeycode);
+    const modifier = retainedModifier ?? provisionalModifierForKey(key);
+    if (modifier === undefined) return;
+
+    if (phase === "press") {
+      const initialPress = retainedModifier === undefined;
+      this.#heldModifiers.set(rawKeycode, modifier);
+      if (modifier === "capsLock") {
+        if (initialPress) this.#provisional.set(modifier, !this.#value(modifier));
+      } else {
+        this.#provisional.set(modifier, this.#hasHeldModifier(modifier));
+      }
+      return;
+    }
+
+    this.#heldModifiers.delete(rawKeycode);
+    // CapsLock describes the lock, not whether its physical key remains down.
+    if (modifier !== "capsLock") {
+      this.#provisional.set(modifier, this.#hasHeldModifier(modifier));
+    }
+  }
+
+  #hasHeldModifier(modifier: ProvisionalModifier): boolean {
+    for (const held of this.#heldModifiers.values()) {
+      if (held === modifier) return true;
+    }
+    return false;
+  }
+
+  #value(modifier: ProvisionalModifier): boolean {
+    return this.#provisional.get(modifier) ?? this.#authoritative[modifier];
+  }
+}
+
+function provisionalModifierForKey(key: string): ProvisionalModifier | undefined {
+  switch (key) {
+    case "Shift":
+      return "shiftKey";
+    case "Control":
+      return "ctrlKey";
+    case "Alt":
+      return "altKey";
+    case "Meta":
+      return "metaKey";
+    case "CapsLock":
+      return "capsLock";
+    case "AltGraph":
+      return "altGraphKey";
+    default:
+      return undefined;
+  }
+}
+
+function emptyModifiers(): KeyModifiers {
+  return {
+    shiftKey: false,
+    ctrlKey: false,
+    altKey: false,
+    metaKey: false,
+    accelKey: false,
+    capsLock: false,
+    altGraphKey: false,
+  };
 }
 
 export function waylandKeyEditDisposition(
