@@ -32,6 +32,12 @@ import {
 } from "./protocol.ts";
 import { damageOpcodeForSurfaceVersion, frameMatchesConfiguration, WaylandConfigureState } from "./window.ts";
 import { type WaylandGlobalInterface, WaylandGlobalRegistry } from "./global_registry.ts";
+import {
+  WaylandPointerAxis,
+  WaylandPointerAxisSource,
+  WaylandPointerFrameAccumulator,
+  WaylandPointerPosition,
+} from "./pointer.ts";
 
 Deno.test("Wayland globals keep one owner and promote a deterministic replacement", () => {
   const actions: string[] = [];
@@ -170,6 +176,151 @@ Deno.test("Wayland pointer capability transitions are symmetric", () => {
   assertEquals(pointerCapabilityAction(false, true), "release");
   assertEquals(pointerCapabilityAction(true, true), undefined);
   assertEquals(pointerCapabilityAction(false, false), undefined);
+});
+
+Deno.test("pointer v5 frames coalesce exact diagonal scroll vectors", () => {
+  const frame = new WaylandPointerFrameAccumulator();
+  frame.beginGeneration(5);
+
+  assertEquals(frame.axis(10, WaylandPointerAxis.vertical, 2560), undefined);
+  assertEquals(frame.axis(11, WaylandPointerAxis.horizontal, -384), undefined);
+  assertEquals(frame.frame(), {
+    time: 11,
+    deltaX: -1.5,
+    deltaY: 10,
+    deltaMode: 0,
+  });
+  assertEquals(frame.frame(), undefined);
+});
+
+Deno.test("Wayland fixed-point halves retain precision and sign symmetry", () => {
+  const frame = new WaylandPointerFrameAccumulator();
+  frame.beginGeneration(5);
+  frame.axis(1, WaylandPointerAxis.vertical, 128);
+  frame.axis(2, WaylandPointerAxis.horizontal, -128);
+
+  assertEquals(frame.frame(), {
+    time: 2,
+    deltaX: -0.5,
+    deltaY: 0.5,
+    deltaMode: 0,
+  });
+});
+
+Deno.test("discrete wheel frames use browser line units", () => {
+  const frame = new WaylandPointerFrameAccumulator();
+  frame.beginGeneration(5);
+
+  // source and discrete ordering is deliberately independent of axis ordering.
+  frame.axisDiscrete(WaylandPointerAxis.horizontal, -1);
+  frame.axisSource(WaylandPointerAxisSource.wheel);
+  frame.axisDiscrete(WaylandPointerAxis.vertical, 2);
+  frame.axis(20, WaylandPointerAxis.vertical, 5120);
+  frame.axis(20, WaylandPointerAxis.horizontal, -2560);
+  assertEquals(frame.frame(), {
+    time: 20,
+    deltaX: -1,
+    deltaY: 2,
+    deltaMode: 1,
+  });
+});
+
+Deno.test("smooth finger and continuous frames keep exact pixel units", () => {
+  for (const source of [WaylandPointerAxisSource.finger, WaylandPointerAxisSource.continuous]) {
+    const frame = new WaylandPointerFrameAccumulator();
+    frame.beginGeneration(5);
+    frame.axisDiscrete(WaylandPointerAxis.vertical, 1);
+    frame.axisSource(source);
+    frame.axis(30, WaylandPointerAxis.vertical, 128);
+    assertEquals(frame.frame(), {
+      time: 30,
+      deltaX: 0,
+      deltaY: 0.5,
+      deltaMode: 0,
+    });
+  }
+});
+
+Deno.test("axis stop clears only the stopped direction", () => {
+  const frame = new WaylandPointerFrameAccumulator();
+  frame.beginGeneration(5);
+  frame.axisDiscrete(WaylandPointerAxis.vertical, 1);
+  frame.axis(40, WaylandPointerAxis.vertical, 256);
+  frame.axis(41, WaylandPointerAxis.horizontal, -128);
+  frame.axisStop(42, WaylandPointerAxis.vertical);
+
+  assertEquals(frame.frame(), {
+    time: 42,
+    deltaX: -0.5,
+    deltaY: 0,
+    deltaMode: 0,
+  });
+  frame.axis(43, WaylandPointerAxis.vertical, 256);
+  frame.axisStop(44, WaylandPointerAxis.vertical);
+  assertEquals(frame.frame(), undefined);
+
+  // A later axis event starts a new motion sequence after the stop.
+  frame.axisStop(45, WaylandPointerAxis.vertical);
+  frame.axis(45, WaylandPointerAxis.vertical, 256);
+  assertEquals(frame.frame(), {
+    time: 45,
+    deltaX: 0,
+    deltaY: 1,
+    deltaMode: 0,
+  });
+});
+
+Deno.test("pointer frames and generations do not leak old scroll metadata", () => {
+  const frame = new WaylandPointerFrameAccumulator();
+  frame.beginGeneration(5);
+  frame.axisSource(WaylandPointerAxisSource.wheel);
+  frame.axisDiscrete(WaylandPointerAxis.vertical, 1);
+  frame.axis(50, WaylandPointerAxis.vertical, 2560);
+  assertEquals(frame.frame()?.deltaMode, 1);
+
+  frame.axis(51, WaylandPointerAxis.vertical, 128);
+  assertEquals(frame.frame(), {
+    time: 51,
+    deltaX: 0,
+    deltaY: 0.5,
+    deltaMode: 0,
+  });
+
+  frame.axis(52, WaylandPointerAxis.vertical, 256);
+  frame.beginGeneration(4);
+  assertEquals(frame.frame(), undefined);
+  assertEquals(frame.axis(53, WaylandPointerAxis.vertical, 128), {
+    time: 53,
+    deltaX: 0,
+    deltaY: 0.5,
+    deltaMode: 0,
+  });
+});
+
+Deno.test("legacy pointer axes dispatch immediately without rounding", () => {
+  const frame = new WaylandPointerFrameAccumulator();
+  frame.beginGeneration(4);
+
+  assertEquals(frame.axis(60, WaylandPointerAxis.vertical, 128), {
+    time: 60,
+    deltaX: 0,
+    deltaY: 0.5,
+    deltaMode: 0,
+  });
+  assertEquals(frame.axis(61, WaylandPointerAxis.horizontal, -128), {
+    time: 61,
+    deltaX: -0.5,
+    deltaY: 0,
+    deltaMode: 0,
+  });
+  assertEquals(frame.frame(), undefined);
+});
+
+Deno.test("enter coordinates seed snapshots before the first motion", () => {
+  const position = new WaylandPointerPosition();
+  position.updateFixed(384, -128);
+
+  assertEquals({ x: position.x, y: position.y }, { x: 1.5, y: -0.5 });
 });
 
 Deno.test("Wayland configurations latch role state and serial as one generation", () => {

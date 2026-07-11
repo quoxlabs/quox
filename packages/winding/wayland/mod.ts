@@ -37,6 +37,7 @@ import {
   type WaylandGlobalOffer,
   WaylandGlobalRegistry,
 } from "./global_registry.ts";
+import { WaylandPointerFrameAccumulator, WaylandPointerPosition } from "./pointer.ts";
 
 // WaylandLibrary coordinates globals and the extracted native controllers.
 class WaylandLibrary implements Library {
@@ -88,8 +89,8 @@ class WaylandLibrary implements Library {
   #seatVtable: BigUint64Array<ArrayBuffer> | undefined;
   #pointer: Deno.PointerObject | null = null;
   #pointerFocus: WaylandWindow | null = null;
-  #pointerX = 0;
-  #pointerY = 0;
+  readonly #pointerPosition = new WaylandPointerPosition();
+  readonly #pointerFrame = new WaylandPointerFrameAccumulator();
   #pointerButtons = 0;
   readonly #pointerClock = new NativeEventClock(2 ** 32);
   readonly #clickCounter = new ClickCounter<MouseButton>();
@@ -624,6 +625,7 @@ class WaylandLibrary implements Library {
     );
     if (!pointer) return;
     this.#pointer = pointer;
+    this.#pointerFrame.beginGeneration(sym.wl_proxy_get_version(pointer));
     this.#ensureCursorShapeDevice();
 
     // wl_pointer events (indices):
@@ -635,9 +637,9 @@ class WaylandLibrary implements Library {
         if (this.#pointer !== pointer) return;
         const window = this.#windowForSurface(surface);
         if (!window) return;
+        this.#pointerFrame.reset();
         this.#pointerFocus = window;
-        this.#pointerX = xFixed / 256;
-        this.#pointerY = yFixed / 256;
+        this.#pointerPosition.updateFixed(xFixed, yFixed);
         this.#setDefaultCursor(serial);
         this.#events.push({ type: "mouseenter", ...this.#pointerSnapshot(), window });
       }),
@@ -650,6 +652,7 @@ class WaylandLibrary implements Library {
         if (this.#pointer !== pointer) return;
         const window = this.#windowForSurface(surface);
         if (!window || window !== this.#pointerFocus) return;
+        this.#pointerFrame.reset();
         this.#pointerFocus = null;
         this.#events.push({ type: "mouseleave", ...this.#pointerSnapshot(), window });
       }),
@@ -662,8 +665,7 @@ class WaylandLibrary implements Library {
         if (this.#pointer !== pointer) return;
         const window = this.#pointerFocus;
         if (!window) return;
-        this.#pointerX = xFixed / 256;
-        this.#pointerY = yFixed / 256;
+        this.#pointerPosition.updateFixed(xFixed, yFixed);
         this.#events.push({ type: "mousemove", ...this.#pointerSnapshot(time), window });
       }),
     );
@@ -706,29 +708,61 @@ class WaylandLibrary implements Library {
         if (this.#pointer !== pointer) return;
         const window = this.#pointerFocus;
         if (!window) return;
-        const delta = value >> 8;
-        if (axis === 0) {
-          this.#events.push({
-            type: "wheel",
-            deltaX: 0,
-            deltaY: delta,
-            deltaMode: 0,
-            ...this.#pointerSnapshot(time),
-            window,
-          });
-        } else if (axis === 1) {
-          this.#events.push({
-            type: "wheel",
-            deltaX: delta,
-            deltaY: 0,
-            deltaMode: 0,
-            ...this.#pointerSnapshot(time),
-            window,
-          });
-        }
+        const wheel = this.#pointerFrame.axis(time, axis, value);
+        if (wheel === undefined) return;
+        this.#events.push({
+          type: "wheel",
+          deltaX: wheel.deltaX,
+          deltaY: wheel.deltaY,
+          deltaMode: wheel.deltaMode,
+          ...this.#pointerSnapshot(wheel.time),
+          window,
+        });
       }),
     );
     this.#pointerListeners.push(axisCb);
+    const frameCb = new Deno.UnsafeCallback(
+      { parameters: ["pointer", "pointer"], result: "void" },
+      this.guardCallback((_data, _ptr) => {
+        if (this.#pointer !== pointer) return;
+        const wheel = this.#pointerFrame.frame();
+        const window = this.#pointerFocus;
+        if (wheel === undefined || !window) return;
+        this.#events.push({
+          type: "wheel",
+          deltaX: wheel.deltaX,
+          deltaY: wheel.deltaY,
+          deltaMode: wheel.deltaMode,
+          ...this.#pointerSnapshot(wheel.time),
+          window,
+        });
+      }),
+    );
+    this.#pointerListeners.push(frameCb);
+    const axisSourceCb = new Deno.UnsafeCallback(
+      { parameters: ["pointer", "pointer", "u32"], result: "void" },
+      this.guardCallback((_data, _ptr, source) => {
+        if (this.#pointer !== pointer || !this.#pointerFocus) return;
+        this.#pointerFrame.axisSource(source);
+      }),
+    );
+    this.#pointerListeners.push(axisSourceCb);
+    const axisStopCb = new Deno.UnsafeCallback(
+      { parameters: ["pointer", "pointer", "u32", "u32"], result: "void" },
+      this.guardCallback((_data, _ptr, time, axis) => {
+        if (this.#pointer !== pointer || !this.#pointerFocus) return;
+        this.#pointerFrame.axisStop(time, axis);
+      }),
+    );
+    this.#pointerListeners.push(axisStopCb);
+    const axisDiscreteCb = new Deno.UnsafeCallback(
+      { parameters: ["pointer", "pointer", "u32", "i32"], result: "void" },
+      this.guardCallback((_data, _ptr, axis, discrete) => {
+        if (this.#pointer !== pointer || !this.#pointerFocus) return;
+        this.#pointerFrame.axisDiscrete(axis, discrete);
+      }),
+    );
+    this.#pointerListeners.push(axisDiscreteCb);
     const ptrEventCount = readEventCount(Deno.UnsafePointer.value(this.ifaces.pointer));
     const pointerVtable = makeVtable(
       this.#pointerListeners,
@@ -791,6 +825,7 @@ class WaylandLibrary implements Library {
     const pointer = this.#pointer;
     const listeners = this.#pointerListeners;
     this.#pointerFocus = null;
+    this.#pointerFrame.beginGeneration(0);
     this.#cursorShapeDevice = null;
     this.#pointer = null;
     this.#pointerButtons = 0;
@@ -848,8 +883,8 @@ class WaylandLibrary implements Library {
     metaKey: boolean;
   } {
     return {
-      x: this.#pointerX,
-      y: this.#pointerY,
+      x: this.#pointerPosition.x,
+      y: this.#pointerPosition.y,
       buttons: this.#pointerButtons,
       timeStamp: time === undefined ? performance.now() : this.#pointerClock.timeStamp(time),
       ...pointerModifiers(this.#keyboardController.modifiers),
@@ -870,7 +905,10 @@ class WaylandLibrary implements Library {
     const errors: unknown[] = [];
     collectCleanupError(errors, () => this.#textInputController.removeWindow(window));
     collectCleanupError(errors, () => this.#keyboardController.removeWindow(window));
-    if (this.#pointerFocus === window) this.#pointerFocus = null;
+    if (this.#pointerFocus === window) {
+      this.#pointerFocus = null;
+      this.#pointerFrame.reset();
+    }
     const key = Deno.UnsafePointer.value(surface);
     if (this.#windowsBySurface.get(key) === window) this.#windowsBySurface.delete(key);
     this.windows.delete(window);
