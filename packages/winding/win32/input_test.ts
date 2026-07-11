@@ -59,6 +59,7 @@ import {
 import { Win32InputController, type Win32InputWindow } from "./input_controller.ts";
 import { decodeWin32DpiChange, scaleWin32OuterGeometry, Win32DpiAwareness, Win32DpiState } from "./dpi.ts";
 import { describeWin32Error, WIN32_SYSTEM_MESSAGE_FLAGS } from "./error.ts";
+import { prepareWin32Frame, Win32RetainedFrame } from "./frame.ts";
 import {
   ImeActivationState,
   keyLocationForCode,
@@ -97,6 +98,83 @@ Deno.test("Win32 system errors suppress inserts and retain the numeric code when
   );
   assertEquals(describeWin32Error(0xdeadbeef), "Win32 error (3735928559)");
   assertEquals(describeWin32Error(317, " \r\n\t"), "Win32 error (317)");
+});
+
+Deno.test("Win32 frame preparation validates bounds, framebuffer size, and exact RGBA storage", () => {
+  const rgba = new Uint8Array([0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0]);
+  const frame = prepareWin32Frame(rgba, 2, 1, { width: 2, height: 1 });
+  assertEquals(frame.bgra, new Uint8Array([0x56, 0x34, 0x12, 0x78, 0xde, 0xbc, 0x9a, 0xf0]));
+  const header = new DataView(frame.bitmapInfo);
+  assertEquals(
+    [
+      header.getUint32(0, true),
+      header.getInt32(4, true),
+      header.getInt32(8, true),
+      header.getUint16(12, true),
+      header.getUint16(14, true),
+      header.getUint32(16, true),
+      header.getUint32(20, true),
+    ],
+    [40, 2, -1, 1, 32, 0, 8],
+  );
+
+  for (const invalid of [0, -1, 1.5, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1, 0x80000000]) {
+    assertThrows(() => prepareWin32Frame(new Uint8Array(), invalid, 1, { width: invalid, height: 1 }), RangeError);
+    assertThrows(() => prepareWin32Frame(new Uint8Array(), 1, invalid, { width: 1, height: invalid }), RangeError);
+  }
+  assertThrows(
+    () =>
+      prepareWin32Frame(new Uint8Array(), 0x7fffffff, 0x7fffffff, {
+        width: 0x7fffffff,
+        height: 0x7fffffff,
+      }),
+    RangeError,
+    "byte length",
+  );
+  assertThrows(() => prepareWin32Frame(rgba, 2, 1, undefined), Error, "unavailable");
+  assertThrows(() => prepareWin32Frame(rgba, 2, 1, { width: 0, height: 0 }), RangeError, "does not match");
+  assertThrows(() => prepareWin32Frame(rgba, 2, 1, { width: 1, height: 1 }), RangeError, "does not match");
+  assertThrows(() => prepareWin32Frame(rgba, 2, 1, { width: 2, height: 2 }), RangeError, "does not match");
+  assertThrows(() => prepareWin32Frame(rgba.subarray(0, 4), 2, 1, { width: 2, height: 1 }), RangeError);
+  assertThrows(() => prepareWin32Frame(rgba.subarray(0, 7), 2, 1, { width: 2, height: 1 }), RangeError);
+  assertThrows(() => prepareWin32Frame(new Uint8Array(9), 2, 1, { width: 2, height: 1 }), RangeError);
+  assertThrows(() => prepareWin32Frame(new Uint8Array(12), 2, 1, { width: 2, height: 1 }), RangeError);
+});
+
+Deno.test("Win32 retains only complete native frame draws for later repaint", () => {
+  const retained = new Win32RetainedFrame();
+  const first = prepareWin32Frame(new Uint8Array([1, 2, 3, 4]), 1, 1, { width: 1, height: 1 });
+  const second = prepareWin32Frame(new Uint8Array([5, 6, 7, 8, 9, 10, 11, 12]), 1, 2, {
+    width: 1,
+    height: 2,
+  });
+  retained.drawAndRetain(first, () => 1);
+
+  for (const result of [0, 1, 3, -1]) {
+    assertThrows(() => retained.drawAndRetain(second, () => result), Error, "scan lines");
+    assert(retained.current === first);
+  }
+  assertThrows(
+    () =>
+      retained.drawAndRetain(second, () => {
+        throw new Error("injected draw failure");
+      }),
+    Error,
+    "injected draw failure",
+  );
+  assert(retained.current === first);
+
+  let repainted: typeof first | undefined;
+  retained.redraw((frame) => {
+    repainted = frame;
+    return frame.height;
+  });
+  assert(repainted === first);
+  assertThrows(() => retained.redraw(() => 0), Error, "scan lines");
+  assert(retained.current === first);
+
+  retained.drawAndRetain(second, () => 2);
+  assert(retained.current === second);
 });
 
 Deno.test({
@@ -255,7 +333,9 @@ Deno.test("Win32 queue gate preserves WM_QUIT and latches after its signed exit 
 
 Deno.test("Win32 client state reports visibility and authoritative size independently", () => {
   const state = new Win32ClientState();
+  assertEquals(state.framebufferSize, undefined);
   assertEquals(state.observe(false, 800, 600), { size: clientSize(800, 600) });
+  assertEquals(state.framebufferSize, { width: 800, height: 600 });
   assertEquals(state.observe(true, 800, 600), { visible: false });
 
   // A size change while minimized must not wait for an unrelated later resize.

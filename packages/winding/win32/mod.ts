@@ -11,6 +11,7 @@ import {
   type Win32OuterGeometry,
 } from "./dpi.ts";
 import { describeWin32Error, WIN32_SYSTEM_MESSAGE_FLAGS } from "./error.ts";
+import { prepareWin32Frame, type Win32PreparedFrame, Win32RetainedFrame } from "./frame.ts";
 import {
   gdi32functions,
   imm32functions,
@@ -37,11 +38,7 @@ import {
 } from "./input.ts";
 import { Win32InputController } from "./input_controller.ts";
 
-// BITMAPINFOHEADER is 40 bytes; for 32bpp BI_RGB no color table follows, so
-// this buffer alone is a valid BITMAPINFO for SetDIBitsToDevice.
-const BITMAPINFOHEADER_SIZE = 40;
 const PAINTSTRUCT_SIZE = 72;
-const BI_RGB = 0;
 const BLACKNESS = 0x00000042;
 const DIB_RGB_COLORS = 0;
 const ERROR_CLASS_DOES_NOT_EXIST = 1411;
@@ -102,10 +99,7 @@ function trackMouseLeave(lib: Win32Library, hWnd: Deno.PointerObject): void {
 class Win32Window implements Window {
   readonly id: bigint;
   readonly #hwnd: Deno.PointerObject;
-  #bgra = new Uint8Array(0) as Uint8Array<ArrayBuffer>;
-  #bmi = new ArrayBuffer(BITMAPINFOHEADER_SIZE);
-  #frameWidth: number | undefined;
-  #frameHeight: number | undefined;
+  readonly #retainedFrame = new Win32RetainedFrame();
   readonly mouseTracking = new Win32MouseTrackingState();
   pointerSnapshot: Win32PointerSnapshot | undefined;
   readonly clientState = new Win32ClientState();
@@ -230,37 +224,12 @@ class Win32Window implements Window {
    * X11 backend) and blits it with `SetDIBitsToDevice`.
    */
   blit(rgba: Uint8Array, width: number, height: number): void {
-    const byteLength = width * height * 4;
-    if (this.#bgra.byteLength !== byteLength) {
-      this.#bgra = new Uint8Array(byteLength) as Uint8Array<ArrayBuffer>;
-    }
-    const bgra = this.#bgra;
-    for (let i = 0; i < rgba.length; i += 4) {
-      bgra[i] = rgba[i + 2]; // B ← R
-      bgra[i + 1] = rgba[i + 1]; // G
-      bgra[i + 2] = rgba[i]; // R ← B
-      bgra[i + 3] = rgba[i + 3]; // A
-    }
-
-    const dv = new DataView(this.#bmi);
-    dv.setUint32(0, BITMAPINFOHEADER_SIZE, true); // biSize
-    dv.setInt32(4, width, true); // biWidth
-    dv.setInt32(8, -height, true); // biHeight (negative = top-down)
-    dv.setUint16(12, 1, true); // biPlanes
-    dv.setUint16(14, 32, true); // biBitCount
-    dv.setUint32(16, BI_RGB, true); // biCompression
-    dv.setUint32(20, byteLength, true); // biSizeImage
-    dv.setInt32(24, 0, true); // biXPelsPerMeter
-    dv.setInt32(28, 0, true); // biYPelsPerMeter
-    dv.setUint32(32, 0, true); // biClrUsed
-    dv.setUint32(36, 0, true); // biClrImportant
-    this.#frameWidth = width;
-    this.#frameHeight = height;
+    const candidate = prepareWin32Frame(rgba, width, height, this.clientState.framebufferSize);
 
     const hdc = this.lib.user32.symbols.GetDC(this.#hwnd);
-    if (hdc == null) throw new Error(this.lib.getLastError());
+    if (hdc == null) throw new Error("winding(win32): GetDC failed");
     try {
-      this.#drawFrame(hdc, width, height);
+      this.#retainedFrame.drawAndRetain(candidate, (frame) => this.#drawFrame(hdc, frame));
     } finally {
       this.lib.user32.symbols.ReleaseDC(this.#hwnd, hdc);
     }
@@ -272,24 +241,22 @@ class Win32Window implements Window {
     if (width > 0 && height > 0 && this.lib.gdi32.symbols.PatBlt(hdc, left, top, width, height, BLACKNESS) === 0) {
       throw new Error("winding(win32): failed to clear the paint region");
     }
-    if (this.#frameWidth !== undefined && this.#frameHeight !== undefined) {
-      this.#drawFrame(hdc, this.#frameWidth, this.#frameHeight);
-    }
+    this.#retainedFrame.redraw((frame) => this.#drawFrame(hdc, frame));
   }
 
-  #drawFrame(hdc: Deno.PointerObject, width: number, height: number): void {
-    this.lib.gdi32.symbols.SetDIBitsToDevice(
+  #drawFrame(hdc: Deno.PointerObject, frame: Win32PreparedFrame): number {
+    return this.lib.gdi32.symbols.SetDIBitsToDevice(
       hdc,
       0,
       0,
-      width,
-      height,
+      frame.width,
+      frame.height,
       0,
       0,
       0,
-      height,
-      this.#bgra,
-      this.#bmi,
+      frame.height,
+      frame.bgra,
+      frame.bitmapInfo,
       DIB_RGB_COLORS,
     );
   }

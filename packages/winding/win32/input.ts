@@ -86,6 +86,12 @@ export class Win32ClientState {
     return this.#minimized;
   }
 
+  get framebufferSize(): { width: number; height: number } | undefined {
+    return this.#framebufferWidth === undefined || this.#framebufferHeight === undefined
+      ? undefined
+      : { width: this.#framebufferWidth, height: this.#framebufferHeight };
+  }
+
   observe(
     minimized: boolean,
     framebufferWidth: number,
