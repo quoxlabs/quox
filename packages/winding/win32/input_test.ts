@@ -15,6 +15,7 @@ import {
   keyboardStateForTranslation,
   logicalKeyFromVirtualKey,
   matchesWin32KeyMessage,
+  normalizeWin32PrintableLogicalKey,
   probeWin32AltGraphLayout,
   repeatedWmCharText,
   ResultEchoSuppressor,
@@ -1131,6 +1132,51 @@ Deno.test("logical virtual-key mapping covers named, function, translated, and u
   assertEquals(logicalKeyFromVirtualKey(VK.PACKET, "\ud83d"), "Unidentified");
 });
 
+Deno.test("Win32 printable logical keys use NFC and zero-or-one-base-plus-marks grammar", () => {
+  assertEquals(normalizeWin32PrintableLogicalKey("e\u0301"), "é");
+  assertEquals(normalizeWin32PrintableLogicalKey("q\u0301"), "q\u0301");
+  assertEquals(normalizeWin32PrintableLogicalKey("🙂"), "🙂");
+  assertEquals(normalizeWin32PrintableLogicalKey("ab"), undefined);
+  assertEquals(normalizeWin32PrintableLogicalKey("\u0301"), "\u0301");
+  assertEquals(normalizeWin32PrintableLogicalKey("\u0301a"), undefined);
+  assertEquals(normalizeWin32PrintableLogicalKey("\u200c"), "\u200c");
+  assertEquals(normalizeWin32PrintableLogicalKey("\u001f"), undefined);
+  assertEquals(normalizeWin32PrintableLogicalKey("\u0085"), undefined);
+  assertEquals(normalizeWin32PrintableLogicalKey("\ud83d"), undefined);
+  assertEquals(normalizeWin32PrintableLogicalKey("\ude42"), undefined);
+  assertEquals(normalizeWin32PrintableLogicalKey(undefined), undefined);
+});
+
+Deno.test("Win32 translation separates normalized logical keys from exact accepted text", () => {
+  const state = new Uint8Array(256);
+  const translate = (virtualKey: number, candidate: string) => {
+    const translated = translateLogicalKey(virtualKey, makeKeyLParam(0x12), state, {
+      toUnicode: () => ({ result: candidate.length, text: candidate }),
+    });
+    return { key: translated.key, text: translated.text, dead: translated.dead };
+  };
+
+  assertEquals(translate(0x45, "e\u0301"), { key: "é", text: "e\u0301", dead: false });
+  assertEquals(translate(0x45, "q\u0301"), { key: "q\u0301", text: "q\u0301", dead: false });
+  assertEquals(translate(0x45, "🙂"), { key: "🙂", text: "🙂", dead: false });
+  assertEquals(translate(0x45, "ab"), { key: "Unidentified", text: "ab", dead: false });
+  assertEquals(translate(0x45, "\u0301"), { key: "\u0301", text: "\u0301", dead: false });
+  assertEquals(translate(0x45, "\u001f"), { key: "Unidentified", text: undefined, dead: false });
+  assertEquals(translate(0x45, "\ud83d"), { key: "Unidentified", text: undefined, dead: false });
+  assertEquals(translate(VK.PACKET, "e\u0301"), { key: "é", text: "e\u0301", dead: false });
+  assertEquals(translate(VK.PACKET, "ab"), { key: "Unidentified", text: "ab", dead: false });
+
+  const dead = translateLogicalKey(0xde, makeKeyLParam(0x28), state, {
+    toUnicode: () => ({ result: -1, text: "´" }),
+  });
+  assertEquals({ key: dead.key, text: dead.text, dead: dead.dead }, {
+    key: "Dead",
+    text: undefined,
+    dead: true,
+  });
+  assertEquals(translate(VK.LEFT, "ab").key, "ArrowLeft");
+});
+
 Deno.test("Win32 language-mode keys use the active HKL LANGID without guessing unknown aliases", () => {
   assertEquals(win32LanguageIdFromKeyboardLayout(0x7fff12340411n), 0x0411);
   assertEquals(win32LanguageIdFromKeyboardLayout(BigInt.asIntN(64, 0xffffffffffff0412n)), 0x0412);
@@ -1222,6 +1268,32 @@ Deno.test("Win32 layout aliases retain keydown identity through repeats, release
       { type: "keydown", key: "HangulMode", code: "KanaMode", location: 0, repeat: false },
       { type: "keyup", key: "HanjaMode", code: "Lang2", location: 0, repeat: undefined },
       { type: "keydown", key: "KanjiMode", code: "Lang2", location: 0, repeat: false },
+    ],
+  );
+});
+
+Deno.test("Win32 retains the normalized logical key through repeat and release", () => {
+  let candidate = "e\u0301";
+  const harness = createInputControllerHarness({ translateKey: () => candidate });
+  harness.controller.attach(harness.window);
+  const down = makeKeyLParam(0x12);
+  const repeat = makeKeyLParam(0x12, { previous: true });
+  const up = makeKeyLParam(0x12, { previous: true, transition: true });
+  harness.controller.handleMessage(harness.window, WM.KEYDOWN, 0x45, down);
+  candidate = "x";
+  harness.controller.handleMessage(harness.window, WM.KEYDOWN, 0x45, repeat);
+  harness.controller.handleMessage(harness.window, WM.KEYUP, 0x45, up);
+
+  assertEquals(
+    harness.events.filter((event) => event.type === "keydown" || event.type === "keyup").map((event) => ({
+      type: event.type,
+      key: event.key,
+      repeat: event.repeat,
+    })),
+    [
+      { type: "keydown", key: "é", repeat: false },
+      { type: "keydown", key: "é", repeat: true },
+      { type: "keyup", key: "é", repeat: false },
     ],
   );
 });
@@ -1627,6 +1699,47 @@ Deno.test("printable physical Ctrl+Alt layout levels use browser AltGraph owners
   assertEquals(browserModifiers.altGraphKey, true);
   assertEquals(browserModifiers.accelKey, false);
   assertEquals(win32KeyEditDisposition(0x51, "@", false, browserModifiers, "@", true), "text-input");
+});
+
+Deno.test("Ctrl+Alt keeps actual text exact but uses stripped fallback only for the logical key", () => {
+  const state = keyboardState([
+    [VK.CONTROL, 0x80],
+    [VK.LCONTROL, 0x80],
+    [VK.MENU, 0x80],
+    [VK.LMENU, 0x80],
+  ]);
+  let actualCalls = 0;
+  const actual = translateLogicalKey(0x51, makeKeyLParam(0x10), state, {
+    toUnicode() {
+      actualCalls++;
+      return { result: 2, text: "ss" };
+    },
+  }, true);
+  assertEquals(actualCalls, 1);
+  assertEquals(actual.key, "Unidentified");
+  assertEquals(actual.text, "ss");
+
+  let fallbackCalls = 0;
+  const fallback = translateLogicalKey(0x45, makeKeyLParam(0x12), state, {
+    toUnicode(_virtualKey, _scanCode, translatedState) {
+      fallbackCalls++;
+      if ((translatedState[VK.CONTROL] & 0x80) !== 0) return { result: 1, text: "\u0005" };
+      assertEquals(translatedState[VK.LCONTROL] & 0x80, 0);
+      assertEquals(translatedState[VK.LMENU] & 0x80, 0);
+      return { result: 2, text: "e\u0301" };
+    },
+  }, true);
+  assertEquals(fallbackCalls, 2);
+  assertEquals(fallback.key, "é");
+  assertEquals(fallback.text, undefined);
+
+  const invalidFallback = translateLogicalKey(0x45, makeKeyLParam(0x12), state, {
+    toUnicode(_virtualKey, _scanCode, translatedState) {
+      return (translatedState[VK.CONTROL] & 0x80) !== 0 ? { result: 0, text: "" } : { result: 2, text: "ab" };
+    },
+  }, true);
+  assertEquals(invalidFallback.key, "Unidentified");
+  assertEquals(invalidFallback.text, undefined);
 });
 
 Deno.test("non-text Ctrl+Alt shortcuts keep their plain key and platform ownership", () => {

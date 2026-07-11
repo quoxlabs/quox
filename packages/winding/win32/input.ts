@@ -713,6 +713,42 @@ export interface LogicalKeyTranslation {
   modifiers: Win32KeyboardModifiers;
 }
 
+const WIN32_COMBINING_MARK = /^\p{M}$/u;
+const WIN32_CONTROL_CHARACTER = /^\p{Cc}$/u;
+
+function isUnicodeScalarText(text: string): boolean {
+  for (const character of text) {
+    const codePoint = character.codePointAt(0)!;
+    if (codePoint >= 0xd800 && codePoint <= 0xdfff) return false;
+  }
+  return true;
+}
+
+/** Normalize one DOM key: zero or one non-Cc base scalar, then combining marks. */
+export function normalizeWin32PrintableLogicalKey(candidate: string | undefined): string | undefined {
+  if (candidate === undefined || candidate.length === 0 || !isUnicodeScalarText(candidate)) return undefined;
+  const normalized = candidate.normalize("NFC");
+  let sawBase = false;
+  let sawLeadingMark = false;
+  for (const character of normalized) {
+    if (WIN32_CONTROL_CHARACTER.test(character)) return undefined;
+    // ECMAScript exposes General_Category=Mark but not canonical combining
+    // class; Mark is the smallest practical approximation of W3C combining.
+    if (WIN32_COMBINING_MARK.test(character)) {
+      if (!sawBase) sawLeadingMark = true;
+      continue;
+    }
+    if (sawBase || sawLeadingMark) return undefined;
+    sawBase = true;
+  }
+  return normalized;
+}
+
+function acceptedWin32TranslationText(text: string | undefined): string | undefined {
+  if (text === undefined || !isUnicodeScalarText(text)) return undefined;
+  return normalizeCommittedText(text);
+}
+
 /** Translate a native key using the active Windows keyboard layout. */
 export function translateLogicalKey(
   virtualKey: number,
@@ -735,7 +771,7 @@ export function translateLogicalKey(
 
   if (translation.result < 0) return { key: "Dead", dead: true, modifiers };
   const translatedText = translation.result > 0 ? translation.text.slice(0, translation.result) : undefined;
-  const text = translatedText === undefined ? undefined : normalizeCommittedText(translatedText);
+  const text = acceptedWin32TranslationText(translatedText);
   if (text === undefined && preserveCtrlAlt) {
     try {
       const fallback = adapter.toUnicode(
@@ -855,17 +891,10 @@ export function logicalKeyFromVirtualKey(
     if (primaryLanguage === 0x12) return virtualKey === VK.KANA ? "HangulMode" : "HanjaMode";
     return "Unidentified";
   }
-  if (virtualKey === VK.PACKET) {
-    if (translatedText === undefined || !isCommitText(translatedText)) return "Unidentified";
-    const scalars = [...translatedText];
-    if (scalars.length !== 1) return "Unidentified";
-    const codePoint = scalars[0].codePointAt(0)!;
-    return codePoint >= 0xd800 && codePoint <= 0xdfff ? "Unidentified" : translatedText;
-  }
   const named = NAMED_VIRTUAL_KEYS.get(virtualKey);
   if (named !== undefined) return named;
   if (virtualKey >= VK.F1 && virtualKey <= VK.F24) return `F${virtualKey - VK.F1 + 1}`;
-  return translatedText !== undefined && isCommitText(translatedText) ? translatedText : "Unidentified";
+  return normalizeWin32PrintableLogicalKey(translatedText) ?? "Unidentified";
 }
 
 /** Text accepted from WM_CHAR/ToUnicodeEx. Key controls are dispatched separately. */
