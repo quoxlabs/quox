@@ -170,6 +170,11 @@ class X11Window implements Window {
     this.input.setCursorArea(x, y, width, height);
   }
 
+  setImeSurroundingText(text: string, selectionStartBytes: number, selectionEndBytes: number): void {
+    this.#assertOpen();
+    this.input.setSurroundingText(text, selectionStartBytes, selectionEndBytes);
+  }
+
   setTitle(title: string): void {
     this.#assertOpen();
     const titleBytes = utf8Bytes(title);
@@ -415,6 +420,9 @@ class X11Library implements Library {
               if (deletion !== undefined) this.#events.push(deletion);
               return;
             }
+            case "replace":
+              this.#events.push({ ...event, window });
+              return;
             default:
               assertNever(event);
           }

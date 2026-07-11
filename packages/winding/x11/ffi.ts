@@ -159,6 +159,24 @@ export const x11functions = {
   // The XIM APIs below are C varargs. Deno FFI has no variadic descriptor, so
   // bind each all-GPR call shape used by this backend to a fixed alias. This is
   // intentionally limited to the repository's existing LP64 Linux target.
+  XCreateICWithPreeditAndString: {
+    name: "XCreateIC",
+    parameters: [
+      "pointer",
+      "buffer",
+      "usize",
+      "buffer",
+      "usize",
+      "buffer",
+      "usize",
+      "buffer",
+      "pointer",
+      "buffer",
+      "buffer",
+      "pointer",
+    ],
+    result: "pointer",
+  },
   XCreateICWithPreeditAttributes: {
     name: "XCreateIC",
     parameters: [
@@ -171,6 +189,22 @@ export const x11functions = {
       "usize",
       "buffer",
       "pointer",
+      "pointer",
+    ],
+    result: "pointer",
+  },
+  XCreateICSimpleWithString: {
+    name: "XCreateIC",
+    parameters: [
+      "pointer",
+      "buffer",
+      "usize",
+      "buffer",
+      "usize",
+      "buffer",
+      "usize",
+      "buffer",
+      "buffer",
       "pointer",
     ],
     result: "pointer",

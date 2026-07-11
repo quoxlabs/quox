@@ -7,6 +7,8 @@ import {
   ImeActivationState,
   type ImeCursorArea,
   normalizeImeCursorArea,
+  utf8OffsetToUtf16Index,
+  validateImeCursorRange,
 } from "../input/mod.ts";
 import { logicalKeyFromKeysym, unicodeTextFromKeysym } from "../linux/mod.ts";
 import { utf8CString as cString } from "../text_encoding.ts";
@@ -65,6 +67,7 @@ const XN_PREEDIT_DRAW_CALLBACK = cString("preeditDrawCallback");
 const XN_PREEDIT_CARET_CALLBACK = cString("preeditCaretCallback");
 const XN_PREEDIT_ATTRIBUTES = cString("preeditAttributes");
 const XN_SPOT_LOCATION = cString("spotLocation");
+const XN_STRING_CONVERSION_CALLBACK = cString("stringConversionCallback");
 
 const PREEDIT_START_DEFINITION = {
   parameters: ["pointer", "pointer", "pointer"],
@@ -333,13 +336,28 @@ export class XimManager implements Disposable {
     if (this.#im === null || this.#styles === undefined) return null;
     const style = context.enabled ? this.#styles.preedit : this.#styles.none;
     if (style === undefined) return null;
+    const conversionRecord = context.createStringConversionCallback();
     let ic: Deno.PointerObject | null;
 
     if (context.enabled && this.#styles.callbacks) {
       const callbackAttributes = context.createCallbackAttributes();
       if (callbackAttributes === null) return null;
       try {
-        ic = this.#x11.XCreateICWithPreeditAttributes(
+        ic = this.#x11.XCreateICWithPreeditAndString(
+          this.#im,
+          XN_INPUT_STYLE,
+          style,
+          XN_CLIENT_WINDOW,
+          context.window,
+          XN_FOCUS_WINDOW,
+          context.window,
+          XN_PREEDIT_ATTRIBUTES,
+          callbackAttributes,
+          XN_STRING_CONVERSION_CALLBACK,
+          conversionRecord,
+          null,
+        );
+        ic ??= this.#x11.XCreateICWithPreeditAttributes(
           this.#im,
           XN_INPUT_STYLE,
           style,
@@ -358,7 +376,21 @@ export class XimManager implements Disposable {
       const positionAttributes = this.#createPositionAttributes(context.cursorArea);
       if (positionAttributes === null) return null;
       try {
-        ic = this.#x11.XCreateICWithPreeditAttributes(
+        ic = this.#x11.XCreateICWithPreeditAndString(
+          this.#im,
+          XN_INPUT_STYLE,
+          style,
+          XN_CLIENT_WINDOW,
+          context.window,
+          XN_FOCUS_WINDOW,
+          context.window,
+          XN_PREEDIT_ATTRIBUTES,
+          positionAttributes,
+          XN_STRING_CONVERSION_CALLBACK,
+          conversionRecord,
+          null,
+        );
+        ic ??= this.#x11.XCreateICWithPreeditAttributes(
           this.#im,
           XN_INPUT_STYLE,
           style,
@@ -374,7 +406,19 @@ export class XimManager implements Disposable {
         this.#x11.XFree(positionAttributes);
       }
     } else {
-      ic = this.#x11.XCreateICSimple(
+      ic = this.#x11.XCreateICSimpleWithString(
+        this.#im,
+        XN_INPUT_STYLE,
+        style,
+        XN_CLIENT_WINDOW,
+        context.window,
+        XN_FOCUS_WINDOW,
+        context.window,
+        XN_STRING_CONVERSION_CALLBACK,
+        conversionRecord,
+        null,
+      );
+      ic ??= this.#x11.XCreateICSimple(
         this.#im,
         XN_INPUT_STYLE,
         style,
@@ -461,6 +505,19 @@ export class XimManager implements Disposable {
   writeCaretPosition(pointer: Deno.PointerObject, position: number): void {
     const value = new Int32Array([position]) as Int32Array<ArrayBuffer>;
     this.#libc.symbols.memcpy(pointer, value, 4n);
+  }
+
+  writeStringConversion(
+    callData: Deno.PointerObject,
+    position: number,
+    text: ArrayBuffer,
+  ): void {
+    const positionValue = new Uint16Array([position]);
+    this.#libc.symbols.memcpy(callData, positionValue, 2n);
+    const textPointer = Deno.UnsafePointer.of(text);
+    if (textPointer === null) return;
+    const address = new BigUint64Array([Deno.UnsafePointer.value(textPointer)]);
+    this.#libc.symbols.memcpy(Deno.UnsafePointer.offset(callData, 16), address, 8n);
   }
 
   [Symbol.dispose](): void {
@@ -627,6 +684,8 @@ export class XimContext implements Disposable {
   #cursor = 0;
   #cursorVisible = true;
   #cursorArea: ImeCursorArea | undefined;
+  #surrounding: { text: string; selectionStart: number; selectionEnd: number } | undefined;
+  #conversionStorage: { bytes: Uint8Array; descriptor: ArrayBuffer } | undefined;
   #stagedEvents: XimEvent[] | null = null;
   #resetPending = false;
   #closed = false;
@@ -693,6 +752,12 @@ export class XimContext implements Disposable {
     if (this.#ic !== null && this.#activation.active) this.manager.setArea(this.#ic, area);
   }
 
+  setSurroundingText(text: string, selectionStart: number, selectionEnd: number): void {
+    const range = validateImeCursorRange(text, selectionStart, selectionEnd);
+    if (range === null) throw new RangeError("winding(x11): invalid UTF-8 surrounding-text selection");
+    this.#surrounding = { text, selectionStart: range[0], selectionEnd: range[1] };
+  }
+
   recreate(_announce = false): void {
     if (this.#closed || this.#ic !== null) return;
     this.#serverInvalidated = false;
@@ -702,7 +767,6 @@ export class XimContext implements Disposable {
   }
 
   createCallbackAttributes(): Deno.PointerObject | null {
-    this.#closeCallbacks();
     const start = new Deno.UnsafeCallback(
       PREEDIT_START_DEFINITION,
       this.manager.guardCallback<XimCallbackArguments, number>(
@@ -765,10 +829,27 @@ export class XimContext implements Disposable {
         (_ic, _clientData, _callData) => this.#resetAfterCallbackFailure(),
       ),
     );
-    this.#callbacks = [start, done, draw, caret];
-    this.#callbackRecords = this.#callbacks.map(callbackRecord);
+    const callbacks = [start, done, draw, caret];
+    const records = callbacks.map(callbackRecord);
+    this.#callbacks.push(...callbacks);
+    this.#callbackRecords.push(...records);
 
-    return this.manager.createPreeditAttributes(this.#callbackRecords);
+    return this.manager.createPreeditAttributes(records);
+  }
+
+  createStringConversionCallback(): BigUint64Array<ArrayBuffer> {
+    this.#closeCallbacks();
+    const callback = new Deno.UnsafeCallback(
+      PREEDIT_CALLBACK_DEFINITION,
+      this.manager.guardCallback<XimCallbackArguments, void>(
+        (_ic, _clientData, callData) => this.#provideSurroundingText(callData),
+        (_ic, _clientData, _callData) => this.#resetAfterCallbackFailure(),
+      ),
+    );
+    const record = callbackRecord(callback);
+    this.#callbacks.push(callback);
+    this.#callbackRecords.push(record);
+    return record;
   }
 
   /** Stage callbacks fired synchronously by one Xutf8LookupString call. */
@@ -882,6 +963,33 @@ export class XimContext implements Disposable {
     for (const callback of this.#callbacks) callback.close();
     this.#callbacks = [];
     this.#callbackRecords = [];
+    this.#conversionStorage = undefined;
+  }
+
+  #provideSurroundingText(callData: Deno.PointerValue): void {
+    if (callData === null) return;
+    const surrounding = this.#surrounding;
+    const text = surrounding?.text ?? "";
+    const cursorUtf16 = surrounding === undefined
+      ? 0
+      : utf8OffsetToUtf16Index(text, surrounding.selectionEnd) ?? 0;
+    const scalars = [...text];
+    const cursor = [...text.slice(0, cursorUtf16)].length;
+    const start = Math.max(0, Math.min(cursor - 32767, scalars.length - 65535));
+    const returnedScalars = scalars.slice(start, start + 65535);
+    const encoded = new TextEncoder().encode(returnedScalars.join(""));
+    const bytes = new Uint8Array(encoded.length + 1);
+    bytes.set(encoded);
+    const bytesPointer = Deno.UnsafePointer.of(bytes);
+    if (bytesPointer === null) return;
+
+    const descriptor = new ArrayBuffer(32);
+    const descriptorView = new DataView(descriptor);
+    descriptorView.setUint16(0, returnedScalars.length, true);
+    descriptorView.setInt32(16, 0, true); // multibyte, not wchar_t
+    descriptorView.setBigUint64(24, Deno.UnsafePointer.value(bytesPointer), true);
+    this.#conversionStorage = { bytes, descriptor };
+    this.manager.writeStringConversion(callData, cursor - start, descriptor);
   }
 
   #resetAfterCallbackFailure(): void {
