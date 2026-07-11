@@ -9,10 +9,7 @@ import type {
   Window,
 } from "../types.ts";
 import { validateImeCursorRange } from "./ime.ts";
-import {
-  keyLocationForCode,
-  normalizeLogicalKey,
-} from "./keyboard.ts";
+import { keyLocationForCode, normalizeLogicalKey } from "./keyboard.ts";
 
 export interface KeyEventInit extends KeyModifiers {
   window: Window;
