@@ -46,6 +46,30 @@ import {
 } from "./global_registry.ts";
 import { WaylandPointerFrameAccumulator, WaylandPointerPosition } from "./pointer.ts";
 
+const LIBC_SO = "libc.so.6";
+const LIBDL_SO = "libdl.so.2";
+
+export type RequiredWaylandDependency = "libc" | "libdl" | "wayland-client" | "xkbcommon";
+
+const WAYLAND_DEPENDENCY_ERRORS: Readonly<Record<RequiredWaylandDependency, string>> = {
+  libc: `winding Wayland requires glibc ${LIBC_SO} with memfd_create because ` +
+    "Deno.dlopen resolves the whole libc FFI symbol descriptor",
+  libdl: `winding Wayland requires glibc ${LIBDL_SO}`,
+  "wayland-client": `winding Wayland requires ${LIBWAYLAND_CLIENT_SO}`,
+  xkbcommon: `winding Wayland requires ${LIBXKBCOMMON_SO}`,
+};
+
+export function openRequiredWaylandDependency<Value>(
+  dependency: RequiredWaylandDependency,
+  open: () => Value,
+): Value {
+  try {
+    return open();
+  } catch (cause) {
+    throw new Error(WAYLAND_DEPENDENCY_ERRORS[dependency], { cause });
+  }
+}
+
 // WaylandLibrary coordinates globals and the extracted native controllers.
 class WaylandLibrary implements Library {
   // Construction either initializes every asserted field or unwinds and throws.
@@ -129,13 +153,19 @@ class WaylandLibrary implements Library {
   constructor() {
     const cleanup = new NativeInitializationCleanup();
     try {
-      this.libc = Deno.dlopen("libc.so.6", libcSymbols); // needed to perform a few syscalls
+      this.libc = openRequiredWaylandDependency("libc", () => Deno.dlopen(LIBC_SO, libcSymbols));
       cleanup.defer(() => this.libc.close());
-      this.libdl = Deno.dlopen("libdl.so.2", libdlSymbols);
+      this.libdl = openRequiredWaylandDependency("libdl", () => Deno.dlopen(LIBDL_SO, libdlSymbols));
       cleanup.defer(() => this.libdl.close());
-      this.wl = Deno.dlopen(LIBWAYLAND_CLIENT_SO, waylandSymbols);
+      this.wl = openRequiredWaylandDependency(
+        "wayland-client",
+        () => Deno.dlopen(LIBWAYLAND_CLIENT_SO, waylandSymbols),
+      );
       cleanup.defer(() => this.wl.close());
-      this.xkb = Deno.dlopen(LIBXKBCOMMON_SO, xkbSymbols);
+      this.xkb = openRequiredWaylandDependency(
+        "xkbcommon",
+        () => Deno.dlopen(LIBXKBCOMMON_SO, xkbSymbols),
+      );
       cleanup.defer(() => this.xkb.close());
       // Retrieve an existing loader handle for dlsym without loading a second time.
       const wlHandle = this.libdl.symbols.dlopen(cStr(LIBWAYLAND_CLIENT_SO), RTLD_NOW | RTLD_NOLOAD);

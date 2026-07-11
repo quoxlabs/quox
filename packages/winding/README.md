@@ -100,3 +100,12 @@ deno run --allow-ffi --allow-env=WAYLAND_DISPLAY,WAYLAND_SOCKET app.ts
 
 When neither signal is readable and nonempty, the top-level loader falls back to X11. Code importing the Wayland backend
 directly may additionally need locale-variable access for XKB/compose initialization.
+
+A readable nonempty Wayland signal is authoritative, not a connection probe. A stale display name, unusable inherited
+socket, or failed Wayland connection throws instead of silently retrying X11. Unset both signals to select X11.
+
+### Wayland platform support
+
+The built-in Wayland binding intentionally supports little-endian LP64 glibc Linux on x86-64 and AArch64. It requires
+`libc.so.6`, `libdl.so.2`, `libwayland-client.so.0`, and `libxkbcommon.so.0`; libc must export `memfd_create`. These are
+explicit support requirements rather than portable library-name or anonymous-file fallbacks.

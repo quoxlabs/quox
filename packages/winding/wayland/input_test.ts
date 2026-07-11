@@ -58,8 +58,39 @@ import {
   WaylandPointerFrameAccumulator,
   WaylandPointerPosition,
 } from "./pointer.ts";
-import { validateWaylandNativeLayout } from "./mod.ts";
+import { openRequiredWaylandDependency, type RequiredWaylandDependency, validateWaylandNativeLayout } from "./mod.ts";
 import type { KeyModifiers } from "../types.ts";
+
+Deno.test("required Wayland dependency failures identify the support boundary", () => {
+  const nativeError = new Error("native loader failed");
+  const cases: ReadonlyArray<readonly [RequiredWaylandDependency, string]> = [
+    [
+      "libc",
+      "winding Wayland requires glibc libc.so.6 with memfd_create because " +
+      "Deno.dlopen resolves the whole libc FFI symbol descriptor",
+    ],
+    ["libdl", "winding Wayland requires glibc libdl.so.2"],
+    ["wayland-client", "winding Wayland requires libwayland-client.so.0"],
+    ["xkbcommon", "winding Wayland requires libxkbcommon.so.0"],
+  ];
+
+  for (const [dependency, message] of cases) {
+    try {
+      openRequiredWaylandDependency(dependency, () => {
+        throw nativeError;
+      });
+    } catch (error) {
+      assert(error instanceof Error);
+      assertEquals(error.message, message);
+      assert(error.cause === nativeError, `${dependency} must retain the native loader error as its cause`);
+      continue;
+    }
+    throw new Error(`Expected ${dependency} loading to fail`);
+  }
+
+  const loaded = {};
+  assert(openRequiredWaylandDependency("wayland-client", () => loaded) === loaded);
+});
 
 Deno.test("Wayland rejects native layouts its hand-packed bindings cannot represent", () => {
   validateWaylandNativeLayout("linux", "x86_64", true);
