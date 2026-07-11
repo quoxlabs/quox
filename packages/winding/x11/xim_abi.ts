@@ -43,14 +43,43 @@ export function packXRectangle(
   return new Uint8Array(buffer) as Uint8Array<ArrayBuffer>;
 }
 
-/** Read an LP64 Linux XIMText. `undefined` means feedback-only or malformed. */
-export function readXimText(pointer: Deno.PointerObject): string[] | undefined {
+export type DecodedXimText =
+  | { readonly kind: "text"; readonly characters: readonly string[] }
+  | { readonly kind: "feedback"; readonly length: number };
+
+/** Read an LP64 Linux XIMText without conflating feedback-only updates with malformed text. */
+export function readXimText(pointer: Deno.PointerObject): DecodedXimText | undefined {
   const view = new Deno.UnsafePointerView(pointer);
-  const length = view.getUint16(0);
-  const isWide = view.getInt32(16) !== 0;
-  const stringPointer = pointerFromAddress(view.getBigUint64(24));
-  if (stringPointer === null) return undefined;
-  return isWide ? decodeWideScalars(stringPointer, length) : decodeUtf8Scalars(stringPointer, length);
+  return decodeXimTextLayout(
+    (offset) => view.getUint16(offset),
+    (offset) => view.getInt32(offset),
+    (offset) => view.getBigUint64(offset),
+    (address, isWide, length) => {
+      const stringPointer = pointerFromAddress(address);
+      if (stringPointer === null) return undefined;
+      return isWide ? decodeWideScalars(stringPointer, length) : decodeUtf8Scalars(stringPointer, length);
+    },
+  );
+}
+
+/** Pure LP64 layout seam used to verify XIMText's pointer-bearing fields without FFI permission. */
+export function decodeXimTextLayout(
+  readUint16: (offset: number) => number,
+  readInt32: (offset: number) => number,
+  readBigUint64: (offset: number) => bigint,
+  decodeCharacters: (address: bigint, isWide: boolean, length: number) => string[] | undefined,
+): DecodedXimText | undefined {
+  const length = readUint16(0);
+  const feedbackAddress = readBigUint64(8);
+  const isWide = readInt32(16) !== 0;
+  const stringAddress = readBigUint64(24);
+  if (stringAddress === 0n) {
+    // Xlib uses a null string with one feedback element per highlighted existing
+    // character, beginning at chg_first. A zero-length update needs no storage.
+    return feedbackAddress !== 0n || length === 0 ? { kind: "feedback", length } : undefined;
+  }
+  const characters = decodeCharacters(stringAddress, isWide, length);
+  return characters === undefined ? undefined : { kind: "text", characters };
 }
 
 function decodeUtf8Scalars(

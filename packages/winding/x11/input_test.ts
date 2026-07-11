@@ -9,7 +9,14 @@ import {
   x11KeyEditDisposition,
   x11ModifierSnapshot,
 } from "./input.ts";
-import { applyPreeditChange, movePreeditCaret, preeditCursorByteOffset, XimCaretDirection } from "./xim_preedit.ts";
+import { decodeXimTextLayout } from "./xim_abi.ts";
+import {
+  applyPreeditChange,
+  applyXimPreeditDraw,
+  movePreeditCaret,
+  preeditCursorByteOffset,
+  XimCaretDirection,
+} from "./xim_preedit.ts";
 import { packRgbaPixels } from "./native_image.ts";
 import { supportsX11Abi, validateX11Geometry } from "./mod.ts";
 import { selectXimStyles } from "./xim.ts";
@@ -93,6 +100,70 @@ Deno.test("XIM preedit draw applies scalar-indexed replacements", () => {
   assertEquals(applyPreeditChange(text, 4, 0, []), true);
   assertEquals(applyPreeditChange(text, 5, 0, []), false);
   assertEquals(applyPreeditChange(text, -1, 1, []), false);
+});
+
+Deno.test("XIM feedback-only preedit draws preserve text and publish only caret changes", () => {
+  const text = [..."aé文"];
+  assertDeepEquals(
+    applyXimPreeditDraw(text, 1, 2, 1, 99, { kind: "feedback", length: 2 }),
+    { cursor: 2, emit: true },
+  );
+  assertEquals(text.join(""), "aé文");
+  assertDeepEquals(
+    applyXimPreeditDraw(text, 2, 2, 0, 99, { kind: "feedback", length: 3 }),
+    { cursor: 2, emit: false },
+  );
+  assertEquals(text.join(""), "aé文");
+  assertEquals(applyXimPreeditDraw(text, 2, 2, 2, 0, { kind: "feedback", length: 2 }), undefined);
+
+  assertDeepEquals(
+    applyXimPreeditDraw(text, 2, 2, 1, 1, { kind: "text", characters: [..."ßx"] }),
+    { cursor: 2, emit: true },
+  );
+  assertEquals(text.join(""), "aßx文");
+  assertDeepEquals(
+    applyXimPreeditDraw(text, 2, 1, 1, 2, { kind: "delete" }),
+    { cursor: 1, emit: true },
+  );
+  assertEquals(text.join(""), "a文");
+});
+
+Deno.test("XIMText decoding distinguishes feedback-only updates from malformed storage", () => {
+  const offsets: number[] = [];
+  const decode = (feedbackAddress: bigint) =>
+    decodeXimTextLayout(
+      (offset) => {
+        offsets.push(offset);
+        return 2;
+      },
+      (offset) => {
+        offsets.push(offset);
+        return 0;
+      },
+      (offset) => {
+        offsets.push(offset);
+        return offset === 8 ? feedbackAddress : 0n;
+      },
+      () => {
+        throw new Error("Feedback-only XIMText must not decode string storage");
+      },
+    );
+  assertDeepEquals(decode(0x1000n), { kind: "feedback", length: 2 });
+  assertDeepEquals(offsets, [0, 8, 16, 24]);
+  assertEquals(decode(0n), undefined);
+
+  const decodedText = decodeXimTextLayout(
+    () => 2,
+    () => 1,
+    (offset) => offset === 24 ? 0x2000n : 0n,
+    (address, isWide, length) => {
+      assertEquals(address, 0x2000n);
+      assertEquals(isWide, true);
+      assertEquals(length, 2);
+      return [..."é文"];
+    },
+  );
+  assertDeepEquals(decodedText, { kind: "text", characters: [..."é文"] });
 });
 
 Deno.test("XIM cursor scalar indices convert to UTF-8 byte offsets", () => {
@@ -202,6 +273,12 @@ Deno.test("X11 pixels follow the server visual masks and byte order", () => {
 function assertEquals<T>(actual: T, expected: T): void {
   if (!Object.is(actual, expected)) {
     throw new Error(`Expected ${String(expected)}, got ${String(actual)}`);
+  }
+}
+
+function assertDeepEquals(actual: unknown, expected: unknown): void {
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    throw new Error(`Expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
   }
 }
 

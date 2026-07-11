@@ -39,6 +39,45 @@ export function applyPreeditChange(
   return true;
 }
 
+export type XimPreeditDrawContent =
+  | { readonly kind: "delete" }
+  | { readonly kind: "text"; readonly characters: readonly string[] }
+  | { readonly kind: "feedback"; readonly length: number };
+
+export interface AppliedXimPreeditDraw {
+  readonly cursor: number;
+  /** Text draws remain observable; feedback-only draws are observable only when the caret moves. */
+  readonly emit: boolean;
+}
+
+/** Apply one XIMPreeditDraw while preserving feedback-only updates as non-text changes. */
+export function applyXimPreeditDraw(
+  characters: string[],
+  currentCursor: number,
+  caret: number,
+  first: number,
+  changedLength: number,
+  content: XimPreeditDrawContent,
+): AppliedXimPreeditDraw | undefined {
+  if (content.kind === "feedback") {
+    if (!isValidPreeditRange(characters.length, first, content.length)) return undefined;
+  } else {
+    const replacement = content.kind === "text" ? content.characters : [];
+    if (!applyPreeditChange(characters, first, changedLength, replacement)) return undefined;
+  }
+
+  const cursor = Number.isSafeInteger(caret) && caret >= 0 && caret <= characters.length ? caret : currentCursor;
+  return {
+    cursor,
+    emit: content.kind !== "feedback" || cursor !== currentCursor,
+  };
+}
+
+function isValidPreeditRange(characterCount: number, first: number, length: number): boolean {
+  return Number.isSafeInteger(first) && Number.isSafeInteger(length) &&
+    first >= 0 && length >= 0 && first <= characterCount && first + length <= characterCount;
+}
+
 /** Apply XIM's synchronous caret request to the backend's one-line preedit model. */
 export function movePreeditCaret(
   characters: readonly string[],

@@ -14,7 +14,7 @@ import { logicalKeyFromKeysym, unicodeTextFromKeysym } from "../linux/mod.ts";
 import { utf8CString as cString } from "../text_encoding.ts";
 import { libcFunctions, x11functions } from "./ffi.ts";
 import { callbackRecord, MAX_XIM_TEXT_BYTES, packXPoint, pointerFromAddress, readXimText } from "./xim_abi.ts";
-import { applyPreeditChange, movePreeditCaret, preeditCursorByteOffset } from "./xim_preedit.ts";
+import { applyXimPreeditDraw, movePreeditCaret, preeditCursorByteOffset } from "./xim_preedit.ts";
 import { fallbackLookupText } from "./input.ts";
 
 type X11Library = Deno.DynamicLibrary<typeof x11functions>;
@@ -805,14 +805,25 @@ export class XimContext implements Disposable {
           const first = view.getInt32(4);
           const length = view.getInt32(8);
           const textPointer = pointerFromAddress(view.getBigUint64(16));
-          const replacement = textPointer === null ? [] : readXimText(textPointer);
-          if (replacement === undefined || !applyPreeditChange(this.#preedit, first, length, replacement)) {
+          const content = textPointer === null ? { kind: "delete" } as const : readXimText(textPointer);
+          if (content === undefined) {
             this.#scheduleNativeReset();
             return;
           }
-          if (Number.isInteger(caret) && caret >= 0 && caret <= this.#preedit.length) {
-            this.#cursor = caret;
+          const applied = applyXimPreeditDraw(
+            this.#preedit,
+            this.#cursor,
+            caret,
+            first,
+            length,
+            content,
+          );
+          if (applied === undefined) {
+            this.#scheduleNativeReset();
+            return;
           }
+          this.#cursor = applied.cursor;
+          if (!applied.emit) return;
           this.#composition.start();
           this.#emitPreedit();
         },
