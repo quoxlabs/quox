@@ -6,6 +6,7 @@ import {
   gdi32functions,
   imm32functions,
   kernel32functions,
+  PM_NOREMOVE,
   PM_REMOVE,
   SIZE_MINIMIZED,
   user32functions,
@@ -14,11 +15,14 @@ import {
 } from "./ffi.ts";
 import {
   decodeMouseLParam,
+  decodeWin32QueuedMessage,
   TranslateMessageReentrancyGuard,
   validateWin32Geometry,
+  Win32MessageQueueGate,
   type Win32MouseButton,
   Win32MouseCaptureState,
   Win32MouseTrackingState,
+  win32QuitExitCode,
 } from "./input.ts";
 import { Win32InputController } from "./input_controller.ts";
 
@@ -763,14 +767,38 @@ class Win32Library implements Library {
     }
   }
   #msg = new ArrayBuffer(48);
+  readonly #messageQueue = new Win32MessageQueueGate();
   event(): UIEvent | undefined {
     if (this.#closed || this.#closing) return undefined;
     this.#callbackErrors.throwIfPending();
     const queued = this.#events.shift();
     if (queued !== undefined) return queued;
+    if (!this.#messageQueue.mayPump) return undefined;
 
     const ptr = Deno.UnsafePointer.of(this.#msg);
-    while (this.#events.length === 0 && this.user32.symbols.PeekMessageW(ptr, null, 0, 0, PM_REMOVE) !== 0) {
+    while (
+      this.#events.length === 0 && this.#messageQueue.mayPump &&
+      this.user32.symbols.PeekMessageW(ptr, null, 0, 0, PM_NOREMOVE) !== 0
+    ) {
+      const next = decodeWin32QueuedMessage(this.#msg);
+      const owner = this.windows.get(next.windowId);
+      const disposition = this.#messageQueue.observe(next, owner !== undefined);
+      if (disposition !== "dispatch" || owner === undefined) break;
+
+      // Remove through the observed HWND rather than NULL. Thread messages are
+      // therefore never selected if sent-message processing changes the queue
+      // between the non-removing peek and this call. WM_QUIT is Win32's one
+      // documented exception to the HWND filter and is handled below.
+      if (this.user32.symbols.PeekMessageW(ptr, owner.hwnd, 0, 0, PM_REMOVE) === 0) continue;
+      const removed = decodeWin32QueuedMessage(this.#msg);
+      if (this.#messageQueue.observe(removed, this.windows.has(removed.windowId)) === "quit") {
+        // PeekMessage always selects WM_QUIT even with an HWND filter. Preserve
+        // a quit posted during sent-message reentry by restoring its exit code
+        // exactly once; the latched gate prevents us from consuming it again.
+        this.user32.symbols.PostQuitMessage(win32QuitExitCode(removed.wParam));
+        break;
+      }
+
       this.input.prepareKeyMessage(this.#msg);
       try {
         this.#translateMessageGuard.begin();

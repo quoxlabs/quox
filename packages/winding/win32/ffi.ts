@@ -86,6 +86,7 @@ export const user32functions = {
     parameters: ["pointer", "pointer", "u32", "u32", "u32"],
     result: "i32",
   },
+  PostQuitMessage: { parameters: ["i32"], result: "void" },
   TranslateMessage: { parameters: ["pointer"], result: "i32" },
   DispatchMessageW: {
     parameters: ["pointer"],
@@ -126,6 +127,7 @@ export const imm32functions = {
 
 /** Window message identifiers handled by wndProc. See WinUser.h. */
 export enum WM {
+  QUIT = 0x0012,
   INPUTLANGCHANGEREQUEST = 0x0050,
   INPUTLANGCHANGE = 0x0051,
   KEYDOWN = 0x0100,

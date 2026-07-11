@@ -2,9 +2,59 @@
 
 import type { KeyEditDisposition } from "../types.ts";
 import { normalizeCommittedText } from "../input/keyboard.ts";
+import { WM } from "./ffi.ts";
 
 const INT32_MIN = -0x80000000;
 const INT32_MAX = 0x7fffffff;
+
+/** The fields Winding needs from the 64-bit Win32 MSG layout. */
+export interface Win32QueuedMessage {
+  /** Zero identifies a thread message rather than a window message. */
+  windowId: bigint;
+  message: number;
+  wParam: bigint;
+  lParam: bigint;
+}
+
+/** Decode the fixed leading fields of the 48-byte MSG used by 64-bit Deno. */
+export function decodeWin32QueuedMessage(buffer: ArrayBuffer): Win32QueuedMessage {
+  if (buffer.byteLength < 32) throw new RangeError("winding(win32): truncated MSG buffer");
+  const view = new DataView(buffer);
+  return {
+    windowId: view.getBigUint64(0, true),
+    message: view.getUint32(8, true),
+    wParam: view.getBigUint64(16, true),
+    lParam: view.getBigInt64(24, true),
+  };
+}
+
+export type Win32QueueDisposition = "dispatch" | "yield" | "quit";
+
+/**
+ * Gives the embedding host ownership of thread and foreign-window messages.
+ * Once a quit is observed, polling remains stopped so an unremoved/reposted
+ * WM_QUIT cannot become a permanent busy-loop obstruction.
+ */
+export class Win32MessageQueueGate {
+  #quitSeen = false;
+
+  get mayPump(): boolean {
+    return !this.#quitSeen;
+  }
+
+  observe(message: Win32QueuedMessage, ownsWindow: boolean): Win32QueueDisposition {
+    if (message.message === WM.QUIT) {
+      this.#quitSeen = true;
+      return "quit";
+    }
+    return message.windowId !== 0n && ownsWindow ? "dispatch" : "yield";
+  }
+}
+
+/** Recover PostQuitMessage's signed int exit code from MSG.wParam. */
+export function win32QuitExitCode(wParam: bigint): number {
+  return Number(BigInt.asIntN(32, wParam));
+}
 
 /** Validate top-left logical outer-window geometry accepted by CreateWindowExW. */
 export function validateWin32Geometry(x: number, y: number, width: number, height: number): void {

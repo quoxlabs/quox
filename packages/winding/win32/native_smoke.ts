@@ -1,5 +1,6 @@
 import type { ImeEvent, Library, Window } from "../types.ts";
-import { UNICODE_NOCHAR, WM } from "./ffi.ts";
+import { PM_REMOVE, UNICODE_NOCHAR, WM } from "./ffi.ts";
+import { decodeWin32QueuedMessage, win32QuitExitCode } from "./input.ts";
 import { load } from "./mod.ts";
 
 // CI invokes this file explicitly on Windows. Its name intentionally avoids
@@ -16,6 +17,14 @@ const testUser32Functions = {
   PostMessageW: {
     parameters: ["pointer", "u32", "usize", "isize"],
     result: "i32",
+  },
+  PeekMessageW: {
+    parameters: ["pointer", "pointer", "u32", "u32", "u32"],
+    result: "i32",
+  },
+  PostQuitMessage: {
+    parameters: ["i32"],
+    result: "void",
   },
   DestroyWindow: {
     parameters: ["pointer"],
@@ -122,6 +131,8 @@ function runLifecycle(
       if (commit?.kind !== "commit" || commit.text !== "A") {
         throw new Error("Expected a Win32 commit containing A");
       }
+
+      assertThreadQueuePreservation(user32, library, window);
     } finally {
       if (destroyExternally && user32.symbols.DestroyWindow(window.hwnd) === 0) {
         throw new Error("DestroyWindow rejected the externally driven lifetime test");
@@ -132,6 +143,57 @@ function runLifecycle(
     }
   } finally {
     library.close();
+  }
+}
+
+function assertThreadQueuePreservation(
+  user32: Deno.DynamicLibrary<typeof testUser32Functions>,
+  library: Library,
+  window: NativeWin32Window,
+): void {
+  const customMessage = 0x8007; // WM_APP + 7
+  const customWParam = 0x1234abcden;
+  const customLParam = -77n;
+  const messageBuffer = new ArrayBuffer(48);
+  const messagePointer = Deno.UnsafePointer.of(messageBuffer);
+  drainEvents(library);
+
+  if (user32.symbols.PostMessageW(null, customMessage, customWParam, customLParam) === 0) {
+    throw new Error("PostMessageW rejected the custom thread message");
+  }
+  if (user32.symbols.PostMessageW(window.hwnd, WM.UNICHAR, 0x42n, 1n) === 0) {
+    throw new Error("PostMessageW rejected the queued Winding message");
+  }
+  if (library.event() !== undefined) {
+    throw new Error("Winding crossed a host-owned thread-message queue boundary");
+  }
+
+  if (user32.symbols.PeekMessageW(messagePointer, null, 0, 0, PM_REMOVE) === 0) {
+    throw new Error("Winding swallowed the custom thread message");
+  }
+  const custom = decodeWin32QueuedMessage(messageBuffer);
+  if (
+    custom.windowId !== 0n || custom.message !== customMessage ||
+    custom.wParam !== customWParam || custom.lParam !== customLParam
+  ) {
+    throw new Error("Winding changed or reordered the custom thread message");
+  }
+
+  const commit = nextImeEdit(library, window);
+  if (commit?.kind !== "commit" || commit.text !== "B") {
+    throw new Error("Winding did not resume pumping its HWND after the host message");
+  }
+  drainEvents(library);
+
+  const exitCode = -123;
+  user32.symbols.PostQuitMessage(exitCode);
+  if (library.event() !== undefined) throw new Error("Winding surfaced an event after WM_QUIT");
+  if (user32.symbols.PeekMessageW(messagePointer, null, 0, 0, PM_REMOVE) === 0) {
+    throw new Error("Winding swallowed WM_QUIT");
+  }
+  const quit = decodeWin32QueuedMessage(messageBuffer);
+  if (quit.windowId !== 0n || quit.message !== WM.QUIT || win32QuitExitCode(quit.wParam) !== exitCode) {
+    throw new Error("Winding did not preserve WM_QUIT and its exit code");
   }
 }
 

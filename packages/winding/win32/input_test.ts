@@ -3,6 +3,7 @@ import {
   AltGraphControlFilter,
   decodeKeyLParam,
   decodeMouseLParam,
+  decodeWin32QueuedMessage,
   isCommitText,
   keyboardModifiers,
   keyboardStateForTranslation,
@@ -19,8 +20,10 @@ import {
   Win32ImeAssociationState,
   win32KeyEditDisposition,
   win32KeyIdentity,
+  Win32MessageQueueGate,
   Win32MouseCaptureState,
   Win32MouseTrackingState,
+  win32QuitExitCode,
   WmCharDecoder,
 } from "./input.ts";
 import {
@@ -82,6 +85,62 @@ Deno.test("TranslateMessage guard defers only sent-message reentry and preserves
   guard.end();
   assertEquals(order, ["outside", "focus", "ime"]);
   assertThrows(() => guard.end());
+});
+
+Deno.test("Win32 queue gate leaves thread messages in FIFO order for its embedding host", () => {
+  const ownedWindow = 0x1111n;
+  const foreignWindow = 0x2222n;
+  const customThreadMessage = 0x8007;
+  const gate = new Win32MessageQueueGate();
+  const queue = [
+    { windowId: ownedWindow, message: WM.PAINT, wParam: 0n, lParam: 0n },
+    { windowId: 0n, message: customThreadMessage, wParam: 0x1234n, lParam: -77n },
+    { windowId: ownedWindow, message: WM.UNICHAR, wParam: 0x41n, lParam: 1n },
+    { windowId: foreignWindow, message: WM.CLOSE, wParam: 0n, lParam: 0n },
+  ];
+  const dispatched: number[] = [];
+  const pumpOwnedPrefix = () => {
+    while (gate.mayPump && queue.length > 0) {
+      const next = queue[0];
+      if (gate.observe(next, next.windowId === ownedWindow) !== "dispatch") break;
+      dispatched.push(queue.shift()!.message);
+    }
+  };
+
+  pumpOwnedPrefix();
+  assertEquals(dispatched, [WM.PAINT]);
+  assertEquals(queue[0], {
+    windowId: 0n,
+    message: customThreadMessage,
+    wParam: 0x1234n,
+    lParam: -77n,
+  });
+
+  // Once the host removes its thread message, Winding resumes at the exact
+  // next queue record and stops again before a foreign HWND.
+  queue.shift();
+  pumpOwnedPrefix();
+  assertEquals(dispatched, [WM.PAINT, WM.UNICHAR]);
+  assertEquals(queue[0].windowId, foreignWindow);
+});
+
+Deno.test("Win32 queue gate preserves WM_QUIT and latches after its signed exit code", () => {
+  const buffer = new ArrayBuffer(48);
+  const view = new DataView(buffer);
+  view.setBigUint64(0, 0n, true);
+  view.setUint32(8, WM.QUIT, true);
+  view.setBigUint64(16, BigInt.asUintN(64, -123n), true);
+  view.setBigInt64(24, 0n, true);
+  const quit = decodeWin32QueuedMessage(buffer);
+  assertEquals(quit, { windowId: 0n, message: WM.QUIT, wParam: 0xffffffffffffff85n, lParam: 0n });
+  assertEquals(win32QuitExitCode(quit.wParam), -123);
+
+  const gate = new Win32MessageQueueGate();
+  assertEquals(gate.observe(quit, false), "quit");
+  assertEquals(gate.mayPump, false);
+  // The queue record was only observed, not removed; a second poll will not
+  // repeatedly rediscover it and cannot turn into a busy loop.
+  assertEquals(quit.wParam, 0xffffffffffffff85n);
 });
 
 Deno.test("Win32 HIMC association remains independent across SETCONTEXT and focus orders", () => {
