@@ -7,6 +7,7 @@ use crate::ffi_numbers::{
     NumericArgumentError, finite_f32, finite_f64, integer_range, known_mask, nonnegative_f64,
     uint32, wasm_usize,
 };
+use crate::form_controls::TextControlStates;
 use crate::node_handles::NodeHandles;
 use crate::{QuoxRenderer, QuoxRendererState, sync_document_layout};
 use blitz_dom::BaseDocument;
@@ -356,12 +357,14 @@ struct ResolvedInputLayout<'a> {
 impl<'a> ResolvedInputLayout<'a> {
     fn new(
         document: &'a mut BaseDocument,
+        text_controls: &mut TextControlStates,
         width: u32,
         height: u32,
         framebuffer_width: u32,
         framebuffer_height: u32,
         device_pixel_ratio: f32,
     ) -> Self {
+        text_controls.reconcile_document(document);
         sync_document_layout(
             document,
             framebuffer_width,
@@ -593,6 +596,7 @@ impl DispatchStack {
     fn begin(
         &mut self,
         document: &mut BaseDocument,
+        text_controls: &mut TextControlStates,
         handles: &mut NodeHandles,
         redraw: &AtomicBool,
         request: DispatchRequest,
@@ -622,16 +626,21 @@ impl DispatchStack {
             return Err(error);
         }
 
-        let result = self.advance(document, handles, redraw);
+        let result = self.advance(document, text_controls, handles, redraw);
         if result.is_err() {
             self.discard_failed_frame(frame_id, redraw);
         }
         result
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a continuation validates both ids while sharing the document's value, handle, and redraw state"
+    )]
     fn resume(
         &mut self,
         document: &mut BaseDocument,
+        text_controls: &mut TextControlStates,
         handles: &mut NodeHandles,
         redraw: &AtomicBool,
         frame_id: u32,
@@ -671,7 +680,7 @@ impl DispatchStack {
         match pending.resume {
             ResumeAction::Normal { suppress_default } => {
                 if !cancelled && !suppress_default {
-                    self.run_default(document, handles, pending.guarded)?;
+                    self.run_default(document, text_controls, handles, pending.guarded)?;
                 }
             }
             ResumeAction::PointerLead {
@@ -694,17 +703,17 @@ impl DispatchStack {
                             ResumeAction::PointerMouse { pointer_default },
                         );
                     }
-                    self.run_default(document, handles, pointer_default)?;
+                    self.run_default(document, text_controls, handles, pointer_default)?;
                 }
             }
             ResumeAction::PointerMouse { pointer_default } => {
                 if !cancelled {
-                    self.run_default(document, handles, pointer_default)?;
+                    self.run_default(document, text_controls, handles, pointer_default)?;
                 }
             }
         }
 
-        self.advance(document, handles, redraw)
+        self.advance(document, text_controls, handles, redraw)
     }
 
     fn abort(&mut self, redraw: &AtomicBool, frame_id: u32) -> bool {
@@ -834,6 +843,7 @@ impl DispatchStack {
     fn advance(
         &mut self,
         document: &mut BaseDocument,
+        text_controls: &mut TextControlStates,
         handles: &mut NodeHandles,
         redraw: &AtomicBool,
     ) -> Result<DispatchStep, DispatchError> {
@@ -964,11 +974,11 @@ impl DispatchStack {
                     if let Some(event) =
                         guard_planned_event(document, handles, target, data, metadata)?
                     {
-                        self.run_default(document, handles, event)?;
+                        self.run_default(document, text_controls, handles, event)?;
                     }
                 }
                 PlannedWork::Action(action) => {
-                    self.run_action(document, handles, action)?;
+                    self.run_action(document, text_controls, handles, action)?;
                 }
             }
         }
@@ -1009,6 +1019,7 @@ impl DispatchStack {
     fn run_default(
         &mut self,
         document: &mut BaseDocument,
+        text_controls: &mut TextControlStates,
         handles: &mut NodeHandles,
         mut guarded: GuardedDomEvent,
     ) -> Result<(), DispatchError> {
@@ -1046,6 +1057,9 @@ impl DispatchStack {
         } else {
             document.handle_dom_event(&mut guarded.event, |event| generated.push(event));
         }
+        // Blitz mutates Parley before returning generated events. Capture the live editor value
+        // now so the first JavaScript `input` listener observes the edit which caused it.
+        text_controls.sync_editor_value(document, guarded.target.raw);
         let new_focus = actual_focus_node_id(document);
         let (old_focus, new_focus) = if generated.iter().any(|event| is_focus_event(&event.data)) {
             let old_focus = old_focus
@@ -1079,6 +1093,7 @@ impl DispatchStack {
     fn run_action(
         &mut self,
         document: &mut BaseDocument,
+        text_controls: &mut TextControlStates,
         handles: &mut NodeHandles,
         action: DispatchAction,
     ) -> Result<(), DispatchError> {
@@ -1104,9 +1119,13 @@ impl DispatchStack {
                 before_bytes,
                 after_bytes,
             } => {
+                let target = document.get_focussed_node_id();
                 if let Some(event) =
                     apply_ime_delete_surrounding(document, before_bytes, after_bytes)
                 {
+                    if let Some(target) = target {
+                        text_controls.sync_editor_value(document, target);
+                    }
                     self.frames
                         .last_mut()
                         .expect("actions run only for an active frame")
@@ -2144,8 +2163,14 @@ fn resolve_input_layout(state: &mut QuoxRendererState) -> ResolvedInputLayout<'_
     let framebuffer_width = state.framebuffer_width;
     let framebuffer_height = state.framebuffer_height;
     let device_pixel_ratio = state.device_pixel_ratio;
+    let QuoxRendererState {
+        document,
+        text_controls,
+        ..
+    } = state;
     ResolvedInputLayout::new(
-        &mut state.document,
+        document,
+        text_controls,
         width,
         height,
         framebuffer_width,
@@ -2160,12 +2185,19 @@ fn begin_request(
 ) -> Result<DispatchStep, DispatchError> {
     let QuoxRendererState {
         document,
+        text_controls,
         redraw_requested,
         node_handles,
         dispatch_stack,
         ..
     } = state;
-    dispatch_stack.begin(document, node_handles, redraw_requested.as_ref(), request)
+    dispatch_stack.begin(
+        document,
+        text_controls,
+        node_handles,
+        redraw_requested.as_ref(),
+        request,
+    )
 }
 
 fn resume_request(
@@ -2176,6 +2208,7 @@ fn resume_request(
 ) -> Result<DispatchStep, DispatchError> {
     let QuoxRendererState {
         document,
+        text_controls,
         redraw_requested,
         node_handles,
         dispatch_stack,
@@ -2183,6 +2216,7 @@ fn resume_request(
     } = state;
     dispatch_stack.resume(
         document,
+        text_controls,
         node_handles,
         redraw_requested.as_ref(),
         frame_id,
@@ -2532,6 +2566,7 @@ mod tests {
 
     struct TestContext {
         document: BaseDocument,
+        text_controls: TextControlStates,
         handles: NodeHandles,
         stack: DispatchStack,
         redraw: Arc<AtomicBool>,
@@ -2540,7 +2575,7 @@ mod tests {
     impl TestContext {
         fn new(body: &str) -> Self {
             let redraw = Arc::new(AtomicBool::new(false));
-            let document = HtmlDocument::from_html(
+            let mut document = HtmlDocument::from_html(
                 &format!("<!doctype html><html><body>{body}</body></html>"),
                 DocumentConfig {
                     viewport: Some(Viewport::new(800, 600, 1.0, ColorScheme::Light)),
@@ -2552,8 +2587,11 @@ mod tests {
                 },
             )
             .into_inner();
+            let mut text_controls = TextControlStates::default();
+            text_controls.reconcile_document(&mut document);
             let mut context = Self {
                 document,
+                text_controls,
                 handles: NodeHandles::default(),
                 stack: DispatchStack::default(),
                 redraw,
@@ -2567,6 +2605,7 @@ mod tests {
             self.stack
                 .begin(
                     &mut self.document,
+                    &mut self.text_controls,
                     &mut self.handles,
                     self.redraw.as_ref(),
                     request,
@@ -2578,6 +2617,7 @@ mod tests {
             self.stack
                 .resume(
                     &mut self.document,
+                    &mut self.text_controls,
                     &mut self.handles,
                     self.redraw.as_ref(),
                     event.frame_id,
@@ -2717,6 +2757,12 @@ mod tests {
             value.expect("test node should be a text input")
         }
 
+        fn live_value(&mut self, node_id: usize) -> String {
+            self.text_controls
+                .value(&mut self.document, node_id)
+                .expect("test node should have a live text-control value")
+        }
+
         fn set_style(&mut self, node_id: usize, value: &str) {
             self.document.mutate().set_attribute(
                 node_id,
@@ -2738,38 +2784,54 @@ mod tests {
             flavor: PointerFlavor,
         ) -> DispatchStep {
             let detail = u32::from(!matches!(flavor, PointerFlavor::Move));
-            let request = ResolvedInputLayout::new(&mut self.document, 800, 600, 800, 600, 1.0)
-                .pointer_request(PointerInput {
-                    native_x: f64::from(x),
-                    native_y: f64::from(y),
-                    x,
-                    y,
-                    button,
-                    buttons,
-                    modifier_bits: 0,
-                    time_stamp: event_time_stamp(),
-                    detail,
-                    flavor,
-                });
+            let request = ResolvedInputLayout::new(
+                &mut self.document,
+                &mut self.text_controls,
+                800,
+                600,
+                800,
+                600,
+                1.0,
+            )
+            .pointer_request(PointerInput {
+                native_x: f64::from(x),
+                native_y: f64::from(y),
+                x,
+                y,
+                button,
+                buttons,
+                modifier_bits: 0,
+                time_stamp: event_time_stamp(),
+                detail,
+                flavor,
+            });
             self.begin(request)
         }
 
         fn begin_trusted_wheel(&mut self, x: f32, y: f32) -> DispatchStep {
-            let request = ResolvedInputLayout::new(&mut self.document, 800, 600, 800, 600, 1.0)
-                .wheel_request(WheelInput {
-                    native_x: f64::from(x),
-                    native_y: f64::from(y),
-                    x,
-                    y,
-                    blitz_delta_x: 0.0,
-                    blitz_delta_y: -40.0,
-                    delta_x: 0.0,
-                    delta_y: 1.0,
-                    delta_mode: 1,
-                    buttons: MouseEventButtons::None,
-                    modifier_bits: 0,
-                    time_stamp: event_time_stamp(),
-                });
+            let request = ResolvedInputLayout::new(
+                &mut self.document,
+                &mut self.text_controls,
+                800,
+                600,
+                800,
+                600,
+                1.0,
+            )
+            .wheel_request(WheelInput {
+                native_x: f64::from(x),
+                native_y: f64::from(y),
+                x,
+                y,
+                blitz_delta_x: 0.0,
+                blitz_delta_y: -40.0,
+                delta_x: 0.0,
+                delta_y: 1.0,
+                delta_mode: 1,
+                buttons: MouseEventButtons::None,
+                modifier_bits: 0,
+                time_stamp: event_time_stamp(),
+            });
             self.begin(request)
         }
     }
@@ -2915,6 +2977,7 @@ mod tests {
                 .stack
                 .advance(
                     &mut context.document,
+                    &mut context.text_controls,
                     &mut context.handles,
                     context.redraw.as_ref(),
                 )
@@ -3722,6 +3785,7 @@ mod tests {
                 .stack
                 .resume(
                     &mut context.document,
+                    &mut context.text_controls,
                     &mut context.handles,
                     context.redraw.as_ref(),
                     inner.frame_id,
@@ -3789,6 +3853,7 @@ mod tests {
                 .stack
                 .advance(
                     &mut context.document,
+                    &mut context.text_controls,
                     &mut context.handles,
                     context.redraw.as_ref(),
                 )
@@ -3818,9 +3883,10 @@ mod tests {
         let input = context.element("editor");
         assert!(context.document.set_focus_to(input));
 
-        let commit = event(context.begin(DispatchRequest::ImeCommit("é".to_owned())));
+        let commit = event(context.begin(DispatchRequest::ImeCommit("é\n".to_owned())));
         assert_eq!(commit.event_type, "input");
         assert_eq!(context.raw_text(input), "é");
+        assert_eq!(context.live_value(input), "é");
         complete(context.resume(&commit, false));
 
         let apple = event(context.begin(DispatchRequest::AppleStandardKeybinding(
@@ -3828,7 +3894,50 @@ mod tests {
         )));
         assert_eq!(apple.event_type, "input");
         assert_eq!(context.raw_text(input), "");
+        assert_eq!(context.live_value(input), "");
         complete(context.resume(&apple, false));
+    }
+
+    #[test]
+    fn default_only_preedit_updates_live_value_before_later_reconciliation() {
+        let mut context = TestContext::new("<input id='editor' value='before'>");
+        let input = context.element("editor");
+        assert!(context.document.set_focus_to(input));
+        context.document.with_text_input(input, |mut driver| {
+            driver.move_to_text_end();
+        });
+
+        complete(context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "候補".to_owned(),
+            None,
+        ))));
+        assert_eq!(context.live_value(input), "before候補");
+        context
+            .text_controls
+            .reconcile_document(&mut context.document);
+        assert_eq!(context.raw_text(input), "before候補");
+    }
+
+    #[test]
+    fn keyboard_default_updates_live_value_before_staging_generated_input() {
+        let mut context = TestContext::new("<input id='editor' value='before'>");
+        let input = context.element("editor");
+        assert!(context.document.set_focus_to(input));
+        context.document.with_text_input(input, |mut driver| {
+            driver.move_to_text_end();
+        });
+
+        let keydown = event(context.begin(DispatchRequest::Key {
+            event: key(Key::Character("x".into()), Code::KeyX, KeyState::Pressed),
+            metadata: host_key_metadata("x"),
+            suppress_default: false,
+        }));
+        assert_eq!(keydown.event_type, "keydown");
+        let input_event = event(context.resume(&keydown, false));
+
+        assert_eq!(input_event.event_type, "input");
+        assert_eq!(context.live_value(input), "beforex");
+        complete(context.resume(&input_event, false));
     }
 
     #[test]
@@ -3885,6 +3994,7 @@ mod tests {
                 .stack
                 .resume(
                     &mut context.document,
+                    &mut context.text_controls,
                     &mut context.handles,
                     context.redraw.as_ref(),
                     1,
@@ -3911,6 +4021,7 @@ mod tests {
                 .stack
                 .resume(
                     &mut context.document,
+                    &mut context.text_controls,
                     &mut context.handles,
                     context.redraw.as_ref(),
                     pending.frame_id + 1,
@@ -3925,6 +4036,7 @@ mod tests {
                 .stack
                 .resume(
                     &mut context.document,
+                    &mut context.text_controls,
                     &mut context.handles,
                     context.redraw.as_ref(),
                     pending.frame_id,
@@ -3966,6 +4078,7 @@ mod tests {
         context.handles.exhaust_for_test();
         let nested = context.stack.begin(
             &mut context.document,
+            &mut context.text_controls,
             &mut context.handles,
             context.redraw.as_ref(),
             DispatchRequest::Pointer {
@@ -3991,6 +4104,7 @@ mod tests {
 
         let result = context.stack.begin(
             &mut context.document,
+            &mut context.text_controls,
             &mut context.handles,
             context.redraw.as_ref(),
             DispatchRequest::Pointer {
@@ -4442,6 +4556,7 @@ mod tests {
             .stack
             .advance(
                 &mut context.document,
+                &mut context.text_controls,
                 &mut context.handles,
                 context.redraw.as_ref(),
             )

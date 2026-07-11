@@ -17,8 +17,8 @@ import {
 } from "./ffi_numbers.ts";
 import { runWithImeSynchronization } from "./ime_requests.ts";
 import { type AssertActive, attachDocumentInternals, type RequestRender } from "./internals.ts";
-import { ELEMENT_NODE, QuoxNodeCache, TEXT_NODE } from "./node_cache.ts";
-import type { QuoxElement, QuoxNode, QuoxText } from "./node.ts";
+import { ELEMENT_NODE, GENERIC_ELEMENT_INTERFACE, QuoxNodeCache, TEXT_NODE } from "./node_cache.ts";
+import type { QuoxElement, QuoxInputElement, QuoxNode, QuoxText, QuoxTextAreaElement } from "./node.ts";
 import {
   type DomDispatchEventStep,
   type DomDispatchFocusPayload,
@@ -50,6 +50,7 @@ type SyntheticEventPathRenderer = WasmRenderer & {
 };
 type InvalidatingTitleRenderer = { set_title(title: string): Uint32Array };
 type LegacyHoverRenderer = { clear_hover(): boolean };
+type ElementInterfaceRenderer = { element_interface(nodeHandle: number): number };
 
 const POINTER_BUTTONS_MASK = 0x1f;
 const POINTER_MODIFIER_MASK = 0x0f;
@@ -148,17 +149,17 @@ export class QuoxDocument extends QuoxEventTarget {
 
   get documentElement(): QuoxElement {
     this.#assertActive();
-    return this.#nodes.get(this.#renderer.document_element(), ELEMENT_NODE);
+    return this.#elementForHandle(this.#renderer.document_element());
   }
 
   get head(): QuoxElement {
     this.#assertActive();
-    return this.#nodes.get(this.#renderer.head(), ELEMENT_NODE);
+    return this.#elementForHandle(this.#renderer.head());
   }
 
   get body(): QuoxElement {
     this.#assertActive();
-    return this.#nodes.get(this.#renderer.body(), ELEMENT_NODE);
+    return this.#elementForHandle(this.#renderer.body());
   }
 
   /**
@@ -645,7 +646,19 @@ export class QuoxDocument extends QuoxEventTarget {
   #nodeForHandle(nodeHandle: number): QuoxNode {
     nodeHandle = assertUint32(nodeHandle, "nodeHandle");
     const nodeKind = (this.#renderer as NodeKindRenderer).node_kind(nodeHandle);
-    return this.#nodes.get(nodeHandle, nodeKind);
+    return nodeKind === ELEMENT_NODE ? this.#elementForHandle(nodeHandle) : this.#nodes.get(nodeHandle, nodeKind);
+  }
+
+  #elementForHandle(nodeHandle: number): QuoxElement {
+    nodeHandle = assertUint32(nodeHandle, "nodeHandle");
+    // Keeping the fallback makes source-level tests and older embedders fail soft as generic
+    // elements. Current Quox WASM always supplies the interface query.
+    const interfaceQuery = (this.#renderer as unknown as Partial<ElementInterfaceRenderer>)
+      .element_interface;
+    const elementInterface = typeof interfaceQuery === "function"
+      ? interfaceQuery.call(this.#renderer, nodeHandle)
+      : GENERIC_ELEMENT_INTERFACE;
+    return this.#nodes.get(nodeHandle, ELEMENT_NODE, elementInterface);
   }
 
   #syntheticEventPath(nodeHandle: number, event: QuoxEvent): readonly QuoxEventTarget[] {
@@ -681,9 +694,12 @@ export class QuoxDocument extends QuoxEventTarget {
     return path;
   }
 
+  createElement(tagName: "input"): QuoxInputElement;
+  createElement(tagName: "textarea"): QuoxTextAreaElement;
+  createElement(tagName: string): QuoxElement;
   createElement(tagName: string): QuoxElement {
     this.#assertActive();
-    return this.#nodes.get(this.#renderer.create_element(tagName), ELEMENT_NODE);
+    return this.#elementForHandle(this.#renderer.create_element(tagName));
   }
 
   createTextNode(text: string): QuoxText {

@@ -8,8 +8,14 @@ import {
 } from "@std/assert";
 import type { QuoxDocument } from "./document.ts";
 import { getElementFunctionProps, setElementFunctionProp } from "./handlers.ts";
-import { ELEMENT_NODE, QuoxNodeCache, TEXT_NODE } from "./node_cache.ts";
-import { QuoxElement, QuoxText } from "./node.ts";
+import {
+  ELEMENT_NODE,
+  INPUT_ELEMENT_INTERFACE,
+  QuoxNodeCache,
+  TEXT_NODE,
+  TEXTAREA_ELEMENT_INTERFACE,
+} from "./node_cache.ts";
+import { QuoxElement, QuoxInputElement, QuoxText, QuoxTextAreaElement } from "./node.ts";
 
 /** Minimal model of the Rust boundary: raw ids are reusable, public handles are not. */
 class FakeHandleBridge {
@@ -71,4 +77,22 @@ Deno.test("node handles cannot alias after unsigned WASM narrowing", () => {
   const cache = new QuoxNodeCache({} as QuoxDocument);
 
   assertThrows(() => cache.get(0x1_0000_0001, ELEMENT_NODE), RangeError);
+});
+
+Deno.test("element interface literals create exact cached wrapper classes", () => {
+  const cache = new QuoxNodeCache({} as QuoxDocument);
+
+  const input: QuoxInputElement = cache.get(1, ELEMENT_NODE, INPUT_ELEMENT_INTERFACE);
+  const textarea: QuoxTextAreaElement = cache.get(2, ELEMENT_NODE, TEXTAREA_ELEMENT_INTERFACE);
+  const generic = cache.get(3, ELEMENT_NODE);
+
+  assertInstanceOf(input, QuoxInputElement);
+  assertInstanceOf(textarea, QuoxTextAreaElement);
+  assertStrictEquals(generic.constructor, QuoxElement);
+  assertThrows(() => cache.get(1, ELEMENT_NODE), TypeError, "changed element interface");
+  assertThrows(
+    () => cache.get(3, ELEMENT_NODE, INPUT_ELEMENT_INTERFACE),
+    TypeError,
+    "changed element interface",
+  );
 });

@@ -1,5 +1,6 @@
 mod dom;
 mod ffi_numbers;
+mod form_controls;
 mod interaction;
 mod node_handles;
 mod render;
@@ -9,6 +10,7 @@ use blitz_html::{HtmlDocument, HtmlProvider};
 use blitz_traits::net::DummyNetProvider;
 use blitz_traits::shell::{ColorScheme, ShellProvider, Viewport};
 use ffi_numbers::{NumericArgumentError, positive_f32, uint32};
+use form_controls::TextControlStates;
 use interaction::staged_dispatch::DispatchStack;
 use linebender_resource_handle::Blob;
 use node_handles::NodeHandles;
@@ -59,6 +61,8 @@ struct QuoxRendererState {
     dispatch_stack: DispatchStack,
     /// Stable public handles for Blitz's internally reusable slab node ids.
     node_handles: NodeHandles,
+    /// Browser-facing live value/dirty state for Blitz-backed text controls.
+    text_controls: TextControlStates,
 }
 
 const IME_REQUEST_CURSOR_AREA: u8 = 1 << 0;
@@ -167,6 +171,18 @@ impl ImeRequestMailbox {
                 .expect("IME restart generation exhausted");
         }
         state.desired_enabled = Some(enabled);
+    }
+
+    fn request_restart(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.desired_restart_generation = state
+            .desired_restart_generation
+            .checked_add(1)
+            .expect("IME restart generation exhausted");
+        state.desired_enabled = Some(true);
     }
 
     fn request_cursor_area(&self, mut cursor_area: [f32; 4]) {
@@ -351,6 +367,7 @@ impl QuoxRendererState {
     /// (via `viewport_scroll()`/`scroll_by`) — quox keeps no mirror of it, which would otherwise
     /// clobber Blitz's own wheel-driven scroll updates.
     fn sync_layout(&mut self) {
+        self.text_controls.reconcile_document(&mut self.document);
         sync_document_layout(
             &mut self.document,
             self.framebuffer_width,
@@ -427,7 +444,7 @@ impl QuoxRenderer {
         let redraw_requested = Arc::new(AtomicBool::new(false));
         let ime_requests = Arc::new(ImeRequestMailbox::default());
 
-        let document = HtmlDocument::from_html(
+        let mut document = HtmlDocument::from_html(
             &initial_html(head, body),
             DocumentConfig {
                 base_url: Some("https://example.com".to_string()),
@@ -443,6 +460,8 @@ impl QuoxRenderer {
             },
         )
         .into_inner();
+        let mut text_controls = TextControlStates::default();
+        text_controls.reconcile_document(&mut document);
 
         Ok(QuoxRenderer {
             state: RefCell::new(QuoxRendererState {
@@ -459,6 +478,7 @@ impl QuoxRenderer {
                 ime_requests,
                 dispatch_stack: DispatchStack::default(),
                 node_handles: NodeHandles::default(),
+                text_controls,
             }),
         })
     }
@@ -603,6 +623,19 @@ mod tests {
         assert_ne!(second_restart[0], first_restart[0]);
         acknowledge(&mailbox, second_restart);
         assert_eq!(mailbox.peek_snapshot(), Ok(None));
+    }
+
+    #[test]
+    fn explicit_editor_restart_keeps_the_context_enabled() {
+        let mailbox = ImeRequestMailbox::default();
+        mailbox.request_enabled(true);
+        let initial = peek(&mailbox);
+        acknowledge(&mailbox, initial);
+
+        mailbox.request_restart();
+        let restart = peek(&mailbox);
+        assert_eq!(restart[1], f64::from(IME_REQUEST_CONTEXT_RESTART));
+        assert_eq!(restart[6], 1.0);
     }
 
     #[test]

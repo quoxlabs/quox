@@ -1,10 +1,14 @@
 use super::{QuoxRenderer, QuoxRendererState};
 use crate::ffi_numbers::{NumericArgumentError, uint32};
+use crate::form_controls::restore_text_editor;
 use blitz_dom::{BaseDocument, DocumentMutator, LocalName, NodeData, QualName, ns};
 use wasm_bindgen::prelude::*;
 
 const ELEMENT_NODE: u8 = 1;
 const TEXT_NODE: u8 = 3;
+const ELEMENT_INTERFACE_GENERIC: u8 = 0;
+const ELEMENT_INTERFACE_INPUT: u8 = 1;
+const ELEMENT_INTERFACE_TEXTAREA: u8 = 2;
 
 fn html_name(local_name: &str) -> QualName {
     QualName {
@@ -37,6 +41,13 @@ fn invalid_node_handle(node_handle: u32) -> JsValue {
 
 fn invalid_element(node_handle: u32) -> JsValue {
     JsValue::from_str(&format!("DOM node handle is not an element: {node_handle}"))
+}
+
+fn invalid_text_control(node_handle: u32) -> JsValue {
+    js_sys::TypeError::new(&format!(
+        "DOM node handle is not a rendered text-like input or textarea: {node_handle}"
+    ))
+    .into()
 }
 
 fn invalid_internal_node(node_id: usize) -> JsValue {
@@ -99,7 +110,48 @@ fn dropped_descendant_ids(document: &BaseDocument, parent_id: usize) -> Vec<usiz
     dropped
 }
 
+#[derive(Clone, Copy, Default)]
+struct FocusedEditorSnapshot {
+    enabled: bool,
+    composing: bool,
+}
+
 impl QuoxRendererState {
+    fn focused_editor_snapshot(&self) -> FocusedEditorSnapshot {
+        let Some(node_id) = self.document.get_focussed_node_id() else {
+            return FocusedEditorSnapshot::default();
+        };
+        let Some(node) = self
+            .document
+            .get_node(node_id)
+            .filter(|node| node.is_focussed())
+        else {
+            return FocusedEditorSnapshot::default();
+        };
+        let Some(editor) = node
+            .element_data()
+            .and_then(blitz_dom::ElementData::text_input_data)
+        else {
+            return FocusedEditorSnapshot::default();
+        };
+        FocusedEditorSnapshot {
+            enabled: true,
+            composing: editor.editor.raw_compose().is_some(),
+        }
+    }
+
+    fn reconcile_native_ime_after_editor_mutation(&self, before: FocusedEditorSnapshot) {
+        let after = self.focused_editor_snapshot();
+        match (before.enabled, after.enabled) {
+            (true, false) => self.ime_requests.request_enabled(false),
+            (false, true) => self.ime_requests.request_enabled(true),
+            (true, true) if before.composing && !after.composing => {
+                self.ime_requests.request_restart();
+            }
+            _ => {}
+        }
+    }
+
     fn mutate_document<T>(
         &mut self,
         op: impl FnOnce(&mut DocumentMutator<'_>) -> Result<T, JsValue>,
@@ -175,7 +227,12 @@ impl QuoxRendererState {
         // Collect and invalidate before mutation so the HTML parser cannot reuse a freed slab
         // index while its old public mapping still exists.
         let dropped = dropped_descendant_ids(&self.document, parent_id);
+        self.text_controls.invalidate_nodes(dropped.iter().copied());
         self.node_handles.invalidate_nodes(dropped)
+    }
+
+    fn reconcile_text_controls(&mut self) {
+        self.text_controls.reconcile_document(&mut self.document);
     }
 
     fn child_element_by_tag(&self, parent_id: usize, tag_name: &str) -> Result<usize, JsValue> {
@@ -237,7 +294,9 @@ impl QuoxRenderer {
         state.mutate_document(|mutator| {
             mutator.remove_node(node_id);
             Ok(())
-        })
+        })?;
+        state.reconcile_text_controls();
+        Ok(())
     }
 
     // Append `child_handle` to `parent_handle`.
@@ -252,7 +311,9 @@ impl QuoxRenderer {
         state.mutate_document(|mutator| {
             mutator.append_children(parent_id, &[child_id]);
             Ok(())
-        })
+        })?;
+        state.reconcile_text_controls();
+        Ok(())
     }
 
     /// Return a node's text content.
@@ -287,10 +348,26 @@ impl QuoxRenderer {
             uint32(node_handle, "nodeHandle").map_err(NumericArgumentError::into_js)?;
         let mut state = self.state.borrow_mut();
         let node_id = state.resolve_element(node_handle)?;
-        state.mutate_document(|mutator| {
+        let ime_before = state.focused_editor_snapshot();
+        let editor = if name.eq_ignore_ascii_case("value") {
+            let QuoxRendererState {
+                document,
+                text_controls,
+                ..
+            } = &mut *state;
+            text_controls.take_editor_for_value_attribute_mutation(document, node_id)
+        } else {
+            None
+        };
+        let result = state.mutate_document(|mutator| {
             mutator.set_attribute(node_id, attr_name(name), value);
             Ok(())
-        })
+        });
+        restore_text_editor(&mut state.document, node_id, editor);
+        result?;
+        state.reconcile_text_controls();
+        state.reconcile_native_ime_after_editor_mutation(ime_before);
+        Ok(())
     }
 
     /// Return an element attribute, preserving the distinction between absent and empty values.
@@ -308,6 +385,7 @@ impl QuoxRenderer {
         let node_id = state.mutate_document(|mutator| {
             Ok(mutator.create_element(html_name(&tag_name.to_ascii_lowercase()), Vec::new()))
         })?;
+        state.reconcile_text_controls();
         state.expose_node(node_id)
     }
 
@@ -322,6 +400,7 @@ impl QuoxRenderer {
             mutator.set_inner_html(node_id, html);
             Ok(())
         })?;
+        state.reconcile_text_controls();
         Ok(invalidated_handles.into_boxed_slice())
     }
 
@@ -345,10 +424,26 @@ impl QuoxRenderer {
             uint32(node_handle, "nodeHandle").map_err(NumericArgumentError::into_js)?;
         let mut state = self.state.borrow_mut();
         let node_id = state.resolve_element(node_handle)?;
-        state.mutate_document(|mutator| {
+        let ime_before = state.focused_editor_snapshot();
+        let editor = if name.eq_ignore_ascii_case("value") {
+            let QuoxRendererState {
+                document,
+                text_controls,
+                ..
+            } = &mut *state;
+            text_controls.take_editor_for_value_attribute_mutation(document, node_id)
+        } else {
+            None
+        };
+        let result = state.mutate_document(|mutator| {
             mutator.clear_attribute(node_id, attr_name(name));
             Ok(())
-        })
+        });
+        restore_text_editor(&mut state.document, node_id, editor);
+        result?;
+        state.reconcile_text_controls();
+        state.reconcile_native_ime_after_editor_mutation(ime_before);
+        Ok(())
     }
 
     /// Replace a node's text content.
@@ -384,6 +479,7 @@ impl QuoxRenderer {
 
             Ok(())
         })?;
+        state.reconcile_text_controls();
         Ok(invalidated_handles.into_boxed_slice())
     }
 
@@ -418,6 +514,7 @@ impl QuoxRenderer {
 
             Ok(())
         })?;
+        state.reconcile_text_controls();
         Ok(invalidated_handles.into_boxed_slice())
     }
 
@@ -443,6 +540,65 @@ impl QuoxRenderer {
         let mut state = self.state.borrow_mut();
         let node_id = state.resolve_node(node_handle)?;
         Ok(state.node_kind(node_id))
+    }
+
+    /// Identify the browser wrapper class for an element without exposing Blitz's raw node id.
+    pub fn element_interface(&self, node_handle: f64) -> Result<u8, JsValue> {
+        let node_handle =
+            uint32(node_handle, "nodeHandle").map_err(NumericArgumentError::into_js)?;
+        let mut state = self.state.borrow_mut();
+        let node_id = state.resolve_element(node_handle)?;
+        let element = state
+            .document
+            .get_node(node_id)
+            .and_then(blitz_dom::Node::element_data)
+            .ok_or_else(|| invalid_element(node_handle))?;
+        if element.name.ns != ns!(html) {
+            return Ok(ELEMENT_INTERFACE_GENERIC);
+        }
+        let local_name = element.name.local.as_ref();
+        Ok(match local_name {
+            "input" => ELEMENT_INTERFACE_INPUT,
+            "textarea" => ELEMENT_INTERFACE_TEXTAREA,
+            _ => ELEMENT_INTERFACE_GENERIC,
+        })
+    }
+
+    /// Read the live value of a rendered text-like form control, including active composition.
+    pub fn form_control_value(&self, node_handle: f64) -> Result<String, JsValue> {
+        let node_handle =
+            uint32(node_handle, "nodeHandle").map_err(NumericArgumentError::into_js)?;
+        let mut state = self.state.borrow_mut();
+        let node_id = state.resolve_element(node_handle)?;
+        let QuoxRendererState {
+            document,
+            text_controls,
+            ..
+        } = &mut *state;
+        text_controls
+            .value(document, node_id)
+            .ok_or_else(|| invalid_text_control(node_handle))
+    }
+
+    /// Set a live value without dispatching an event. Returns whether the value changed.
+    pub fn set_form_control_value(&self, node_handle: f64, value: &str) -> Result<bool, JsValue> {
+        let node_handle =
+            uint32(node_handle, "nodeHandle").map_err(NumericArgumentError::into_js)?;
+        let mut state = self.state.borrow_mut();
+        let node_id = state.resolve_element(node_handle)?;
+        let ime_before = state.focused_editor_snapshot();
+        let changed = {
+            let QuoxRendererState {
+                document,
+                text_controls,
+                ..
+            } = &mut *state;
+            text_controls
+                .set_value(document, node_id, value)
+                .ok_or_else(|| invalid_text_control(node_handle))?
+        };
+        state.reconcile_native_ime_after_editor_mutation(ime_before);
+        Ok(changed)
     }
 
     /// Return a target-first propagation path for a synthetic event dispatched on a DOM node.

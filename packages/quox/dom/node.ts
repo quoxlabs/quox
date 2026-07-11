@@ -15,6 +15,39 @@ type AttributeRenderer = {
   get_attribute(nodeHandle: number, name: string): string | undefined;
 };
 
+type LiveTextControlRenderer = {
+  form_control_value(nodeHandle: number): string;
+  set_form_control_value(nodeHandle: number, value: string): boolean;
+};
+
+/** Web IDL DOMString conversion followed by the scalar-value repair required by Rust UTF-8. */
+function boundaryString(value: unknown): string {
+  if (typeof value === "symbol") throw new TypeError("a Web IDL string cannot be a symbol");
+  const source = String(value);
+  let result = "";
+  for (let index = 0; index < source.length; index += 1) {
+    const codeUnit = source.charCodeAt(index);
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      const next = source.charCodeAt(index + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        result += source[index] + source[index + 1];
+        index += 1;
+      } else {
+        result += "\ufffd";
+      }
+    } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+      result += "\ufffd";
+    } else {
+      result += source[index];
+    }
+  }
+  return result;
+}
+
+function controlValueString(value: unknown): string {
+  return value === null ? "" : boundaryString(value);
+}
+
 export class QuoxNode extends QuoxEventTarget {
   readonly ownerDocument: QuoxDocument;
   readonly #nodeId: number;
@@ -99,6 +132,54 @@ export class QuoxElement extends QuoxNode {
     const { renderer, requestRender } = documentInternals(this.ownerDocument);
     renderer.remove_attribute(this.nodeId, name);
     requestRender();
+  }
+}
+
+export class QuoxInputElement extends QuoxElement {
+  get value(): string {
+    const { renderer } = documentInternals(this.ownerDocument);
+    return (renderer as unknown as LiveTextControlRenderer).form_control_value(this.nodeId);
+  }
+
+  set value(value: string) {
+    const { renderer, requestRender } = documentInternals(this.ownerDocument);
+    const changed = (renderer as unknown as LiveTextControlRenderer).set_form_control_value(
+      this.nodeId,
+      controlValueString(value),
+    );
+    if (changed) requestRender();
+  }
+
+  get defaultValue(): string {
+    return this.getAttribute("value") ?? "";
+  }
+
+  set defaultValue(value: string) {
+    this.setAttribute("value", boundaryString(value));
+  }
+}
+
+export class QuoxTextAreaElement extends QuoxElement {
+  get value(): string {
+    const { renderer } = documentInternals(this.ownerDocument);
+    return (renderer as unknown as LiveTextControlRenderer).form_control_value(this.nodeId);
+  }
+
+  set value(value: string) {
+    const { renderer, requestRender } = documentInternals(this.ownerDocument);
+    const changed = (renderer as unknown as LiveTextControlRenderer).set_form_control_value(
+      this.nodeId,
+      controlValueString(value),
+    );
+    if (changed) requestRender();
+  }
+
+  get defaultValue(): string {
+    return this.textContent;
+  }
+
+  set defaultValue(value: string) {
+    this.textContent = boundaryString(value);
   }
 }
 
