@@ -13,6 +13,8 @@ type DocumentInternals = {
   readonly assertActive: AssertActive;
   readonly invalidateNodeHandles: InvalidateNodeHandles;
   readonly isDispatching: () => boolean;
+  readonly focusElement: (nodeHandle: number) => void;
+  readonly blurElement: (nodeHandle: number) => void;
   readonly syntheticEventPath: (
     nodeHandle: number,
     event: QuoxEvent,

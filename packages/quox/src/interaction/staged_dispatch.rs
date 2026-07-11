@@ -2,7 +2,7 @@ use super::{
     apply_ime_delete_surrounding, is_insertable_text, key_event, mouse_button, pointer_buttons,
     preedit_cursor, validate_key_abi,
 };
-use crate::dom::{actual_focus_node_id, public_dom_node_id};
+use crate::dom::{actual_focus_node_id, is_programmatically_focusable, public_dom_node_id};
 use crate::ffi_numbers::{
     NumericArgumentError, finite_f32, finite_f64, integer_range, known_mask, nonnegative_f64,
     uint32, wasm_usize,
@@ -245,11 +245,20 @@ enum PlannedWork {
     Action(DispatchAction),
 }
 
-#[derive(Clone, Copy)]
 enum DispatchAction {
     PointerDownState(PlannedHover),
     PointerUpState,
     ClearHover,
+    LoseFocus {
+        target: GuardedNode,
+        related_target: Option<GuardedNode>,
+        metadata: EventMetadata,
+    },
+    GainFocus {
+        target: GuardedNode,
+        related_target: Option<GuardedNode>,
+        metadata: EventMetadata,
+    },
     ImeDeleteSurrounding {
         before_bytes: usize,
         after_bytes: usize,
@@ -313,6 +322,8 @@ enum DispatchRequest {
         before_bytes: usize,
         after_bytes: usize,
     },
+    Focus(usize),
+    Blur(usize),
 }
 
 #[derive(Clone, Copy)]
@@ -787,6 +798,12 @@ impl DispatchStack {
                     suppress_default,
                 });
             }
+            DispatchRequest::Focus(target_id) => {
+                plan_programmatic_focus(document, handles, planned, target_id)?;
+            }
+            DispatchRequest::Blur(target_id) => {
+                plan_programmatic_blur(document, handles, planned, target_id)?;
+            }
             DispatchRequest::Ime(event) => {
                 planned.push_back(PlannedWork::DefaultOnly {
                     target: PlannedTarget::Focused,
@@ -855,6 +872,16 @@ impl DispatchStack {
             debug_assert!(frame.pending.is_none());
 
             if let Some(event) = frame.generated.pop_front() {
+                if matches!(
+                    &event.event.data,
+                    DomEventData::Focus(_) | DomEventData::FocusIn(_)
+                ) && actual_focus_node_id(document) != Some(event.target.raw)
+                {
+                    // A focus listener may synchronously redirect focus before the paired
+                    // focusin record reaches the front of the queue. Do not announce a stale
+                    // focus owner after that nested transition completes.
+                    continue;
+                }
                 if let Some(event) = freeze_event_path(document, handles, event)? {
                     return self.stage(
                         redraw,
@@ -1115,6 +1142,60 @@ impl DispatchStack {
             DispatchAction::ClearHover => {
                 document.clear_hover();
             }
+            DispatchAction::LoseFocus {
+                target,
+                related_target,
+                metadata,
+            } => {
+                if actual_focus_node_id(document) != Some(target.raw)
+                    || !node_is_live(target, document, handles)
+                {
+                    return Ok(());
+                }
+
+                text_controls.sync_editor_value(document, target.raw);
+                document.clear_focus();
+                self.frames
+                    .last_mut()
+                    .expect("focus changes run only for an active frame")
+                    .redraw_requested = true;
+                let generated =
+                    guard_focus_pair(document, handles, target, related_target, metadata, false)?;
+                self.frames
+                    .last_mut()
+                    .expect("focus changes run only for an active frame")
+                    .generated
+                    .extend(generated);
+            }
+            DispatchAction::GainFocus {
+                target,
+                related_target,
+                metadata,
+            } => {
+                // Loss-event listeners can focus another element, detach the requested target,
+                // or make it unfocusable. Browser focus steps must honor that synchronous work
+                // instead of stealing focus back when the outer transition resumes.
+                document.resolve(0.0);
+                if actual_focus_node_id(document).is_some()
+                    || !node_is_live(target, document, handles)
+                    || !is_programmatically_focusable(document, target.raw)
+                    || !document.set_focus_to(target.raw)
+                {
+                    return Ok(());
+                }
+
+                self.frames
+                    .last_mut()
+                    .expect("focus changes run only for an active frame")
+                    .redraw_requested = true;
+                let generated =
+                    guard_focus_pair(document, handles, target, related_target, metadata, true)?;
+                self.frames
+                    .last_mut()
+                    .expect("focus changes run only for an active frame")
+                    .generated
+                    .extend(generated);
+            }
             DispatchAction::ImeDeleteSurrounding {
                 before_bytes,
                 after_bytes,
@@ -1171,6 +1252,96 @@ impl DispatchStack {
             }
         }
     }
+}
+
+fn plan_programmatic_focus(
+    document: &BaseDocument,
+    handles: &mut NodeHandles,
+    planned: &mut VecDeque<PlannedWork>,
+    target_id: usize,
+) -> Result<(), DispatchError> {
+    if !is_programmatically_focusable(document, target_id) {
+        return Ok(());
+    }
+    let Some(target) = guard_node(document, handles, target_id)? else {
+        return Ok(());
+    };
+    let old_focus = actual_focus_node_id(document);
+    if old_focus == Some(target_id) {
+        return Ok(());
+    }
+    let old_focus = old_focus
+        .map(|old_focus| guard_node(document, handles, old_focus))
+        .transpose()?
+        .flatten();
+    let metadata = EventMetadata::native();
+    if let Some(old_focus) = old_focus {
+        planned.push_back(PlannedWork::Action(DispatchAction::LoseFocus {
+            target: old_focus,
+            related_target: Some(target),
+            metadata: metadata.clone(),
+        }));
+    }
+    planned.push_back(PlannedWork::Action(DispatchAction::GainFocus {
+        target,
+        related_target: old_focus,
+        metadata,
+    }));
+    Ok(())
+}
+
+fn plan_programmatic_blur(
+    document: &BaseDocument,
+    handles: &mut NodeHandles,
+    planned: &mut VecDeque<PlannedWork>,
+    target_id: usize,
+) -> Result<(), DispatchError> {
+    if actual_focus_node_id(document) != Some(target_id) {
+        return Ok(());
+    }
+    let Some(target) = guard_node(document, handles, target_id)? else {
+        return Ok(());
+    };
+    planned.push_back(PlannedWork::Action(DispatchAction::LoseFocus {
+        target,
+        related_target: None,
+        metadata: EventMetadata::native(),
+    }));
+    Ok(())
+}
+
+fn guard_focus_pair(
+    document: &BaseDocument,
+    handles: &mut NodeHandles,
+    target: GuardedNode,
+    related_target: Option<GuardedNode>,
+    metadata: EventMetadata,
+    gained: bool,
+) -> Result<VecDeque<GuardedDomEvent>, DispatchError> {
+    let data = if gained {
+        [
+            DomEventData::Focus(blitz_traits::events::BlitzFocusEvent),
+            DomEventData::FocusIn(blitz_traits::events::BlitzFocusEvent),
+        ]
+    } else {
+        [
+            DomEventData::Blur(blitz_traits::events::BlitzFocusEvent),
+            DomEventData::FocusOut(blitz_traits::events::BlitzFocusEvent),
+        ]
+    };
+    let metadata = metadata.with_related_target(related_target);
+    let mut guarded = VecDeque::with_capacity(data.len());
+    for data in data {
+        if let Some(event) = guard_queued_event(
+            document,
+            handles,
+            DomEvent::new(target.raw, data),
+            metadata.clone(),
+        )? {
+            guarded.push_back(event);
+        }
+    }
+    Ok(guarded)
 }
 
 fn wheel_target_forwards_default(document: &BaseDocument, target: usize) -> bool {
@@ -2437,6 +2608,35 @@ impl QuoxRenderer {
         finish_step(&mut state, step)
     }
 
+    pub fn begin_focus(&self, node_handle: f64) -> Result<JsValue, JsValue> {
+        let node_handle =
+            uint32(node_handle, "nodeHandle").map_err(NumericArgumentError::into_js)?;
+        let mut state = self.state.borrow_mut();
+        let node_id = state.resolve_element(node_handle)?;
+        if let Some(focus_id) = actual_focus_node_id(&state.document) {
+            let QuoxRendererState {
+                document,
+                text_controls,
+                ..
+            } = &mut *state;
+            text_controls.sync_editor_value(document, focus_id);
+        }
+        // Programmatic focusability depends on the latest connected tree and computed display.
+        // Resolve pending DOM/style work before planning which element, if any, may receive focus.
+        resolve_input_layout(&mut state);
+        let step = begin_request(&mut state, DispatchRequest::Focus(node_id));
+        finish_step(&mut state, step)
+    }
+
+    pub fn begin_blur(&self, node_handle: f64) -> Result<JsValue, JsValue> {
+        let node_handle =
+            uint32(node_handle, "nodeHandle").map_err(NumericArgumentError::into_js)?;
+        let mut state = self.state.borrow_mut();
+        let node_id = state.resolve_element(node_handle)?;
+        let step = begin_request(&mut state, DispatchRequest::Blur(node_id));
+        finish_step(&mut state, step)
+    }
+
     pub fn begin_apple_standard_keybinding(&self, command: &str) -> Result<JsValue, JsValue> {
         let mut state = self.state.borrow_mut();
         let step = begin_request(
@@ -2562,18 +2762,20 @@ mod tests {
         handles: NodeHandles,
         stack: DispatchStack,
         redraw: Arc<AtomicBool>,
+        ime_requests: Arc<ImeRequestMailbox>,
     }
 
     impl TestContext {
         fn new(body: &str) -> Self {
             let redraw = Arc::new(AtomicBool::new(false));
+            let ime_requests = Arc::new(ImeRequestMailbox::default());
             let mut document = HtmlDocument::from_html(
                 &format!("<!doctype html><html><body>{body}</body></html>"),
                 DocumentConfig {
                     viewport: Some(Viewport::new(800, 600, 1.0, ColorScheme::Light)),
                     shell_provider: Some(Arc::new(QuoxShellProvider {
                         redraw_requested: Arc::clone(&redraw),
-                        ime_requests: Arc::new(ImeRequestMailbox::default()),
+                        ime_requests: Arc::clone(&ime_requests),
                     })),
                     ..Default::default()
                 },
@@ -2587,6 +2789,7 @@ mod tests {
                 handles: NodeHandles::default(),
                 stack: DispatchStack::default(),
                 redraw,
+                ime_requests,
             };
             context.document.resolve(0.0);
             let _ = context.redraw.swap(false, Ordering::Relaxed);
@@ -2826,6 +3029,27 @@ mod tests {
             });
             self.begin(request)
         }
+
+        fn begin_programmatic_focus(&mut self, node_id: usize) -> DispatchStep {
+            if let Some(focus_id) = actual_focus_node_id(&self.document) {
+                self.text_controls
+                    .sync_editor_value(&mut self.document, focus_id);
+            }
+            ResolvedInputLayout::new(
+                &mut self.document,
+                &mut self.text_controls,
+                800,
+                600,
+                800,
+                600,
+                1.0,
+            );
+            self.begin(DispatchRequest::Focus(node_id))
+        }
+
+        fn begin_programmatic_blur(&mut self, node_id: usize) -> DispatchStep {
+            self.begin(DispatchRequest::Blur(node_id))
+        }
     }
 
     fn event(step: DispatchStep) -> DispatchEventStep {
@@ -2929,6 +3153,13 @@ mod tests {
                 location: 0,
             },
         )
+    }
+
+    fn focus_related_target(event: &DispatchEventStep) -> Option<u32> {
+        let Some(DispatchEventPayload::Focus { related_target }) = event.payload.as_deref() else {
+            panic!("{} should carry a focus payload", event.event_type);
+        };
+        *related_target
     }
 
     fn stage_generated(
@@ -3709,6 +3940,393 @@ mod tests {
     }
 
     #[test]
+    fn programmatic_focus_transfers_in_browser_order_with_live_state_and_relationships() {
+        let mut context =
+            TestContext::new("<input id='old' value='old'><button id='new'>new</button>");
+        let old = context.element("old");
+        let new = context.element("new");
+        assert!(context.document.set_focus_to(old));
+
+        let blur = event(context.begin_programmatic_focus(new));
+        assert_eq!(blur.event_type, "blur");
+        assert!(!blur.bubbles);
+        assert!(!blur.cancelable);
+        assert!(blur.composed);
+        assert_eq!(actual_focus_node_id(&context.document), None);
+        let old_handle = blur.target;
+        let new_handle = focus_related_target(&blur).expect("blur should identify its destination");
+
+        let focusout = event(context.resume(&blur, false));
+        assert_eq!(focusout.event_type, "focusout");
+        assert!(focusout.bubbles);
+        assert!(!focusout.cancelable);
+        assert_eq!(focusout.target, old_handle);
+        assert_eq!(focus_related_target(&focusout), Some(new_handle));
+        assert_eq!(actual_focus_node_id(&context.document), None);
+
+        let focus = event(context.resume(&focusout, false));
+        assert_eq!(focus.event_type, "focus");
+        assert!(!focus.bubbles);
+        assert_eq!(focus.target, new_handle);
+        assert_eq!(focus_related_target(&focus), Some(old_handle));
+        assert_eq!(actual_focus_node_id(&context.document), Some(new));
+
+        let focusin = event(context.resume(&focus, false));
+        assert_eq!(focusin.event_type, "focusin");
+        assert!(focusin.bubbles);
+        assert_eq!(focusin.target, new_handle);
+        assert_eq!(focus_related_target(&focusin), Some(old_handle));
+        assert_eq!(focusin.time_stamp.to_bits(), blur.time_stamp.to_bits());
+        let (_, redraw_requested) = complete(context.resume(&focusin, false));
+        assert!(redraw_requested);
+        assert_eq!(actual_focus_node_id(&context.document), Some(new));
+    }
+
+    #[test]
+    fn programmatic_focus_and_blur_noops_match_the_current_owner() {
+        let mut context = TestContext::new("<button id='button'>button</button><input id='other'>");
+        let button = context.element("button");
+        let other = context.element("other");
+
+        let first = context.begin_programmatic_focus(button);
+        let (types, _, redraw_requested) = drain(&mut context, first);
+        assert_eq!(types, ["focus", "focusin"]);
+        assert!(redraw_requested);
+        assert_eq!(actual_focus_node_id(&context.document), Some(button));
+
+        let same = context.begin_programmatic_focus(button);
+        assert!(!complete(same).1);
+        let wrong_blur = context.begin_programmatic_blur(other);
+        assert!(!complete(wrong_blur).1);
+        assert_eq!(actual_focus_node_id(&context.document), Some(button));
+
+        let blur = event(context.begin_programmatic_blur(button));
+        assert_eq!(blur.event_type, "blur");
+        assert_eq!(focus_related_target(&blur), None);
+        assert_eq!(actual_focus_node_id(&context.document), None);
+        let focusout = event(context.resume(&blur, false));
+        assert_eq!(focusout.event_type, "focusout");
+        assert_eq!(focus_related_target(&focusout), None);
+        let (_, redraw_requested) = complete(context.resume(&focusout, false));
+        assert!(redraw_requested);
+        assert_eq!(actual_focus_node_id(&context.document), None);
+    }
+
+    #[test]
+    fn programmatic_focus_accepts_negative_tabindex_and_rejects_ineligible_targets() {
+        let mut context = TestContext::new(
+            "<input id='owner'>\
+             <div id='negative' tabindex='-1'></div>\
+             <a id='link' href='https://example.com'>link</a>\
+             <div id='plain'></div>\
+             <button id='disabled' disabled>disabled</button>\
+             <input id='hidden-input' type='hidden'>\
+             <section hidden><button id='hidden-child'>hidden</button></section>\
+             <section style='display:none'><button id='display-child'>hidden</button></section>\
+             <section inert><button id='inert-child'>inert</button></section>\
+             <button id='visibility-hidden' style='visibility:hidden'>hidden</button>\
+             <button id='visibility-collapse' style='visibility:collapse'>collapsed</button>\
+             <section style='visibility:hidden'>\
+               <button id='visibility-override' style='visibility:visible'>visible</button>\
+             </section>",
+        );
+        let owner = context.element("owner");
+        assert!(context.document.set_focus_to(owner));
+
+        for id in [
+            "plain",
+            "disabled",
+            "hidden-input",
+            "hidden-child",
+            "display-child",
+            "inert-child",
+            "visibility-hidden",
+            "visibility-collapse",
+        ] {
+            let target = context.element(id);
+            let rejected = context.begin_programmatic_focus(target);
+            complete(rejected);
+            assert_eq!(
+                actual_focus_node_id(&context.document),
+                Some(owner),
+                "#{id} must not take focus",
+            );
+        }
+
+        context.document.clear_focus();
+        let negative = context.element("negative");
+        let (types, _, _) = {
+            let step = context.begin_programmatic_focus(negative);
+            drain(&mut context, step)
+        };
+        assert_eq!(types, ["focus", "focusin"]);
+        assert_eq!(actual_focus_node_id(&context.document), Some(negative));
+
+        context.document.clear_focus();
+        let link = context.element("link");
+        let (types, _, _) = {
+            let step = context.begin_programmatic_focus(link);
+            drain(&mut context, step)
+        };
+        assert_eq!(types, ["focus", "focusin"]);
+        assert_eq!(actual_focus_node_id(&context.document), Some(link));
+
+        context.document.clear_focus();
+        let visibility_override = context.element("visibility-override");
+        let (types, _, _) = {
+            let step = context.begin_programmatic_focus(visibility_override);
+            drain(&mut context, step)
+        };
+        assert_eq!(types, ["focus", "focusin"]);
+        assert_eq!(
+            actual_focus_node_id(&context.document),
+            Some(visibility_override),
+        );
+    }
+
+    #[test]
+    fn disabled_fieldsets_exempt_only_the_first_legend_subtree() {
+        let mut context = TestContext::new(
+            "<input id='owner'>\
+             <fieldset disabled>\
+               <legend><input id='first-legend'></legend>\
+               <input id='nonlegend'>\
+               <legend><input id='second-legend'></legend>\
+             </fieldset>\
+             <fieldset disabled>\
+               <legend>\
+                 <fieldset disabled>\
+                   <legend><input id='nested-exempt'></legend>\
+                   <input id='nested-inner-disabled'>\
+                 </fieldset>\
+               </legend>\
+             </fieldset>\
+             <fieldset disabled>\
+               <div>\
+                 <fieldset disabled>\
+                   <legend><input id='nested-outer-disabled'></legend>\
+                 </fieldset>\
+               </div>\
+             </fieldset>",
+        );
+        let owner = context.element("owner");
+        assert!(context.document.set_focus_to(owner));
+
+        for id in [
+            "nonlegend",
+            "second-legend",
+            "nested-inner-disabled",
+            "nested-outer-disabled",
+        ] {
+            let target = context.element(id);
+            let rejected = context.begin_programmatic_focus(target);
+            assert!(!complete(rejected).1);
+            assert_eq!(
+                actual_focus_node_id(&context.document),
+                Some(owner),
+                "#{id} must inherit disabled fieldset state",
+            );
+        }
+
+        for id in ["first-legend", "nested-exempt"] {
+            context.document.clear_focus();
+            let target = context.element(id);
+            let step = context.begin_programmatic_focus(target);
+            let (types, _, redraw_requested) = drain(&mut context, step);
+            assert_eq!(types, ["focus", "focusin"], "#{id} should accept tabindex");
+            assert!(redraw_requested);
+            assert_eq!(actual_focus_node_id(&context.document), Some(target));
+        }
+    }
+
+    #[test]
+    fn actually_disabled_special_controls_reject_explicit_tabindex() {
+        let mut context = TestContext::new(
+            "<input id='owner'>\
+             <fieldset id='disabled-fieldset' disabled tabindex='0'></fieldset>\
+             <option id='disabled-option' disabled tabindex='0' style='display:block'>disabled</option>\
+             <optgroup id='disabled-optgroup' disabled tabindex='0' label='disabled'>\
+               <option id='optgroup-option' tabindex='0' style='display:block'>inherited</option>\
+             </optgroup>\
+             <select id='disabled-select' disabled tabindex='0'>\
+               <optgroup id='select-optgroup' tabindex='0' label='select disabled'>\
+                 <option id='select-option' tabindex='0' style='display:block'>inherited</option>\
+               </optgroup>\
+             </select>\
+             <fieldset id='plain-fieldset'></fieldset>\
+             <optgroup id='plain-optgroup' label='plain'>\
+               <option id='plain-option'>plain</option>\
+             </optgroup>\
+             <fieldset id='enabled-fieldset' tabindex='0'></fieldset>\
+             <fieldset disabled>\
+               <fieldset id='nested-enabled-fieldset' tabindex='0'></fieldset>\
+             </fieldset>\
+             <optgroup id='enabled-optgroup' tabindex='0' label='enabled'>\
+               <option id='enabled-option' tabindex='0' style='display:block'>enabled</option>\
+             </optgroup>",
+        );
+        let owner = context.element("owner");
+        assert!(context.document.set_focus_to(owner));
+
+        for id in [
+            "disabled-fieldset",
+            "disabled-option",
+            "disabled-optgroup",
+            "optgroup-option",
+            "disabled-select",
+            "select-optgroup",
+            "select-option",
+        ] {
+            let target = context.element(id);
+            let rejected = context.begin_programmatic_focus(target);
+            assert!(!complete(rejected).1);
+            assert_eq!(
+                actual_focus_node_id(&context.document),
+                Some(owner),
+                "#{id} must remain actually disabled despite tabindex",
+            );
+        }
+
+        for id in ["plain-fieldset", "plain-optgroup", "plain-option"] {
+            let target = context.element(id);
+            let rejected = context.begin_programmatic_focus(target);
+            assert!(!complete(rejected).1);
+            assert_eq!(
+                actual_focus_node_id(&context.document),
+                Some(owner),
+                "#{id} must not become implicitly focusable",
+            );
+        }
+
+        for id in [
+            "enabled-fieldset",
+            "nested-enabled-fieldset",
+            "enabled-optgroup",
+            "enabled-option",
+        ] {
+            context.document.clear_focus();
+            let target = context.element(id);
+            let step = context.begin_programmatic_focus(target);
+            let (types, _, redraw_requested) = drain(&mut context, step);
+            assert_eq!(types, ["focus", "focusin"], "#{id} should accept tabindex");
+            assert!(redraw_requested);
+            assert_eq!(actual_focus_node_id(&context.document), Some(target));
+        }
+    }
+
+    #[test]
+    fn nested_loss_listener_focus_wins_over_the_outer_destination() {
+        let mut context = TestContext::new(
+            "<button id='old'>old</button><button id='outer'>outer</button><button id='inner'>inner</button>",
+        );
+        let old = context.element("old");
+        let outer = context.element("outer");
+        let inner = context.element("inner");
+        assert!(context.document.set_focus_to(old));
+
+        let outer_blur = event(context.begin_programmatic_focus(outer));
+        assert_eq!(outer_blur.event_type, "blur");
+        assert_eq!(actual_focus_node_id(&context.document), None);
+
+        let nested = context.begin_programmatic_focus(inner);
+        let (nested_types, _, _) = drain(&mut context, nested);
+        assert_eq!(nested_types, ["focus", "focusin"]);
+        assert_eq!(actual_focus_node_id(&context.document), Some(inner));
+
+        let outer_remainder = context.resume(&outer_blur, false);
+        let (outer_types, _, _) = drain(&mut context, outer_remainder);
+        assert_eq!(outer_types, ["focusout"]);
+        assert_eq!(actual_focus_node_id(&context.document), Some(inner));
+    }
+
+    #[test]
+    fn nested_focus_listener_redirect_suppresses_the_stale_outer_focusin() {
+        let mut context =
+            TestContext::new("<button id='outer'>outer</button><button id='inner'>inner</button>");
+        let outer = context.element("outer");
+        let inner = context.element("inner");
+
+        let outer_focus = event(context.begin_programmatic_focus(outer));
+        assert_eq!(outer_focus.event_type, "focus");
+        assert_eq!(actual_focus_node_id(&context.document), Some(outer));
+
+        let nested = context.begin_programmatic_focus(inner);
+        let (nested_types, _, _) = drain(&mut context, nested);
+        assert_eq!(nested_types, ["blur", "focusout", "focus", "focusin"]);
+        assert_eq!(actual_focus_node_id(&context.document), Some(inner));
+
+        let outer_remainder = context.resume(&outer_focus, false);
+        complete(outer_remainder);
+        assert_eq!(actual_focus_node_id(&context.document), Some(inner));
+    }
+
+    #[test]
+    fn stale_or_newly_disabled_destination_is_not_focused_after_loss_listeners() {
+        let mut stale =
+            TestContext::new("<button id='old'>old</button><button id='new'>new</button>");
+        let old = stale.element("old");
+        let new = stale.element("new");
+        assert!(stale.document.set_focus_to(old));
+        let blur = event(stale.begin_programmatic_focus(new));
+        let stale_handle = focus_related_target(&blur).expect("destination should be guarded");
+        assert_eq!(stale.handles.invalidate_node(new), Some(stale_handle));
+        let replacement_handle = stale.handles.expose(new).expect("fresh handle should fit");
+        assert_ne!(replacement_handle, stale_handle);
+        let remainder = stale.resume(&blur, false);
+        let (types, _, _) = drain(&mut stale, remainder);
+        assert_eq!(types, ["focusout"]);
+        assert_eq!(actual_focus_node_id(&stale.document), None);
+
+        let mut disabled =
+            TestContext::new("<button id='old'>old</button><button id='new'>new</button>");
+        let old = disabled.element("old");
+        let new = disabled.element("new");
+        assert!(disabled.document.set_focus_to(old));
+        let blur = event(disabled.begin_programmatic_focus(new));
+        disabled.document.mutate().set_attribute(
+            new,
+            QualName {
+                prefix: None,
+                ns: ns!(),
+                local: LocalName::from("disabled"),
+            },
+            "",
+        );
+        let remainder = disabled.resume(&blur, false);
+        let (types, _, _) = drain(&mut disabled, remainder);
+        assert_eq!(types, ["focusout"]);
+        assert_eq!(actual_focus_node_id(&disabled.document), None);
+    }
+
+    #[test]
+    fn programmatic_focus_syncs_live_text_and_native_ime_edges() {
+        let mut context = TestContext::new("<input id='old' value='seed'><input id='new'>");
+        let old = context.element("old");
+        let new = context.element("new");
+        assert!(context.document.set_focus_to(old));
+        context.document.with_text_input(old, |mut driver| {
+            driver.move_to_text_end();
+            driver.set_compose("候補", None);
+        });
+
+        let blur = event(context.begin_programmatic_focus(new));
+        assert_eq!(context.live_value(old), "seed候補");
+
+        let focusout = event(context.resume(&blur, false));
+        let focus = event(context.resume(&focusout, false));
+        assert_eq!(focus.event_type, "focus");
+        let enabled = context
+            .ime_requests
+            .peek_snapshot()
+            .expect("IME peek should succeed")
+            .expect("focus should publish an IME edge");
+        assert!(enabled[6] > 0.5);
+        let remainder = context.resume(&focus, false);
+        let _ = drain(&mut context, remainder);
+        assert_eq!(actual_focus_node_id(&context.document), Some(new));
+    }
+
+    #[test]
     fn key_cancellation_and_native_policy_both_prevent_editor_defaults() {
         for (javascript_cancels, native_suppresses) in [(true, false), (false, true)] {
             let mut context = TestContext::new("<input id='editor' value='ab'>");
@@ -3817,6 +4435,7 @@ mod tests {
         let mut context =
             TestContext::new("<section id='outer'><button id='button'>go</button></section>");
         let button = context.element("button");
+        assert!(context.document.set_focus_to(button));
         let target = guard_node(&context.document, &mut context.handles, button)
             .expect("path handles should fit")
             .expect("focus target should be live");

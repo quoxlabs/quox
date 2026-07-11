@@ -195,6 +195,22 @@ class FakeLiveControlRenderer {
     };
   }
 
+  begin_focus(): unknown {
+    return {
+      kind: "complete",
+      frameId: this.#nextFrame++,
+      redrawRequested: false,
+    };
+  }
+
+  begin_blur(): unknown {
+    return {
+      kind: "complete",
+      frameId: this.#nextFrame++,
+      redrawRequested: false,
+    };
+  }
+
   resume_dom_dispatch(frameId: number): unknown {
     const step = this.#pending.get(frameId);
     if (step === undefined) throw new Error("fake dispatch frame is not pending");

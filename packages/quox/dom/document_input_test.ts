@@ -45,6 +45,16 @@ class FakeInputRenderer {
     return this.#complete(true);
   }
 
+  begin_focus(...args: unknown[]): unknown {
+    this.calls.push({ method: "focus", args });
+    return this.#complete(true);
+  }
+
+  begin_blur(...args: unknown[]): unknown {
+    this.calls.push({ method: "blur", args });
+    return this.#complete(true);
+  }
+
   begin_apple_standard_keybinding(command: string): unknown {
     this.calls.push({ method: "appleCommand", args: [command] });
     return this.#complete(false);

@@ -106,6 +106,12 @@ export class QuoxDocument extends QuoxEventTarget {
       assertActive,
       invalidateNodeHandles: (nodeHandles) => this.#nodes.invalidate(nodeHandles),
       isDispatching: () => this.#dispatchDepth !== 0,
+      focusElement: (nodeHandle) => {
+        this.#dispatchInputEvent(() => this.#dispatchPort.beginFocus(nodeHandle));
+      },
+      blurElement: (nodeHandle) => {
+        this.#dispatchInputEvent(() => this.#dispatchPort.beginBlur(nodeHandle));
+      },
       syntheticEventPath: (nodeHandle, event) => this.#syntheticEventPath(nodeHandle, event),
     });
   }

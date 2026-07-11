@@ -28,6 +28,8 @@ function createElement(attributes: Record<string, string>): QuoxElement {
     assertActive: () => undefined,
     invalidateNodeHandles: () => undefined,
     isDispatching: () => false,
+    focusElement: () => undefined,
+    blurElement: () => undefined,
     syntheticEventPath: () => [element],
   });
   return element;

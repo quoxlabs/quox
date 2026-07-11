@@ -1792,6 +1792,7 @@ dependencies = [
  "keyboard-types",
  "linebender_resource_handle",
  "smol_str",
+ "stylo",
  "vello",
  "wasm-bindgen",
  "wasm-bindgen-futures",

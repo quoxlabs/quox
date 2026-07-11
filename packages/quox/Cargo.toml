@@ -23,6 +23,7 @@ futures-intrusive = "0.5"
 js-sys = "=0.3.85"
 keyboard-types = "0.7"
 smol_str = "0.3.6"
+style = { package = "stylo", version = "=0.18.0" }
 vello = "0.9"
 wasm-bindgen = "=0.2.108"
 wasm-bindgen-futures = "=0.4.58"

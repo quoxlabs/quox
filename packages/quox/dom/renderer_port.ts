@@ -208,6 +208,8 @@ export interface DomDispatchRendererSource {
     location: number,
     eventFlags: number,
   ): unknown;
+  begin_focus(nodeHandle: number): unknown;
+  begin_blur(nodeHandle: number): unknown;
   begin_apple_standard_keybinding(command: string): unknown;
   begin_ime_enabled(): unknown;
   begin_ime_disabled(): unknown;
@@ -916,6 +918,14 @@ export class DomDispatchRendererPort {
     return this.#validateInitial(
       this.#renderer.begin_key_event(code, key, keycode, modifierBits, location, eventFlags),
     );
+  }
+
+  beginFocus(nodeHandle: number): DomDispatchStep {
+    return this.#validateInitial(this.#renderer.begin_focus(assertUint32(nodeHandle, "nodeHandle")));
+  }
+
+  beginBlur(nodeHandle: number): DomDispatchStep {
+    return this.#validateInitial(this.#renderer.begin_blur(assertUint32(nodeHandle, "nodeHandle")));
   }
 
   beginAppleStandardKeybinding(command: string): DomDispatchStep {

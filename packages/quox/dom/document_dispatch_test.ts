@@ -214,6 +214,14 @@ class FakeDispatchRenderer {
     return this.#begin("begin_key_event", args);
   }
 
+  begin_focus(...args: unknown[]): unknown {
+    return this.#begin("begin_focus", args);
+  }
+
+  begin_blur(...args: unknown[]): unknown {
+    return this.#begin("begin_blur", args);
+  }
+
   begin_apple_standard_keybinding(...args: unknown[]): unknown {
     return this.#begin("begin_apple_standard_keybinding", args);
   }
@@ -319,6 +327,171 @@ function createHarness(onDispatchIdle: () => void = () => undefined): {
   );
   return { document, renderer, window, renders, syncs };
 }
+
+Deno.test("element focus and blur pump browser focus events through staged dispatch", () => {
+  const { document, renderer, renders, syncs } = createHarness();
+  const old = document.createElement("input");
+  const next = document.createElement("button");
+  const calls: string[] = [];
+
+  old.addEventListener("blur", (event) => {
+    calls.push("blur");
+    assert(event instanceof QuoxFocusEvent);
+    assertStrictEquals(event.relatedTarget, next);
+  });
+  old.addEventListener("focusout", (event) => {
+    calls.push("focusout");
+    assertStrictEquals((event as QuoxFocusEvent).relatedTarget, next);
+  });
+  next.addEventListener("focus", (event) => {
+    calls.push("focus");
+    assertStrictEquals((event as QuoxFocusEvent).relatedTarget, old);
+  });
+  next.addEventListener("focusin", (event) => {
+    calls.push("focusin");
+    assertStrictEquals((event as QuoxFocusEvent).relatedTarget, old);
+  });
+
+  renderer.queueFrame([
+    {
+      type: "blur",
+      target: old.nodeId,
+      path: [old.nodeId],
+      bubbles: false,
+      cancelable: false,
+      payload: { relatedTarget: next.nodeId },
+    },
+    {
+      type: "focusout",
+      target: old.nodeId,
+      path: [old.nodeId],
+      cancelable: false,
+      payload: { relatedTarget: next.nodeId },
+    },
+    {
+      type: "focus",
+      target: next.nodeId,
+      path: [next.nodeId],
+      bubbles: false,
+      cancelable: false,
+      payload: { relatedTarget: old.nodeId },
+    },
+    {
+      type: "focusin",
+      target: next.nodeId,
+      path: [next.nodeId],
+      cancelable: false,
+      payload: { relatedTarget: old.nodeId },
+    },
+  ], true);
+  next.focus();
+
+  assertEquals(calls, ["blur", "focusout", "focus", "focusin"]);
+  assertEquals(
+    renderer.calls.find(([method]) => method === "begin_focus")?.slice(2),
+    [next.nodeId],
+  );
+  assertEquals(renders, ["render"]);
+  assertEquals(syncs, ["sync"]);
+
+  calls.length = 0;
+  renderer.queueFrame([
+    {
+      type: "blur",
+      target: next.nodeId,
+      path: [next.nodeId],
+      bubbles: false,
+      cancelable: false,
+      payload: { relatedTarget: null },
+    },
+    {
+      type: "focusout",
+      target: next.nodeId,
+      path: [next.nodeId],
+      cancelable: false,
+      payload: { relatedTarget: null },
+    },
+  ]);
+  next.blur();
+  assertEquals(
+    renderer.calls.find(([method]) => method === "begin_blur")?.slice(2),
+    [next.nodeId],
+  );
+  assertEquals(syncs, ["sync", "sync"]);
+});
+
+Deno.test("focus methods may open nested frames from a loss listener", () => {
+  const order: string[] = [];
+  const renderer = new FakeDispatchRenderer();
+  const document = new QuoxDocument(
+    renderer as unknown as WasmRenderer,
+    () => undefined,
+    () => undefined,
+    undefined,
+    () => order.push("sync"),
+  );
+  const old = document.createElement("button");
+  const outer = document.createElement("button");
+  const inner = document.createElement("input");
+
+  renderer.queueFrame([
+    {
+      type: "blur",
+      target: old.nodeId,
+      path: [old.nodeId],
+      bubbles: false,
+      cancelable: false,
+      payload: { relatedTarget: outer.nodeId },
+    },
+    {
+      type: "focusout",
+      target: old.nodeId,
+      path: [old.nodeId],
+      cancelable: false,
+      payload: { relatedTarget: outer.nodeId },
+    },
+  ]);
+  renderer.queueFrame([
+    {
+      type: "focus",
+      target: inner.nodeId,
+      path: [inner.nodeId],
+      bubbles: false,
+      cancelable: false,
+      payload: { relatedTarget: null },
+    },
+    {
+      type: "focusin",
+      target: inner.nodeId,
+      path: [inner.nodeId],
+      cancelable: false,
+      payload: { relatedTarget: null },
+    },
+  ]);
+  old.addEventListener("blur", () => {
+    order.push("outer blur before");
+    inner.focus();
+    order.push("outer blur after");
+  });
+  old.addEventListener("focusout", () => order.push("outer focusout"));
+  inner.addEventListener("focus", () => order.push("inner focus"));
+  inner.addEventListener("focusin", () => order.push("inner focusin"));
+
+  outer.focus();
+  assertEquals(order, [
+    "outer blur before",
+    "inner focus",
+    "inner focusin",
+    "sync",
+    "outer blur after",
+    "outer focusout",
+    "sync",
+  ]);
+  assertEquals(
+    renderer.calls.filter(([method]) => method === "begin_focus").map((call) => call.slice(2)),
+    [[outer.nodeId], [inner.nodeId]],
+  );
+});
 
 Deno.test("trusted staged events preserve multiplicity and capture, target, bubble order", () => {
   const { document, renderer, window } = createHarness();

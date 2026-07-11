@@ -483,6 +483,14 @@ class FakeRenderer implements DomDispatchRendererSource {
     return this.#call("begin_key_event", code, key, keycode, modifierBits, location, eventFlags);
   }
 
+  begin_focus(nodeHandle: number): unknown {
+    return this.#call("begin_focus", nodeHandle);
+  }
+
+  begin_blur(nodeHandle: number): unknown {
+    return this.#call("begin_blur", nodeHandle);
+  }
+
   begin_apple_standard_keybinding(command: string): unknown {
     return this.#call("begin_apple_standard_keybinding", command);
   }
@@ -526,6 +534,8 @@ Deno.test("renderer port forwards every staged entry point and validates its res
   port.beginPointerUp(1, 2, 0, 2, 4, 14, 2);
   port.beginWheel(1, 2, 3.5, -4.5, -0.25, 0.5, 1, 0, 4, 15);
   port.beginKeyEvent("KeyA", "a", 44, 1, 0, 1);
+  port.beginFocus(17);
+  port.beginBlur(18);
   port.beginAppleStandardKeybinding("moveLeft:");
   port.beginImeEnabled();
   port.beginImeDisabled();
@@ -539,6 +549,8 @@ Deno.test("renderer port forwards every staged entry point and validates its res
     ["begin_pointer_up", 1, 2, 0, 2, 4, 14, 2],
     ["begin_wheel", 1, 2, 3.5, -4.5, -0.25, 0.5, 1, 0, 4, 15],
     ["begin_key_event", "KeyA", "a", 44, 1, 0, 1],
+    ["begin_focus", 17],
+    ["begin_blur", 18],
     ["begin_apple_standard_keybinding", "moveLeft:"],
     ["begin_ime_enabled"],
     ["begin_ime_disabled"],
@@ -549,6 +561,8 @@ Deno.test("renderer port forwards every staged entry point and validates its res
 
   renderer.nextStep = { kind: "complete", frameId: 0, redrawRequested: false };
   assertThrows(() => port.beginImeEnabled(), RangeError);
+  assertThrows(() => port.beginFocus(-1), RangeError);
+  assertThrows(() => port.beginBlur(1.5), RangeError);
 });
 
 Deno.test("renderer port validates continuation arguments and frame ownership", () => {

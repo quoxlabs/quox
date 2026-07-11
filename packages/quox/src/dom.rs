@@ -2,6 +2,7 @@ use super::{QuoxRenderer, QuoxRendererState};
 use crate::ffi_numbers::{NumericArgumentError, uint32};
 use crate::form_controls::restore_text_editor;
 use blitz_dom::{BaseDocument, DocumentMutator, LocalName, NodeData, QualName, ns};
+use style::computed_values::visibility::T as Visibility;
 use wasm_bindgen::prelude::*;
 
 const ELEMENT_NODE: u8 = 1;
@@ -75,6 +76,185 @@ pub(super) fn actual_focus_node_id(document: &BaseDocument) -> Option<usize> {
             .get_node(*target)
             .is_some_and(|node| node.flags.is_in_document())
     })
+}
+
+fn is_disabled_by_fieldset(document: &BaseDocument, target_id: usize) -> bool {
+    let mut ancestor_id = document.get_node(target_id).and_then(|node| node.parent);
+    while let Some(current_id) = ancestor_id {
+        let Some(current) = document.get_node(current_id) else {
+            return false;
+        };
+        if current.element_data().is_some_and(|element| {
+            element.name.ns == ns!(html)
+                && element.name.local.as_ref() == "fieldset"
+                && element.has_attr(LocalName::from("disabled"))
+        }) {
+            let first_legend = current.children.iter().copied().find(|child_id| {
+                document.get_node(*child_id).is_some_and(|child| {
+                    child.element_data().is_some_and(|element| {
+                        element.name.ns == ns!(html) && element.name.local.as_ref() == "legend"
+                    })
+                })
+            });
+            if !first_legend
+                .is_some_and(|legend_id| subtree_contains_node(document, legend_id, target_id))
+            {
+                return true;
+            }
+        }
+        ancestor_id = current.parent;
+    }
+    false
+}
+
+fn is_disabled_form_control(document: &BaseDocument, node_id: usize) -> bool {
+    document.get_node(node_id).is_some_and(|node| {
+        node.element_data().is_some_and(|element| {
+            element.name.ns == ns!(html)
+                && matches!(
+                    element.name.local.as_ref(),
+                    "button" | "input" | "select" | "textarea"
+                )
+                && (element.has_attr(LocalName::from("disabled"))
+                    || is_disabled_by_fieldset(document, node_id))
+        })
+    })
+}
+
+fn nearest_ancestor_select(document: &BaseDocument, node_id: usize) -> Option<usize> {
+    let mut ancestor_id = document.get_node(node_id).and_then(|node| node.parent);
+    let mut saw_optgroup = false;
+    while let Some(current_id) = ancestor_id {
+        let current = document.get_node(current_id)?;
+        if let Some(element) = current
+            .element_data()
+            .filter(|element| element.name.ns == ns!(html))
+        {
+            match element.name.local.as_ref() {
+                "datalist" | "hr" | "option" => return None,
+                "optgroup" if saw_optgroup => return None,
+                "optgroup" => saw_optgroup = true,
+                "select" => return Some(current_id),
+                _ => {}
+            }
+        }
+        ancestor_id = current.parent;
+    }
+    None
+}
+
+fn option_is_disabled(document: &BaseDocument, node_id: usize) -> bool {
+    let Some(option) = document
+        .get_node(node_id)
+        .and_then(blitz_dom::Node::element_data)
+    else {
+        return false;
+    };
+    if option.has_attr(LocalName::from("disabled")) {
+        return true;
+    }
+
+    let mut ancestor_id = document.get_node(node_id).and_then(|node| node.parent);
+    while let Some(current_id) = ancestor_id {
+        let Some(current) = document.get_node(current_id) else {
+            return false;
+        };
+        if let Some(element) = current
+            .element_data()
+            .filter(|element| element.name.ns == ns!(html))
+        {
+            match element.name.local.as_ref() {
+                "select" | "hr" | "datalist" | "option" => return false,
+                "optgroup" => return element.has_attr(LocalName::from("disabled")),
+                _ => {}
+            }
+        }
+        ancestor_id = current.parent;
+    }
+    false
+}
+
+fn is_html_actually_disabled(document: &BaseDocument, node_id: usize) -> bool {
+    let Some(element) = document
+        .get_node(node_id)
+        .and_then(blitz_dom::Node::element_data)
+    else {
+        return false;
+    };
+    if element.name.ns != ns!(html) {
+        return false;
+    }
+
+    match element.name.local.as_ref() {
+        "button" | "input" | "select" | "textarea" => is_disabled_form_control(document, node_id),
+        "fieldset" => element.has_attr(LocalName::from("disabled")),
+        "optgroup" => {
+            element.has_attr(LocalName::from("disabled"))
+                || nearest_ancestor_select(document, node_id)
+                    .is_some_and(|select_id| is_disabled_form_control(document, select_id))
+        }
+        "option" => {
+            option_is_disabled(document, node_id)
+                || nearest_ancestor_select(document, node_id)
+                    .is_some_and(|select_id| is_disabled_form_control(document, select_id))
+        }
+        _ => false,
+    }
+}
+
+/// Return whether an element can receive focus through the DOM `focus()` method. Blitz's cached
+/// focusability deliberately models sequential focus navigation, so an explicit negative
+/// `tabindex` needs a separate programmatic-focus path.
+pub(super) fn is_programmatically_focusable(document: &BaseDocument, node_id: usize) -> bool {
+    let Some(node) = document.get_node(node_id) else {
+        return false;
+    };
+    let Some(element) = node.element_data() else {
+        return false;
+    };
+    if !node.flags.is_in_document()
+        || is_html_actually_disabled(document, node_id)
+        || (element.name.ns == ns!(html)
+            && element.name.local.as_ref() == "input"
+            && element
+                .attr(LocalName::from("type"))
+                .is_some_and(|value| value.eq_ignore_ascii_case("hidden")))
+    {
+        return false;
+    }
+    if node.primary_styles().is_some_and(|style| {
+        matches!(
+            style.clone_visibility(),
+            Visibility::Hidden | Visibility::Collapse
+        )
+    }) {
+        return false;
+    }
+
+    // `inert` and display suppression on an ancestor also remove the target from the focusable
+    // areas. Style has been resolved by the public focus entry point before this check runs.
+    let mut ancestor_id = Some(node_id);
+    while let Some(current_id) = ancestor_id {
+        let Some(current) = document.get_node(current_id) else {
+            return false;
+        };
+        if current
+            .element_data()
+            .is_some_and(|ancestor| ancestor.has_attr(LocalName::from("inert")))
+            || current
+                .primary_styles()
+                .is_some_and(|style| style.clone_display().is_none())
+        {
+            return false;
+        }
+        ancestor_id = current.parent;
+    }
+
+    node.is_focussable()
+        || element
+            .attr(LocalName::from("tabindex"))
+            .and_then(|value| value.trim().parse::<i32>().ok())
+            .is_some()
 }
 
 /// Return Blitz's retained focus owner even if a previous tree mutation disconnected it. The
@@ -276,7 +456,7 @@ impl QuoxRendererState {
         Ok(node_id)
     }
 
-    fn resolve_element(&mut self, node_handle: u32) -> Result<usize, JsValue> {
+    pub(super) fn resolve_element(&mut self, node_handle: u32) -> Result<usize, JsValue> {
         let node_id = self.resolve_node(node_handle)?;
         self.document
             .get_node(node_id)

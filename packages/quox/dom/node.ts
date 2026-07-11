@@ -105,6 +105,14 @@ export class QuoxNode extends QuoxEventTarget {
 }
 
 export class QuoxElement extends QuoxNode {
+  focus(): void {
+    documentInternals(this.ownerDocument).focusElement(this.nodeId);
+  }
+
+  blur(): void {
+    documentInternals(this.ownerDocument).blurElement(this.nodeId);
+  }
+
   set innerHTML(value: QuoxInnerHTML) {
     const { invalidateNodeHandles, renderer, requestRender } = documentInternals(this.ownerDocument);
     const html = value;
