@@ -52,6 +52,7 @@ Deno.test({
 function runLifecycle(user32: Deno.DynamicLibrary<typeof testUser32Functions>, destroyExternally: boolean): void {
   const library = load();
   try {
+    assertConcurrentLibraryRejected();
     const window = library.openWindow(0, 0, 64, 48) as NativeWin32Window;
     try {
       assertWindowGeometry(user32, window, 0, 0, 64, 48);
@@ -90,6 +91,17 @@ function runLifecycle(user32: Deno.DynamicLibrary<typeof testUser32Functions>, d
   } finally {
     library.close();
   }
+}
+
+function assertConcurrentLibraryRejected(): void {
+  try {
+    const unexpected = load();
+    unexpected.close();
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("only one library instance")) return;
+    throw error;
+  }
+  throw new Error("A second live Win32 library was unexpectedly accepted");
 }
 
 function drainEvents(library: Library): void {

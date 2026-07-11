@@ -23,6 +23,8 @@ const ERROR_CLASS_DOES_NOT_EXIST = 1411;
 const SW_SHOW = 5;
 const WS_OVERLAPPEDWINDOW = 0x00CF0000;
 
+let win32LibraryActive = false;
+
 // TRACKMOUSEEVENT: cbSize(4) + dwFlags(4) + hwndTrack(8, 8-byte aligned) +
 // dwHoverTime(4) + 4 bytes trailing padding to the struct's 8-byte alignment = 24 bytes.
 const TRACKMOUSEEVENT_SIZE = 24;
@@ -266,16 +268,9 @@ class Win32Library implements Library {
   #closing = false;
   #closed = false;
   constructor() {
-    this.kernel32 = Deno.dlopen("kernel32", kernel32functions);
-    this.user32 = Deno.dlopen("user32", user32functions);
-    this.gdi32 = Deno.dlopen("gdi32", gdi32functions);
-    this.imm32 = Deno.dlopen("imm32", imm32functions);
-    this.input = new Win32InputController(
-      this.user32,
-      this.imm32,
-      (event) => this.#events.push(event),
-      (id) => this.windows.get(id),
-    );
+    if (win32LibraryActive) {
+      throw new Error("winding(win32): only one library instance may be active");
+    }
 
     const wndClassDv = new DataView(this.#wndClass);
     let off = 0;
@@ -393,6 +388,37 @@ class Win32Library implements Library {
         }
       }),
     );
+    win32LibraryActive = true;
+    const rollback = new ConstructionRollback(() => {
+      win32LibraryActive = false;
+    });
+    rollback.defer(() => this.#wndProc.close());
+    this.kernel32 = rollback.acquire(
+      () => Deno.dlopen("kernel32", kernel32functions),
+      (library) => library.close(),
+    );
+    this.user32 = rollback.acquire(
+      () => Deno.dlopen("user32", user32functions),
+      (library) => library.close(),
+    );
+    this.gdi32 = rollback.acquire(
+      () => Deno.dlopen("gdi32", gdi32functions),
+      (library) => library.close(),
+    );
+    this.imm32 = rollback.acquire(
+      () => Deno.dlopen("imm32", imm32functions),
+      (library) => library.close(),
+    );
+    this.input = rollback.acquire(
+      () =>
+        new Win32InputController(
+          this.user32,
+          this.imm32,
+          (event) => this.#events.push(event),
+          (id) => this.windows.get(id),
+        ),
+      (input) => input.close(),
+    );
     wndClassDv.setBigUint64(
       off,
       BigInt(Deno.UnsafePointer.value(this.#wndProc.pointer)),
@@ -407,11 +433,11 @@ class Win32Library implements Library {
     off += 4;
 
     // hInstance
-    const instance = this.kernel32.symbols.GetModuleHandleW(null);
-    if (BigInt(instance) == 0n) throw new Error(this.getLastError());
+    const instance = rollback.run(() => this.kernel32.symbols.GetModuleHandleW(null));
+    if (BigInt(instance) == 0n) rollback.fail(new Error(rollback.run(() => this.getLastError())));
     this.#instance = BigInt(instance);
-    const instancePointer = Deno.UnsafePointer.create(this.#instance);
-    if (instancePointer === null) throw new Error("winding(win32): invalid module handle");
+    const instancePointer = rollback.run(() => Deno.UnsafePointer.create(this.#instance));
+    if (instancePointer === null) rollback.fail(new Error("winding(win32): invalid module handle"));
     this.instance = instancePointer;
     wndClassDv.setBigUint64(off, this.#instance, true);
     off += 8;
@@ -420,9 +446,9 @@ class Win32Library implements Library {
     off += 8;
 
     // hCursor
-    const cursor = this.user32.symbols.LoadCursorW(null, 32512n);
+    const cursor = rollback.run(() => this.user32.symbols.LoadCursorW(null, 32512n));
     // (IDC_ARROW - https://learn.microsoft.com/en-us/windows/win32/menurc/about-cursors)
-    if (BigInt(cursor) === 0n) throw new Error(this.getLastError());
+    if (BigInt(cursor) === 0n) rollback.fail(new Error(rollback.run(() => this.getLastError())));
     wndClassDv.setBigUint64(off, BigInt(cursor), true);
     off += 8;
 
@@ -446,12 +472,13 @@ class Win32Library implements Library {
     off += 8;
 
     if (off !== this.#wndClass.byteLength) {
-      throw new Error("Bug: mismatched offset with expected WNDCLASS size");
+      rollback.fail(new Error("Bug: mismatched offset with expected WNDCLASS size"));
     }
 
-    const wndClass = this.user32.symbols.RegisterClassExW(this.#wndClass);
-    if (wndClass == 0) throw new Error(this.getLastError());
+    const wndClass = rollback.run(() => this.user32.symbols.RegisterClassExW(this.#wndClass));
+    if (wndClass == 0) rollback.fail(new Error(rollback.run(() => this.getLastError())));
     this.#classRegistered = true;
+    rollback.commit();
   }
 
   purgeWindowEvents(window: Win32Window): void {
@@ -585,7 +612,46 @@ class Win32Library implements Library {
     captureError(errors, () => this.kernel32.close());
     this.#closed = true;
     this.#closing = false;
+    win32LibraryActive = false;
     throwCollected(errors, "Failed to close Win32 library");
+  }
+}
+
+class ConstructionRollback {
+  readonly #cleanup: Array<() => void> = [];
+
+  constructor(readonly onFailure: () => void) {}
+
+  acquire<Resource>(create: () => Resource, close: (resource: Resource) => void): Resource {
+    const resource = this.run(create);
+    this.defer(() => close(resource));
+    return resource;
+  }
+
+  defer(cleanup: () => void): void {
+    this.#cleanup.push(cleanup);
+  }
+
+  run<Result>(operation: () => Result): Result {
+    try {
+      return operation();
+    } catch (error) {
+      this.fail(error);
+    }
+  }
+
+  fail(error: unknown): never {
+    const errors = [error];
+    for (let index = this.#cleanup.length - 1; index >= 0; index--) {
+      captureError(errors, this.#cleanup[index]);
+    }
+    this.#cleanup.length = 0;
+    this.onFailure();
+    throw collectedError(errors, "Failed to construct Win32 library");
+  }
+
+  commit(): void {
+    this.#cleanup.length = 0;
   }
 }
 
