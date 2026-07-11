@@ -223,6 +223,7 @@ export class DarwinNativeClasses {
 
       const delegate = allocateClassPair(getClass("NSObject"), `WindingWindowDelegate_${suffix}`);
       allocatedDelegate = delegate;
+      addProtocol(delegate, getProtocol("NSWindowDelegate"));
       addMethod(delegate, sel("windowShouldClose:"), shouldClose.pointer, `${OBJC_BOOL_ENCODING}@:@`);
       addMethod(delegate, sel("windowDidResize:"), didResize.pointer, "v@:@");
       for (const selector of WINDOW_GEOMETRY_SELECTORS) {

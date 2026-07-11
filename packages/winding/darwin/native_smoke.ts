@@ -601,6 +601,10 @@ function testProtocolAndStructAbis(): void {
         );
       }
       const delegateClass = window.lib.nativeClasses.delegate;
+      assert(
+        classConformsToProtocol(runtime, delegateClass, getProtocol(runtime, "NSWindowDelegate")),
+        "WindingWindowDelegate does not conform to NSWindowDelegate",
+      );
       for (const selector of WINDOW_GEOMETRY_SELECTORS) {
         assert(
           respondsToSelector(
