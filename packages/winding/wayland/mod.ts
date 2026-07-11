@@ -31,6 +31,7 @@ import { WaylandWindow } from "./window.ts";
 import { WaylandTextInputController } from "./text_input_controller.ts";
 import { WaylandKeyboardController } from "./keyboard_controller.ts";
 import { WaylandShmBuffer } from "./shm_buffer.ts";
+import { type WaylandShmFormatGeneration, WaylandShmFormatState } from "./shm_format.ts";
 import {
   type BoundWaylandGlobal,
   isWaylandGlobalInterface,
@@ -76,6 +77,10 @@ class WaylandLibrary implements Library {
   #registry: Deno.PointerObject | null = null;
   compositor: Deno.PointerObject | null = null;
   shm: Deno.PointerObject | null = null;
+  readonly #shmFormats = new WaylandShmFormatState();
+  #shmFormatGeneration: WaylandShmFormatGeneration | undefined;
+  #shmFormatListener: AnyCallback | null = null;
+  #shmFormatVtable: BigUint64Array<ArrayBuffer> | undefined;
   xdgWmBase: Deno.PointerObject | null = null;
   #cursorShapeManager: Deno.PointerObject | null = null;
   #cursorShapeDevice: Deno.PointerObject | null = null;
@@ -198,10 +203,11 @@ class WaylandLibrary implements Library {
     // revents at offset 6 is zeroed by default
 
     this.#initGlobals();
-    // A second roundtrip makes the initially selected seat's capabilities available before the
-    // constructor returns. Seats announced later are initialized directly by their bind callback.
-    if (this.#seat) this.roundtripDisplay("seat initialization");
+    // Global events can bind objects while the registry roundtrip is already dispatching. A second
+    // roundtrip makes those objects' seat-capability and SHM-format events available before return.
+    if (this.#seat || this.shm) this.roundtripDisplay("bound global initialization");
     this.#callbackErrors.throwIfPending();
+    if (this.shm) this.requireArgb8888ShmFormat();
   }
 
   #initGlobals(): void {
@@ -298,6 +304,7 @@ class WaylandLibrary implements Library {
       } else if (offer.interface === "wl_shm") {
         this.shm = proxy;
         this.#coreCursorUnavailable = false;
+        this.#setupShmFormatListener(proxy);
       } else if (offer.interface === "wl_seat") {
         this.#seat = proxy;
         this.#setupSeat(proxy);
@@ -331,8 +338,20 @@ class WaylandLibrary implements Library {
       return;
     }
     if (global.interface === "wl_shm") {
-      if (this.shm === proxy) this.shm = null;
-      this.wl.symbols.wl_proxy_destroy(proxy);
+      let listener: AnyCallback | null = null;
+      if (this.shm === proxy) {
+        this.shm = null;
+        const generation = this.#shmFormatGeneration;
+        this.#shmFormatGeneration = undefined;
+        if (generation !== undefined) this.#shmFormats.releaseBinding(generation);
+        listener = this.#shmFormatListener;
+        this.#shmFormatListener = null;
+        this.#shmFormatVtable = undefined;
+      }
+      const errors: unknown[] = [];
+      collectCleanupError(errors, () => this.wl.symbols.wl_proxy_destroy(proxy));
+      if (listener) collectCleanupError(errors, () => listener.close());
+      throwCleanupErrors("winding failed to release Wayland shared memory", errors);
       return;
     }
     if (global.interface === "wl_seat") {
@@ -390,6 +409,27 @@ class WaylandLibrary implements Library {
       return;
     }
     this.#textInputController.unbindManager(proxy);
+  }
+
+  #setupShmFormatListener(proxy: Deno.PointerObject): void {
+    const generation = this.#shmFormats.beginBinding();
+    this.#shmFormatGeneration = generation;
+    const listener = new Deno.UnsafeCallback(
+      { parameters: ["pointer", "pointer", "u32"], result: "void" },
+      this.guardCallback((_data, _shm, format) => {
+        if (this.#shmFormats.advertise(generation, format)) this.#coreCursorUnavailable = false;
+      }),
+    );
+    this.#shmFormatListener = listener;
+    const vtable = makeVtable([listener], 1, this.noop);
+    this.#shmFormatVtable = vtable;
+    if (this.wl.symbols.wl_proxy_add_listener(proxy, Deno.UnsafePointer.of(vtable), null) !== 0) {
+      throw new Error("winding failed to listen for Wayland shared-memory formats");
+    }
+  }
+
+  requireArgb8888ShmFormat(): void {
+    this.#shmFormats.requireArgb8888();
   }
 
   #setDefaultCursor(serial: number): void {
@@ -977,6 +1017,7 @@ class WaylandLibrary implements Library {
     if (!this.compositor || !this.shm || !this.xdgWmBase) {
       throw new Error("winding wayland globals not ready (compositor/shm/xdg_wm_base missing)");
     }
+    this.requireArgb8888ShmFormat();
     return new WaylandWindow(this, w, h);
   }
 

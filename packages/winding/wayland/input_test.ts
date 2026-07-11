@@ -12,7 +12,7 @@ import {
   WaylandKeyTransitionState,
   type XkbKeyTranslator,
 } from "./keyboard.ts";
-import { CURSOR_SHAPE_MANAGER_V1_REQUESTS, WlOp } from "./ffi.ts";
+import { CURSOR_SHAPE_MANAGER_V1_REQUESTS, WlOp, WlShmFormat } from "./ffi.ts";
 import { createWaylandSurroundingTextState, TextInputV3Batch, TextInputV3SerialGate } from "./text_input.ts";
 import { CompositionState, keyLocationForCode, normalizeImeCursorArea, validateImeCursorRange } from "../input/mod.ts";
 import { logicalKeyFromKeysym } from "../linux/mod.ts";
@@ -35,6 +35,7 @@ import {
   waylandConnectionError,
 } from "./protocol.ts";
 import { createOpaqueBlackFrame } from "./shm_buffer.ts";
+import { MISSING_ARGB8888_SHM_FORMAT, type WaylandShmFormatGeneration, WaylandShmFormatState } from "./shm_format.ts";
 import { damageOpcodeForSurfaceVersion, frameMatchesConfiguration, WaylandConfigureState } from "./window.ts";
 import { type WaylandGlobalInterface, WaylandGlobalRegistry } from "./global_registry.ts";
 import {
@@ -130,6 +131,64 @@ Deno.test("Wayland global candidates are selected independently per interface", 
   registry.remove(12);
   assertEquals(registry.active("wl_compositor")?.name, 14);
   assertEquals(active.get("wl_compositor"), 14);
+});
+
+Deno.test("Wayland SHM format advertisements require ARGB8888", () => {
+  const state = new WaylandShmFormatState();
+  const generation = state.beginBinding();
+
+  assertEquals(state.advertise(generation, WlShmFormat.XRGB8888), false);
+  assertEquals(state.advertise(generation, 2 ** 32), false);
+  assertEquals(state.hasArgb8888, false);
+  assertThrowsMessage(() => state.requireArgb8888(), MISSING_ARGB8888_SHM_FORMAT);
+
+  assertEquals(state.advertise(generation, WlShmFormat.ARGB8888), true);
+  assertEquals(state.advertise(generation, WlShmFormat.ARGB8888), false);
+  assertEquals(state.hasArgb8888, true);
+  state.requireArgb8888();
+});
+
+Deno.test("Wayland SHM format generations follow global replacement and ignore stale callbacks", () => {
+  interface Binding {
+    readonly generation: WaylandShmFormatGeneration;
+    closed: boolean;
+  }
+
+  const state = new WaylandShmFormatState();
+  const bindings = new Map<number, Binding>();
+  const registry = new WaylandGlobalRegistry<Binding>(
+    (offer) => {
+      const binding = { generation: state.beginBinding(), closed: false };
+      bindings.set(offer.name, binding);
+      return binding;
+    },
+    (global) => {
+      global.binding.closed = true;
+      state.releaseBinding(global.binding.generation);
+    },
+  );
+
+  registry.announce({ name: 9, interface: "wl_shm", offeredVersion: 1 });
+  registry.announce({ name: 4, interface: "wl_shm", offeredVersion: 1 });
+  const first = bindings.get(9)!;
+  state.advertise(first.generation, WlShmFormat.ARGB8888);
+  assertEquals(state.hasArgb8888, true);
+
+  registry.remove(9);
+  const replacement = bindings.get(4)!;
+  assertEquals(first.closed, true);
+  assertEquals(state.hasArgb8888, false);
+
+  state.advertise(first.generation, WlShmFormat.ARGB8888);
+  assertEquals(state.hasArgb8888, false);
+  state.advertise(replacement.generation, WlShmFormat.ARGB8888);
+  assertEquals(state.hasArgb8888, true);
+  state.releaseBinding(first.generation);
+  assertEquals(state.hasArgb8888, true);
+
+  registry.close();
+  assertEquals(replacement.closed, true);
+  assertEquals(state.hasArgb8888, false);
 });
 
 Deno.test("cursor-shape manager metadata includes the version-1 tablet request", () => {

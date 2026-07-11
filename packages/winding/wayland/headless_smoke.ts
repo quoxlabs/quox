@@ -12,7 +12,7 @@ Deno.test("Wayland SHM conversion premultiplies straight RGBA before channel swa
   assertBytes(destination, Uint8Array.of(0, 0, 128, 128, 30, 20, 10, 255, 0, 0, 0, 0, 2, 1, 1, 128));
 });
 
-Deno.test("Wayland maps on open, blits, and survives repeated lifecycles", () => {
+Deno.test("Wayland negotiates SHM, maps on open, blits, and survives repeated lifecycles", () => {
   const pixels = new Uint8Array(WIDTH * HEIGHT * 4);
   pixels.fill(0xff);
 

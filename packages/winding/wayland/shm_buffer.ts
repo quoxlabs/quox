@@ -23,6 +23,7 @@ export interface WaylandShmHost {
     readonly shmPool: Deno.PointerObject;
     readonly buffer: Deno.PointerObject;
   };
+  requireArgb8888ShmFormat(): void;
 }
 
 const MAX_BUFFERS = 3;
@@ -68,6 +69,7 @@ export class WaylandShmBuffer {
   constructor(readonly host: WaylandShmHost) {}
 
   write(rgba: Uint8Array, width: number, height: number): Deno.PointerObject | null {
+    this.host.requireArgb8888ShmFormat();
     const size = checkedImageSize(width, height);
     if (rgba.byteLength < size) {
       throw new RangeError(`winding Wayland blit needs ${size} RGBA bytes, received ${rgba.byteLength}`);
