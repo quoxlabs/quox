@@ -19,6 +19,9 @@ Deno.test("X11 opens a window, configures XIM, and translates a basic keypress",
     const window = library.openWindow(0, 0, 64, 64) as NativeX11Window;
     drainEvents(library);
 
+    // Context construction crosses the fixed all-GPR XIM aliases selected by
+    // the server, including the optional surrounding-text callback shape.
+    window.setImeSurroundingText("before after", 7, 7);
     window.setImeCursorArea(8, 12, 2, 18);
     window.setImeEnabled(true);
     focusWindow(window);
