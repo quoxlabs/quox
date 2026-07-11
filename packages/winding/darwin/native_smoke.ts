@@ -298,6 +298,28 @@ function testKeydownOrdering(): void {
         const keyUp = library.event();
         assert(keyUp?.type === "keyup", "expected keyup");
         assertEquals(keyUp.key, "A");
+
+        // A key may already be held when the backend becomes active, so its
+        // release has no cached press to pair with.
+        sendVoidId(window.contentView, sel(runtime, "keyUp:"), keyUpEvent);
+        const initiallyHeldKeyUp = library.event();
+        assert(initiallyHeldKeyUp?.type === "keyup", "expected unmatched keyup");
+        assertEquals(initiallyHeldKeyUp.key, "A");
+
+        // Losing focus deliberately clears the press cache. AppKit's current
+        // characters must still give the subsequent release a useful key.
+        sendVoidId(window.contentView, sel(runtime, "keyDown:"), event);
+        drainEvents(library);
+        const delegate = sendId(window.nsWindow, sel(runtime, "delegate"));
+        assert(delegate !== null, "Darwin window has no native delegate");
+        sendVoidId(delegate, sel(runtime, "windowDidResignKey:"), null);
+        drainEvents(library);
+        sendVoidId(delegate, sel(runtime, "windowDidBecomeKey:"), null);
+        drainEvents(library);
+        sendVoidId(window.contentView, sel(runtime, "keyUp:"), keyUpEvent);
+        const recoveredKeyUp = library.event();
+        assert(recoveredKeyUp?.type === "keyup", "expected recovered keyup");
+        assertEquals(recoveredKeyUp.key, "A");
       } finally {
         for (let i = owned.length - 1; i >= 0; i--) {
           sendVoid(owned[i], sel(runtime, "release"));

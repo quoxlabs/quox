@@ -703,7 +703,7 @@ class DarwinWindow implements Window, DarwinNativeResponder {
     this.lib.markNativeEventHandled(event);
     const native = this.#nativeKeyData(event);
     const matchedPress = this.#pressedKeys.has(native.base.keycode);
-    const retainedKey = this.#pressedKeys.release(native.base.keycode);
+    const retainedKey = this.#pressedKeys.release(native.base.keycode, native.base.key);
     const currentKey = matchedPress && retainedKey !== "Dead" ? native.base.key : retainedKey;
     const key: KeyUpEvent = createKeyUpEvent({
       ...native.base,
