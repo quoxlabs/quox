@@ -1,6 +1,6 @@
 use super::{
     apply_ime_delete_surrounding, is_insertable_text, key_event, mouse_button, pointer_buttons,
-    pointer_event, preedit_cursor, validate_key_abi,
+    preedit_cursor, validate_key_abi,
 };
 use crate::dom::public_dom_node_id;
 use crate::ffi_numbers::{
@@ -8,11 +8,11 @@ use crate::ffi_numbers::{
     uint32, wasm_usize,
 };
 use crate::node_handles::NodeHandles;
-use crate::{QuoxRenderer, QuoxRendererState};
+use crate::{QuoxRenderer, QuoxRendererState, sync_document_layout};
 use blitz_dom::BaseDocument;
 use blitz_traits::events::{
     BlitzImeEvent, BlitzPointerEvent, BlitzPointerId, BlitzWheelDelta, BlitzWheelEvent, DomEvent,
-    DomEventData, MouseEventButton,
+    DomEventData, MouseEventButton, Point as ElementPoint, PointerDetails,
 };
 use js_sys::{Array, Object, Reflect};
 use std::collections::VecDeque;
@@ -305,6 +305,132 @@ enum DispatchRequest {
         before_bytes: usize,
         after_bytes: usize,
     },
+}
+
+#[derive(Clone, Copy)]
+struct PointerInput {
+    native_x: f64,
+    native_y: f64,
+    x: f32,
+    y: f32,
+    button: MouseEventButton,
+    buttons: blitz_traits::events::MouseEventButtons,
+    modifier_bits: u32,
+    time_stamp: f64,
+    detail: u32,
+    flavor: PointerFlavor,
+}
+
+#[derive(Clone, Copy)]
+struct WheelInput {
+    native_x: f64,
+    native_y: f64,
+    x: f32,
+    y: f32,
+    blitz_delta_x: f64,
+    blitz_delta_y: f64,
+    delta_x: f64,
+    delta_y: f64,
+    delta_mode: u32,
+    buttons: blitz_traits::events::MouseEventButtons,
+    modifier_bits: u32,
+    time_stamp: f64,
+}
+
+/// Proof that pending DOM/style work has been resolved for one trusted input occurrence.
+/// Request construction consumes the proof so callers cannot accidentally reuse one layout
+/// snapshot for a later native record.
+struct ResolvedInputLayout<'a> {
+    document: &'a BaseDocument,
+    width: u32,
+    height: u32,
+}
+
+impl<'a> ResolvedInputLayout<'a> {
+    fn new(
+        document: &'a mut BaseDocument,
+        width: u32,
+        height: u32,
+        framebuffer_width: u32,
+        framebuffer_height: u32,
+        device_pixel_ratio: f32,
+    ) -> Self {
+        sync_document_layout(
+            document,
+            framebuffer_width,
+            framebuffer_height,
+            device_pixel_ratio,
+        );
+        Self {
+            document,
+            width,
+            height,
+        }
+    }
+
+    fn pointer_request(self, input: PointerInput) -> DispatchRequest {
+        let scroll = self.document.viewport_scroll();
+        let metadata = EventMetadata::pointer(
+            input.time_stamp,
+            native_pointer_coordinates(input.native_x, input.native_y, scroll.x, scroll.y),
+            input.detail,
+        );
+        super::viewport_point_to_page(
+            input.x,
+            input.y,
+            self.width,
+            self.height,
+            scroll.x,
+            scroll.y,
+        )
+        .map_or(DispatchRequest::Empty, |(page_x, page_y)| {
+            DispatchRequest::Pointer {
+                event: BlitzPointerEvent {
+                    id: BlitzPointerId::Mouse,
+                    is_primary: true,
+                    coords: super::pointer_coords(input.x, input.y, page_x, page_y),
+                    button: input.button,
+                    buttons: input.buttons,
+                    mods: super::build_pointer_modifiers(input.modifier_bits),
+                    details: PointerDetails::default(),
+                    // Blitz overwrites this relative to the hit target before reading it.
+                    element: ElementPoint::default(),
+                },
+                flavor: input.flavor,
+                metadata,
+            }
+        })
+    }
+
+    fn wheel_request(self, input: WheelInput) -> DispatchRequest {
+        let scroll = self.document.viewport_scroll();
+        let metadata = EventMetadata::wheel(
+            input.time_stamp,
+            native_pointer_coordinates(input.native_x, input.native_y, scroll.x, scroll.y),
+            input.delta_x,
+            input.delta_y,
+            input.delta_mode,
+        );
+        super::viewport_point_to_page(
+            input.x,
+            input.y,
+            self.width,
+            self.height,
+            scroll.x,
+            scroll.y,
+        )
+        .map_or(DispatchRequest::Empty, |(page_x, page_y)| {
+            DispatchRequest::Wheel {
+                event: BlitzWheelEvent {
+                    delta: BlitzWheelDelta::Pixels(input.blitz_delta_x, input.blitz_delta_y),
+                    coords: super::pointer_coords(input.x, input.y, page_x, page_y),
+                    buttons: input.buttons,
+                    mods: super::build_pointer_modifiers(input.modifier_bits),
+                },
+                metadata,
+            }
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1910,6 +2036,22 @@ fn set(object: &Object, key: &str, value: JsValue) -> Result<(), JsValue> {
     Reflect::set(object, &JsValue::from_str(key), &value).map(|_| ())
 }
 
+fn resolve_input_layout(state: &mut QuoxRendererState) -> ResolvedInputLayout<'_> {
+    let width = state.width;
+    let height = state.height;
+    let framebuffer_width = state.framebuffer_width;
+    let framebuffer_height = state.framebuffer_height;
+    let device_pixel_ratio = state.device_pixel_ratio;
+    ResolvedInputLayout::new(
+        &mut state.document,
+        width,
+        height,
+        framebuffer_width,
+        framebuffer_height,
+        device_pixel_ratio,
+    )
+}
+
 fn begin_request(
     state: &mut QuoxRendererState,
     request: DispatchRequest,
@@ -1976,18 +2118,19 @@ impl QuoxRenderer {
         let time_stamp =
             nonnegative_f64(time_stamp, "timeStamp").map_err(NumericArgumentError::into_js)?;
         let mut state = self.state.borrow_mut();
-        let scroll = state.document.viewport_scroll();
-        let metadata = EventMetadata::pointer(
+        let request = resolve_input_layout(&mut state).pointer_request(PointerInput {
+            native_x,
+            native_y,
+            x,
+            y,
+            button: MouseEventButton::Main,
+            buttons,
+            modifier_bits,
             time_stamp,
-            native_pointer_coordinates(native_x, native_y, scroll.x, scroll.y),
-            0,
-        );
-        let request = pointer_event(&state, x, y, MouseEventButton::Main, buttons, modifier_bits)
-            .map_or(DispatchRequest::Empty, |event| DispatchRequest::Pointer {
-                event,
-                flavor: PointerFlavor::Move,
-                metadata,
-            });
+            detail: 0,
+            flavor: PointerFlavor::Move,
+        });
+        state.refresh_ime_cursor_area();
         let step = begin_request(&mut state, request);
         finish_step(&mut state, step)
     }
@@ -2018,20 +2161,19 @@ impl QuoxRenderer {
             nonnegative_f64(time_stamp, "timeStamp").map_err(NumericArgumentError::into_js)?;
         let detail = uint32(detail, "detail").map_err(NumericArgumentError::into_js)?;
         let mut state = self.state.borrow_mut();
-        let scroll = state.document.viewport_scroll();
-        let metadata = EventMetadata::pointer(
+        let request = resolve_input_layout(&mut state).pointer_request(PointerInput {
+            native_x,
+            native_y,
+            x,
+            y,
+            button,
+            buttons,
+            modifier_bits,
             time_stamp,
-            native_pointer_coordinates(native_x, native_y, scroll.x, scroll.y),
             detail,
-        );
-        let request = pointer_event(&state, x, y, button, buttons, modifier_bits).map_or(
-            DispatchRequest::Empty,
-            |event| DispatchRequest::Pointer {
-                event,
-                flavor: PointerFlavor::Down,
-                metadata,
-            },
-        );
+            flavor: PointerFlavor::Down,
+        });
+        state.refresh_ime_cursor_area();
         let step = begin_request(&mut state, request);
         finish_step(&mut state, step)
     }
@@ -2062,20 +2204,19 @@ impl QuoxRenderer {
             nonnegative_f64(time_stamp, "timeStamp").map_err(NumericArgumentError::into_js)?;
         let detail = uint32(detail, "detail").map_err(NumericArgumentError::into_js)?;
         let mut state = self.state.borrow_mut();
-        let scroll = state.document.viewport_scroll();
-        let metadata = EventMetadata::pointer(
+        let request = resolve_input_layout(&mut state).pointer_request(PointerInput {
+            native_x,
+            native_y,
+            x,
+            y,
+            button,
+            buttons,
+            modifier_bits,
             time_stamp,
-            native_pointer_coordinates(native_x, native_y, scroll.x, scroll.y),
             detail,
-        );
-        let request = pointer_event(&state, x, y, button, buttons, modifier_bits).map_or(
-            DispatchRequest::Empty,
-            |event| DispatchRequest::Pointer {
-                event,
-                flavor: PointerFlavor::Up,
-                metadata,
-            },
-        );
+            flavor: PointerFlavor::Up,
+        });
+        state.refresh_ime_cursor_area();
         let step = begin_request(&mut state, request);
         finish_step(&mut state, step)
     }
@@ -2115,27 +2256,21 @@ impl QuoxRenderer {
         let time_stamp =
             nonnegative_f64(time_stamp, "timeStamp").map_err(NumericArgumentError::into_js)?;
         let mut state = self.state.borrow_mut();
-        let scroll = state.document.viewport_scroll();
-        let metadata = EventMetadata::wheel(
-            time_stamp,
-            native_pointer_coordinates(native_x, native_y, scroll.x, scroll.y),
+        let request = resolve_input_layout(&mut state).wheel_request(WheelInput {
+            native_x,
+            native_y,
+            x,
+            y,
+            blitz_delta_x,
+            blitz_delta_y,
             delta_x,
             delta_y,
             delta_mode,
-        );
-        let request =
-            super::viewport_point_to_page(x, y, state.width, state.height, scroll.x, scroll.y)
-                .map_or(DispatchRequest::Empty, |(page_x, page_y)| {
-                    DispatchRequest::Wheel {
-                        event: BlitzWheelEvent {
-                            delta: BlitzWheelDelta::Pixels(blitz_delta_x, blitz_delta_y),
-                            coords: super::pointer_coords(x, y, page_x, page_y),
-                            buttons,
-                            mods: super::build_pointer_modifiers(modifier_bits),
-                        },
-                        metadata,
-                    }
-                });
+            buttons,
+            modifier_bits,
+            time_stamp,
+        });
+        state.refresh_ime_cursor_area();
         let step = begin_request(&mut state, request);
         finish_step(&mut state, step)
     }
@@ -2283,7 +2418,7 @@ fn positive_id(value: f64, name: &'static str) -> Result<u32, JsValue> {
 mod tests {
     use super::*;
     use crate::{ImeRequestMailbox, QuoxShellProvider};
-    use blitz_dom::{DocumentConfig, LocalName, NodeData};
+    use blitz_dom::{DocumentConfig, LocalName, NodeData, QualName, ns};
     use blitz_html::HtmlDocument;
     use blitz_traits::events::{
         BlitzFocusEvent, BlitzInputEvent, BlitzKeyEvent, KeyState, MouseEventButtons,
@@ -2479,6 +2614,62 @@ mod tests {
             });
             value.expect("test node should be a text input")
         }
+
+        fn set_style(&mut self, node_id: usize, value: &str) {
+            self.document.mutate().set_attribute(
+                node_id,
+                QualName {
+                    prefix: None,
+                    ns: ns!(),
+                    local: LocalName::from("style"),
+                },
+                value,
+            );
+        }
+
+        fn begin_trusted_pointer(
+            &mut self,
+            x: f32,
+            y: f32,
+            button: MouseEventButton,
+            buttons: MouseEventButtons,
+            flavor: PointerFlavor,
+        ) -> DispatchStep {
+            let detail = u32::from(!matches!(flavor, PointerFlavor::Move));
+            let request = ResolvedInputLayout::new(&mut self.document, 800, 600, 800, 600, 1.0)
+                .pointer_request(PointerInput {
+                    native_x: f64::from(x),
+                    native_y: f64::from(y),
+                    x,
+                    y,
+                    button,
+                    buttons,
+                    modifier_bits: 0,
+                    time_stamp: event_time_stamp(),
+                    detail,
+                    flavor,
+                });
+            self.begin(request)
+        }
+
+        fn begin_trusted_wheel(&mut self, x: f32, y: f32) -> DispatchStep {
+            let request = ResolvedInputLayout::new(&mut self.document, 800, 600, 800, 600, 1.0)
+                .wheel_request(WheelInput {
+                    native_x: f64::from(x),
+                    native_y: f64::from(y),
+                    x,
+                    y,
+                    blitz_delta_x: 0.0,
+                    blitz_delta_y: -40.0,
+                    delta_x: 0.0,
+                    delta_y: 1.0,
+                    delta_mode: 1,
+                    buttons: MouseEventButtons::None,
+                    modifier_bits: 0,
+                    time_stamp: event_time_stamp(),
+                });
+            self.begin(request)
+        }
     }
 
     fn event(step: DispatchStep) -> DispatchEventStep {
@@ -2511,6 +2702,24 @@ mod tests {
                     frame_id,
                     redraw_requested,
                 } => return (types, frame_id, redraw_requested),
+            }
+        }
+    }
+
+    fn next_event_of_type(
+        context: &mut TestContext,
+        mut step: DispatchStep,
+        event_type: &str,
+    ) -> DispatchEventStep {
+        loop {
+            match step {
+                DispatchStep::Event(current) if current.event_type == event_type => return current,
+                DispatchStep::Event(current) => {
+                    step = context.resume(&current, false);
+                }
+                DispatchStep::Complete { .. } => {
+                    panic!("dispatch completed before {event_type}")
+                }
             }
         }
     }
@@ -2644,6 +2853,141 @@ mod tests {
                 "pointermove",
                 "mousemove",
             ]
+        );
+    }
+
+    #[test]
+    fn trusted_pointer_targets_use_layout_resolved_at_occurrence() {
+        let mut context = TestContext::new(
+            "<div id='old' style='position:absolute;left:0;top:0;width:100px;height:100px'></div>\
+             <div id='new' style='position:absolute;left:240px;top:0;width:100px;height:100px'></div>",
+        );
+        let old = context.element("old");
+        let new = context.element("new");
+        let point = (40.0, 40.0);
+        assert_eq!(
+            context
+                .document
+                .hit(point.0, point.1)
+                .map(|hit| hit.node_id),
+            Some(old)
+        );
+
+        let away_style = "position:absolute;left:240px;top:0;width:100px;height:100px";
+        let here_style = "position:absolute;left:0;top:0;width:100px;height:100px";
+        context.set_style(old, away_style);
+        context.set_style(new, here_style);
+        // Mutation invalidates style/layout but does not itself paint or resolve geometry.
+        assert_eq!(
+            context
+                .document
+                .hit(point.0, point.1)
+                .map(|hit| hit.node_id),
+            Some(old)
+        );
+        let step = context.begin_trusted_pointer(
+            point.0,
+            point.1,
+            MouseEventButton::Main,
+            MouseEventButtons::None,
+            PointerFlavor::Move,
+        );
+        let pointer_move = next_event_of_type(&mut context, step, "pointermove");
+        assert_eq!(context.handles.resolve(pointer_move.target), Some(new));
+        let remainder = context.resume(&pointer_move, false);
+        let _ = drain(&mut context, remainder);
+
+        context.set_style(old, here_style);
+        context.set_style(new, away_style);
+        assert_eq!(
+            context
+                .document
+                .hit(point.0, point.1)
+                .map(|hit| hit.node_id),
+            Some(new)
+        );
+        let step = context.begin_trusted_pointer(
+            point.0,
+            point.1,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            PointerFlavor::Down,
+        );
+        let down = next_event_of_type(&mut context, step, "pointerdown");
+        assert_eq!(context.handles.resolve(down.target), Some(old));
+        let remainder = context.resume(&down, false);
+        let _ = drain(&mut context, remainder);
+
+        context.set_style(old, away_style);
+        context.set_style(new, here_style);
+        assert_eq!(
+            context
+                .document
+                .hit(point.0, point.1)
+                .map(|hit| hit.node_id),
+            Some(old)
+        );
+        let step = context.begin_trusted_pointer(
+            point.0,
+            point.1,
+            MouseEventButton::Main,
+            MouseEventButtons::None,
+            PointerFlavor::Up,
+        );
+        let up = next_event_of_type(&mut context, step, "pointerup");
+        assert_eq!(context.handles.resolve(up.target), Some(new));
+        let remainder = context.resume(&up, false);
+        let _ = drain(&mut context, remainder);
+    }
+
+    #[test]
+    fn trusted_wheel_default_uses_layout_resolved_at_occurrence() {
+        let mut context = TestContext::new(
+            "<div id='scroller' style='overflow:auto;width:120px;height:80px'>\
+               <div id='content' style='height:40px'></div>\
+             </div>",
+        );
+        let scroller = context.element("scroller");
+        let content_id = context.element("content");
+        let point = context.center(content_id);
+        assert!(context.document.set_hover_to(point.0, point.1));
+        assert!(
+            context
+                .document
+                .get_node(scroller)
+                .expect("scroller should exist")
+                .final_layout
+                .scroll_height()
+                .abs()
+                < f32::EPSILON
+        );
+
+        context.set_style(content_id, "height:400px");
+        // Until trusted input flushes layout, Blitz still sees the old non-scrollable geometry.
+        assert!(
+            context
+                .document
+                .get_node(scroller)
+                .expect("scroller should exist")
+                .final_layout
+                .scroll_height()
+                .abs()
+                < f32::EPSILON
+        );
+        let wheel_event = event(context.begin_trusted_wheel(point.0, point.1));
+        assert_eq!(wheel_event.event_type, "wheel");
+        let remainder = context.resume(&wheel_event, false);
+        let _ = drain(&mut context, remainder);
+        assert!(
+            (context
+                .document
+                .get_node(scroller)
+                .expect("scroller should exist")
+                .scroll_offset
+                .y
+                - 40.0)
+                .abs()
+                < f64::EPSILON
         );
     }
 

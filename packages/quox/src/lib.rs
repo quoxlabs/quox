@@ -343,20 +343,20 @@ fn focused_ime_cursor_area(document: &mut BaseDocument) -> Option<[f32; 4]> {
 }
 
 impl QuoxRendererState {
-    /// Resolve layout for the current viewport state. Shared by `render()` and
-    /// `node_from_point()` so hit-testing never sees stale geometry — mirrors how browsers
-    /// force a layout flush before geometry queries like `elementFromPoint`. Blitz's own
-    /// `set_viewport` already re-clamps scroll on every call, so scroll position is owned
-    /// entirely by `BaseDocument` (via `viewport_scroll()`/`scroll_by`) — quox keeps no
-    /// mirror of it, which would otherwise clobber Blitz's own wheel-driven scroll updates.
+    /// Resolve layout for the current viewport state. Shared by `render()`, `node_from_point()`,
+    /// and every trusted pointer/wheel occurrence so hit tests and input defaults never see
+    /// arbitrarily stale geometry. A layout change alone does not yet synthesize boundary events
+    /// for a stationary pointer. Blitz's own `set_viewport` already re-clamps scroll on every
+    /// call, so scroll position is owned entirely by `BaseDocument`
+    /// (via `viewport_scroll()`/`scroll_by`) — quox keeps no mirror of it, which would otherwise
+    /// clobber Blitz's own wheel-driven scroll updates.
     fn sync_layout(&mut self) {
-        self.document.set_viewport(Viewport::new(
+        sync_document_layout(
+            &mut self.document,
             self.framebuffer_width,
             self.framebuffer_height,
             self.device_pixel_ratio,
-            ColorScheme::Light,
-        ));
-        self.document.resolve(0.0);
+        );
         self.refresh_ime_cursor_area();
     }
 
@@ -369,6 +369,24 @@ impl QuoxRendererState {
             self.ime_requests.request_cursor_area(cursor_area);
         }
     }
+}
+
+/// Flush pending DOM/style changes into the geometry shared by painting and trusted hit tests.
+/// Keeping this operation independent of the renderer makes the input-layout contract directly
+/// testable without constructing a GPU device.
+fn sync_document_layout(
+    document: &mut BaseDocument,
+    framebuffer_width: u32,
+    framebuffer_height: u32,
+    device_pixel_ratio: f32,
+) {
+    document.set_viewport(Viewport::new(
+        framebuffer_width,
+        framebuffer_height,
+        device_pixel_ratio,
+        ColorScheme::Light,
+    ));
+    document.resolve(0.0);
 }
 
 #[wasm_bindgen]

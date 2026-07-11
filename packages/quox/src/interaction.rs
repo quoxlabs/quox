@@ -1,12 +1,11 @@
-use super::{QuoxRenderer, QuoxRendererState};
+use super::QuoxRenderer;
 use crate::ffi_numbers::{
     NumericArgumentError, NumericResult, finite_f32, integer_range, known_mask, wasm_usize,
 };
 use blitz_dom::BaseDocument;
 use blitz_traits::events::{
-    BlitzInputEvent, BlitzKeyEvent, BlitzPointerEvent, BlitzPointerId, DomEvent, DomEventData,
-    KeyState, MouseEventButton, MouseEventButtons, Point as ElementPoint, PointerCoords,
-    PointerDetails,
+    BlitzInputEvent, BlitzKeyEvent, DomEvent, DomEventData, KeyState, MouseEventButton,
+    MouseEventButtons, PointerCoords,
 };
 use keyboard_types::{Code, Key, Location, Modifiers};
 use std::num::NonZeroUsize;
@@ -250,35 +249,6 @@ fn pointer_coords(x: f32, y: f32, page_x: f32, page_y: f32) -> PointerCoords {
         client_x: x,
         client_y: y,
     }
-}
-
-/// Build a `BlitzPointerEvent` for a mouse pointer at logical viewport `(x, y)`, or `None` if
-/// the coordinates are non-finite or outside the viewport (mirrors `node_from_point`'s
-/// guard).
-fn pointer_event(
-    state: &QuoxRendererState,
-    x: f32,
-    y: f32,
-    button: MouseEventButton,
-    buttons: MouseEventButtons,
-    modifier_bits: u32,
-) -> Option<BlitzPointerEvent> {
-    let scroll = state.document.viewport_scroll();
-    let (page_x, page_y) =
-        viewport_point_to_page(x, y, state.width, state.height, scroll.x, scroll.y)?;
-
-    Some(BlitzPointerEvent {
-        id: BlitzPointerId::Mouse,
-        is_primary: true,
-        coords: pointer_coords(x, y, page_x, page_y),
-        button,
-        buttons,
-        mods: build_pointer_modifiers(modifier_bits),
-        details: PointerDetails::default(),
-        // Overwritten internally by Blitz (relative to the hit target's bounding rect)
-        // before it's read anywhere, so the value passed in here is irrelevant.
-        element: ElementPoint { x: 0.0, y: 0.0 },
-    })
 }
 
 fn key_event(
