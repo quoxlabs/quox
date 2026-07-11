@@ -6,6 +6,7 @@ import { WM } from "./ffi.ts";
 
 const INT32_MIN = -0x80000000;
 const INT32_MAX = 0x7fffffff;
+const UTF8_ENCODER = new TextEncoder();
 
 /** The fields Winding needs from the 64-bit Win32 MSG layout. */
 export interface Win32QueuedMessage {
@@ -822,6 +823,62 @@ function isLowSurrogate(codeUnit: number): boolean {
 /** Expand a decoded scalar only after surrogate assembly and control filtering. */
 export function repeatedWmCharText(decoded: DecodedWmChar): string {
   return decoded.text.repeat(decoded.repeatCount);
+}
+
+export interface InsertOnTypePreedit {
+  text: string;
+  cursorRange: readonly [start: number, end: number];
+}
+
+/**
+ * Compatibility state for Korean IMM's documented insert-on-type behavior.
+ * Each unmatched WM_CHAR replaces the previous provisional character. Native
+ * composition/result data discards it; otherwise END promotes it exactly once
+ * so an accepted character is not lost. An explicit cancellation must clear
+ * the state before END because that message does not distinguish accept/cancel.
+ */
+export class InsertOnTypeFallbackState {
+  #active = false;
+  #pendingText: string | undefined;
+
+  get active(): boolean {
+    return this.#active;
+  }
+
+  get pendingText(): string | undefined {
+    return this.#pendingText;
+  }
+
+  start(): void {
+    this.#active = true;
+    this.#pendingText = undefined;
+  }
+
+  update(text: string): InsertOnTypePreedit | undefined {
+    if (!this.#active || text.length === 0) return undefined;
+    this.#pendingText = text;
+    const end = UTF8_ENCODER.encode(text).byteLength;
+    return { text, cursorRange: [end, end] };
+  }
+
+  /** Native composition text or a definitive result supersedes the fallback. */
+  authoritative(): void {
+    this.#pendingText = undefined;
+  }
+
+  /** Discard provisional text on an explicit cancellation path. */
+  cancel(): void {
+    this.#active = false;
+    this.#pendingText = undefined;
+  }
+
+  /** Take a still-provisional character once when native composition ends. */
+  finish(): string | undefined {
+    const text = this.#pendingText;
+    this.#active = false;
+    this.#pendingText = undefined;
+    return text;
+  }
 }
 
 /** Prevents IMM32 result strings from being committed again by a following WM_CHAR echo. */

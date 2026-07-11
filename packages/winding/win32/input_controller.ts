@@ -42,8 +42,10 @@ import {
 } from "./ffi.ts";
 import {
   AltGraphControlFilter,
+  type DecodedWmChar,
   decodeKeyLParam,
   expandWin32KeyRepeats,
+  InsertOnTypeFallbackState,
   isCommitText,
   keyboardModifiers,
   logicalKeyFromVirtualKey,
@@ -87,6 +89,7 @@ interface WindowInputState {
   readonly composition: CompositionState;
   compositionAttributes?: Uint8Array;
   compositionClauses?: Uint8Array;
+  cancelingComposition: boolean;
   nativeCompositionDirty: boolean;
   cursorArea?: ImeCursorArea;
   surroundingText?: {
@@ -98,6 +101,8 @@ interface WindowInputState {
   readonly altGraphTextKeys: Set<string>;
   readonly altGraphControlFilter: AltGraphControlFilter;
   readonly charDecoder: WmCharDecoder;
+  readonly imeCharDecoder: WmCharDecoder;
+  readonly insertOnType: InsertOnTypeFallbackState;
   readonly resultEcho: ResultEchoSuppressor;
 }
 
@@ -153,11 +158,14 @@ export class Win32InputController {
       activation: new ImeActivationState(),
       association: new Win32ImeAssociationState(),
       composition: new CompositionState(),
+      cancelingComposition: false,
       nativeCompositionDirty: false,
       logicalKeys: new PressedLogicalKeyCache<string>(),
       altGraphTextKeys: new Set<string>(),
       altGraphControlFilter: new AltGraphControlFilter(),
       charDecoder: new WmCharDecoder(),
+      imeCharDecoder: new WmCharDecoder(),
+      insertOnType: new InsertOnTypeFallbackState(),
       resultEcho: new ResultEchoSuppressor(),
     };
     this.#states.set(window, state);
@@ -198,6 +206,8 @@ export class Win32InputController {
     }
     state.composition.reset();
     state.charDecoder.reset();
+    state.imeCharDecoder.reset();
+    state.insertOnType.cancel();
     state.resultEcho.clear();
     state.logicalKeys.clear();
     state.altGraphTextKeys.clear();
@@ -366,6 +376,7 @@ export class Win32InputController {
         if (Number(wParam) === UNICODE_NOCHAR) return 1n;
         if (window !== undefined && state !== undefined) {
           this.#flushCharDecoder(window, state);
+          this.#flushImeCharDecoder(window, state);
           this.#handleUniChar(window, state, Number(wParam), lParam);
           return 0n;
         }
@@ -374,14 +385,18 @@ export class Win32InputController {
         this.#altGraphLayouts.clear();
         for (const [inputWindow, inputState] of this.#states) {
           this.#flushCharDecoder(inputWindow, inputState);
+          this.#flushImeCharDecoder(inputWindow, inputState);
           inputState.altGraphControlFilter.reset();
           inputState.altGraphTextKeys.clear();
         }
         return undefined;
       case WM.IME_STARTCOMPOSITION:
         if (window !== undefined && state?.activation.desired) {
+          if (state.cancelingComposition) return 0n;
           this.#flushCharDecoder(window, state);
+          this.#flushImeCharDecoder(window, state);
           state.composition.start();
+          state.insertOnType.start();
           this.#clearCompositionMetadata(state);
           state.resultEcho.clear();
           if (!state.activation.active) this.#setImeActive(window, state, true);
@@ -390,6 +405,7 @@ export class Win32InputController {
         }
         return undefined;
       case WM.IME_COMPOSITION:
+        if (state?.cancelingComposition) return 0n;
         if (
           window !== undefined && state?.activation.desired &&
           this.#handleImeComposition(window, state, wParam, lParam)
@@ -397,15 +413,31 @@ export class Win32InputController {
         return undefined;
       case WM.IME_ENDCOMPOSITION:
         if (window !== undefined && state?.activation.desired) {
+          if (state.cancelingComposition) {
+            state.charDecoder.reset();
+            state.imeCharDecoder.reset();
+            state.insertOnType.cancel();
+            this.#queuePreedit(window, state.composition.cancel());
+            this.#clearCompositionMetadata(state);
+            return 0n;
+          }
           this.#flushCharDecoder(window, state);
-          this.#queuePreedit(window, state.composition.cancel());
+          this.#flushImeCharDecoder(window, state);
+          const compatibilityResult = state.insertOnType.finish();
+          if (compatibilityResult === undefined) {
+            this.#queuePreedit(window, state.composition.cancel());
+          } else {
+            // END does not say whether composition was accepted or canceled.
+            // Explicit cancellation paths discard this fallback beforehand.
+            this.#applyImeUpdate(window, state, { result: compatibilityResult });
+          }
           this.#clearCompositionMetadata(state);
           return 0n;
         }
         return undefined;
       case WM.IME_CHAR:
         if (window !== undefined && state !== undefined) {
-          this.#handleChar(window, state, wParam, lParam);
+          this.#handleImeChar(window, state, wParam, lParam);
           return 0n;
         }
         return undefined;
@@ -743,6 +775,7 @@ export class Win32InputController {
 
   #applyImeUpdate(window: Win32InputWindow, state: WindowInputState, update: ImeCompositionUpdate): void {
     if (update.result !== undefined && isCommitText(update.result)) {
+      state.insertOnType.authoritative();
       state.composition.commit();
       this.#clearCompositionMetadata(state);
       const commit = createImeCommitEvent(window, update.result);
@@ -750,6 +783,7 @@ export class Win32InputController {
     }
     if (update.preedit === undefined) return;
     if (update.preedit === null || update.preedit.text.length === 0) {
+      state.insertOnType.cancel();
       this.#queuePreedit(window, state.composition.cancel());
       this.#clearCompositionMetadata(state);
       return;
@@ -768,15 +802,52 @@ export class Win32InputController {
   ): void {
     const repeatCount = decodeKeyLParam(lParam).repeatCount;
     for (const decoded of state.charDecoder.push(wParam, repeatCount)) {
-      if (state.resultEcho.consume(decoded.text, decoded.repeatCount)) continue;
-      this.#applyImeUpdate(window, state, { result: repeatedWmCharText(decoded) });
+      this.#applyDecodedChar(window, state, decoded, false);
+    }
+  }
+
+  #handleImeChar(
+    window: Win32InputWindow,
+    state: WindowInputState,
+    wParam: number | bigint,
+    lParam: number | bigint,
+  ): void {
+    const repeatCount = decodeKeyLParam(lParam).repeatCount;
+    for (const decoded of state.imeCharDecoder.push(wParam, repeatCount)) {
+      this.#applyDecodedChar(window, state, decoded, true);
     }
   }
 
   #flushCharDecoder(window: Win32InputWindow, state: WindowInputState): void {
     for (const decoded of state.charDecoder.flush()) {
-      if (state.resultEcho.consume(decoded.text, decoded.repeatCount)) continue;
-      this.#applyImeUpdate(window, state, { result: repeatedWmCharText(decoded) });
+      this.#applyDecodedChar(window, state, decoded, false);
+    }
+  }
+
+  #flushImeCharDecoder(window: Win32InputWindow, state: WindowInputState): void {
+    for (const decoded of state.imeCharDecoder.flush()) {
+      this.#applyDecodedChar(window, state, decoded, true);
+    }
+  }
+
+  #applyDecodedChar(
+    window: Win32InputWindow,
+    state: WindowInputState,
+    decoded: DecodedWmChar,
+    conversionResult: boolean,
+  ): void {
+    if (state.cancelingComposition) return;
+    if (state.resultEcho.consume(decoded.text, decoded.repeatCount)) return;
+    const text = repeatedWmCharText(decoded);
+    if (conversionResult) {
+      this.#applyImeUpdate(window, state, { result: text });
+      return;
+    }
+    if (state.insertOnType.active) {
+      const preedit = state.insertOnType.update(text);
+      if (preedit !== undefined) this.#applyImeUpdate(window, state, { preedit });
+    } else if (!state.composition.active) {
+      this.#applyImeUpdate(window, state, { result: text });
     }
   }
 
@@ -907,6 +978,7 @@ export class Win32InputController {
     });
     if (response === undefined || response === null) return false;
     const update = response.update;
+    if ((flags & (GCS_COMPSTR | GCS_RESULTSTR)) !== 0) state.insertOnType.authoritative();
     if (update.result !== undefined && isCommitText(update.result)) state.resultEcho.expect(update.result);
     this.#applyImeUpdate(window, state, update);
     if (response.metadataChanged && update.preedit !== undefined && update.preedit !== null) {
@@ -961,8 +1033,17 @@ export class Win32InputController {
   }
 
   #cancelComposition(window: Win32InputWindow, state: WindowInputState): void {
+    const cancelNativeComposition = state.composition.active;
+    state.insertOnType.cancel();
+    if (cancelNativeComposition) {
+      // ImmNotifyIME can synchronously reenter the WndProc. Suppress both
+      // character streams until native cancellation and local cleanup finish.
+      state.cancelingComposition = true;
+      state.charDecoder.reset();
+      state.imeCharDecoder.reset();
+    }
     let cancelError: Error | undefined;
-    if (state.composition.active) {
+    if (cancelNativeComposition) {
       try {
         const contextUsed = this.#withImeContext(window, (context) => {
           if (this.#imm32.symbols.ImmNotifyIME(context, NI_COMPOSITIONSTR, CPS_CANCEL, 0) === 0) {
@@ -977,10 +1058,21 @@ export class Win32InputController {
         cancelError = error instanceof Error ? error : new Error(String(error));
       }
     }
-    this.#flushCharDecoder(window, state);
-    this.#queuePreedit(window, state.composition.cancel());
-    this.#clearCompositionMetadata(state);
-    state.resultEcho.clear();
+    try {
+      if (cancelNativeComposition) {
+        state.charDecoder.reset();
+        state.imeCharDecoder.reset();
+      } else {
+        this.#flushCharDecoder(window, state);
+        this.#flushImeCharDecoder(window, state);
+      }
+      state.insertOnType.cancel();
+      this.#queuePreedit(window, state.composition.cancel());
+      this.#clearCompositionMetadata(state);
+      state.resultEcho.clear();
+    } finally {
+      state.cancelingComposition = false;
+    }
     if (cancelError !== undefined) throw cancelError;
   }
 

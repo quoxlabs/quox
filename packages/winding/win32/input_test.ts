@@ -6,6 +6,7 @@ import {
   decodeMouseLParam,
   decodeWin32ClientRect,
   decodeWin32QueuedMessage,
+  InsertOnTypeFallbackState,
   isCommitText,
   keyboardModifiers,
   keyboardStateForTranslation,
@@ -49,6 +50,7 @@ import {
   GCS_COMPCLAUSE,
   GCS_COMPSTR,
   GCS_CURSORPOS,
+  GCS_RESULTSTR,
   imm32functions,
   IMR_QUERYCHARPOSITION,
   user32functions,
@@ -416,6 +418,142 @@ Deno.test({
   },
 });
 
+Deno.test("active-composition WM_CHAR evolves as replaceable Hangul and commits once at END", () => {
+  const harness = createInputControllerHarness();
+  startImeComposition(harness);
+  for (const text of ["ㄱ", "가", "간"]) {
+    harness.controller.handleMessage(harness.window, WM.CHAR, text.charCodeAt(0), 1n);
+  }
+  harness.controller.handleMessage(harness.window, WM.IME_ENDCOMPOSITION, 0n, 0n);
+  harness.controller.handleMessage(harness.window, WM.IME_ENDCOMPOSITION, 0n, 0n);
+
+  assertEquals(textImeEvents(harness.events), [
+    { kind: "preedit", text: "ㄱ", cursorRange: [3, 3] },
+    { kind: "preedit", text: "가", cursorRange: [3, 3] },
+    { kind: "preedit", text: "간", cursorRange: [3, 3] },
+    { kind: "commit", text: "간" },
+  ]);
+});
+
+Deno.test("authoritative IMM result commits over fallback and suppresses its WM_CHAR echo", () => {
+  const compositionData = new Map<number, Uint8Array | number>([
+    [GCS_RESULTSTR, utf16Le("간")],
+  ]);
+  const harness = createInputControllerHarness({ compositionData });
+  startImeComposition(harness);
+  harness.controller.handleMessage(harness.window, WM.CHAR, "가".charCodeAt(0), 1n);
+  harness.controller.handleMessage(harness.window, WM.IME_COMPOSITION, 0n, GCS_RESULTSTR);
+  harness.controller.handleMessage(harness.window, WM.CHAR, "간".charCodeAt(0), 1n);
+  harness.controller.handleMessage(harness.window, WM.IME_ENDCOMPOSITION, 0n, 0n);
+
+  assertEquals(textImeEvents(harness.events), [
+    { kind: "preedit", text: "가", cursorRange: [3, 3] },
+    { kind: "commit", text: "간" },
+  ]);
+});
+
+Deno.test("explicit IMM cancellation discards fallback text before END", () => {
+  const harness = createInputControllerHarness();
+  startImeComposition(harness);
+  harness.controller.handleMessage(harness.window, WM.CHAR, "가".charCodeAt(0), 1n);
+  harness.controller.handleMessage(harness.window, WM.IME_COMPOSITION, 0n, 0n);
+  harness.controller.handleMessage(harness.window, WM.IME_ENDCOMPOSITION, 0n, 0n);
+
+  assertEquals(textImeEvents(harness.events), [
+    { kind: "preedit", text: "가", cursorRange: [3, 3] },
+    { kind: "preedit", text: "", cursorRange: null },
+  ]);
+
+  const disabled = createInputControllerHarness();
+  startImeComposition(disabled);
+  disabled.controller.handleMessage(disabled.window, WM.CHAR, "나".charCodeAt(0), 1n);
+  disabled.controller.setImeEnabled(disabled.window, false);
+  disabled.controller.handleMessage(disabled.window, WM.IME_ENDCOMPOSITION, 0n, 0n);
+  assertEquals(textImeEvents(disabled.events), [
+    { kind: "preedit", text: "나", cursorRange: [3, 3] },
+    { kind: "preedit", text: "", cursorRange: null },
+  ]);
+});
+
+Deno.test("synchronous cancellation reentry discards ordinary and IME character streams", () => {
+  let reenter = () => {};
+  const harness = createInputControllerHarness({ onNotifyIme: () => reenter() });
+  startImeComposition(harness);
+  harness.controller.handleMessage(harness.window, WM.CHAR, "가".charCodeAt(0), 1n);
+  harness.controller.handleMessage(harness.window, WM.CHAR, 0xd83d, 1n);
+  reenter = () => {
+    harness.controller.handleMessage(harness.window, WM.CHAR, 0xde42, 1n);
+    harness.controller.handleMessage(harness.window, WM.CHAR, "나".charCodeAt(0), 1n);
+    harness.controller.handleMessage(harness.window, WM.IME_CHAR, "다".charCodeAt(0), 1n);
+    harness.controller.handleMessage(harness.window, WM.IME_ENDCOMPOSITION, 0n, 0n);
+  };
+  harness.controller.setImeEnabled(harness.window, false);
+
+  assertEquals(textImeEvents(harness.events), [
+    { kind: "preedit", text: "가", cursorRange: [3, 3] },
+    { kind: "preedit", text: "", cursorRange: null },
+  ]);
+});
+
+Deno.test("authoritative composition text supersedes insert-on-type fallback", () => {
+  const compositionData = new Map<number, Uint8Array | number>([
+    [GCS_COMPSTR, utf16Le("가")],
+    [GCS_CURSORPOS, 1],
+  ]);
+  const harness = createInputControllerHarness({ compositionData });
+  startImeComposition(harness);
+  harness.controller.handleMessage(harness.window, WM.CHAR, "ㄱ".charCodeAt(0), 1n);
+  harness.controller.handleMessage(
+    harness.window,
+    WM.IME_COMPOSITION,
+    0n,
+    GCS_COMPSTR | GCS_CURSORPOS,
+  );
+  harness.controller.handleMessage(harness.window, WM.IME_ENDCOMPOSITION, 0n, 0n);
+
+  assertEquals(textImeEvents(harness.events), [
+    { kind: "preedit", text: "ㄱ", cursorRange: [3, 3] },
+    { kind: "preedit", text: "가", cursorRange: [3, 3] },
+    { kind: "preedit", text: "", cursorRange: null },
+  ]);
+});
+
+Deno.test("WM_IME_CHAR stays definitive while ordinary non-composition WM_CHAR commits immediately", () => {
+  const composing = createInputControllerHarness();
+  startImeComposition(composing);
+  composing.controller.handleMessage(composing.window, WM.CHAR, "ㄱ".charCodeAt(0), 1n);
+  composing.controller.handleMessage(composing.window, WM.IME_CHAR, "가".charCodeAt(0), 1n);
+  composing.controller.handleMessage(composing.window, WM.IME_ENDCOMPOSITION, 0n, 0n);
+  assertEquals(textImeEvents(composing.events), [
+    { kind: "preedit", text: "ㄱ", cursorRange: [3, 3] },
+    { kind: "commit", text: "가" },
+  ]);
+
+  const ordinary = createInputControllerHarness();
+  ordinary.controller.attach(ordinary.window);
+  ordinary.controller.handleMessage(ordinary.window, WM.CHAR, "x".charCodeAt(0), 1n);
+  assertEquals(textImeEvents(ordinary.events), [{ kind: "commit", text: "x" }]);
+});
+
+Deno.test("WM_IME_CHAR assembles supplementary results and consumes authoritative result echoes", () => {
+  const supplementary = createInputControllerHarness();
+  startImeComposition(supplementary);
+  supplementary.controller.handleMessage(supplementary.window, WM.IME_CHAR, 0xd83d, 1n);
+  supplementary.controller.handleMessage(supplementary.window, WM.IME_CHAR, 0xde42, 1n);
+  supplementary.controller.handleMessage(supplementary.window, WM.IME_ENDCOMPOSITION, 0n, 0n);
+  assertEquals(textImeEvents(supplementary.events), [{ kind: "commit", text: "🙂" }]);
+
+  const compositionData = new Map<number, Uint8Array | number>([
+    [GCS_RESULTSTR, utf16Le("가")],
+  ]);
+  const echoed = createInputControllerHarness({ compositionData });
+  startImeComposition(echoed);
+  echoed.controller.handleMessage(echoed.window, WM.IME_COMPOSITION, 0n, GCS_RESULTSTR);
+  echoed.controller.handleMessage(echoed.window, WM.IME_CHAR, "가".charCodeAt(0), 1n);
+  echoed.controller.handleMessage(echoed.window, WM.IME_ENDCOMPOSITION, 0n, 0n);
+  assertEquals(textImeEvents(echoed.events), [{ kind: "commit", text: "가" }]);
+});
+
 Deno.test("Win32 leaves character-position requests unhandled when inactive, active, or unfocused", () => {
   const harness = createInputControllerHarness();
   harness.controller.attach(harness.window);
@@ -738,6 +876,30 @@ Deno.test("mismatched surrogate repeat counts preserve valid pairs and recover l
     { text: "🙂", repeatCount: 1 },
     { text: "�", repeatCount: 2 },
   ]);
+});
+
+Deno.test("insert-on-type fallback keeps evolving Hangul replaceable and finishes once", () => {
+  const fallback = new InsertOnTypeFallbackState();
+  fallback.start();
+  assertEquals(fallback.update("ㄱ"), { text: "ㄱ", cursorRange: [3, 3] });
+  assertEquals(fallback.update("가"), { text: "가", cursorRange: [3, 3] });
+  assertEquals(fallback.update("간"), { text: "간", cursorRange: [3, 3] });
+  assertEquals(fallback.pendingText, "간");
+  assertEquals(fallback.finish(), "간");
+  assertEquals(fallback.finish(), undefined);
+});
+
+Deno.test("authoritative and canceled compositions discard insert-on-type fallback text", () => {
+  const fallback = new InsertOnTypeFallbackState();
+  fallback.start();
+  fallback.update("가");
+  fallback.authoritative();
+  assertEquals(fallback.active, true);
+  assertEquals(fallback.finish(), undefined);
+  fallback.start();
+  fallback.update("나");
+  fallback.cancel();
+  assertEquals(fallback.finish(), undefined);
 });
 
 Deno.test("IMM UTF-16 cursor positions convert to UTF-8 byte offsets only at scalar boundaries", () => {
@@ -1068,6 +1230,7 @@ interface FakeImmBehavior {
   keyText?: ReadonlyMap<number, string>;
   keyboardState?: ReadonlyArray<readonly [virtualKey: number, state: number]>;
   compositionData?: ReadonlyMap<number, Uint8Array | number>;
+  onNotifyIme?: () => void;
 }
 
 function createInputControllerHarness(behavior: FakeImmBehavior = {}) {
@@ -1118,6 +1281,7 @@ function createInputControllerHarness(behavior: FakeImmBehavior = {}) {
       },
       ImmNotifyIME() {
         calls.notifications++;
+        behavior.onNotifyIme?.();
         return behavior.notifyResult ?? 1;
       },
       ImmSetCandidateWindow() {
@@ -1163,6 +1327,30 @@ function createInputControllerHarness(behavior: FakeImmBehavior = {}) {
     }),
   );
   return { calls, controller, events, window };
+}
+
+type TextImeEvent =
+  | { kind: "preedit"; text: string; cursorRange: readonly [number, number] | null }
+  | { kind: "commit"; text: string };
+
+function textImeEvents(events: readonly UIEvent[]): TextImeEvent[] {
+  const result: TextImeEvent[] = [];
+  for (const event of events) {
+    if (event.type !== "ime") continue;
+    if (event.kind === "preedit") {
+      result.push({ kind: event.kind, text: event.text, cursorRange: event.cursorRange });
+    } else if (event.kind === "commit") {
+      result.push({ kind: event.kind, text: event.text });
+    }
+  }
+  return result;
+}
+
+function startImeComposition(harness: ReturnType<typeof createInputControllerHarness>): void {
+  harness.controller.attach(harness.window);
+  harness.controller.observeNativeFocus(harness.window, true);
+  harness.controller.setImeEnabled(harness.window, true);
+  harness.controller.handleMessage(harness.window, WM.IME_STARTCOMPOSITION, 0n, 0n);
 }
 
 function dispatchKeyDown(
