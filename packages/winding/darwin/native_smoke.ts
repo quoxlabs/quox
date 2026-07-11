@@ -642,10 +642,41 @@ function testProtocolAndStructAbis(): void {
       assertEquals(documentSelection, { location: 1n, length: 2n });
 
       const sendId = openMessage(handles, ["pointer", "pointer"], "pointer");
+      const sendIdCharacters = openMessage(
+        handles,
+        ["pointer", "pointer", "buffer", "usize"],
+        "pointer",
+      );
+      const sendVoid = openMessage(handles, ["pointer", "pointer"], "void");
       window.setTitle("left\0🙂right");
       const exactTitle = sendId(window.nsWindow, sel(runtime, "title"));
       assert(exactTitle !== null, "NSWindow returned a nil title");
       assertEquals(readCFString(cf, exactTitle), "left\0🙂right");
+      window.setTitle("\ufeffleading BOM");
+      const bomTitle = sendId(window.nsWindow, sel(runtime, "title"));
+      assert(bomTitle !== null, "NSWindow returned a nil BOM title");
+      assertEquals(readCFString(cf, bomTitle), "\ufeffleading BOM");
+
+      const malformedAlloc = sendId(
+        getClass(runtime, "NSString"),
+        sel(runtime, "alloc"),
+      );
+      assert(malformedAlloc !== null, "failed to allocate malformed NSString");
+      const malformed = sendIdCharacters(
+        malformedAlloc,
+        sel(runtime, "initWithCharacters:length:"),
+        new Uint16Array([0xd800]),
+        1,
+      );
+      assert(malformed !== null, "failed to initialize malformed NSString");
+      try {
+        assertThrowsMessage(
+          () => readCFString(cf, malformed),
+          "failed to convert complete CFString",
+        );
+      } finally {
+        sendVoid(malformed, sel(runtime, "release"));
+      }
       const attributedSubstring = openMessage(
         handles,
         ["pointer", "pointer", NSRANGE, "pointer"],

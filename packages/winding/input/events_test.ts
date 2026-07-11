@@ -104,8 +104,16 @@ Deno.test("IME builders enforce canonical cursor, commit, and deletion shapes", 
     cursorRange: null,
   });
   assertEquals(createImeCommitEvent(window, ""), undefined);
-  assertEquals(createImeCommitEvent(window, "\u0003"), undefined);
-  assertEquals(createImeCommitEvent(window, "\u0085"), undefined);
+  for (
+    const text of ["\u0000", "\t", "\n", "\u001f", "\u007f", "\u0080", "\u009f"]
+  ) {
+    assertEquals(createImeCommitEvent(window, text), {
+      type: "ime",
+      kind: "commit",
+      window,
+      text,
+    });
+  }
   assertEquals(createImeCommitEvent(window, "日本"), {
     type: "ime",
     kind: "commit",

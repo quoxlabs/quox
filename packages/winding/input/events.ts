@@ -9,7 +9,10 @@ import type {
   Window,
 } from "../types.ts";
 import { validateImeCursorRange } from "./ime.ts";
-import { keyLocationForCode, normalizeCommittedText, normalizeLogicalKey } from "./keyboard.ts";
+import {
+  keyLocationForCode,
+  normalizeLogicalKey,
+} from "./keyboard.ts";
 
 export interface KeyEventInit extends KeyModifiers {
   window: Window;
@@ -83,8 +86,7 @@ export function createImePreeditEvent(
 
 /** Empty commits carry no semantic edit and are omitted. */
 export function createImeCommitEvent(window: Window, text: string): ImeEvent | undefined {
-  const committed = normalizeCommittedText(text);
-  return committed === undefined ? undefined : { type: "ime", kind: "commit", window, text: committed };
+  return text.length === 0 ? undefined : { type: "ime", kind: "commit", window, text };
 }
 
 /** Invalid or empty surrounding deletions are omitted. */

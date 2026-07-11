@@ -394,7 +394,11 @@ export function readCFString(cf: CoreFoundation, string: Deno.PointerValue): str
   if (converted !== utf16Length || used[0] < 0n || used[0] > maximum) {
     throw new Error("winding(darwin) failed to convert complete CFString to UTF-8");
   }
-  return new TextDecoder().decode(bytes.subarray(0, Number(used[0])));
+  // `ignoreBOM: true` disables TextDecoder's signature stripping, preserving
+  // a genuine leading U+FEFF from the native NSString.
+  return new TextDecoder("utf-8", { ignoreBOM: true }).decode(
+    bytes.subarray(0, Number(used[0])),
+  );
 }
 
 // kCGImageAlphaLast | kCGBitmapByteOrderDefault: straight (non-premultiplied)

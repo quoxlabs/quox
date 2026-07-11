@@ -13,7 +13,6 @@ import {
   validateImeCursorArea,
 } from "../input/mod.ts";
 import { NS_NOT_FOUND } from "./ffi.ts";
-import { printableText } from "./text_input.ts";
 export { NS_NOT_FOUND } from "./ffi.ts";
 
 export interface Utf16Range {
@@ -327,7 +326,7 @@ export class DarwinInputState {
     replacementLocation: number | bigint = NS_NOT_FOUND,
     replacementLength: number | bigint = 0,
   ): string | undefined {
-    const committed = printableText(text);
+    const committed = text.length === 0 ? undefined : text;
     if (committed === undefined) return undefined;
     this.#removeTrailingPreeditClear();
     const replaced = this.#emitDocumentReplacement(replacementLocation, replacementLength, committed);
@@ -353,11 +352,7 @@ export class DarwinInputState {
       return undefined;
     }
     const text = this.#markedText;
-    const committed = printableText(text);
-    if (committed === undefined) {
-      this.cancelComposition();
-      return undefined;
-    }
+    const committed = text;
     this.#removeTrailingPreeditClear();
     this.#clearMarkedText();
     this.#composition.commit();

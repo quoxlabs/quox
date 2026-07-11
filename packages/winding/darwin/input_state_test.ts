@@ -145,11 +145,16 @@ Deno.test("Darwin commit retracts a synchronous marked-text clear", () => {
   assertEquals(state.composing, false);
 });
 
-Deno.test("Darwin filters control and AppKit function-key commit text", () => {
+Deno.test("Darwin preserves arbitrary non-empty NSTextInputClient commits", () => {
   const state = inputState();
-  assertEquals(state.insertText("\u0003"), undefined);
-  assertEquals(state.insertText("\uf702"), undefined);
-  assertEquals(state.drainEvents(), []);
+  assertEquals(state.insertText("\u0003"), "\u0003");
+  assertEquals(state.insertText("\uf702"), "\uf702");
+  assertEquals(state.insertText("line\n\ttext"), "line\n\ttext");
+  assertEquals(state.drainEvents(), [
+    { type: "ime", kind: "commit", text: "\u0003", window: TEST_WINDOW },
+    { type: "ime", kind: "commit", text: "\uf702", window: TEST_WINDOW },
+    { type: "ime", kind: "commit", text: "line\n\ttext", window: TEST_WINDOW },
+  ]);
 });
 
 Deno.test("Darwin unmark accepts composition while cancel and disable do not", () => {
