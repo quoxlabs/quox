@@ -2,6 +2,7 @@ import { assert, assertEquals, assertThrows } from "jsr:@std/assert@^1.0.19";
 import type { KeyDownEvent, UIEvent } from "../types.ts";
 import {
   AltGraphControlFilter,
+  CsInsertCharAssembler,
   decodeKeyLParam,
   decodeMouseLParam,
   decodeWin32ClientRect,
@@ -48,6 +49,7 @@ import {
   ATTR_TARGET_CONVERTED,
   ATTR_TARGET_NOTCONVERTED,
   CS_INSERTCHAR,
+  CS_NOMOVECARET,
   GCS_COMPATTR,
   GCS_COMPCLAUSE,
   GCS_COMPSTR,
@@ -694,6 +696,94 @@ Deno.test("Win32 composition restart discards fallback commits and stale result-
   ]);
 });
 
+Deno.test("Win32 CS_INSERTCHAR assembles one supplementary preedit at a UTF-8 cursor boundary", () => {
+  const compositionData = new Map<number, Uint8Array | number>([
+    [GCS_COMPSTR, utf16Le("ab")],
+    [GCS_CURSORPOS, 1],
+  ]);
+  const moving = createInputControllerHarness({ compositionData });
+  startImeComposition(moving);
+  moving.controller.handleMessage(moving.window, WM.IME_COMPOSITION, 0n, GCS_COMPSTR | GCS_CURSORPOS);
+  const beforeHigh = textImeEvents(moving.events).length;
+  moving.controller.handleMessage(moving.window, WM.IME_COMPOSITION, 0xd83d, CS_INSERTCHAR);
+  assertEquals(textImeEvents(moving.events).length, beforeHigh);
+  moving.controller.handleMessage(moving.window, WM.IME_COMPOSITION, 0xde42, CS_INSERTCHAR);
+  assertEquals(textImeEvents(moving.events), [
+    { kind: "preedit", text: "ab", cursorRange: [1, 1] },
+    { kind: "preedit", text: "a🙂b", cursorRange: [5, 5] },
+  ]);
+
+  const fixed = createInputControllerHarness({ compositionData });
+  startImeComposition(fixed);
+  fixed.controller.handleMessage(fixed.window, WM.IME_COMPOSITION, 0n, GCS_COMPSTR | GCS_CURSORPOS);
+  fixed.controller.handleMessage(fixed.window, WM.IME_COMPOSITION, 0xd83d, CS_INSERTCHAR | CS_NOMOVECARET);
+  fixed.controller.handleMessage(fixed.window, WM.IME_COMPOSITION, 0xde42, CS_INSERTCHAR);
+  assertEquals(textImeEvents(fixed.events).at(-1), {
+    kind: "preedit",
+    text: "a🙂b",
+    cursorRange: [1, 1],
+  });
+});
+
+Deno.test("Win32 CS_INSERTCHAR recovers malformed units without publishing surrogate text", () => {
+  const harness = createInputControllerHarness();
+  startImeComposition(harness);
+  harness.controller.handleMessage(harness.window, WM.IME_COMPOSITION, 0xd800, CS_INSERTCHAR);
+  assertEquals(textImeEvents(harness.events), []);
+  harness.controller.handleMessage(harness.window, WM.IME_COMPOSITION, "X".charCodeAt(0), CS_INSERTCHAR);
+  assertEquals(textImeEvents(harness.events), [
+    { kind: "preedit", text: "�X", cursorRange: [4, 4] },
+  ]);
+});
+
+Deno.test("Win32 drops pending CS_INSERTCHAR units at native composition boundaries", () => {
+  const restarted = createInputControllerHarness();
+  startImeComposition(restarted);
+  restarted.controller.handleMessage(restarted.window, WM.IME_COMPOSITION, 0xd83d, CS_INSERTCHAR);
+  restarted.controller.handleMessage(restarted.window, WM.IME_STARTCOMPOSITION, 0n, 0n);
+  restarted.controller.handleMessage(restarted.window, WM.IME_COMPOSITION, 0xde42, CS_INSERTCHAR);
+  assertEquals(textImeEvents(restarted.events), [
+    { kind: "preedit", text: "�", cursorRange: [3, 3] },
+  ]);
+
+  const compositionData = new Map<number, Uint8Array | number>([
+    [GCS_COMPSTR, utf16Le("A")],
+    [GCS_CURSORPOS, 1],
+  ]);
+  const authoritative = createInputControllerHarness({ compositionData });
+  startImeComposition(authoritative);
+  authoritative.controller.handleMessage(authoritative.window, WM.IME_COMPOSITION, 0xd83d, CS_INSERTCHAR);
+  authoritative.controller.handleMessage(
+    authoritative.window,
+    WM.IME_COMPOSITION,
+    0n,
+    GCS_COMPSTR | GCS_CURSORPOS,
+  );
+  authoritative.controller.handleMessage(authoritative.window, WM.IME_COMPOSITION, 0xde42, CS_INSERTCHAR);
+  assertEquals(textImeEvents(authoritative.events), [
+    { kind: "preedit", text: "A", cursorRange: [1, 1] },
+    { kind: "preedit", text: "A�", cursorRange: [4, 4] },
+  ]);
+
+  for (const boundary of ["end", "blur"] as const) {
+    const harness = createInputControllerHarness();
+    startImeComposition(harness);
+    harness.controller.handleMessage(harness.window, WM.IME_COMPOSITION, 0xd83d, CS_INSERTCHAR);
+    if (boundary === "end") {
+      harness.controller.handleMessage(harness.window, WM.IME_ENDCOMPOSITION, 0n, 0n);
+      harness.controller.handleMessage(harness.window, WM.IME_STARTCOMPOSITION, 0n, 0n);
+    } else {
+      harness.controller.observeNativeFocus(harness.window, false);
+      harness.controller.observeNativeFocus(harness.window, true);
+    }
+    const beforeLow = textImeEvents(harness.events).length;
+    harness.controller.handleMessage(harness.window, WM.IME_COMPOSITION, 0xde42, CS_INSERTCHAR);
+    assertEquals(textImeEvents(harness.events).slice(beforeLow), [
+      { kind: "preedit", text: "�", cursorRange: [3, 3] },
+    ]);
+  }
+});
+
 Deno.test("Win32 ignores direct and deferred composition traffic while blurred or natively inactive", () => {
   const blurred = createInputControllerHarness();
   blurred.controller.attach(blurred.window);
@@ -1212,6 +1302,28 @@ Deno.test("WM_CHAR decoder assembles surrogate pairs and recovers malformed UTF-
   assertEquals(decoder.push(0xdbff, 2), []);
   assertEquals(decoder.flush(), [{ text: "�", repeatCount: 2 }]);
   assertEquals(decoder.flush(), []);
+});
+
+Deno.test("CS_INSERTCHAR assembler emits only complete scalars and recovers malformed units", () => {
+  const assembler = new CsInsertCharAssembler();
+  assertEquals(assembler.push("A".charCodeAt(0), false), [{ text: "A", noMoveCaret: false }]);
+  assertEquals(assembler.push(0xd83d, true), []);
+  assertEquals(assembler.push(0xde42, false), [{ text: "🙂", noMoveCaret: true }]);
+  assertEquals(assembler.push(0xdc00, true), [{ text: "�", noMoveCaret: true }]);
+
+  assertEquals(assembler.push(0xd800, false), []);
+  assertEquals(assembler.push("X".charCodeAt(0), true), [
+    { text: "�", noMoveCaret: false },
+    { text: "X", noMoveCaret: true },
+  ]);
+  assertEquals(assembler.push(0xd800, false), []);
+  assertEquals(assembler.push(0xd83d, true), [{ text: "�", noMoveCaret: false }]);
+  assertEquals(assembler.push(0xde42, false), [{ text: "🙂", noMoveCaret: true }]);
+
+  assertEquals(assembler.push(0xd83d, false), []);
+  assembler.reset();
+  assertEquals(assembler.push(0xde42, false), [{ text: "�", noMoveCaret: false }]);
+  assertEquals(assembler.push(0x08, false), []);
 });
 
 Deno.test("mismatched surrogate repeat counts preserve valid pairs and recover leftovers", () => {

@@ -843,6 +843,51 @@ export class WmCharDecoder {
   }
 }
 
+export interface DecodedCsInsertChar {
+  text: string;
+  noMoveCaret: boolean;
+}
+
+/**
+ * A separate UTF-16 scalar stream for CS_INSERTCHAR. Malformed in-stream
+ * units recover as U+FFFD, while reset silently drops an interrupted high.
+ */
+export class CsInsertCharAssembler {
+  #pendingHigh: { codeUnit: number; noMoveCaret: boolean } | undefined;
+
+  push(codeUnit: number | bigint, noMoveCaret: boolean): DecodedCsInsertChar[] {
+    const unit = Number(BigInt(codeUnit) & 0xffffn);
+    const decoded: DecodedCsInsertChar[] = [];
+    if (this.#pendingHigh !== undefined) {
+      const pending = this.#pendingHigh;
+      this.#pendingHigh = undefined;
+      if (isLowSurrogate(unit)) {
+        const codePoint = 0x10000 + ((pending.codeUnit - 0xd800) << 10) + (unit - 0xdc00);
+        decoded.push({
+          text: String.fromCodePoint(codePoint),
+          noMoveCaret: pending.noMoveCaret || noMoveCaret,
+        });
+        return decoded;
+      }
+      decoded.push({ text: "\ufffd", noMoveCaret: pending.noMoveCaret });
+    }
+
+    if (isHighSurrogate(unit)) {
+      this.#pendingHigh = { codeUnit: unit, noMoveCaret };
+    } else if (isLowSurrogate(unit)) {
+      decoded.push({ text: "\ufffd", noMoveCaret });
+    } else {
+      const text = String.fromCharCode(unit);
+      if (isCommitText(text)) decoded.push({ text, noMoveCaret });
+    }
+    return decoded;
+  }
+
+  reset(): void {
+    this.#pendingHigh = undefined;
+  }
+}
+
 function normalizeRepeatCount(repeatCount: number): number {
   if (!Number.isFinite(repeatCount)) return 1;
   return Math.min(0xffff, Math.max(1, Math.trunc(repeatCount)));

@@ -47,6 +47,7 @@ import {
 } from "./ffi.ts";
 import {
   AltGraphControlFilter,
+  CsInsertCharAssembler,
   type DecodedWmChar,
   decodeKeyLParam,
   expandWin32KeyRepeats,
@@ -109,6 +110,7 @@ interface WindowInputState {
   readonly altGraphControlFilter: AltGraphControlFilter;
   readonly charDecoder: WmCharDecoder;
   readonly imeCharDecoder: WmCharDecoder;
+  readonly insertCharAssembler: CsInsertCharAssembler;
   readonly insertOnType: InsertOnTypeFallbackState;
   readonly resultEcho: ResultEchoSuppressor;
 }
@@ -172,6 +174,7 @@ export class Win32InputController {
       altGraphControlFilter: new AltGraphControlFilter(),
       charDecoder: new WmCharDecoder(),
       imeCharDecoder: new WmCharDecoder(),
+      insertCharAssembler: new CsInsertCharAssembler(),
       insertOnType: new InsertOnTypeFallbackState(),
       resultEcho: new ResultEchoSuppressor(),
     };
@@ -214,6 +217,7 @@ export class Win32InputController {
     state.composition.reset();
     state.charDecoder.reset();
     state.imeCharDecoder.reset();
+    state.insertCharAssembler.reset();
     state.insertOnType.cancel();
     state.resultEcho.clear();
     state.logicalKeys.clear();
@@ -399,6 +403,7 @@ export class Win32InputController {
         for (const [inputWindow, inputState] of this.#states) {
           this.#flushCharDecoder(inputWindow, inputState);
           this.#flushImeCharDecoder(inputWindow, inputState);
+          inputState.insertCharAssembler.reset();
           inputState.altGraphControlFilter.reset();
           inputState.altGraphTextKeys.clear();
         }
@@ -410,6 +415,7 @@ export class Win32InputController {
         // instead of flushing stale data into the new session.
         state.charDecoder.reset();
         state.imeCharDecoder.reset();
+        state.insertCharAssembler.reset();
         this.#queuePreedit(window, state.composition.restart());
         state.insertOnType.start();
         this.#clearCompositionMetadata(state);
@@ -422,6 +428,7 @@ export class Win32InputController {
         return this.#handleImeComposition(window, state, wParam, lParam) ? 0n : undefined;
       case WM.IME_ENDCOMPOSITION: {
         if (window === undefined || state === undefined || !this.#acceptsNativeComposition(state)) return undefined;
+        state.insertCharAssembler.reset();
         if (state.cancelingComposition) {
           state.charDecoder.reset();
           state.imeCharDecoder.reset();
@@ -571,6 +578,7 @@ export class Win32InputController {
     for (const state of this.#states.values()) {
       state.composition.reset();
       state.charDecoder.reset();
+      state.insertCharAssembler.reset();
       state.resultEcho.clear();
       state.logicalKeys.clear();
       state.altGraphTextKeys.clear();
@@ -788,6 +796,7 @@ export class Win32InputController {
 
   #applyImeUpdate(window: Win32InputWindow, state: WindowInputState, update: ImeCompositionUpdate): void {
     if (update.result !== undefined && isCommitText(update.result)) {
+      state.insertCharAssembler.reset();
       state.insertOnType.authoritative();
       state.composition.commit();
       this.#clearCompositionMetadata(state);
@@ -796,6 +805,7 @@ export class Win32InputController {
     }
     if (update.preedit === undefined) return;
     if (update.preedit === null || update.preedit.text.length === 0) {
+      state.insertCharAssembler.reset();
       state.insertOnType.cancel();
       this.#queuePreedit(window, state.composition.cancel());
       this.#clearCompositionMetadata(state);
@@ -929,20 +939,23 @@ export class Win32InputController {
   ): boolean {
     const flags = Number(BigInt(lParam) & 0xffffffffn);
     if ((flags & IME_COMPOSITION_FLAGS) === 0) {
+      state.insertCharAssembler.reset();
       this.#applyImeUpdate(window, state, { preedit: null });
       return true;
     }
 
+    const transientInsert = (flags & CS_INSERTCHAR) !== 0 &&
+      (flags & (GCS_COMPSTR | GCS_RESULTSTR)) === 0;
+    if (!transientInsert) state.insertCharAssembler.reset();
     let insertedPreedit: { text: string; cursorRange?: readonly [number, number] } | undefined;
-    if ((flags & CS_INSERTCHAR) !== 0 && (flags & GCS_COMPSTR) === 0) {
-      const character = String.fromCharCode(Number(BigInt(wParam) & 0xffffn));
-      if (isCommitText(character)) {
-        insertedPreedit = insertCompositionCharacter(
-          state.composition.text,
-          state.composition.cursorRange ?? undefined,
-          character,
-          (flags & CS_NOMOVECARET) !== 0,
-        );
+    if (transientInsert) {
+      let text = state.composition.text;
+      let cursorRange = state.composition.cursorRange ?? undefined;
+      for (const scalar of state.insertCharAssembler.push(wParam, (flags & CS_NOMOVECARET) !== 0)) {
+        const inserted = insertCompositionCharacter(text, cursorRange, scalar.text, scalar.noMoveCaret);
+        text = inserted.text;
+        cursorRange = inserted.cursorRange;
+        insertedPreedit = inserted;
       }
     }
     if ((flags & GCS_ALL) === 0) {
@@ -989,7 +1002,10 @@ export class Win32InputController {
       }
       return { update: { result, preedit }, attributes, clauses, metadataChanged };
     });
-    if (response === undefined || response === null) return false;
+    if (response === undefined || response === null) {
+      state.insertCharAssembler.reset();
+      return false;
+    }
     const update = response.update;
     if ((flags & (GCS_COMPSTR | GCS_RESULTSTR)) !== 0) state.insertOnType.authoritative();
     if (update.result !== undefined && isCommitText(update.result)) state.resultEcho.expect(update.result);
@@ -1054,6 +1070,7 @@ export class Win32InputController {
   #cancelComposition(window: Win32InputWindow, state: WindowInputState): void {
     const cancelNativeComposition = state.composition.active;
     state.insertOnType.cancel();
+    state.insertCharAssembler.reset();
     if (cancelNativeComposition) {
       // ImmNotifyIME can synchronously reenter the WndProc. Suppress both
       // character streams until native cancellation and local cleanup finish.
@@ -1086,6 +1103,7 @@ export class Win32InputController {
         this.#flushImeCharDecoder(window, state);
       }
       state.insertOnType.cancel();
+      state.insertCharAssembler.reset();
       this.#queuePreedit(window, state.composition.cancel());
       this.#clearCompositionMetadata(state);
       state.resultEcho.clear();
