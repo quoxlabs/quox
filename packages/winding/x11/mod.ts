@@ -946,9 +946,12 @@ class X11Library implements Library {
     if (keyboard === null) return;
     try {
       if (this.X11.symbols.XkbGetNames(this.display, XKB_KEY_NAMES_MASK, keyboard) === 0) return;
+      const minimumOutput = new Int32Array(1);
+      const maximumOutput = new Int32Array(1);
+      this.X11.symbols.XDisplayKeycodes(this.display, minimumOutput, maximumOutput);
+      const minimum = Math.max(0, minimumOutput[0]);
+      const maximum = Math.min(255, maximumOutput[0]);
       const keyboardView = new Deno.UnsafePointerView(keyboard);
-      const minimum = keyboardView.getUint8(12);
-      const maximum = keyboardView.getUint8(13);
       const namesAddress = keyboardView.getBigUint64(48);
       const namesPointer = Deno.UnsafePointer.create(namesAddress);
       if (namesPointer === null) return;
