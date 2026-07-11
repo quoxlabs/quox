@@ -34,6 +34,7 @@ import {
   readWlArrayU32,
   waylandConnectionError,
 } from "./protocol.ts";
+import { createOpaqueBlackFrame } from "./shm_buffer.ts";
 import { damageOpcodeForSurfaceVersion, frameMatchesConfiguration, WaylandConfigureState } from "./window.ts";
 import { type WaylandGlobalInterface, WaylandGlobalRegistry } from "./global_registry.ts";
 import {
@@ -154,6 +155,27 @@ Deno.test("Wayland surface damage uses only requests supported by the bound vers
   assertEquals(damageOpcodeForSurfaceVersion(3), WlOp.SURFACE_DAMAGE);
   assertEquals(damageOpcodeForSurfaceVersion(4), WlOp.SURFACE_DAMAGE_BUFFER);
   assertEquals(damageOpcodeForSurfaceVersion(6), WlOp.SURFACE_DAMAGE_BUFFER);
+});
+
+Deno.test("Wayland initial window frames are opaque black", () => {
+  assertEquals([...createOpaqueBlackFrame(2, 2)], [
+    0,
+    0,
+    0,
+    255,
+    0,
+    0,
+    0,
+    255,
+    0,
+    0,
+    0,
+    255,
+    0,
+    0,
+    0,
+    255,
+  ]);
 });
 
 Deno.test("Wayland connection errors retain protocol object details", () => {

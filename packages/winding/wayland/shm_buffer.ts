@@ -27,6 +27,13 @@ export interface WaylandShmHost {
 
 const MAX_BUFFERS = 3;
 
+/** Create a public-format frame that maps a new surface as opaque black. */
+export function createOpaqueBlackFrame(width: number, height: number): Uint8Array {
+  const rgba = new Uint8Array(checkedImageSize(width, height));
+  for (let index = 3; index < rgba.byteLength; index += 4) rgba[index] = 0xff;
+  return rgba;
+}
+
 /** Convert the public straight-alpha RGBA bytes to Wayland's premultiplied BGRA layout. */
 export function copyStraightRgbaToPremultipliedBgra(
   source: Uint8Array,

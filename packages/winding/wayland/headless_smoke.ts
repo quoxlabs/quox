@@ -12,7 +12,7 @@ Deno.test("Wayland SHM conversion premultiplies straight RGBA before channel swa
   assertBytes(destination, Uint8Array.of(0, 0, 128, 128, 30, 20, 10, 255, 0, 0, 0, 0, 2, 1, 1, 128));
 });
 
-Deno.test("Wayland opens, blits, and survives repeated lifecycles", () => {
+Deno.test("Wayland maps on open, blits, and survives repeated lifecycles", () => {
   const pixels = new Uint8Array(WIDTH * HEIGHT * 4);
   pixels.fill(0xff);
 
@@ -21,6 +21,9 @@ Deno.test("Wayland opens, blits, and survives repeated lifecycles", () => {
     try {
       const window = library.openWindow(0, 0, WIDTH, HEIGHT);
       try {
+        // Opening performs the bufferless configure handshake and presents the
+        // initial black frame before any application-provided blit.
+        drainEvents(library);
         window.setTitle(`winding Wayland smoke test ${iteration + 1}`);
         window.setImeCursorArea(4.25, 8.5, 12.75, 16.5);
         window.setImeSurroundingText("before after", 6, 6);

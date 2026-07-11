@@ -14,7 +14,7 @@ import {
   throwCleanupErrors,
   WL_MARSHAL_FLAG_DESTROY,
 } from "./protocol.ts";
-import { WaylandShmBuffer, type WaylandShmHost } from "./shm_buffer.ts";
+import { createOpaqueBlackFrame, WaylandShmBuffer, type WaylandShmHost } from "./shm_buffer.ts";
 
 export function damageOpcodeForSurfaceVersion(version: number): number {
   return version >= 4 ? WlOp.SURFACE_DAMAGE_BUFFER : WlOp.SURFACE_DAMAGE;
@@ -181,7 +181,14 @@ export class WaylandWindow implements Window {
       );
       lib.roundtripDisplay("initial window configure");
       lib.throwCallbackError();
-      if (this.#configuration) this.#ackConfiguration(this.#configuration);
+      const configuration = this.#configuration;
+      if (!configuration) throw new Error("winding Wayland compositor did not send an initial configure");
+      this.#present(
+        createOpaqueBlackFrame(configuration.width, configuration.height),
+        configuration.width,
+        configuration.height,
+        configuration,
+      );
       return;
     } catch (error) {
       errors.push(error);
@@ -321,6 +328,11 @@ export class WaylandWindow implements Window {
     if (this.#closed || !this.#surface) return;
     const configuration = this.#configuration;
     if (!configuration || !frameMatchesConfiguration(configuration, width, height, frameToken)) return;
+    this.#present(rgba, width, height, configuration);
+  }
+
+  #present(rgba: Uint8Array, width: number, height: number, configuration: WaylandConfiguration): void {
+    if (!this.#surface) return;
     const buffer = this.#shmBuffer.write(rgba, width, height);
     if (!buffer) return;
     this.#ackConfiguration(configuration);
