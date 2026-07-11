@@ -13,6 +13,13 @@ import {
 import { isVNode, mount, type QuoxRenderable } from "./mount.ts";
 import type { QuoxElement, QuoxInnerHTML } from "./node.ts";
 import { fitRgbaToFramebuffer, FramebufferState } from "./framebuffer.ts";
+import {
+  BufferedEventSource,
+  collectInitializationCleanupErrors,
+  INITIALIZATION_EVENT_POLL_INTERVAL_MS,
+  InitializationEventPump,
+  WindowStartupGate,
+} from "./initialization_pump.ts";
 
 export type {
   QuoxAppleStandardKeybindingEvent,
@@ -71,6 +78,8 @@ export class QuoxWindow implements Disposable {
   #devicePixelRatio = 1;
   #frameToken: number | undefined;
   readonly #renderer: WasmRenderer;
+  readonly #events: BufferedEventSource<WindingUIEvent>;
+  readonly #startup = new WindowStartupGate();
   #intervalId: ReturnType<typeof setInterval> | null = null;
   #rendering = false;
   #renderQueued = false;
@@ -96,6 +105,7 @@ export class QuoxWindow implements Disposable {
     this.#height = height;
     this.#framebuffer = new FramebufferState(width, height);
     this.#renderer = renderer;
+    this.#events = new BufferedEventSource(() => this.#lib.event());
     this.document = new QuoxDocument(
       renderer,
       () => this.#requestRender(),
@@ -159,37 +169,59 @@ export class QuoxWindow implements Disposable {
     const lib = windingLoad();
     let win: WindingWindow | undefined;
     let renderer: WasmRenderer | undefined;
+    let eventPump: InitializationEventPump<WindingUIEvent> | undefined;
     try {
       win = lib.openWindow(0, 0, width, height);
+      eventPump = new InitializationEventPump(() => lib.event());
+      eventPump.start();
+      eventPump.checkpoint();
+
       renderer = await WasmRenderer.create(width, height, head, body);
+      eventPump.checkpoint();
       const quoxWindow = new QuoxWindow(lib, win, width, height, renderer);
       await mountWindowContent(quoxWindow.document.head, options.head);
+      eventPump.checkpoint();
       await mountWindowContent(quoxWindow.document.body, options.body);
+      eventPump.checkpoint();
       quoxWindow.setTitle(options.title ?? (quoxWindow.document.title || DEFAULT_WINDOW_TITLE));
       quoxWindow.#syncNativeImeRequests();
+      quoxWindow.#events.handoff(eventPump.finish());
       return quoxWindow;
     } catch (error) {
       const errors = [error];
+      const cleanupOperations: Array<() => void> = [];
       if (renderer !== undefined) {
         const ownedRenderer = renderer;
-        captureCleanupError(errors, () => ownedRenderer.free());
+        cleanupOperations.push(() => ownedRenderer.free());
       }
       if (win !== undefined) {
         const ownedWindow = win;
-        captureCleanupError(errors, () => ownedWindow.close());
+        cleanupOperations.push(() => ownedWindow.close());
       }
-      captureCleanupError(errors, () => lib.close());
+      cleanupOperations.push(() => lib.close());
+      collectInitializationCleanupErrors(errors, eventPump, cleanupOperations);
       throw cleanupError(errors, "Quox window initialization failed");
     }
   }
 
   /** Start native event polling and queue an initial render. */
   start(): void {
-    if (this.#intervalId !== null) return;
-    this.#intervalId = setInterval(() => {
+    if (this.#stopped || this.#disposed || this.#intervalId !== null) return;
+    const intervalId = setInterval(() => {
       this.#pollEvents();
-    }, 16);
-    this.#requestRender();
+    }, INITIALIZATION_EVENT_POLL_INTERVAL_MS);
+    this.#intervalId = intervalId;
+    try {
+      if (!this.#startup.start(() => this.#pollEvents(), () => this.#requestRender())) {
+        clearInterval(intervalId);
+        this.#intervalId = null;
+        return;
+      }
+    } catch (error) {
+      clearInterval(intervalId);
+      this.#intervalId = null;
+      throw error;
+    }
   }
 
   #pollEvents(): void {
@@ -197,7 +229,7 @@ export class QuoxWindow implements Disposable {
     const listenerErrors: unknown[] = [];
     try {
       let ev: WindingUIEvent | undefined;
-      while ((ev = this.#lib.event()) !== undefined) {
+      while ((ev = this.#events.read()) !== undefined) {
         const mapped = mapWindingEvent(ev);
 
         if (this.#inputRouter.route(mapped) === "close") {
@@ -236,7 +268,7 @@ export class QuoxWindow implements Disposable {
     if (this.#stopped || this.#disposed) return;
 
     this.#needsRender = true;
-    if (this.#renderQueued) return;
+    if (!this.#startup.renderingEnabled || this.#renderQueued) return;
 
     this.#renderQueued = true;
     setTimeout(() => {
@@ -314,6 +346,8 @@ export class QuoxWindow implements Disposable {
   stop(): void {
     if (this.#stopped) return;
     this.#stopped = true;
+    this.#startup.cancel();
+    this.#events.discardBuffered();
 
     if (this.#intervalId !== null) {
       clearInterval(this.#intervalId);
