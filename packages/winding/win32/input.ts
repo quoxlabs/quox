@@ -259,6 +259,16 @@ export interface Win32KeyboardModifiers {
   altGraphKey: boolean;
 }
 
+/** Match browser AltGraph exposure without treating every Ctrl+Alt shortcut as text. */
+export function shouldExposeAltGraph(
+  modifiers: Win32KeyboardModifiers,
+  layoutHasAltGraph: boolean,
+  producesText: boolean,
+): boolean {
+  return layoutHasAltGraph &&
+    (modifiers.altGraphKey || (producesText && modifiers.ctrlKey && modifiers.altKey));
+}
+
 /** Classify one Win32 keydown using its actual native message ownership. */
 export function win32KeyEditDisposition(
   key: string,
@@ -300,9 +310,9 @@ export function keyboardModifiers(state: Uint8Array): Win32KeyboardModifiers {
  * should still resolve the underlying printable logical key, while AltGr must
  * retain both of the modifier bits Windows uses to select its layout level.
  */
-export function keyboardStateForTranslation(state: Uint8Array, altGraphKey = isAltGraphActive(state)): Uint8Array {
+export function keyboardStateForTranslation(state: Uint8Array, preserveCtrlAlt = isAltGraphActive(state)): Uint8Array {
   const translatedState = Uint8Array.from(state);
-  if (altGraphKey) return translatedState;
+  if (preserveCtrlAlt) return translatedState;
 
   for (
     const virtualKey of [
@@ -350,9 +360,10 @@ export function translateLogicalKey(
   lParam: number | bigint,
   keyboardState: Uint8Array,
   adapter: ToUnicodeAdapter,
+  preserveCtrlAlt = isAltGraphActive(keyboardState),
 ): LogicalKeyTranslation {
   const modifiers = keyboardModifiers(keyboardState);
-  const state = keyboardStateForTranslation(keyboardState, modifiers.altGraphKey);
+  const state = keyboardStateForTranslation(keyboardState, preserveCtrlAlt);
   const scanCode = decodeKeyLParam(lParam).scanCode;
 
   let translation: ToUnicodeResult;
@@ -365,6 +376,25 @@ export function translateLogicalKey(
   if (translation.result < 0) return { key: "Dead", dead: true, modifiers };
   const translatedText = translation.result > 0 ? translation.text.slice(0, translation.result) : undefined;
   const text = translatedText === undefined ? undefined : normalizeCommittedText(translatedText);
+  if (text === undefined && preserveCtrlAlt) {
+    try {
+      const fallback = adapter.toUnicode(
+        virtualKey,
+        scanCode,
+        keyboardStateForTranslation(keyboardState, false),
+        TO_UNICODE_NO_STATE_CHANGE,
+      );
+      if (fallback.result < 0) return { key: "Dead", dead: true, modifiers };
+      const fallbackText = fallback.result > 0 ? fallback.text.slice(0, fallback.result) : undefined;
+      return {
+        key: logicalKeyFromVirtualKey(virtualKey, fallbackText),
+        dead: false,
+        modifiers,
+      };
+    } catch {
+      return { key: logicalKeyFromVirtualKey(virtualKey), dead: false, modifiers };
+    }
+  }
   return {
     key: logicalKeyFromVirtualKey(virtualKey, translatedText),
     ...(text === undefined ? {} : { text }),

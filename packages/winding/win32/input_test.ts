@@ -9,6 +9,7 @@ import {
   logicalKeyFromVirtualKey,
   repeatedWmCharText,
   ResultEchoSuppressor,
+  shouldExposeAltGraph,
   TO_UNICODE_NO_STATE_CHANGE,
   translateLogicalKey,
   validateWin32Geometry,
@@ -213,6 +214,61 @@ Deno.test("AltGr preserves Control and right Alt for layout translation without 
   });
   assertEquals(translated.key, "@");
   assertEquals(translated.modifiers.altGraphKey, true);
+});
+
+Deno.test("printable physical Ctrl+Alt layout levels use browser AltGraph ownership", () => {
+  const state = keyboardState([
+    [VK.SHIFT, 0x80],
+    [VK.CONTROL, 0x80],
+    [VK.LCONTROL, 0x80],
+    [VK.MENU, 0x80],
+    [VK.LMENU, 0x80],
+  ]);
+  const translated = translateLogicalKey(0x51, makeKeyLParam(0x10), state, {
+    toUnicode(_virtualKey, _scanCode, translatedState) {
+      assert(translatedState[VK.SHIFT] >= 0x80);
+      assert(translatedState[VK.LCONTROL] >= 0x80);
+      assert(translatedState[VK.LMENU] >= 0x80);
+      return { result: 1, text: "@" };
+    },
+  }, true);
+  assertEquals(translated.key, "@");
+  assertEquals(translated.text, "@");
+  assertEquals(translated.modifiers.altGraphKey, false);
+
+  const altGraphKey = shouldExposeAltGraph(translated.modifiers, true, translated.text !== undefined);
+  const browserModifiers = {
+    ...translated.modifiers,
+    altGraphKey,
+    accelKey: translated.modifiers.ctrlKey && !altGraphKey,
+  };
+  assertEquals(browserModifiers.altGraphKey, true);
+  assertEquals(browserModifiers.accelKey, false);
+  assertEquals(win32KeyEditDisposition("@", false, browserModifiers, "@", true), "text-input");
+});
+
+Deno.test("non-text Ctrl+Alt shortcuts keep their plain key and platform ownership", () => {
+  const state = keyboardState([
+    [VK.CONTROL, 0x80],
+    [VK.LCONTROL, 0x80],
+    [VK.MENU, 0x80],
+    [VK.LMENU, 0x80],
+  ]);
+  let calls = 0;
+  const translated = translateLogicalKey(0x43, makeKeyLParam(0x2e), state, {
+    toUnicode(_virtualKey, _scanCode, translatedState) {
+      calls++;
+      if ((translatedState[VK.CONTROL] & 0x80) !== 0) return { result: 0, text: "" };
+      assertEquals(translatedState[VK.LCONTROL] & 0x80, 0);
+      assertEquals(translatedState[VK.LMENU] & 0x80, 0);
+      return { result: 1, text: "c" };
+    },
+  }, true);
+  assertEquals(calls, 2);
+  assertEquals(translated.key, "c");
+  assertEquals(translated.text, undefined);
+  assertEquals(shouldExposeAltGraph(translated.modifiers, true, false), false);
+  assertEquals(win32KeyEditDisposition("c", false, translated.modifiers, undefined, true), "platform");
 });
 
 Deno.test("Win32 edit ownership follows WM_SYSKEYDOWN rather than inferred Alt state", () => {

@@ -50,6 +50,7 @@ import {
   logicalKeyFromVirtualKey,
   repeatedWmCharText,
   ResultEchoSuppressor,
+  shouldExposeAltGraph,
   type ToUnicodeAdapter,
   translateLogicalKey,
   VK,
@@ -88,6 +89,7 @@ interface WindowInputState {
     selectionEndBytes: number;
   };
   readonly logicalKeys: PressedLogicalKeyCache<string>;
+  readonly altGraphTextKeys: Set<string>;
   readonly altGraphControlFilter: AltGraphControlFilter;
   readonly charDecoder: WmCharDecoder;
   readonly resultEcho: ResultEchoSuppressor;
@@ -138,6 +140,7 @@ export class Win32InputController {
       activation: new ImeActivationState(),
       composition: new CompositionState(),
       logicalKeys: new PressedLogicalKeyCache<string>(),
+      altGraphTextKeys: new Set<string>(),
       altGraphControlFilter: new AltGraphControlFilter(),
       charDecoder: new WmCharDecoder(),
       resultEcho: new ResultEchoSuppressor(),
@@ -176,6 +179,7 @@ export class Win32InputController {
     state.charDecoder.reset();
     state.resultEcho.clear();
     state.logicalKeys.clear();
+    state.altGraphTextKeys.clear();
     state.altGraphControlFilter.reset();
     state.activation.reset();
     this.#states.delete(window);
@@ -230,6 +234,7 @@ export class Win32InputController {
     state.activation.setFocused(false);
     this.#reconcileIme(window, state);
     state.logicalKeys.clear();
+    state.altGraphTextKeys.clear();
     state.altGraphControlFilter.reset();
     this.#enqueue({ type: "blur", window });
   }
@@ -281,13 +286,13 @@ export class Win32InputController {
         if (window !== undefined && state !== undefined) this.#flushCharDecoder(window, state);
         return 0n;
       case WM.SYSCHAR:
-        if (window !== undefined && state !== undefined && this.#currentModifiers().altGraphKey) {
+        if (window !== undefined && state !== undefined && this.#currentModifiers(true).altGraphKey) {
           this.#handleChar(window, state, wParam, lParam);
           return 0n;
         }
         return undefined;
       case WM.SYSDEADCHAR:
-        if (window !== undefined && state !== undefined && this.#currentModifiers().altGraphKey) {
+        if (window !== undefined && state !== undefined && this.#currentModifiers(true).altGraphKey) {
           this.#flushCharDecoder(window, state);
           return 0n;
         }
@@ -305,6 +310,7 @@ export class Win32InputController {
         for (const [inputWindow, inputState] of this.#states) {
           this.#flushCharDecoder(inputWindow, inputState);
           inputState.altGraphControlFilter.reset();
+          inputState.altGraphTextKeys.clear();
         }
         return undefined;
       case WM.IME_STARTCOMPOSITION:
@@ -378,27 +384,34 @@ export class Win32InputController {
     const layout = this.#user32.symbols.GetKeyboardLayout(0);
     const layoutHasAltGraph = this.#layoutHasAltGraph(layout);
     const modifiers = keyboardModifiers(keyboardState);
-    modifiers.altGraphKey = layoutHasAltGraph && modifiers.altGraphKey;
-    modifiers.accelKey = modifiers.ctrlKey && !modifiers.altGraphKey;
+    modifiers.altGraphKey = shouldExposeAltGraph(modifiers, layoutHasAltGraph, false);
 
     const code = getDomCode(message.lParam);
+    const identity = win32KeyIdentity(message.virtualKey, message.lParam);
     let key = logicalKeyFromVirtualKey(message.virtualKey);
     let translatedText: string | undefined;
     if (type === "keydown") {
-      const stateForTranslation = Uint8Array.from(keyboardState);
-      if (!layoutHasAltGraph) stateForTranslation[VK.RMENU] &= 0x7f;
       const translated = translateLogicalKey(
         message.virtualKey,
         message.lParam,
-        stateForTranslation,
+        keyboardState,
         this.#toUnicodeAdapter(layout),
+        layoutHasAltGraph && modifiers.ctrlKey && modifiers.altKey,
       );
       key = translated.key;
       translatedText = translated.text;
+      if (modifiers.ctrlKey && modifiers.altKey && translatedText !== undefined) {
+        state.altGraphTextKeys.add(identity);
+      } else if (!decodeKeyLParam(message.lParam).isRepeat) {
+        state.altGraphTextKeys.delete(identity);
+      }
+    } else if (state.altGraphTextKeys.delete(identity)) {
+      modifiers.altGraphKey = layoutHasAltGraph;
     }
+    modifiers.altGraphKey = shouldExposeAltGraph(modifiers, layoutHasAltGraph, translatedText !== undefined);
+    modifiers.accelKey = modifiers.ctrlKey && !modifiers.altGraphKey;
     if (code === "AltRight") key = modifiers.altGraphKey && layoutHasAltGraph ? "AltGraph" : "Alt";
 
-    const identity = win32KeyIdentity(message.virtualKey, message.lParam);
     if (type === "keydown") {
       key = state.logicalKeys.press(identity, key);
       state.resultEcho.clear();
@@ -450,6 +463,7 @@ export class Win32InputController {
       state.charDecoder.reset();
       state.resultEcho.clear();
       state.logicalKeys.clear();
+      state.altGraphTextKeys.clear();
       state.altGraphControlFilter.reset();
       state.activation.reset();
     }
@@ -488,10 +502,10 @@ export class Win32InputController {
     return state;
   }
 
-  #currentModifiers() {
+  #currentModifiers(characterMessage = false) {
     const modifiers = keyboardModifiers(this.#snapshotKeyboardState());
-    modifiers.altGraphKey = this.#layoutHasAltGraph(this.#user32.symbols.GetKeyboardLayout(0)) &&
-      modifiers.altGraphKey;
+    const layoutHasAltGraph = this.#layoutHasAltGraph(this.#user32.symbols.GetKeyboardLayout(0));
+    modifiers.altGraphKey = shouldExposeAltGraph(modifiers, layoutHasAltGraph, characterMessage);
     modifiers.accelKey = modifiers.ctrlKey && !modifiers.altGraphKey;
     return modifiers;
   }
@@ -586,25 +600,32 @@ export class Win32InputController {
     const layout = this.#user32.symbols.GetKeyboardLayout(0);
     const layoutHasAltGraph = this.#layoutHasAltGraph(layout);
     const modifiers = keyboardModifiers(keyboardState);
-    modifiers.altGraphKey = layoutHasAltGraph && modifiers.altGraphKey;
-    modifiers.accelKey = modifiers.ctrlKey && !modifiers.altGraphKey;
+    modifiers.altGraphKey = shouldExposeAltGraph(modifiers, layoutHasAltGraph, false);
     const code = getDomCode(lParam);
+    const identity = win32KeyIdentity(Number(wParam), lParam);
     let key = logicalKeyFromVirtualKey(Number(wParam));
     let translatedText: string | undefined;
     if (type === "keydown") {
-      const stateForTranslation = Uint8Array.from(keyboardState);
-      if (!layoutHasAltGraph) stateForTranslation[VK.RMENU] &= 0x7f;
       const translated = translateLogicalKey(
         Number(wParam),
         lParam,
-        stateForTranslation,
+        keyboardState,
         this.#toUnicodeAdapter(layout),
+        layoutHasAltGraph && modifiers.ctrlKey && modifiers.altKey,
       );
       key = translated.key;
       translatedText = translated.text;
+      if (modifiers.ctrlKey && modifiers.altKey && translatedText !== undefined) {
+        state.altGraphTextKeys.add(identity);
+      } else if (!decodeKeyLParam(lParam).isRepeat) {
+        state.altGraphTextKeys.delete(identity);
+      }
+    } else if (state.altGraphTextKeys.delete(identity)) {
+      modifiers.altGraphKey = layoutHasAltGraph;
     }
+    modifiers.altGraphKey = shouldExposeAltGraph(modifiers, layoutHasAltGraph, translatedText !== undefined);
+    modifiers.accelKey = modifiers.ctrlKey && !modifiers.altGraphKey;
     if (code === "AltRight") key = modifiers.altGraphKey ? "AltGraph" : "Alt";
-    const identity = win32KeyIdentity(Number(wParam), lParam);
     key = type === "keydown" ? state.logicalKeys.press(identity, key) : state.logicalKeys.release(identity, key);
     return {
       suppress: false,
