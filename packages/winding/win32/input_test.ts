@@ -57,6 +57,7 @@ import {
   WM,
 } from "./ffi.ts";
 import { Win32InputController, type Win32InputWindow } from "./input_controller.ts";
+import { decodeWin32DpiChange, scaleWin32OuterGeometry, Win32DpiAwareness, Win32DpiState } from "./dpi.ts";
 import {
   ImeActivationState,
   keyLocationForCode,
@@ -243,19 +244,19 @@ Deno.test("Win32 queue gate preserves WM_QUIT and latches after its signed exit 
 
 Deno.test("Win32 client state reports visibility and authoritative size independently", () => {
   const state = new Win32ClientState();
-  assertEquals(state.observe(false, 800, 600), { size: { width: 800, height: 600 } });
+  assertEquals(state.observe(false, 800, 600), { size: clientSize(800, 600) });
   assertEquals(state.observe(true, 800, 600), { visible: false });
 
   // A size change while minimized must not wait for an unrelated later resize.
-  assertEquals(state.observe(true, 640, 480), { size: { width: 640, height: 480 } });
+  assertEquals(state.observe(true, 640, 480), { size: clientSize(640, 480) });
   // Restore can carry both visibility and a new drawable size.
   assertEquals(state.observe(false, 1024, 768), {
     visible: true,
-    size: { width: 1024, height: 768 },
+    size: clientSize(1024, 768),
   });
   assertEquals(state.observe(false, 1024, 768), {});
   // Maximize is still visible, so only its dimensions change.
-  assertEquals(state.observe(false, 1920, 1080), { size: { width: 1920, height: 1080 } });
+  assertEquals(state.observe(false, 1920, 1080), { size: clientSize(1920, 1080) });
 });
 
 Deno.test("Win32 client state preserves zero and dimensions wider than WM_SIZE words", () => {
@@ -270,7 +271,7 @@ Deno.test("Win32 client state preserves zero and dimensions wider than WM_SIZE w
 
   const state = new Win32ClientState();
   assertEquals(state.observe(false, oversizedZeroHeight.width, oversizedZeroHeight.height), {
-    size: oversizedZeroHeight,
+    size: clientSize(oversizedZeroHeight.width, oversizedZeroHeight.height),
   });
   assertEquals(state.contains(69_999, 0), false);
   assertThrows(() => decodeWin32ClientRect(new ArrayBuffer(15)), RangeError, "truncated RECT");
@@ -278,6 +279,90 @@ Deno.test("Win32 client state preserves zero and dimensions wider than WM_SIZE w
   view.setInt32(0, 10, true);
   view.setInt32(8, 9, true);
   assertThrows(() => decodeWin32ClientRect(rectangle), Error, "invalid client rectangle");
+});
+
+Deno.test("Win32 DPI state maps the primary-screen logical origin and outer frame without client adjustment", () => {
+  const unaware = new Win32DpiState(Win32DpiAwareness.UNAWARE, 192);
+  assertEquals(unaware.dpi, 96);
+  assertEquals(unaware.devicePixelRatio, 1);
+
+  const systemAware = new Win32DpiState(Win32DpiAwareness.SYSTEM, 144);
+  assertEquals(systemAware.outerGeometry(-100, 20, 800, 600), {
+    x: -150,
+    y: 30,
+    width: 1200,
+    height: 900,
+  });
+  assertEquals(systemAware.handlesDpiChanges, false);
+  assertEquals(systemAware.update(192), false);
+  assertEquals(systemAware.dpi, 144);
+
+  const mixedMonitor = new Win32DpiState(Win32DpiAwareness.PER_MONITOR, 192);
+  assertEquals(scaleWin32OuterGeometry(-100, 20, 800, 600, 144, 144), {
+    x: -150,
+    y: 30,
+    width: 1200,
+    height: 900,
+  });
+  assertEquals(mixedMonitor.outerGeometry(-100, 20, 800, 600, 144), {
+    x: -150,
+    y: 30,
+    width: 1600,
+    height: 1200,
+  });
+  assertThrows(() => new Win32DpiState(Win32DpiAwareness.INVALID, 96));
+});
+
+Deno.test("WM_DPICHANGED updates scale before one authoritative logical/framebuffer resize", () => {
+  const rectangle = new ArrayBuffer(16);
+  const view = new DataView(rectangle);
+  view.setInt32(0, -200, true);
+  view.setInt32(4, 100, true);
+  view.setInt32(8, 1400, true);
+  view.setInt32(12, 1300, true);
+  const change = decodeWin32DpiChange((192 << 16) | 192, rectangle);
+  assertEquals(change, { dpi: 192, x: -200, y: 100, width: 1600, height: 1200 });
+
+  const dpi = new Win32DpiState(Win32DpiAwareness.PER_MONITOR, 144);
+  const client = new Win32ClientState();
+  assertEquals(client.observe(false, 1200, 900, dpi.devicePixelRatio), {
+    size: clientSize(1200, 900, 1.5),
+  });
+  assertEquals(dpi.update(change.dpi), true);
+  assertEquals(client.observe(false, 1600, 1200, dpi.devicePixelRatio), {
+    size: clientSize(1600, 1200, 2),
+  });
+  assertEquals(client.observe(false, 1600, 1200, dpi.devicePixelRatio), {});
+
+  assertThrows(() => decodeWin32DpiChange((144 << 16) | 192, rectangle));
+  assertThrows(() => decodeWin32DpiChange((192 << 16) | 192, new ArrayBuffer(15)));
+
+  view.setInt32(0, -1, true);
+  view.setInt32(4, -1, true);
+  view.setInt32(8, 0x7ffffffe, true);
+  view.setInt32(12, 0x7ffffffe, true);
+  assertEquals(decodeWin32DpiChange((192 << 16) | 192, rectangle), {
+    dpi: 192,
+    x: -1,
+    y: -1,
+    width: 0x7fffffff,
+    height: 0x7fffffff,
+  });
+
+  view.setInt32(8, 0x7fffffff, true);
+  assertThrows(() => decodeWin32DpiChange((192 << 16) | 192, rectangle), Error, "invalid");
+  view.setInt32(8, 0x7ffffffe, true);
+  view.setInt32(12, 0x7fffffff, true);
+  assertThrows(() => decodeWin32DpiChange((192 << 16) | 192, rectangle), Error, "invalid");
+});
+
+Deno.test("native client and screen-wheel points convert to public logical coordinates", () => {
+  const dpi = new Win32DpiState(Win32DpiAwareness.PER_MONITOR, 192);
+  assertEquals(
+    { x: dpi.nativeToLogical(600), y: dpi.nativeToLogical(300) },
+    { x: 300, y: 150 },
+  );
+  assertEquals(dpi.logicalToNative(12.5), 25);
 });
 
 Deno.test("Win32 HIMC association remains independent across SETCONTEXT and focus orders", () => {
@@ -358,6 +443,27 @@ Deno.test("Win32 input reports both failed IME placement operations", () => {
   assertEquals(harness.calls.candidatePlacements, 1);
   assertEquals(harness.calls.compositionPlacements, 1);
   assertEquals(harness.calls.releases, 1);
+});
+
+Deno.test("Win32 caches logical IME geometry and reapplies scaled native forms after DPI changes", () => {
+  const behavior: FakeImmBehavior = { devicePixelRatio: 1.5 };
+  const harness = createInputControllerHarness(behavior);
+  harness.controller.attach(harness.window);
+  harness.controller.observeNativeFocus(harness.window, true);
+  harness.controller.setImeCursorArea(harness.window, 10, 20, 2, 10);
+  harness.controller.setImeEnabled(harness.window, true);
+
+  behavior.devicePixelRatio = 2;
+  harness.controller.dpiChanged(harness.window);
+
+  assertEquals(harness.calls.candidateForms.map((form) => readCandidateForm(form)), [
+    { point: [15, 45], rect: [15, 30, 18, 45] },
+    { point: [20, 60], rect: [20, 40, 24, 60] },
+  ]);
+  assertEquals(harness.calls.compositionForms.map((form) => readCompositionForm(form)), [
+    { point: [15, 45], rect: [15, 30, 18, 45] },
+    { point: [20, 60], rect: [20, 40, 24, 60] },
+  ]);
 });
 
 Deno.test("Win32 input recovers association after native cancellation failure", () => {
@@ -1207,6 +1313,26 @@ function readRect(view: DataView, offset: number): [number, number, number, numb
   ];
 }
 
+function readCandidateForm(buffer: ArrayBuffer) {
+  const view = new DataView(buffer);
+  return { point: readPoint(view, 8), rect: readRect(view, 16) };
+}
+
+function readCompositionForm(buffer: ArrayBuffer) {
+  const view = new DataView(buffer);
+  return { point: readPoint(view, 4), rect: readRect(view, 12) };
+}
+
+function clientSize(framebufferWidth: number, framebufferHeight: number, devicePixelRatio = 1) {
+  return {
+    width: framebufferWidth / devicePixelRatio,
+    height: framebufferHeight / devicePixelRatio,
+    framebufferWidth,
+    framebufferHeight,
+    devicePixelRatio,
+  };
+}
+
 function utf16Le(text: string): Uint8Array {
   const bytes = new Uint8Array(text.length * 2);
   const view = new DataView(bytes.buffer);
@@ -1231,6 +1357,7 @@ interface FakeImmBehavior {
   keyboardState?: ReadonlyArray<readonly [virtualKey: number, state: number]>;
   compositionData?: ReadonlyMap<number, Uint8Array | number>;
   onNotifyIme?: () => void;
+  devicePixelRatio?: number;
 }
 
 function createInputControllerHarness(behavior: FakeImmBehavior = {}) {
@@ -1242,6 +1369,8 @@ function createInputControllerHarness(behavior: FakeImmBehavior = {}) {
     compositionPlacements: 0,
     notifications: 0,
     releases: 0,
+    candidateForms: [] as ArrayBuffer[],
+    compositionForms: [] as ArrayBuffer[],
   };
   const events: UIEvent[] = [];
   const user32 = {
@@ -1284,12 +1413,14 @@ function createInputControllerHarness(behavior: FakeImmBehavior = {}) {
         behavior.onNotifyIme?.();
         return behavior.notifyResult ?? 1;
       },
-      ImmSetCandidateWindow() {
+      ImmSetCandidateWindow(_context: unknown, form: ArrayBuffer) {
         calls.candidatePlacements++;
+        calls.candidateForms.push(form.slice(0));
         return behavior.candidateResult ?? 1;
       },
-      ImmSetCompositionWindow() {
+      ImmSetCompositionWindow(_context: unknown, form: ArrayBuffer) {
         calls.compositionPlacements++;
+        calls.compositionForms.push(form.slice(0));
         return behavior.compositionResult ?? 1;
       },
       ImmGetCompositionStringW(_context: unknown, index: number) {
@@ -1301,6 +1432,9 @@ function createInputControllerHarness(behavior: FakeImmBehavior = {}) {
   const window: Win32InputWindow = {
     id: 1n,
     hwnd,
+    get devicePixelRatio() {
+      return behavior.devicePixelRatio ?? 1;
+    },
     close() {},
     setTitle() {},
     blit() {},

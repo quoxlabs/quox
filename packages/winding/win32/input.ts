@@ -61,7 +61,13 @@ export interface Win32ClientStateChange {
   /** Present only when minimized/restored visibility changed. */
   visible?: boolean;
   /** Present only when either authoritative client dimension changed. */
-  size?: { width: number; height: number };
+  size?: {
+    width: number;
+    height: number;
+    framebufferWidth: number;
+    framebufferHeight: number;
+    devicePixelRatio: number;
+  };
 }
 
 /**
@@ -72,16 +78,40 @@ export class Win32ClientState {
   #minimized = false;
   #width: number | undefined;
   #height: number | undefined;
+  #framebufferWidth: number | undefined;
+  #framebufferHeight: number | undefined;
+  #devicePixelRatio: number | undefined;
 
-  observe(minimized: boolean, width: number, height: number): Win32ClientStateChange {
+  get minimized(): boolean {
+    return this.#minimized;
+  }
+
+  observe(
+    minimized: boolean,
+    framebufferWidth: number,
+    framebufferHeight: number,
+    devicePixelRatio = 1,
+  ): Win32ClientStateChange {
+    if (!Number.isFinite(devicePixelRatio) || devicePixelRatio <= 0) {
+      throw new RangeError("winding(win32): invalid device pixel ratio");
+    }
+    const width = framebufferWidth / devicePixelRatio;
+    const height = framebufferHeight / devicePixelRatio;
     const visibilityChanged = minimized !== this.#minimized;
-    const sizeChanged = width !== this.#width || height !== this.#height;
+    const sizeChanged = width !== this.#width || height !== this.#height ||
+      framebufferWidth !== this.#framebufferWidth || framebufferHeight !== this.#framebufferHeight ||
+      devicePixelRatio !== this.#devicePixelRatio;
     this.#minimized = minimized;
     this.#width = width;
     this.#height = height;
+    this.#framebufferWidth = framebufferWidth;
+    this.#framebufferHeight = framebufferHeight;
+    this.#devicePixelRatio = devicePixelRatio;
     return {
       ...(visibilityChanged ? { visible: !minimized } : {}),
-      ...(sizeChanged ? { size: { width, height } } : {}),
+      ...(
+        sizeChanged ? { size: { width, height, framebufferWidth, framebufferHeight, devicePixelRatio } } : {}
+      ),
     };
   }
 

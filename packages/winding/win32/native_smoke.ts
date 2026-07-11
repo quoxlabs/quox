@@ -47,6 +47,14 @@ const testUser32Functions = {
     parameters: ["pointer", "buffer"],
     result: "i32",
   },
+  GetDpiForWindow: {
+    parameters: ["pointer"],
+    result: "u32",
+  },
+  GetDpiForSystem: {
+    parameters: [],
+    result: "u32",
+  },
   SetWindowPos: {
     parameters: ["pointer", "pointer", "i32", "i32", "i32", "i32", "u32"],
     result: "i32",
@@ -127,14 +135,14 @@ function runLifecycle(
       assertWindowGeometry(user32, window, 0, 0, 320, 240);
       const size = assertSingleInitialResize(library, window);
       assertRepaintPixel(user32, gdi32, window, 0x000000);
-      const rgba = new Uint8Array(size.width * size.height * 4);
+      const rgba = new Uint8Array(size.framebufferWidth * size.framebufferHeight * 4);
       for (let offset = 0; offset < rgba.length; offset += 4) {
         rgba[offset] = 0x12;
         rgba[offset + 1] = 0x34;
         rgba[offset + 2] = 0x56;
         rgba[offset + 3] = 0xff;
       }
-      window.blit(rgba, size.width, size.height);
+      window.blit(rgba, size.framebufferWidth, size.framebufferHeight);
       assertRepaintPixel(user32, gdi32, window, 0x563412);
       // Keep hosted CI independent of foreground-window and desktop behavior.
       user32.symbols.ShowWindow(window.hwnd, SW_HIDE);
@@ -161,7 +169,10 @@ function runLifecycle(
         throw new Error("Expected a Win32 commit containing A");
       }
 
-      assertAuthoritativeResizeEvents(user32, library, window, size);
+      assertAuthoritativeResizeEvents(user32, library, window, {
+        width: size.framebufferWidth,
+        height: size.framebufferHeight,
+      });
       assertThreadQueuePreservation(user32, library, window);
     } finally {
       if (destroyExternally && user32.symbols.DestroyWindow(window.hwnd) === 0) {
@@ -308,10 +319,15 @@ function assertNativeWindowState(
     throw new Error(`Expected resize=${changed}, received ${resize.length} resize events`);
   }
   const last = resize.at(-1);
+  const dpi = user32.symbols.GetDpiForWindow(window.hwnd);
+  if (dpi === 0) throw new Error("GetDpiForWindow rejected the native resize test");
+  const devicePixelRatio = dpi / 96;
   if (
     last !== undefined &&
-    (last.width !== currentSize.width || last.height !== currentSize.height ||
-      last.framebufferWidth !== currentSize.width || last.framebufferHeight !== currentSize.height)
+    (last.width !== currentSize.width / devicePixelRatio ||
+      last.height !== currentSize.height / devicePixelRatio ||
+      last.framebufferWidth !== currentSize.width || last.framebufferHeight !== currentSize.height ||
+      last.devicePixelRatio !== devicePixelRatio)
   ) {
     throw new Error(
       `Expected authoritative client size ${currentSize.width}x${currentSize.height}, received ${last.width}x${last.height}`,
@@ -426,25 +442,51 @@ function assertWindowGeometry(
     view.getInt32(8, true) - view.getInt32(0, true),
     view.getInt32(12, true) - view.getInt32(4, true),
   ];
-  const expected = [x, y, width, height];
+  const systemDpi = user32.symbols.GetDpiForSystem();
+  const windowDpi = user32.symbols.GetDpiForWindow(window.hwnd);
+  if (systemDpi === 0 || windowDpi === 0) throw new Error("DPI query rejected the Win32 geometry test");
+  const expected = [
+    Math.round(x * systemDpi / 96),
+    Math.round(y * systemDpi / 96),
+    Math.round(width * windowDpi / 96),
+    Math.round(height * windowDpi / 96),
+  ];
   if (actual.some((value, index) => value !== expected[index])) {
     throw new Error(`Expected Win32 outer geometry ${expected.join(",")}, received ${actual.join(",")}`);
   }
 }
 
-function assertSingleInitialResize(library: Library, window: Window): { width: number; height: number } {
+function assertSingleInitialResize(
+  library: Library,
+  window: Window,
+): {
+  width: number;
+  height: number;
+  framebufferWidth: number;
+  framebufferHeight: number;
+} {
   let resizeCount = 0;
-  let size: { width: number; height: number } | undefined;
+  let size:
+    | { width: number; height: number; framebufferWidth: number; framebufferHeight: number }
+    | undefined;
   for (let count = 0; count < 64; count++) {
     const event = library.event();
     if (event === undefined) break;
     if (event.type === "resize" && event.window === window) {
       resizeCount++;
-      size = { width: event.width, height: event.height };
+      size = {
+        width: event.width,
+        height: event.height,
+        framebufferWidth: event.framebufferWidth,
+        framebufferHeight: event.framebufferHeight,
+      };
     }
   }
   if (resizeCount !== 1) throw new Error(`Expected one initial Win32 resize event, received ${resizeCount}`);
-  if (size === undefined || size.width <= 0 || size.height <= 0) {
+  if (
+    size === undefined || size.width <= 0 || size.height <= 0 ||
+    size.framebufferWidth <= 0 || size.framebufferHeight <= 0
+  ) {
     throw new Error("Expected positive initial Win32 client dimensions");
   }
   return size;

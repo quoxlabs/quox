@@ -23,6 +23,18 @@ Winding intentionally does not ship a compiled Objective-C catch shim. The packa
 frameworks, and a complete shim would need architecture-specific wrappers for every Objective-C message shape while
 still being unable to catch memory faults. Known AppKit preconditions should instead be enforced before crossing FFI.
 
+## Win32 DPI hosting
+
+The Win32 backend inherits the calling thread's effective DPI-awareness context and never changes process-global or
+thread-global awareness. Public window, client, pointer, and IME geometry uses 96-DPI logical units. Resize events keep
+the exact native client-pixel dimensions separately as `framebufferWidth`/`framebufferHeight`, with `devicePixelRatio`
+describing the conversion required by `blit()`.
+
+For per-monitor-aware host contexts, Winding applies the suggested outer rectangle from `WM_DPICHANGED`, refreshes the
+logical/framebuffer resize state, and repositions native IME UI. DPI-unaware and system-aware hosts retain Windows'
+bitmap-virtualization behavior. Outer window positions are scaled from the primary display's logical origin using the
+context-appropriate system DPI; outer dimensions use the target window's DPI once its monitor is known.
+
 ## Usage
 
 Create `app.ts` with the following content.

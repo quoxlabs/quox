@@ -3,6 +3,14 @@ import { DeferredNativeError, guardNativeCallback } from "../input/callback.ts";
 import { EventQueue } from "../input/event_queue.ts";
 import { ClickCounter, NativeEventClock } from "../input/events.ts";
 import {
+  decodeWin32DpiChange,
+  scaleWin32OuterGeometry,
+  USER_DEFAULT_SCREEN_DPI,
+  Win32DpiAwareness,
+  Win32DpiState,
+  type Win32OuterGeometry,
+} from "./dpi.ts";
+import {
   gdi32functions,
   imm32functions,
   kernel32functions,
@@ -37,6 +45,8 @@ const BLACKNESS = 0x00000042;
 const DIB_RGB_COLORS = 0;
 const ERROR_CLASS_DOES_NOT_EXIST = 1411;
 const SW_SHOW = 5;
+const SWP_NOZORDER = 0x0004;
+const SWP_NOACTIVATE = 0x0010;
 const WS_OVERLAPPEDWINDOW = 0x00CF0000;
 
 let win32LibraryActive = false;
@@ -98,6 +108,7 @@ class Win32Window implements Window {
   readonly mouseTracking = new Win32MouseTrackingState();
   pointerSnapshot: Win32PointerSnapshot | undefined;
   readonly clientState = new Win32ClientState();
+  readonly dpiState: Win32DpiState;
   #closing = false;
   #destroyed = false;
 
@@ -108,16 +119,27 @@ class Win32Window implements Window {
     y: number,
     width: number,
     height: number,
+    creationThreadDpiAwareness: Win32DpiAwareness,
+    systemDpi: number,
   ) {
+    if (
+      creationThreadDpiAwareness === Win32DpiAwareness.UNAWARE &&
+      systemDpi !== USER_DEFAULT_SCREEN_DPI
+    ) {
+      throw new Error("winding(win32): unaware thread reported non-default system DPI");
+    }
+    // Create on the intended monitor using primary/system scaling first. Once
+    // the HWND exists, its monitor DPI can refine outer size without moving it.
+    const provisionalGeometry = scaleWin32OuterGeometry(x, y, width, height, systemDpi, systemDpi);
     const window = lib.user32.symbols.CreateWindowExW(
       0,
       classNameBuf,
       null,
       WS_OVERLAPPEDWINDOW,
-      x,
-      y,
-      width,
-      height,
+      provisionalGeometry.x,
+      provisionalGeometry.y,
+      provisionalGeometry.width,
+      provisionalGeometry.height,
       null,
       null,
       lib.instance,
@@ -126,8 +148,29 @@ class Win32Window implements Window {
     if (window == null) throw new Error(lib.getLastError());
     this.#hwnd = window;
     this.id = BigInt(Deno.UnsafePointer.value(window));
-    lib.windows.set(this.id, this);
     try {
+      this.dpiState = lib.dpiStateForWindow(window);
+      let appliedGeometry = provisionalGeometry;
+      for (let attempt = 0; attempt < 4; attempt++) {
+        const nativeGeometry = this.dpiState.outerGeometry(x, y, width, height, systemDpi);
+        if (
+          nativeGeometry.x !== appliedGeometry.x || nativeGeometry.y !== appliedGeometry.y ||
+          nativeGeometry.width !== appliedGeometry.width || nativeGeometry.height !== appliedGeometry.height
+        ) {
+          lib.setOuterGeometry(window, nativeGeometry);
+          appliedGeometry = nativeGeometry;
+        }
+        const observedDpi = lib.dpiForWindow(window);
+        if (observedDpi === this.dpiState.dpi) break;
+        if (!this.dpiState.handlesDpiChanges || attempt === 3) {
+          throw new Error("winding(win32): initial window DPI did not stabilize");
+        }
+        // A large size correction can change the monitor owning the still-
+        // hidden HWND. Re-query and refine so an initialization-time
+        // WM_DPICHANGED cannot leave cached scale stale before registration.
+        this.dpiState.update(observedDpi);
+      }
+      lib.windows.set(this.id, this);
       lib.input.attach(this);
       lib.publishInitialWindowState(this);
       lib.user32.symbols.ShowWindow(window, SW_SHOW);
@@ -146,6 +189,14 @@ class Win32Window implements Window {
 
   get hwnd(): Deno.PointerObject {
     return this.#hwnd;
+  }
+
+  get devicePixelRatio(): number {
+    return this.dpiState.devicePixelRatio;
+  }
+
+  nativeToLogical(value: number): number {
+    return this.dpiState.nativeToLogical(value);
   }
 
   containsClientPoint(x: number, y: number): boolean {
@@ -348,6 +399,16 @@ class Win32Library implements Library {
         }
         if (inputResult !== undefined) return inputResult;
         switch (uMsg) {
+          case WM.NCCREATE:
+            // Per-Monitor-V1 hosts require this window-local opt-in for the
+            // non-client frame. V2 does it automatically; other contexts can
+            // reject the call without affecting client-area DPI handling.
+            try {
+              this.user32.symbols.EnableNonClientDpiScaling(hWnd);
+            } catch {
+              // Optional enhancement only: continue normal NCCREATE handling.
+            }
+            break;
           case WM.PAINT: {
             if (win === undefined) break;
             const paint = new ArrayBuffer(PAINTSTRUCT_SIZE);
@@ -380,6 +441,23 @@ class Win32Library implements Library {
             if (win === undefined) break;
             this.#publishClientState(win, Number(wParam) === SIZE_MINIMIZED);
             break;
+          }
+          case WM.DPICHANGED: {
+            if (win === undefined || !win.dpiState.handlesDpiChanges) break;
+            const rectanglePointer = Deno.UnsafePointer.create(BigInt(lParam));
+            if (rectanglePointer === null) throw new Error("winding(win32): WM_DPICHANGED omitted its rectangle");
+            const rectangle = new Uint8Array(16);
+            new Deno.UnsafePointerView(rectanglePointer).copyInto(rectangle);
+            const change = decodeWin32DpiChange(wParam, rectangle);
+            win.dpiState.update(change.dpi);
+            const errors: unknown[] = [];
+            // Updating DPI first ensures a synchronous WM_SIZE is converted
+            // with the new scale rather than publishing a stale logical size.
+            captureError(errors, () => this.setOuterGeometry(win.hwnd, change));
+            captureError(errors, () => this.#publishClientState(win, win.clientState.minimized));
+            captureError(errors, () => this.input.dpiChanged(win));
+            throwCollected(errors, "Failed to apply Win32 DPI change");
+            return 0n;
           }
           case WM.CLOSE:
             if (win === undefined) break;
@@ -602,6 +680,57 @@ class Win32Library implements Library {
     this.#events.purgeWindow(window);
   }
 
+  currentThreadDpiAwareness(): Win32DpiAwareness {
+    const context = this.user32.symbols.GetThreadDpiAwarenessContext();
+    if (context === null) throw new Error("winding(win32): no thread DPI awareness context");
+    return this.#dpiAwareness(context);
+  }
+
+  dpiStateForWindow(window: Deno.PointerObject): Win32DpiState {
+    const context = this.user32.symbols.GetWindowDpiAwarenessContext(window);
+    if (context === null) throw new Error("winding(win32): no window DPI awareness context");
+    return new Win32DpiState(this.#dpiAwareness(context), this.dpiForWindow(window));
+  }
+
+  dpiForWindow(window: Deno.PointerObject): number {
+    const dpi = this.user32.symbols.GetDpiForWindow(window);
+    if (dpi === 0) throw new Error("winding(win32): GetDpiForWindow failed");
+    return dpi;
+  }
+
+  systemDpi(): number {
+    const dpi = this.user32.symbols.GetDpiForSystem();
+    if (dpi === 0) throw new Error("winding(win32): GetDpiForSystem failed");
+    return dpi;
+  }
+
+  #dpiAwareness(context: Deno.PointerObject): Win32DpiAwareness {
+    const awareness = this.user32.symbols.GetAwarenessFromDpiAwarenessContext(context);
+    if (
+      awareness !== Win32DpiAwareness.UNAWARE && awareness !== Win32DpiAwareness.SYSTEM &&
+      awareness !== Win32DpiAwareness.PER_MONITOR
+    ) {
+      throw new Error("winding(win32): invalid DPI awareness context");
+    }
+    return awareness;
+  }
+
+  setOuterGeometry(window: Deno.PointerObject, geometry: Win32OuterGeometry): void {
+    if (
+      this.user32.symbols.SetWindowPos(
+        window,
+        null,
+        geometry.x,
+        geometry.y,
+        geometry.width,
+        geometry.height,
+        SWP_NOZORDER | SWP_NOACTIVATE,
+      ) === 0
+    ) {
+      throw new Error(this.getLastError());
+    }
+  }
+
   #nativeCaptureOwner(): bigint | undefined {
     const capture = this.user32.symbols.GetCapture();
     return capture === null ? undefined : BigInt(Deno.UnsafePointer.value(capture));
@@ -637,6 +766,10 @@ class Win32Library implements Library {
       point.x = clientPoint[0];
       point.y = clientPoint[1];
     }
+    // Mouse messages and ScreenToClient use the HWND's native coordinate
+    // space. Public pointer coordinates share the resize event's logical units.
+    point.x = window.nativeToLogical(point.x);
+    point.y = window.nativeToLogical(point.y);
     const keyState = Number(BigInt(wParam) & 0xffffn);
     let buttons = win32Buttons(keyState);
     if (changedButton !== undefined && pressed !== undefined) {
@@ -711,8 +844,13 @@ class Win32Library implements Library {
     if (this.user32.symbols.GetClientRect(window.hwnd, clientRect) === 0) {
       throw new Error(this.getLastError());
     }
-    const { width, height } = decodeWin32ClientRect(clientRect);
-    const change = window.clientState.observe(minimized, width, height);
+    const framebuffer = decodeWin32ClientRect(clientRect);
+    const change = window.clientState.observe(
+      minimized,
+      framebuffer.width,
+      framebuffer.height,
+      window.devicePixelRatio,
+    );
     if (change.visible !== undefined) {
       this.#events.push({ type: "visibilitychange", visible: change.visible, window });
     }
@@ -721,9 +859,9 @@ class Win32Library implements Library {
         type: "resize",
         width: change.size.width,
         height: change.size.height,
-        framebufferWidth: change.size.width,
-        framebufferHeight: change.size.height,
-        devicePixelRatio: 1,
+        framebufferWidth: change.size.framebufferWidth,
+        framebufferHeight: change.size.framebufferHeight,
+        devicePixelRatio: change.size.devicePixelRatio,
         window,
       });
     }
@@ -733,7 +871,9 @@ class Win32Library implements Library {
   openWindow(x = 0, y = 0, w = 800, h = 600): Win32Window {
     if (this.#closed || this.#closing) throw new Error("winding(win32): library is closed");
     validateWin32Geometry(x, y, w, h);
-    const window = new Win32Window(this, this.#classNameBuffer, x, y, w, h);
+    const threadAwareness = this.currentThreadDpiAwareness();
+    const systemDpi = this.systemDpi();
+    const window = new Win32Window(this, this.#classNameBuffer, x, y, w, h, threadAwareness, systemDpi);
     try {
       this.#callbackErrors.throwIfPending();
       return window;

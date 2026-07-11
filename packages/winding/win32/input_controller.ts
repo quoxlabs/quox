@@ -11,7 +11,12 @@ import {
   ImeActivationState,
   type PreeditUpdate,
 } from "../input/mod.ts";
-import { type ImeCursorArea, normalizeImeCursorArea, validateImeCursorRange } from "../input/ime.ts";
+import {
+  type ImeCursorArea,
+  normalizeImeCursorArea,
+  validateImeCursorArea,
+  validateImeCursorRange,
+} from "../input/ime.ts";
 import { PressedLogicalKeyCache } from "../input/pressed_keys.ts";
 import { getDomCode } from "./dom_code.ts";
 import {
@@ -81,6 +86,7 @@ const IME_COMPOSITION_FLAGS = GCS_ALL | CS_INSERTCHAR | CS_NOMOVECARET;
 export interface Win32InputWindow extends Window {
   readonly id: bigint;
   readonly hwnd: Deno.PointerObject;
+  readonly devicePixelRatio: number;
 }
 
 interface WindowInputState {
@@ -229,10 +235,16 @@ export class Win32InputController {
   }
 
   setImeCursorArea(window: Win32InputWindow, x: number, y: number, width: number, height: number): void {
-    const rectangle = normalizeImeCursorArea(x, y, width, height);
+    const rectangle = validateImeCursorArea(x, y, width, height);
     if (rectangle === undefined) return;
     const state = this.#state(window);
     state.cursorArea = rectangle;
+    if (state.activation.active) this.#applyImeCursorArea(window, state);
+  }
+
+  /** Reapply cached logical IME geometry after the HWND's effective DPI changes. */
+  dpiChanged(window: Win32InputWindow): void {
+    const state = this.#state(window);
     if (state.activation.active) this.#applyImeCursorArea(window, state);
   }
 
@@ -1077,7 +1089,15 @@ export class Win32InputController {
   }
 
   #applyImeCursorArea(window: Win32InputWindow, state: WindowInputState): void {
-    const rectangle = state.cursorArea;
+    const logical = state.cursorArea;
+    if (logical === undefined) return;
+    const scale = window.devicePixelRatio;
+    const rectangle = normalizeImeCursorArea(
+      logical.x * scale,
+      logical.y * scale,
+      logical.width * scale,
+      logical.height * scale,
+    );
     if (rectangle === undefined) return;
     const applied = this.#withImeContext(window, (context) => {
       const errors: unknown[] = [];
