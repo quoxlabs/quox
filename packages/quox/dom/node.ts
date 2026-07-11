@@ -20,6 +20,109 @@ type LiveTextControlRenderer = {
   set_form_control_value(nodeHandle: number, value: string): boolean;
 };
 
+type TextControlSelectionRenderer = {
+  form_control_selection(nodeHandle: number): Uint32Array | undefined;
+  set_form_control_selection(
+    nodeHandle: number,
+    start: number,
+    end: number,
+    direction: number,
+  ): boolean | undefined;
+  select_form_control_text(nodeHandle: number): boolean;
+};
+
+export type QuoxSelectionDirection = "none" | "forward" | "backward";
+
+type TextControlSelection = {
+  readonly start: number;
+  readonly end: number;
+  readonly direction: QuoxSelectionDirection;
+};
+
+const UINT32_MODULUS = 0x1_0000_0000;
+
+/** Web IDL `unsigned long` conversion (ordinary modulo semantics, without Clamp/EnforceRange). */
+function unsignedLong(value: unknown): number {
+  // Unary plus performs ECMAScript ToNumber, including the required TypeError for Symbol/BigInt.
+  const number = +(value as number);
+  if (!Number.isFinite(number) || number === 0) return 0;
+  const remainder = Math.trunc(number) % UINT32_MODULUS;
+  return remainder < 0 ? remainder + UINT32_MODULUS : remainder;
+}
+
+function selectionDirection(value: unknown): QuoxSelectionDirection {
+  if (value === undefined) return "none";
+  if (typeof value === "symbol") throw new TypeError("a Web IDL string cannot be a symbol");
+  const direction = String(value);
+  return direction === "forward" || direction === "backward" ? direction : "none";
+}
+
+function selectionDirectionCode(direction: QuoxSelectionDirection): number {
+  switch (direction) {
+    case "none":
+      return 0;
+    case "forward":
+      return 1;
+    case "backward":
+      return 2;
+  }
+}
+
+function readTextControlSelection(element: QuoxElement): TextControlSelection | null {
+  const { renderer } = documentInternals(element.ownerDocument);
+  const values = (renderer as unknown as TextControlSelectionRenderer).form_control_selection(element.nodeId);
+  if (values === undefined) return null;
+  if (values.length !== 3) throw new RangeError("quox: invalid text-control selection payload");
+  const start = assertUint32(values[0], "selectionStart");
+  const end = assertUint32(values[1], "selectionEnd");
+  const directionCode = assertUint32(values[2], "selectionDirection");
+  const direction = directionCode === 0
+    ? "none"
+    : directionCode === 1
+    ? "forward"
+    : directionCode === 2
+    ? "backward"
+    : undefined;
+  if (direction === undefined || end < start) {
+    throw new RangeError("quox: invalid text-control selection payload");
+  }
+  return { start, end, direction };
+}
+
+function requireTextControlSelection(element: QuoxElement): TextControlSelection {
+  const selection = readTextControlSelection(element);
+  if (selection === null) {
+    throw new DOMException("The input element's type does not support selection.", "InvalidStateError");
+  }
+  return selection;
+}
+
+function setTextControlSelection(
+  element: QuoxElement,
+  start: number,
+  end: number,
+  direction: QuoxSelectionDirection,
+): void {
+  const { renderer, requestRender } = documentInternals(element.ownerDocument);
+  const changed = (renderer as unknown as TextControlSelectionRenderer).set_form_control_selection(
+    element.nodeId,
+    start,
+    end,
+    selectionDirectionCode(direction),
+  );
+  if (changed === undefined) {
+    throw new DOMException("The input element's type does not support selection.", "InvalidStateError");
+  }
+  if (changed) requestRender();
+}
+
+function selectTextControl(element: QuoxElement): void {
+  const { renderer, requestRender } = documentInternals(element.ownerDocument);
+  if ((renderer as unknown as TextControlSelectionRenderer).select_form_control_text(element.nodeId)) {
+    requestRender();
+  }
+}
+
 /** Web IDL DOMString conversion followed by the scalar-value repair required by Rust UTF-8. */
 function boundaryString(value: unknown): string {
   if (typeof value === "symbol") throw new TypeError("a Web IDL string cannot be a symbol");
@@ -165,6 +268,51 @@ export class QuoxInputElement extends QuoxElement {
   set defaultValue(value: string) {
     this.setAttribute("value", boundaryString(value));
   }
+
+  get selectionStart(): number | null {
+    return readTextControlSelection(this)?.start ?? null;
+  }
+
+  set selectionStart(value: number | null) {
+    const start = unsignedLong(value);
+    const selection = requireTextControlSelection(this);
+    const end = selection.end < start ? start : selection.end;
+    setTextControlSelection(this, start, end, selection.direction);
+  }
+
+  get selectionEnd(): number | null {
+    return readTextControlSelection(this)?.end ?? null;
+  }
+
+  set selectionEnd(value: number | null) {
+    const end = unsignedLong(value);
+    const selection = requireTextControlSelection(this);
+    setTextControlSelection(this, selection.start, end, selection.direction);
+  }
+
+  get selectionDirection(): QuoxSelectionDirection | null {
+    return readTextControlSelection(this)?.direction ?? null;
+  }
+
+  set selectionDirection(value: QuoxSelectionDirection | null) {
+    const direction = selectionDirection(value);
+    const selection = requireTextControlSelection(this);
+    setTextControlSelection(this, selection.start, selection.end, direction);
+  }
+
+  setSelectionRange(start: number, end: number, direction: QuoxSelectionDirection = "none"): void {
+    if (arguments.length < 2) {
+      throw new TypeError("setSelectionRange requires at least 2 arguments");
+    }
+    const convertedStart = unsignedLong(start);
+    const convertedEnd = unsignedLong(end);
+    const convertedDirection = selectionDirection(direction);
+    setTextControlSelection(this, convertedStart, convertedEnd, convertedDirection);
+  }
+
+  select(): void {
+    selectTextControl(this);
+  }
 }
 
 export class QuoxTextAreaElement extends QuoxElement {
@@ -188,6 +336,51 @@ export class QuoxTextAreaElement extends QuoxElement {
 
   set defaultValue(value: string) {
     this.textContent = boundaryString(value);
+  }
+
+  get selectionStart(): number {
+    return requireTextControlSelection(this).start;
+  }
+
+  set selectionStart(value: number) {
+    const start = unsignedLong(value);
+    const selection = requireTextControlSelection(this);
+    const end = selection.end < start ? start : selection.end;
+    setTextControlSelection(this, start, end, selection.direction);
+  }
+
+  get selectionEnd(): number {
+    return requireTextControlSelection(this).end;
+  }
+
+  set selectionEnd(value: number) {
+    const end = unsignedLong(value);
+    const selection = requireTextControlSelection(this);
+    setTextControlSelection(this, selection.start, end, selection.direction);
+  }
+
+  get selectionDirection(): QuoxSelectionDirection {
+    return requireTextControlSelection(this).direction;
+  }
+
+  set selectionDirection(value: QuoxSelectionDirection) {
+    const direction = selectionDirection(value);
+    const selection = requireTextControlSelection(this);
+    setTextControlSelection(this, selection.start, selection.end, direction);
+  }
+
+  setSelectionRange(start: number, end: number, direction: QuoxSelectionDirection = "none"): void {
+    if (arguments.length < 2) {
+      throw new TypeError("setSelectionRange requires at least 2 arguments");
+    }
+    const convertedStart = unsignedLong(start);
+    const convertedEnd = unsignedLong(end);
+    const convertedDirection = selectionDirection(direction);
+    setTextControlSelection(this, convertedStart, convertedEnd, convertedDirection);
+  }
+
+  select(): void {
+    selectTextControl(this);
   }
 }
 

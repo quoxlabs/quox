@@ -1,6 +1,6 @@
 use super::{QuoxRenderer, QuoxRendererState};
-use crate::ffi_numbers::{NumericArgumentError, uint32};
-use crate::form_controls::restore_text_editor;
+use crate::ffi_numbers::{NumericArgumentError, integer_range, uint32};
+use crate::form_controls::{TextControlSelectionDirection, restore_text_editor};
 use blitz_dom::{BaseDocument, DocumentMutator, LocalName, NodeData, QualName, ns};
 use style::computed_values::visibility::T as Visibility;
 use wasm_bindgen::prelude::*;
@@ -49,6 +49,18 @@ fn unsupported_form_control_value(node_handle: u32) -> JsValue {
         "DOM node handle does not identify a supported form-control value: {node_handle}"
     ))
     .into()
+}
+
+fn selection_offset(value: usize) -> Result<u32, JsValue> {
+    u32::try_from(value).map_err(|_| {
+        js_sys::RangeError::new("quox: text-control selection offset exceeds unsigned long").into()
+    })
+}
+
+fn selection_index(value: u32) -> Result<usize, JsValue> {
+    usize::try_from(value).map_err(|_| {
+        js_sys::RangeError::new("quox: text-control selection offset exceeds target usize").into()
+    })
 }
 
 fn invalid_internal_node(node_id: usize) -> JsValue {
@@ -915,6 +927,80 @@ impl QuoxRenderer {
         };
         state.reconcile_native_ime_after_editor_mutation(ime_before);
         Ok(changed)
+    }
+
+    /// Return `[selectionStart, selectionEnd, direction]` for a selectable text control. Input
+    /// states to which HTML's range APIs do not apply return `undefined` at the JS boundary.
+    pub fn form_control_selection(&self, node_handle: f64) -> Result<Option<Box<[u32]>>, JsValue> {
+        let node_handle =
+            uint32(node_handle, "nodeHandle").map_err(NumericArgumentError::into_js)?;
+        let mut state = self.state.borrow_mut();
+        let node_id = state.resolve_element(node_handle)?;
+        let selection = {
+            let QuoxRendererState {
+                document,
+                text_controls,
+                ..
+            } = &mut *state;
+            text_controls.selection(document, node_id)
+        };
+        let Some(selection) = selection else {
+            return Ok(None);
+        };
+        Ok(Some(
+            [
+                selection_offset(selection.start)?,
+                selection_offset(selection.end)?,
+                selection.direction.wire_value(),
+            ]
+            .into(),
+        ))
+    }
+
+    /// Set a selectable control's UTF-16 range and return whether its extent or direction changed.
+    /// `undefined` tells the browser wrapper to throw `InvalidStateError` for this input state.
+    pub fn set_form_control_selection(
+        &self,
+        node_handle: f64,
+        start: f64,
+        end: f64,
+        direction: f64,
+    ) -> Result<Option<bool>, JsValue> {
+        let node_handle =
+            uint32(node_handle, "nodeHandle").map_err(NumericArgumentError::into_js)?;
+        let start = uint32(start, "selectionStart").map_err(NumericArgumentError::into_js)?;
+        let end = uint32(end, "selectionEnd").map_err(NumericArgumentError::into_js)?;
+        let direction = integer_range(direction, 0, 2, "selectionDirection")
+            .map_err(NumericArgumentError::into_js)?;
+        let direction =
+            TextControlSelectionDirection::from_wire_value(direction).ok_or_else(|| {
+                js_sys::RangeError::new("quox: unknown text-control selection direction")
+            })?;
+        let start = selection_index(start)?;
+        let end = selection_index(end)?;
+        let mut state = self.state.borrow_mut();
+        let node_id = state.resolve_element(node_handle)?;
+        let QuoxRendererState {
+            document,
+            text_controls,
+            ..
+        } = &mut *state;
+        Ok(text_controls.set_selection_range(document, node_id, start, end, direction))
+    }
+
+    /// Select every character in a control whose current rendered UI exposes selectable text.
+    /// Unsupported and button-like controls follow HTML by ignoring the call.
+    pub fn select_form_control_text(&self, node_handle: f64) -> Result<bool, JsValue> {
+        let node_handle =
+            uint32(node_handle, "nodeHandle").map_err(NumericArgumentError::into_js)?;
+        let mut state = self.state.borrow_mut();
+        let node_id = state.resolve_element(node_handle)?;
+        let QuoxRendererState {
+            document,
+            text_controls,
+            ..
+        } = &mut *state;
+        Ok(text_controls.select_all(document, node_id))
     }
 
     /// Return a target-first propagation path for a synthetic event dispatched on a DOM node.

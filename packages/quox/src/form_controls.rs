@@ -12,6 +12,47 @@ pub(crate) struct TextControlStates {
     controls: HashMap<usize, TextControlState>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum TextControlSelectionDirection {
+    #[default]
+    None,
+    Forward,
+    Backward,
+}
+
+impl TextControlSelectionDirection {
+    pub(crate) fn from_wire_value(value: u32) -> Option<Self> {
+        match value {
+            0 => Some(Self::None),
+            1 => Some(Self::Forward),
+            2 => Some(Self::Backward),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn wire_value(self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::Forward => 1,
+            Self::Backward => 2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TextControlSelection {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) direction: TextControlSelectionDirection,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct EditorSelectionState {
+    anchor: usize,
+    focus: usize,
+    direction: TextControlSelectionDirection,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TextControlKind {
     InputText,
@@ -98,6 +139,9 @@ struct TextControlState {
     /// Exact Parley buffer. URL/email sanitizers may expose a different API value without making
     /// a read mutate the user's in-progress editor text or composition.
     editor_value: String,
+    /// Parley's raw UTF-8 anchor/focus plus the browser direction which Parley cannot represent
+    /// independently (most importantly, a non-collapsed selection with direction `none`).
+    selection: EditorSelectionState,
     dirty_value: bool,
     /// False while an otherwise-retained valid value is passing through an input value-mode
     /// which Quox/Blitz cannot currently render, expose, or sanitize (date/range/color and
@@ -189,6 +233,7 @@ impl TextControlStates {
         kind: TextControlKind,
         default_value: String,
     ) {
+        self.sync_editor_selection(document, node_id);
         let control = self
             .controls
             .entry(node_id)
@@ -197,10 +242,12 @@ impl TextControlStates {
                 value: kind.normalize_value(&default_value),
                 editor_value: kind.normalize_value(&default_value),
                 default_value: default_value.clone(),
+                selection: EditorSelectionState::default(),
                 dirty_value: false,
                 active: true,
             });
 
+        let selection_projection_kind = control.kind;
         let previously_selectable = control.active && control.kind.supports_selection();
         let reactivating = !control.active;
         let mut move_selection_to_start = false;
@@ -222,11 +269,27 @@ impl TextControlStates {
         }
 
         let editor_value = control.editor_value.clone();
+        let preserved_direction = control.selection.direction;
         ensure_text_editor(document, node_id, kind);
-        apply_value_to_editor(document, node_id, &editor_value, false);
+        apply_value_to_editor(
+            document,
+            node_id,
+            &editor_value,
+            false,
+            selection_projection_kind,
+        );
         if move_selection_to_start {
             document.with_text_input(node_id, |mut driver| driver.move_to_text_start());
         }
+        self.record_editor_selection(
+            document,
+            node_id,
+            if move_selection_to_start {
+                TextControlSelectionDirection::None
+            } else {
+                preserved_direction
+            },
+        );
     }
 
     /// Return the live value, including active composition text. Native defaults synchronize this
@@ -268,17 +331,36 @@ impl TextControlStates {
             };
         }
 
-        let control = self
-            .controls
-            .get_mut(&node_id)
-            .expect("reconcile_control inserted the text control");
-        let value = control.kind.normalize_value(value);
-        let value_changed = control.value != value;
-        let editor_changed = control.editor_value != value;
-        control.value.clone_from(&value);
-        control.editor_value.clone_from(&value);
-        control.dirty_value = true;
-        apply_value_to_editor(document, node_id, &value, value_changed);
+        self.sync_editor_selection(document, node_id);
+        let (value, value_changed, editor_changed, preserved_direction, kind) = {
+            let control = self
+                .controls
+                .get_mut(&node_id)
+                .expect("reconcile_control inserted the text control");
+            let value = control.kind.normalize_value(value);
+            let value_changed = control.value != value;
+            let editor_changed = control.editor_value != value;
+            control.value.clone_from(&value);
+            control.editor_value.clone_from(&value);
+            control.dirty_value = true;
+            (
+                value,
+                value_changed,
+                editor_changed,
+                control.selection.direction,
+                control.kind,
+            )
+        };
+        apply_value_to_editor(document, node_id, &value, value_changed, kind);
+        self.record_editor_selection(
+            document,
+            node_id,
+            if value_changed {
+                TextControlSelectionDirection::None
+            } else {
+                preserved_direction
+            },
+        );
         Some(value_changed || editor_changed)
     }
 
@@ -293,9 +375,12 @@ impl TextControlStates {
         if !self.controls.contains_key(&node_id) && !self.reconcile_control(document, node_id) {
             return false;
         }
-        let Some((raw_editor_value, composing)) = editor_snapshot(document, node_id) else {
+        let Some(snapshot) = editor_snapshot(document, node_id) else {
             return false;
         };
+        self.sync_editor_selection_from_snapshot(node_id, &snapshot);
+        let raw_editor_value = snapshot.raw_text;
+        let composing = snapshot.composing;
         let (changed, corrected_editor_value) = {
             let control = self
                 .controls
@@ -325,9 +410,195 @@ impl TextControlStates {
             )
         };
         if let Some(editor_value) = corrected_editor_value {
-            apply_value_to_editor(document, node_id, &editor_value, false);
+            let control = self
+                .controls
+                .get(&node_id)
+                .expect("a reconciled editor has browser state");
+            let preserved_direction = control.selection.direction;
+            let kind = control.kind;
+            apply_value_to_editor(document, node_id, &editor_value, false, kind);
+            self.record_editor_selection(document, node_id, preserved_direction);
         }
         changed
+    }
+
+    fn sync_editor_selection(&mut self, document: &BaseDocument, node_id: usize) {
+        let Some(snapshot) = editor_snapshot(document, node_id) else {
+            return;
+        };
+        self.sync_editor_selection_from_snapshot(node_id, &snapshot);
+    }
+
+    fn sync_editor_selection_from_snapshot(&mut self, node_id: usize, snapshot: &EditorSnapshot) {
+        let Some(control) = self.controls.get_mut(&node_id) else {
+            return;
+        };
+        if (control.selection.anchor, control.selection.focus) == (snapshot.anchor, snapshot.focus)
+        {
+            return;
+        }
+
+        control.selection = EditorSelectionState {
+            anchor: snapshot.anchor,
+            focus: snapshot.focus,
+            direction: selection_direction_from_editor(snapshot.anchor, snapshot.focus),
+        };
+    }
+
+    fn record_editor_selection(
+        &mut self,
+        document: &BaseDocument,
+        node_id: usize,
+        direction: TextControlSelectionDirection,
+    ) {
+        let Some(snapshot) = editor_snapshot(document, node_id) else {
+            return;
+        };
+        let Some(control) = self.controls.get_mut(&node_id) else {
+            return;
+        };
+        control.selection = EditorSelectionState {
+            anchor: snapshot.anchor,
+            focus: snapshot.focus,
+            direction,
+        };
+    }
+
+    /// Return the browser selection for input states to which the range APIs apply, and for every
+    /// textarea. Offsets are UTF-16 code units in the sanitized API value, not Parley's UTF-8
+    /// buffer coordinates.
+    pub(crate) fn selection(
+        &mut self,
+        document: &mut BaseDocument,
+        node_id: usize,
+    ) -> Option<TextControlSelection> {
+        self.prepare_managed_control(document, node_id);
+        self.sync_editor_selection(document, node_id);
+        self.supported_selection(document, node_id)
+    }
+
+    /// Apply HTML's set-the-selection-range algorithm. `None` distinguishes input states for
+    /// which setters must throw `InvalidStateError` from a supported no-op.
+    pub(crate) fn set_selection_range(
+        &mut self,
+        document: &mut BaseDocument,
+        node_id: usize,
+        mut start: usize,
+        mut end: usize,
+        direction: TextControlSelectionDirection,
+    ) -> Option<bool> {
+        self.prepare_managed_control(document, node_id);
+        self.sync_editor_selection(document, node_id);
+        let old_selection = self.supported_selection(document, node_id)?;
+        let old_editor_selection = self.controls.get(&node_id)?.selection;
+        let (kind, value_len) = {
+            let control = self.controls.get(&node_id)?;
+            (control.kind, control.value.encode_utf16().count())
+        };
+
+        start = start.min(value_len);
+        end = end.min(value_len);
+        if end <= start {
+            start = end;
+        }
+
+        let snapshot = editor_snapshot(document, node_id)?;
+        let projection = SelectionProjection::new(kind, &snapshot.raw_text);
+        let raw_start = projection.raw_byte_for_utf16(start);
+        let raw_end = projection.raw_byte_for_utf16(end);
+        let (anchor, focus) = if direction == TextControlSelectionDirection::Backward {
+            (raw_end, raw_start)
+        } else {
+            (raw_start, raw_end)
+        };
+        document.with_text_input(node_id, |mut driver| {
+            driver.select_byte_range(anchor, focus);
+        });
+        self.record_editor_selection(document, node_id, direction);
+
+        let new_selection = self.supported_selection(document, node_id)?;
+        let new_editor_selection = self.controls.get(&node_id)?.selection;
+        Some(new_selection != old_selection || new_editor_selection != old_editor_selection)
+    }
+
+    /// Select all text exposed by the current editor. HTML permits `select()` on a few input
+    /// states whose range properties do not apply (notably email and number), while controls with
+    /// no selectable text simply ignore the call.
+    pub(crate) fn select_all(&mut self, document: &mut BaseDocument, node_id: usize) -> bool {
+        self.prepare_managed_control(document, node_id);
+        self.sync_editor_selection(document, node_id);
+        let Some(control) = self.controls.get(&node_id) else {
+            return false;
+        };
+        if !control.active {
+            return false;
+        }
+        if control.kind.supports_selection() {
+            let value_len = control.value.encode_utf16().count();
+            return self
+                .set_selection_range(
+                    document,
+                    node_id,
+                    0,
+                    value_len,
+                    TextControlSelectionDirection::None,
+                )
+                .unwrap_or(false);
+        }
+
+        let Some(before) = editor_snapshot(document, node_id) else {
+            return false;
+        };
+        let before_state = self
+            .controls
+            .get(&node_id)
+            .expect("the managed control state remains present")
+            .selection;
+        let raw_len = before.raw_text.len();
+        document.with_text_input(node_id, |mut driver| {
+            driver.select_byte_range(0, raw_len);
+        });
+        self.record_editor_selection(document, node_id, TextControlSelectionDirection::None);
+        let Some(after) = editor_snapshot(document, node_id) else {
+            return false;
+        };
+        before_state
+            != EditorSelectionState {
+                anchor: after.anchor,
+                focus: after.focus,
+                direction: TextControlSelectionDirection::None,
+            }
+    }
+
+    fn prepare_managed_control(&mut self, document: &mut BaseDocument, node_id: usize) -> bool {
+        if self.controls.contains_key(&node_id) {
+            self.sync_editor_value(document, node_id);
+        }
+        self.reconcile_control(document, node_id)
+    }
+
+    fn supported_selection(
+        &self,
+        document: &BaseDocument,
+        node_id: usize,
+    ) -> Option<TextControlSelection> {
+        let control = self.controls.get(&node_id)?;
+        if !control.active || !control.kind.supports_selection() {
+            return None;
+        }
+        let snapshot = editor_snapshot(document, node_id)?;
+        let projection = SelectionProjection::new(control.kind, &snapshot.raw_text);
+        debug_assert_eq!(
+            control.kind.normalize_user_value(&snapshot.raw_text),
+            control.value
+        );
+        let anchor = projection.utf16_for_raw_byte(snapshot.anchor);
+        let focus = projection.utf16_for_raw_byte(snapshot.focus);
+        Some(TextControlSelection {
+            start: anchor.min(focus),
+            end: anchor.max(focus),
+            direction: control.selection.direction,
+        })
     }
 
     /// Temporarily remove only an editor whose live/default state Quox owns. Blitz writes a
@@ -590,13 +861,152 @@ fn editor_value(document: &BaseDocument, node_id: usize) -> Option<String> {
         .map(|input| input.editor.raw_text().to_owned())
 }
 
-fn editor_snapshot(document: &BaseDocument, node_id: usize) -> Option<(String, bool)> {
+struct EditorSnapshot {
+    raw_text: String,
+    composing: bool,
+    anchor: usize,
+    focus: usize,
+}
+
+fn editor_snapshot(document: &BaseDocument, node_id: usize) -> Option<EditorSnapshot> {
     let editor = &document
         .get_node(node_id)?
         .element_data()?
         .text_input_data()?
         .editor;
-    Some((editor.raw_text().to_owned(), editor.raw_compose().is_some()))
+    let selection = editor.raw_selection();
+    Some(EditorSnapshot {
+        raw_text: editor.raw_text().to_owned(),
+        composing: editor.raw_compose().is_some(),
+        anchor: selection.anchor().index(),
+        focus: selection.focus().index(),
+    })
+}
+
+fn selection_direction_from_editor(anchor: usize, focus: usize) -> TextControlSelectionDirection {
+    match anchor.cmp(&focus) {
+        std::cmp::Ordering::Less => TextControlSelectionDirection::Forward,
+        std::cmp::Ordering::Equal => TextControlSelectionDirection::None,
+        std::cmp::Ordering::Greater => TextControlSelectionDirection::Backward,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ProjectedCharacter {
+    raw_start: usize,
+    raw_end: usize,
+    utf16_start: usize,
+    utf16_end: usize,
+}
+
+/// Monotonic projection between Parley's exact raw buffer and the sanitized value on which HTML
+/// defines selection offsets. The two differ only transiently while composition is active, but
+/// selection APIs remain synchronous and observable during that interval.
+struct SelectionProjection {
+    characters: Vec<ProjectedCharacter>,
+    utf16_len: usize,
+}
+
+impl SelectionProjection {
+    fn new(kind: TextControlKind, raw_text: &str) -> Self {
+        let raw_characters = raw_text
+            .char_indices()
+            .map(|(raw_start, character)| (raw_start, raw_start + character.len_utf8(), character))
+            .collect::<Vec<_>>();
+        let emitted = match kind {
+            TextControlKind::InputText => raw_characters
+                .into_iter()
+                .filter(|(_, _, character)| !matches!(character, '\r' | '\n'))
+                .collect::<Vec<_>>(),
+            TextControlKind::InputUrl => {
+                let filtered = raw_characters
+                    .into_iter()
+                    .filter(|(_, _, character)| !matches!(character, '\r' | '\n'))
+                    .collect::<Vec<_>>();
+                let first = filtered.iter().position(|(_, _, character)| {
+                    !matches!(character, '\u{0009}' | '\u{000c}' | '\u{0020}')
+                });
+                let last = filtered.iter().rposition(|(_, _, character)| {
+                    !matches!(character, '\u{0009}' | '\u{000c}' | '\u{0020}')
+                });
+                match (first, last) {
+                    (Some(first), Some(last)) => filtered[first..=last].to_vec(),
+                    _ => Vec::new(),
+                }
+            }
+            TextControlKind::TextArea => {
+                let mut emitted = Vec::with_capacity(raw_characters.len());
+                let mut index = 0;
+                while let Some(&(raw_start, mut raw_end, character)) = raw_characters.get(index) {
+                    if character == '\r' {
+                        if let Some(&(_, next_end, '\n')) = raw_characters.get(index + 1) {
+                            raw_end = next_end;
+                            index += 1;
+                        }
+                        emitted.push((raw_start, raw_end, '\n'));
+                    } else {
+                        emitted.push((raw_start, raw_end, character));
+                    }
+                    index += 1;
+                }
+                emitted
+            }
+            // Range properties do not apply to these states. Keeping an identity projection makes
+            // this helper robust if another caller inspects their editor in the future.
+            TextControlKind::InputEmail
+            | TextControlKind::InputMultipleEmail
+            | TextControlKind::InputNumber => raw_characters,
+        };
+
+        let mut utf16_len = 0;
+        let characters = emitted
+            .into_iter()
+            .map(|(raw_start, raw_end, character)| {
+                let utf16_start = utf16_len;
+                utf16_len += character.len_utf16();
+                ProjectedCharacter {
+                    raw_start,
+                    raw_end,
+                    utf16_start,
+                    utf16_end: utf16_len,
+                }
+            })
+            .collect();
+        Self {
+            characters,
+            utf16_len,
+        }
+    }
+
+    fn utf16_for_raw_byte(&self, raw_offset: usize) -> usize {
+        let mut offset = 0;
+        for character in &self.characters {
+            if raw_offset <= character.raw_start {
+                return character.utf16_start;
+            }
+            if raw_offset < character.raw_end {
+                return character.utf16_start;
+            }
+            offset = character.utf16_end;
+        }
+        offset
+    }
+
+    fn raw_byte_for_utf16(&self, utf16_offset: usize) -> usize {
+        let utf16_offset = utf16_offset.min(self.utf16_len);
+        for (index, character) in self.characters.iter().enumerate() {
+            if utf16_offset <= character.utf16_start || utf16_offset < character.utf16_end {
+                return character.raw_start;
+            }
+            if utf16_offset == character.utf16_end {
+                return self
+                    .characters
+                    .get(index + 1)
+                    .map_or(character.raw_end, |next| next.raw_start);
+            }
+        }
+        0
+    }
 }
 
 fn apply_value_to_editor(
@@ -604,6 +1014,7 @@ fn apply_value_to_editor(
     node_id: usize,
     value: &str,
     move_caret_to_end: bool,
+    selection_projection_kind: TextControlKind,
 ) {
     document.with_text_input(node_id, |mut driver| {
         if driver.editor.raw_text() == value {
@@ -611,8 +1022,9 @@ fn apply_value_to_editor(
         }
         let old_text = driver.editor.raw_text().to_owned();
         let old_selection = driver.editor.raw_selection();
-        let anchor_utf16 = utf16_offset_for_byte(&old_text, old_selection.anchor().index());
-        let focus_utf16 = utf16_offset_for_byte(&old_text, old_selection.focus().index());
+        let projection = SelectionProjection::new(selection_projection_kind, &old_text);
+        let anchor_utf16 = projection.utf16_for_raw_byte(old_selection.anchor().index());
+        let focus_utf16 = projection.utf16_for_raw_byte(old_selection.focus().index());
         if driver.editor.raw_compose().is_some() {
             // Whole-value replacement aborts composition. `clear_compose` also restores a caret
             // which Parley's set_text alone would leave hidden.
@@ -630,15 +1042,6 @@ fn apply_value_to_editor(
     });
 }
 
-fn utf16_offset_for_byte(value: &str, byte_offset: usize) -> usize {
-    let byte_offset = byte_offset.min(value.len());
-    value
-        .get(..byte_offset)
-        .unwrap_or(value)
-        .encode_utf16()
-        .count()
-}
-
 fn byte_offset_for_utf16(value: &str, utf16_offset: usize) -> usize {
     let mut consumed = 0;
     for (byte_offset, character) in value.char_indices() {
@@ -653,7 +1056,9 @@ fn byte_offset_for_utf16(value: &str, utf16_offset: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{TextControlStates, restore_text_editor};
+    use super::{
+        TextControlSelection, TextControlSelectionDirection, TextControlStates, restore_text_editor,
+    };
     use blitz_dom::{BaseDocument, DocumentConfig, LocalName, QualName, local_name, ns};
     use blitz_html::{HtmlDocument, HtmlProvider};
     use std::sync::Arc;
@@ -712,6 +1117,17 @@ mod tests {
             .editor
             .raw_selection()
             .text_range()
+    }
+
+    fn raw_editor_selection(document: &BaseDocument, node_id: usize) -> (usize, usize) {
+        let selection = document
+            .get_node(node_id)
+            .and_then(blitz_dom::Node::element_data)
+            .and_then(blitz_dom::ElementData::text_input_data)
+            .expect("test node should have an editor")
+            .editor
+            .raw_selection();
+        (selection.anchor().index(), selection.focus().index())
     }
 
     #[test]
@@ -1580,5 +1996,329 @@ mod tests {
                 .and_then(blitz_dom::ElementData::text_input_data)
                 .is_some()
         );
+    }
+
+    #[test]
+    fn range_selection_uses_html_applicability_utf16_offsets_and_direction() {
+        let mut document = document(
+            "<input id='text' value='A🙂B'><input id='search' type='search'>\
+             <input id='tel' type='tel'><input id='url' type='url'>\
+             <input id='password' type='password'><input id='email' type='email'>\
+             <input id='number' type='number'><input id='date' type='date'>\
+             <textarea id='area'>A🙂B</textarea>",
+        );
+        let mut controls = TextControlStates::default();
+        controls.reconcile_document(&mut document);
+
+        for id in ["text", "search", "tel", "url", "password", "area"] {
+            let node_id = element(&document, id);
+            assert_eq!(
+                controls.selection(&mut document, node_id),
+                Some(TextControlSelection {
+                    start: 0,
+                    end: 0,
+                    direction: TextControlSelectionDirection::None,
+                }),
+                "{id} should expose a range"
+            );
+        }
+        for id in ["email", "number", "date"] {
+            let node_id = element(&document, id);
+            assert_eq!(controls.selection(&mut document, node_id), None);
+            assert_eq!(
+                controls.set_selection_range(
+                    &mut document,
+                    node_id,
+                    0,
+                    0,
+                    TextControlSelectionDirection::None,
+                ),
+                None
+            );
+        }
+
+        let text = element(&document, "text");
+        assert_eq!(
+            controls.set_selection_range(
+                &mut document,
+                text,
+                1,
+                3,
+                TextControlSelectionDirection::None,
+            ),
+            Some(true)
+        );
+        assert_eq!(raw_editor_selection(&document, text), (1, 5));
+        assert_eq!(
+            controls.selection(&mut document, text),
+            Some(TextControlSelection {
+                start: 1,
+                end: 3,
+                direction: TextControlSelectionDirection::None,
+            })
+        );
+        assert_eq!(
+            controls.set_selection_range(
+                &mut document,
+                text,
+                1,
+                3,
+                TextControlSelectionDirection::Backward,
+            ),
+            Some(true)
+        );
+        assert_eq!(raw_editor_selection(&document, text), (5, 1));
+        assert_eq!(
+            controls.selection(&mut document, text),
+            Some(TextControlSelection {
+                start: 1,
+                end: 3,
+                direction: TextControlSelectionDirection::Backward,
+            })
+        );
+
+        // Parley cannot place a cursor inside a UTF-8 scalar (and may further snap to a shaped
+        // cluster), so the middle UTF-16 unit of the emoji resolves to its preceding boundary.
+        controls.set_selection_range(
+            &mut document,
+            text,
+            2,
+            3,
+            TextControlSelectionDirection::Forward,
+        );
+        assert_eq!(controls.selection(&mut document, text).unwrap().start, 1);
+
+        controls.set_selection_range(
+            &mut document,
+            text,
+            usize::MAX,
+            2,
+            TextControlSelectionDirection::Forward,
+        );
+        assert_eq!(
+            controls.selection(&mut document, text),
+            Some(TextControlSelection {
+                start: 1,
+                end: 1,
+                direction: TextControlSelectionDirection::Forward,
+            })
+        );
+    }
+
+    #[test]
+    fn selection_projects_sanitized_composition_without_ending_it() {
+        let mut document = document("<input id='url' type='url' value='abc'>");
+        let url = element(&document, "url");
+        let mut controls = TextControlStates::default();
+        controls.reconcile_document(&mut document);
+        document.with_text_input(url, |mut driver| {
+            driver.move_to_text_start();
+            driver.set_compose("  ", Some((2, 2)));
+        });
+        controls.sync_editor_value(&mut document, url);
+
+        assert_eq!(controls.value(&mut document, url).as_deref(), Some("abc"));
+        assert_eq!(
+            super::editor_value(&document, url).as_deref(),
+            Some("  abc")
+        );
+        assert_eq!(controls.selection(&mut document, url).unwrap().start, 0);
+
+        assert_eq!(
+            controls.set_selection_range(
+                &mut document,
+                url,
+                0,
+                3,
+                TextControlSelectionDirection::Backward,
+            ),
+            Some(true)
+        );
+        let editor = document
+            .get_node(url)
+            .and_then(blitz_dom::Node::element_data)
+            .and_then(blitz_dom::ElementData::text_input_data)
+            .unwrap();
+        assert_eq!(editor.editor.raw_text(), "  abc");
+        assert_eq!(editor.editor.raw_compose().as_ref(), Some(&(0..2)));
+        assert_eq!(raw_editor_selection(&document, url), (5, 2));
+        assert_eq!(
+            controls.selection(&mut document, url),
+            Some(TextControlSelection {
+                start: 0,
+                end: 3,
+                direction: TextControlSelectionDirection::Backward,
+            })
+        );
+
+        document.with_text_input(url, |mut driver| driver.finish_compose());
+        controls.sync_editor_value(&mut document, url);
+        assert_eq!(super::editor_value(&document, url).as_deref(), Some("abc"));
+        assert_eq!(raw_editor_selection(&document, url), (3, 0));
+        assert_eq!(
+            controls.selection(&mut document, url),
+            Some(TextControlSelection {
+                start: 0,
+                end: 3,
+                direction: TextControlSelectionDirection::Backward,
+            })
+        );
+
+        document.with_text_input(url, |mut driver| {
+            driver.move_to_text_start();
+            driver.set_compose("  ", Some((2, 2)));
+        });
+        controls.sync_editor_value(&mut document, url);
+        assert_eq!(controls.selection(&mut document, url).unwrap().start, 0);
+        assert_eq!(
+            controls.set_value(&mut document, url, "abc"),
+            Some(true),
+            "the editor still contains unsanitized preedit text"
+        );
+        assert_eq!(super::editor_value(&document, url).as_deref(), Some("abc"));
+        assert_eq!(raw_editor_selection(&document, url), (0, 0));
+        assert_eq!(controls.selection(&mut document, url).unwrap().start, 0);
+    }
+
+    #[test]
+    fn sanitized_selection_reports_raw_caret_movement_for_repaint() {
+        let mut document = document("<input id='url' type='url' value='abc'>");
+        let url = element(&document, "url");
+        let mut controls = TextControlStates::default();
+        controls.reconcile_document(&mut document);
+        document.with_text_input(url, |mut driver| {
+            driver.move_to_text_start();
+            driver.set_compose("  ", Some((0, 0)));
+        });
+        controls.sync_editor_value(&mut document, url);
+
+        assert_eq!(raw_editor_selection(&document, url), (0, 0));
+        assert_eq!(
+            controls.selection(&mut document, url),
+            Some(TextControlSelection {
+                start: 0,
+                end: 0,
+                direction: TextControlSelectionDirection::None,
+            })
+        );
+        assert_eq!(
+            controls.set_selection_range(
+                &mut document,
+                url,
+                0,
+                0,
+                TextControlSelectionDirection::None,
+            ),
+            Some(true),
+            "the exposed range is unchanged, but the rendered raw caret moved"
+        );
+        assert_eq!(raw_editor_selection(&document, url), (2, 2));
+        assert_eq!(
+            controls.selection(&mut document, url),
+            Some(TextControlSelection {
+                start: 0,
+                end: 0,
+                direction: TextControlSelectionDirection::None,
+            })
+        );
+        assert_eq!(
+            controls.set_selection_range(
+                &mut document,
+                url,
+                0,
+                0,
+                TextControlSelectionDirection::None,
+            ),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn value_type_and_detach_transitions_keep_selection_state_coherent() {
+        let mut document = document("<input id='field' value='abcdef'>");
+        let field = element(&document, "field");
+        let mut controls = TextControlStates::default();
+        controls.reconcile_document(&mut document);
+        controls.set_selection_range(
+            &mut document,
+            field,
+            1,
+            4,
+            TextControlSelectionDirection::Backward,
+        );
+
+        assert_eq!(
+            controls.set_value(&mut document, field, "abcdef"),
+            Some(false)
+        );
+        assert_eq!(
+            controls.selection(&mut document, field).unwrap().direction,
+            TextControlSelectionDirection::Backward
+        );
+
+        controls.set_value(&mut document, field, "x");
+        assert_eq!(
+            controls.selection(&mut document, field),
+            Some(TextControlSelection {
+                start: 1,
+                end: 1,
+                direction: TextControlSelectionDirection::None,
+            })
+        );
+
+        controls.set_selection_range(
+            &mut document,
+            field,
+            0,
+            1,
+            TextControlSelectionDirection::Backward,
+        );
+        document.mutate().remove_node(field);
+        assert_eq!(
+            controls.selection(&mut document, field),
+            Some(TextControlSelection {
+                start: 0,
+                end: 1,
+                direction: TextControlSelectionDirection::Backward,
+            })
+        );
+
+        set_input_type(&mut document, field, "email");
+        controls.reconcile_document(&mut document);
+        assert_eq!(controls.selection(&mut document, field), None);
+        set_input_type(&mut document, field, "text");
+        controls.reconcile_document(&mut document);
+        assert_eq!(
+            controls.selection(&mut document, field),
+            Some(TextControlSelection {
+                start: 0,
+                end: 0,
+                direction: TextControlSelectionDirection::None,
+            })
+        );
+    }
+
+    #[test]
+    fn select_all_includes_editor_backed_email_and_bad_number_text() {
+        let mut document = document(
+            "<input id='email' type='email' value='a@b.test'>\
+             <input id='number' type='number'><input id='date' type='date'>",
+        );
+        let email = element(&document, "email");
+        let number = element(&document, "number");
+        let date = element(&document, "date");
+        let mut controls = TextControlStates::default();
+        controls.reconcile_document(&mut document);
+        document.with_text_input(number, |mut driver| {
+            driver.insert_or_replace_selection("-");
+        });
+        controls.sync_editor_value(&mut document, number);
+
+        assert!(controls.select_all(&mut document, email));
+        assert_eq!(raw_editor_selection(&document, email), (0, 8));
+        assert!(controls.select_all(&mut document, number));
+        assert_eq!(raw_editor_selection(&document, number), (0, 1));
+        assert!(!controls.select_all(&mut document, date));
+        assert!(!controls.select_all(&mut document, email));
     }
 }

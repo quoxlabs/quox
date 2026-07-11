@@ -9,6 +9,9 @@ interface ControlState {
   defaultText: string;
   value: string;
   dirty: boolean;
+  selectionStart: number;
+  selectionEnd: number;
+  selectionDirection: 0 | 1 | 2;
 }
 
 type InputValueMode = "value" | "unsupported-value" | "default" | "default-on" | "filename";
@@ -44,6 +47,37 @@ function isValueMode(mode: InputValueMode): boolean {
   return mode === "value" || mode === "unsupported-value";
 }
 
+function supportsSelectionRange(control: ControlState): boolean {
+  if (control.tagName === "textarea") return true;
+  if (control.tagName !== "input") return false;
+  const type = (control.attributes.get("type") ?? "").toLowerCase();
+  return ![
+    "hidden",
+    "email",
+    "date",
+    "datetime-local",
+    "month",
+    "week",
+    "time",
+    "number",
+    "range",
+    "color",
+    "checkbox",
+    "radio",
+    "file",
+    "submit",
+    "image",
+    "reset",
+    "button",
+  ].includes(type);
+}
+
+function hasSelectableText(control: ControlState): boolean {
+  if (supportsSelectionRange(control)) return true;
+  if (control.tagName !== "input") return false;
+  return ["email", "number"].includes((control.attributes.get("type") ?? "").toLowerCase());
+}
+
 class FakeLiveControlRenderer {
   readonly #controls = new Map<number, ControlState>();
   readonly #pending = new Map<number, unknown>();
@@ -63,6 +97,9 @@ class FakeLiveControlRenderer {
       defaultText: "",
       value: "",
       dirty: false,
+      selectionStart: 0,
+      selectionEnd: 0,
+      selectionDirection: 0,
     });
     return handle;
   }
@@ -121,7 +158,58 @@ class FakeLiveControlRenderer {
     const changed = control.value !== value;
     control.value = value;
     control.dirty = true;
+    if (changed) {
+      control.selectionStart = value.length;
+      control.selectionEnd = value.length;
+      control.selectionDirection = 0;
+    }
     return changed;
+  }
+
+  form_control_selection(nodeHandle: number): Uint32Array | undefined {
+    const control = this.#control(nodeHandle);
+    if (!supportsSelectionRange(control)) return undefined;
+    return new Uint32Array([
+      control.selectionStart,
+      control.selectionEnd,
+      control.selectionDirection,
+    ]);
+  }
+
+  set_form_control_selection(
+    nodeHandle: number,
+    start: number,
+    end: number,
+    direction: number,
+  ): boolean | undefined {
+    const control = this.#control(nodeHandle);
+    if (!supportsSelectionRange(control)) return undefined;
+    const valueLength = control.value.length;
+    start = Math.min(start, valueLength);
+    end = Math.min(end, valueLength);
+    if (end <= start) start = end;
+    const changed = control.selectionStart !== start || control.selectionEnd !== end ||
+      control.selectionDirection !== direction;
+    control.selectionStart = start;
+    control.selectionEnd = end;
+    control.selectionDirection = direction as 0 | 1 | 2;
+    return changed;
+  }
+
+  select_form_control_text(nodeHandle: number): boolean {
+    const control = this.#control(nodeHandle);
+    if (!hasSelectableText(control)) return false;
+    const changed = control.selectionStart !== 0 || control.selectionEnd !== control.value.length ||
+      control.selectionDirection !== 0;
+    control.selectionStart = 0;
+    control.selectionEnd = control.value.length;
+    control.selectionDirection = 0;
+    return changed;
+  }
+
+  selectionForTest(nodeHandle: number): readonly [number, number, number] {
+    const control = this.#control(nodeHandle);
+    return [control.selectionStart, control.selectionEnd, control.selectionDirection];
   }
 
   get_attribute(nodeHandle: number, name: string): string | undefined {
@@ -132,6 +220,7 @@ class FakeLiveControlRenderer {
     const control = this.#control(nodeHandle);
     name = name.toLowerCase();
     const previousMode = control.tagName === "input" && name === "type" ? inputValueMode(control) : undefined;
+    const previouslySelectable = supportsSelectionRange(control);
     control.attributes.set(name, value);
     if (previousMode !== undefined) {
       this.#applyTypeTransition(control, previousMode);
@@ -141,12 +230,18 @@ class FakeLiveControlRenderer {
     ) {
       control.value = value;
     }
+    if (!previouslySelectable && supportsSelectionRange(control)) {
+      control.selectionStart = 0;
+      control.selectionEnd = 0;
+      control.selectionDirection = 0;
+    }
   }
 
   remove_attribute(nodeHandle: number, name: string): void {
     const control = this.#control(nodeHandle);
     name = name.toLowerCase();
     const previousMode = control.tagName === "input" && name === "type" ? inputValueMode(control) : undefined;
+    const previouslySelectable = supportsSelectionRange(control);
     control.attributes.delete(name);
     if (previousMode !== undefined) {
       this.#applyTypeTransition(control, previousMode);
@@ -155,6 +250,11 @@ class FakeLiveControlRenderer {
       isValueMode(inputValueMode(control)) && !control.dirty
     ) {
       control.value = "";
+    }
+    if (!previouslySelectable && supportsSelectionRange(control)) {
+      control.selectionStart = 0;
+      control.selectionEnd = 0;
+      control.selectionDirection = 0;
     }
   }
 
@@ -497,4 +597,183 @@ Deno.test("a native edit is visible before its first input listener", () => {
   });
 
   assertEquals(seen, ["native edit"]);
+});
+
+Deno.test("text-control range properties preserve direction and follow setter adjustment rules", () => {
+  const { document, renders } = createDocument();
+  const input = document.createElement("input");
+  input.defaultValue = "abcdef";
+  const events: string[] = [];
+  for (const type of ["focus", "blur", "input", "change"]) {
+    input.addEventListener(type, () => events.push(type));
+  }
+  const setupRenders = renders.count;
+
+  assertEquals([input.selectionStart, input.selectionEnd, input.selectionDirection], [0, 0, "none"]);
+  input.setSelectionRange(1, 4, "backward");
+  assertEquals([input.selectionStart, input.selectionEnd, input.selectionDirection], [1, 4, "backward"]);
+  assertEquals(renders.count, setupRenders + 1);
+
+  input.setSelectionRange(1, 4, "backward");
+  assertEquals(renders.count, setupRenders + 1, "an identical range does not repaint");
+
+  input.selectionDirection = "none";
+  assertEquals([input.selectionStart, input.selectionEnd, input.selectionDirection], [1, 4, "none"]);
+  input.selectionStart = 5;
+  assertEquals([input.selectionStart, input.selectionEnd], [5, 5], "raising start also raises end");
+  input.selectionEnd = 2;
+  assertEquals([input.selectionStart, input.selectionEnd], [2, 2], "end before start collapses at end");
+  assertEquals(events, []);
+});
+
+Deno.test("selection applicability follows input state while select uses rendered editor text", () => {
+  for (const type of ["", "text", "search", "tel", "url", "password", "wat"]) {
+    const { document } = createDocument();
+    const input = document.createElement("input");
+    if (type !== "") input.setAttribute("type", type);
+    assertEquals(input.selectionStart, 0, `${type || "missing"} supports ranges`);
+    input.setSelectionRange(0, 0, "forward");
+    assertEquals(input.selectionDirection, "forward");
+  }
+
+  for (
+    const type of [
+      "email",
+      "number",
+      "date",
+      "datetime-local",
+      "month",
+      "week",
+      "time",
+      "range",
+      "color",
+      "checkbox",
+      "radio",
+      "file",
+      "hidden",
+      "submit",
+      "image",
+      "reset",
+      "button",
+    ]
+  ) {
+    const { document } = createDocument();
+    const input = document.createElement("input");
+    input.setAttribute("type", type);
+    assertEquals(input.selectionStart, null, `${type} does not expose range properties`);
+    const propertyError = assertThrows(() => {
+      input.selectionStart = 0;
+    }, DOMException);
+    assertEquals(propertyError.name, "InvalidStateError");
+    const methodError = assertThrows(() => input.setSelectionRange(0, 0), DOMException);
+    assertEquals(methodError.name, "InvalidStateError");
+  }
+
+  for (const type of ["email", "number"]) {
+    const { document, renderer, renders } = createDocument();
+    const input = document.createElement("input");
+    input.setAttribute("type", type);
+    input.value = "1234";
+    const setupRenders = renders.count;
+    input.select();
+    assertEquals(renderer.selectionForTest(input.nodeId), [0, 4, 0]);
+    assertEquals(renders.count, setupRenders + 1, `${type} renders selectable editor text`);
+  }
+
+  const { document, renders } = createDocument();
+  const date = document.createElement("input");
+  date.setAttribute("type", "date");
+  const setupRenders = renders.count;
+  date.select();
+  assertEquals(renders.count, setupRenders, "a picker-backed unsupported mode ignores select");
+});
+
+Deno.test("selection arguments use Web IDL unsigned-long and DOMString conversions", () => {
+  const { document } = createDocument();
+  const input = document.createElement("input");
+  const textarea = document.createElement("textarea");
+  input.defaultValue = "A🙂B";
+
+  assertEquals(input.setSelectionRange.length, 2);
+  assertEquals(textarea.setSelectionRange.length, 2);
+  assertThrows(() => Reflect.apply(input.setSelectionRange, input, []), TypeError, "at least 2");
+  assertThrows(() => Reflect.apply(input.setSelectionRange, input, [1]), TypeError, "at least 2");
+  assertThrows(() => Reflect.apply(textarea.setSelectionRange, textarea, []), TypeError, "at least 2");
+
+  const unsupported = document.createElement("input");
+  unsupported.setAttribute("type", "email");
+  assertThrows(
+    () => Reflect.apply(unsupported.setSelectionRange, unsupported, []),
+    TypeError,
+    "at least 2",
+  );
+
+  input.setSelectionRange(1, 3, "forward");
+  assertEquals([input.selectionStart, input.selectionEnd], [1, 3], "offsets count UTF-16 code units");
+  input.setSelectionRange(-1, -1);
+  assertEquals([input.selectionStart, input.selectionEnd], [4, 4], "negative values wrap then clamp");
+  input.setSelectionRange(Number.NaN, Number.POSITIVE_INFINITY);
+  assertEquals([input.selectionStart, input.selectionEnd], [0, 0]);
+  input.setSelectionRange(1.9, 3.9, "backward");
+  assertEquals([input.selectionStart, input.selectionEnd, input.selectionDirection], [1, 3, "backward"]);
+
+  (input as unknown as { selectionStart: unknown }).selectionStart = null;
+  assertEquals(input.selectionStart, 0);
+  (input as unknown as { selectionDirection: unknown }).selectionDirection = "sideways";
+  assertEquals(input.selectionDirection, "none");
+  (input as unknown as { selectionDirection: unknown }).selectionDirection = null;
+  assertEquals(input.selectionDirection, "none");
+  assertThrows(
+    () => ((input as unknown as { selectionStart: unknown }).selectionStart = 1n),
+    TypeError,
+  );
+  assertThrows(
+    () => input.setSelectionRange(0, 0, Symbol("direction") as unknown as "forward"),
+    TypeError,
+    "Web IDL string",
+  );
+
+  let conversions = 0;
+  (input as unknown as { selectionDirection: unknown }).selectionDirection = {
+    toString() {
+      conversions += 1;
+      return "forward";
+    },
+  };
+  assertEquals(conversions, 1);
+  assertEquals(input.selectionDirection, "forward");
+
+  const conversionError = assertThrows(
+    () => {
+      (input as unknown as { selectionStart: unknown }).selectionStart = {
+        valueOf() {
+          input.setAttribute("type", "email");
+          return 1;
+        },
+      };
+    },
+    DOMException,
+  );
+  assertEquals(conversionError.name, "InvalidStateError", "applicability is checked after conversion");
+});
+
+Deno.test("textarea selection and select work without focusing or dispatching editing events", () => {
+  const { document, renders } = createDocument();
+  const textarea = document.createElement("textarea");
+  textarea.defaultValue = "A🙂B";
+  const events: string[] = [];
+  for (const type of ["focus", "blur", "input", "change"]) {
+    textarea.addEventListener(type, () => events.push(type));
+  }
+  const setupRenders = renders.count;
+
+  textarea.setSelectionRange(1, 3, "backward");
+  assertEquals([textarea.selectionStart, textarea.selectionEnd, textarea.selectionDirection], [1, 3, "backward"]);
+  textarea.select();
+  assertEquals([textarea.selectionStart, textarea.selectionEnd, textarea.selectionDirection], [0, 4, "none"]);
+  const rendered = renders.count;
+  textarea.select();
+  assertEquals(renders.count, rendered, "reselecting the same range does not repaint");
+  assertEquals(renders.count, setupRenders + 2);
+  assertEquals(events, []);
 });
