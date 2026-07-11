@@ -358,6 +358,7 @@ class Win32Library implements Library {
             const paint = new ArrayBuffer(PAINTSTRUCT_SIZE);
             const hdc = this.user32.symbols.BeginPaint(hWnd, paint);
             if (hdc === null) throw new Error("winding(win32): BeginPaint failed");
+            let paintError: unknown;
             try {
               const view = new DataView(paint);
               win.paint(
@@ -367,11 +368,17 @@ class Win32Library implements Library {
                 view.getInt32(20, true),
                 view.getInt32(24, true),
               );
-            } finally {
-              if (this.user32.symbols.EndPaint(hWnd, paint) === 0) {
-                throw new Error("winding(win32): EndPaint failed");
-              }
+            } catch (error) {
+              paintError = error;
             }
+            const endPaintError = this.user32.symbols.EndPaint(hWnd, paint) === 0
+              ? new Error("winding(win32): EndPaint failed")
+              : undefined;
+            if (paintError !== undefined && endPaintError !== undefined) {
+              throw new AggregateError([paintError, endPaintError], "winding(win32): failed to paint window");
+            }
+            if (paintError !== undefined) throw paintError;
+            if (endPaintError !== undefined) throw endPaintError;
             return 0n;
           }
           case WM.SIZE: {
