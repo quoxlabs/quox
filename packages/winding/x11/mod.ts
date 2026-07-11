@@ -945,7 +945,9 @@ class X11Library implements Library {
     const keyboard = this.X11.symbols.XkbGetMap(this.display, 0, XKB_USE_CORE_KBD);
     if (keyboard === null) return;
     try {
-      if (this.X11.symbols.XkbGetNames(this.display, XKB_KEY_NAMES_MASK, keyboard) === 0) return;
+      // XkbGetNames returns an X11 Status: zero is Success, unlike the Bool
+      // returned by XkbQueryExtension immediately above.
+      if (this.X11.symbols.XkbGetNames(this.display, XKB_KEY_NAMES_MASK, keyboard) !== 0) return;
       const minimumOutput = new Int32Array(1);
       const maximumOutput = new Int32Array(1);
       this.X11.symbols.XDisplayKeycodes(this.display, minimumOutput, maximumOutput);
