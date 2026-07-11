@@ -20,7 +20,12 @@ import {
   type WaylandNativeLibrary,
   WL_MARSHAL_FLAG_DESTROY,
 } from "./protocol.ts";
-import { type TextInputEdit, TextInputV3Batch, type WaylandSurroundingTextState } from "./text_input.ts";
+import {
+  type TextInputEdit,
+  TextInputV3Batch,
+  TextInputV3SerialGate,
+  type WaylandSurroundingTextState,
+} from "./text_input.ts";
 import type { WaylandWindow } from "./window.ts";
 
 export interface WaylandTextInputHost {
@@ -45,6 +50,7 @@ export class WaylandTextInputController {
   #focus: WaylandWindow | null = null;
   #enabledWindow: WaylandWindow | null = null;
   readonly #batch = new TextInputV3Batch();
+  readonly #serialGate = new TextInputV3SerialGate();
   readonly #listeners: AnyCallback[] = [];
   #vtable: BigUint64Array<ArrayBuffer> | undefined;
   #closed = false;
@@ -91,6 +97,7 @@ export class WaylandTextInputController {
     collectCleanupError(errors, () => window.imeActivation.setDesired(false));
     collectCleanupError(errors, () => window.imeActivation.setFocused(false));
     if (this.#focus === window || this.#enabledWindow === window) {
+      this.#serialGate.reset();
       collectCleanupError(errors, () => this.#reconcile(window, true));
       if (this.#focus === window) this.#focus = null;
       if (this.#enabledWindow === window) this.#enabledWindow = null;
@@ -112,17 +119,21 @@ export class WaylandTextInputController {
   updateCursorArea(window: WaylandWindow): void {
     const area = window.imeCursorArea;
     if (!area || this.#enabledWindow !== window || this.#focus !== window || !this.#input) return;
-    this.#sendCursorArea(area);
-    this.#commitState();
-    this.host.flushDisplay("updating the text-input cursor rectangle");
+    this.#serialGate.sendState(() => {
+      this.#sendCursorArea(area);
+      this.#commitState();
+      this.host.flushDisplay("updating the text-input cursor rectangle");
+    });
   }
 
   updateSurroundingText(window: WaylandWindow): void {
     const surrounding = window.imeSurroundingText;
     if (!surrounding || this.#enabledWindow !== window || this.#focus !== window || !this.#input) return;
-    this.#sendSurroundingText(surrounding);
-    this.#commitState();
-    this.host.flushDisplay("updating text-input surrounding text");
+    this.#serialGate.sendState(() => {
+      this.#sendSurroundingText(surrounding);
+      this.#commitState();
+      this.host.flushDisplay("updating text-input surrounding text");
+    });
   }
 
   close(): void {
@@ -143,12 +154,13 @@ export class WaylandTextInputController {
     this.#input = null;
     this.#focus = null;
     this.#enabledWindow = null;
+    this.#serialGate.reset();
     const listeners = this.#listeners.splice(0);
     this.#vtable = undefined;
 
     const errors: unknown[] = [];
     if (affectedWindow) {
-      collectCleanupError(errors, () => this.#emitEdits(affectedWindow, this.#batch.resetEdits()));
+      collectCleanupError(errors, () => this.#emitEdits(affectedWindow, this.#batch.resetProtocolState()));
       collectCleanupError(errors, () => {
         const clear = affectedWindow.composition.cancel();
         if (clear !== undefined) {
@@ -156,7 +168,7 @@ export class WaylandTextInputController {
         }
       });
     } else {
-      collectCleanupError(errors, () => this.#batch.resetEdits());
+      collectCleanupError(errors, () => this.#batch.resetProtocolState());
     }
     for (const window of this.host.windows()) {
       collectCleanupError(errors, () => window.imeActivation.setFocused(false));
@@ -211,6 +223,7 @@ export class WaylandTextInputController {
           this.syncWindow(window, true);
           return;
         }
+        this.#serialGate.reset();
         const previous = this.#enabledWindow ?? this.#focus;
         this.#focus = null;
         if (previous) this.syncWindow(previous, false);
@@ -226,6 +239,7 @@ export class WaylandTextInputController {
         if (this.#input !== input) return;
         const window = this.host.windowForSurface(surface);
         if (!window || window !== this.#focus) return;
+        this.#serialGate.reset();
         this.#focus = null;
         this.syncWindow(window, false);
       }),
@@ -266,10 +280,12 @@ export class WaylandTextInputController {
         if (this.#input !== input) return;
         const window = this.#enabledWindow;
         if (!window || window !== this.#focus) {
+          this.#serialGate.reset();
           this.#batch.resetEdits();
           return;
         }
-        this.#emitEdits(window, this.#batch.done(serial).edits);
+        const result = this.#batch.done(serial);
+        this.#serialGate.handleDone(result.serialMatches, () => this.#emitEdits(window, result.edits));
       }),
     );
     this.#listeners.push(done);
@@ -290,6 +306,7 @@ export class WaylandTextInputController {
           !this.#input || this.host.keyboardFocus() !== window || this.#focus !== window ||
           this.#enabledWindow !== null
         ) return false;
+        this.#serialGate.reset();
         this.host.resetLocalCompose();
         const clear = window.composition.cancel();
         if (clear !== undefined) {
@@ -303,14 +320,14 @@ export class WaylandTextInputController {
           0,
           args(),
         );
-        if (window.imeSurroundingText) this.#sendSurroundingText(window.imeSurroundingText);
-        if (window.imeCursorArea) this.#sendCursorArea(window.imeCursorArea);
+        this.#sendFullState(window);
         this.#commitState();
         this.#enabledWindow = window;
         this.host.flushDisplay("enabling text input");
         return true;
       },
       deactivate: () => {
+        this.#serialGate.reset();
         this.#emitEdits(window, this.#batch.resetEdits());
         const clear = window.composition.cancel();
         if (clear !== undefined) {
@@ -348,6 +365,27 @@ export class WaylandTextInputController {
     );
   }
 
+  #sendFullState(window: WaylandWindow): void {
+    if (window.imeSurroundingText) this.#sendSurroundingText(window.imeSurroundingText);
+    if (window.imeCursorArea) this.#sendCursorArea(window.imeCursorArea);
+  }
+
+  #resendFullState(window: WaylandWindow): void {
+    if (!this.#input || this.#enabledWindow !== window || this.#focus !== window) return;
+    this.#sendFullState(window);
+    this.#commitState();
+    this.host.flushDisplay("resynchronizing text-input state");
+  }
+
+  /** Send deferred state only after the application has consumed every edit in the done batch. */
+  flushPendingState(): void {
+    this.#serialGate.finishRecovery(() => {
+      const window = this.#enabledWindow;
+      if (!window || window !== this.#focus) return;
+      this.#resendFullState(window);
+    });
+  }
+
   #sendSurroundingText(surrounding: WaylandSurroundingTextState): void {
     if (!this.#input) return;
     const text = cStr(surrounding.wireText);
@@ -366,7 +404,7 @@ export class WaylandTextInputController {
   }
 
   #commitState(): void {
-    if (!this.#input) return;
+    if (!this.#input || this.#serialGate.blocksState) return;
     this.host.wl.symbols.wl_proxy_marshal_array_flags(
       this.#input,
       WlOp.ZWP_TEXT_INPUT_COMMIT,

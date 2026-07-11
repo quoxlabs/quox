@@ -77,6 +77,49 @@ export interface TextInputDoneResult {
   readonly edits: TextInputEdit[];
 }
 
+/**
+ * Holds outbound double-buffered state after a compositor `done` reports an older client commit.
+ * Incoming edits are still applied immediately; `finishRecovery` resends the latest complete
+ * application state only after the compositor catches up and the edits have been consumed.
+ */
+export class TextInputV3SerialGate {
+  #state: "open" | "waiting" | "recovering" = "open";
+
+  get awaitingMatchingDone(): boolean {
+    return this.#state === "waiting";
+  }
+
+  get blocksState(): boolean {
+    return this.#state !== "open";
+  }
+
+  sendState(send: () => void): boolean {
+    if (this.blocksState) return false;
+    send();
+    return true;
+  }
+
+  handleDone(serialMatches: boolean, applyEdits: () => void): boolean {
+    if (!serialMatches) this.#state = "waiting";
+    const shouldRecover = serialMatches && this.#state === "waiting";
+    applyEdits();
+    if (!shouldRecover || this.#state !== "waiting") return false;
+    this.#state = "recovering";
+    return true;
+  }
+
+  finishRecovery(resendLatestState: () => void): boolean {
+    if (this.#state !== "recovering") return false;
+    this.#state = "open";
+    resendLatestState();
+    return true;
+  }
+
+  reset(): void {
+    this.#state = "open";
+  }
+}
+
 interface PendingPreedit {
   readonly text: string;
   readonly cursorRange: ImeCursorRange | null;
@@ -155,6 +198,13 @@ export class TextInputV3Batch {
     const edits: TextInputEdit[] = this.#visiblePreedit ? [{ type: "preedit", text: "", cursorRange: null }] : [];
     this.#visiblePreedit = false;
     this.#resetPending();
+    return edits;
+  }
+
+  /** Reset state whose lifetime is the current `zwp_text_input_v3` proxy. */
+  resetProtocolState(): TextInputEdit[] {
+    const edits = this.resetEdits();
+    this.#clientCommitSerial = 0;
     return edits;
   }
 

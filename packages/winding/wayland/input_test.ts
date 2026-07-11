@@ -10,7 +10,7 @@ import {
   type XkbKeyTranslator,
 } from "./keyboard.ts";
 import { CURSOR_SHAPE_MANAGER_V1_REQUESTS, WlOp } from "./ffi.ts";
-import { createWaylandSurroundingTextState, TextInputV3Batch } from "./text_input.ts";
+import { createWaylandSurroundingTextState, TextInputV3Batch, TextInputV3SerialGate } from "./text_input.ts";
 import { keyLocationForCode, normalizeImeCursorArea, validateImeCursorRange } from "../input/mod.ts";
 import { logicalKeyFromKeysym } from "../linux/mod.ts";
 import {
@@ -462,6 +462,84 @@ Deno.test("text-input done flushes edits in protocol order and reports serial ma
       { type: "preedit", text: "next", cursorRange: [1, 3] },
     ],
   });
+});
+
+Deno.test("stale text-input done applies edits while coalescing state until a matching serial", () => {
+  const gate = new TextInputV3SerialGate();
+  let latestState = { surrounding: "initial", cursorX: 1 };
+  const sentStates: Array<typeof latestState> = [];
+  const appliedEdits: string[] = [];
+  let commits = 0;
+  const sendLatestState = () => {
+    sentStates.push({ ...latestState });
+    commits++;
+  };
+
+  assert(gate.sendState(sendLatestState));
+  assert(!gate.handleDone(false, () => appliedEdits.push("stale edit")));
+
+  latestState = { surrounding: "first update", cursorX: 5 };
+  assert(!gate.sendState(sendLatestState));
+  latestState = { surrounding: "latest update", cursorX: 9 };
+  assert(!gate.sendState(sendLatestState));
+  assertEquals(commits, 1);
+
+  assert(gate.handleDone(
+    true,
+    () => {
+      appliedEdits.push("matching edit");
+      latestState = { surrounding: "after matching edit", cursorX: 12 };
+      assert(!gate.sendState(sendLatestState));
+    },
+  ));
+
+  // Recovery waits until the application has consumed every event from the matching done batch.
+  assertEquals(commits, 1);
+  assert(gate.finishRecovery(sendLatestState));
+
+  assertEquals(appliedEdits, ["stale edit", "matching edit"]);
+  assertEquals(sentStates, [
+    { surrounding: "initial", cursorX: 1 },
+    { surrounding: "after matching edit", cursorX: 12 },
+  ]);
+  assertEquals(commits, 2);
+  assert(!gate.finishRecovery(sendLatestState));
+  assertEquals(commits, 2);
+  assertEquals(gate.awaitingMatchingDone, false);
+});
+
+Deno.test("text-input serial gating resets at activation, focus, and teardown boundaries", () => {
+  for (const boundary of ["activation", "focus", "teardown"]) {
+    const gate = new TextInputV3SerialGate();
+    gate.handleDone(false, () => undefined);
+    assert(gate.awaitingMatchingDone, `${boundary} setup should be gated`);
+
+    gate.reset();
+    gate.handleDone(false, () => undefined);
+    assert(gate.handleDone(true, () => undefined), `${boundary} setup should schedule recovery`);
+    gate.reset();
+    assert(
+      !gate.finishRecovery(() => {
+        throw new Error(`${boundary} must cancel deferred recovery`);
+      }),
+    );
+    let sends = 0;
+    assert(gate.sendState(() => sends++), `${boundary} should permit fresh state`);
+    assertEquals(sends, 1);
+  }
+});
+
+Deno.test("replacing a text-input proxy resets its protocol-local commit serial", () => {
+  const batch = new TextInputV3Batch();
+  assertEquals(batch.recordClientCommit(), 1);
+  batch.setPreedit("visible", 0, 7);
+  batch.done(1);
+  assertEquals(batch.recordClientCommit(), 2);
+  batch.setCommit("must not cross proxies");
+
+  assertEquals(batch.resetProtocolState(), [{ type: "preedit", text: "", cursorRange: null }]);
+  assertEquals(batch.clientCommitSerial, 0);
+  assertEquals(batch.done(0).edits, []);
 });
 
 Deno.test("text-input pending fields reset and reverse cursor endpoints are normalized", () => {

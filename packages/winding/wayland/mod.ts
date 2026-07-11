@@ -948,6 +948,9 @@ class WaylandLibrary implements Library {
     const queued = this.#events.shift();
     if (queued !== undefined) return queued;
     this.#callbackErrors.throwIfPending();
+    // A text-input done batch may produce several public edits. The consumer recalculates its
+    // surrounding-text snapshot while handling them, so recover only once that queue is empty.
+    this.#textInputController.flushPendingState();
     const sym = this.wl.symbols;
     this.flushDisplay("event flush");
 
@@ -983,6 +986,7 @@ class WaylandLibrary implements Library {
     const dispatched = this.#events.shift();
     if (dispatched !== undefined) return dispatched;
     this.#callbackErrors.throwIfPending();
+    this.#textInputController.flushPendingState();
     return undefined;
   }
 
