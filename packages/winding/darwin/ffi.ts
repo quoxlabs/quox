@@ -13,6 +13,20 @@ export const LIBOBJC = "/usr/lib/libobjc.dylib";
 export const APPKIT = "/System/Library/Frameworks/AppKit.framework/AppKit";
 export const CORE_GRAPHICS = "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics";
 export const CORE_FOUNDATION = "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation";
+export const LIBSYSTEM = "/usr/lib/libSystem.B.dylib";
+
+export const systemSymbols = {
+  pthread_main_np: { parameters: [], result: "i32" },
+} as const satisfies Deno.ForeignLibraryInterface;
+
+export type DarwinSystem = Deno.DynamicLibrary<typeof systemSymbols>;
+
+/** AppKit objects and event dispatch are confined to the process main thread. */
+export function assertMainThread(system: DarwinSystem): void {
+  if (system.symbols.pthread_main_np() === 0) {
+    throw new Error("winding(darwin): AppKit must be used on the process main thread (not a Worker)");
+  }
+}
 
 export const runtimeSymbols = {
   objc_getClass: { parameters: ["buffer"], result: "pointer" },

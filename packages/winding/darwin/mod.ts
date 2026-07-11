@@ -22,6 +22,7 @@ import {
   addProtocol as runtimeAddProtocol,
   allocateClassPair as runtimeAllocateClassPair,
   APPKIT,
+  assertMainThread,
   cfSymbols,
   cgSymbols,
   CORE_FOUNDATION,
@@ -30,6 +31,7 @@ import {
   getClass as runtimeGetClass,
   getProtocol as runtimeGetProtocol,
   LIBOBJC,
+  LIBSYSTEM,
   NSPOINT,
   NSRECT,
   type ObjcRuntime,
@@ -40,6 +42,7 @@ import {
   runtimeSymbols,
   sel as runtimeSel,
   selectorName as runtimeSelectorName,
+  systemSymbols,
 } from "./ffi.ts";
 import {
   type DarwinNativeClasses,
@@ -141,6 +144,12 @@ function openMsgSendSymbols(libraries: Closeable[]) {
 function openDarwinFfi() {
   const opened: Closeable[] = [];
   try {
+    // This must be the first native check. Loading AppKit is harmless by
+    // itself, but no AppKit class or object may be touched from a Worker.
+    const system = Deno.dlopen(LIBSYSTEM, systemSymbols);
+    opened.push(system);
+    assertMainThread(system);
+
     // Load AppKit into the process so its Objective-C classes become resolvable;
     // we never call anything through this handle directly.
     const appKit = Deno.dlopen(APPKIT, {});
@@ -165,6 +174,8 @@ function openDarwinFfi() {
       nsrect,
       cg,
       cf,
+      system,
+      assertMainThread: () => assertMainThread(system),
       getClass: (name: string) => runtimeGetClass(runtime, name),
       sel: (name: string) => runtimeSel(runtime, name),
       allocateClassPair: (superclass: Deno.PointerObject, name: string) =>
@@ -267,6 +278,7 @@ class DarwinWindow implements Window, DarwinNativeResponder {
   #prevImageBuf: Uint8Array | undefined;
 
   constructor(readonly lib: DarwinLibrary, x = 0, y = 0, w = 800, h = 600) {
+    lib.assertMainThread();
     const { getClass, sel, send } = lib.ffi;
     const alloc = send.id(getClass("NSWindow"), sel("alloc"));
     const rect = new Float64Array([x, y, w, h]);
@@ -650,6 +662,7 @@ class DarwinWindow implements Window, DarwinNativeResponder {
   }
 
   setImeEnabled(enabled: boolean): void {
+    this.lib.assertMainThread();
     if (this.#closed || enabled === this.inputState.imeEnabled) return;
     this.inputState.setImeEnabled(enabled);
     this.#flushInputState();
@@ -657,6 +670,7 @@ class DarwinWindow implements Window, DarwinNativeResponder {
   }
 
   setImeCursorArea(x: number, y: number, width: number, height: number): void {
+    this.lib.assertMainThread();
     if (this.#closed) return;
     this.inputState.setCursorArea(x, y, width, height);
     const { sel, send } = this.lib.ffi;
@@ -665,6 +679,7 @@ class DarwinWindow implements Window, DarwinNativeResponder {
   }
 
   cancelComposition(): void {
+    this.lib.assertMainThread();
     if (this.#closed) return;
     this.inputState.cancelComposition();
     this.#flushInputState();
@@ -734,6 +749,7 @@ class DarwinWindow implements Window, DarwinNativeResponder {
   }
 
   setTitle(title: string): void {
+    this.lib.assertMainThread();
     const { sel, send } = this.lib.ffi;
     const titleString = makeNSString(this.lib.ffi, title);
     send.void_id(this.nsWindow, sel("setTitle:"), titleString);
@@ -741,6 +757,7 @@ class DarwinWindow implements Window, DarwinNativeResponder {
   }
 
   blit(rgba: Uint8Array, width: number, height: number): void {
+    this.lib.assertMainThread();
     const { cf, cg, sel, send } = this.lib.ffi;
     this.#prevImageBuf = this.#imageBuf;
     // Own a stable copy: the caller's buffer isn't guaranteed to outlive this call.
@@ -776,6 +793,7 @@ class DarwinWindow implements Window, DarwinNativeResponder {
   }
   close(): void {
     if (this.#closed) return;
+    this.lib.assertMainThread();
     this.#closed = true;
     const errors: unknown[] = [];
     const cleanup = (operation: () => void): void => {
@@ -833,6 +851,10 @@ class DarwinLibrary implements Library {
     this.colorSpace = colorSpace;
   }
 
+  assertMainThread(): void {
+    this.ffi.assertMainThread();
+  }
+
   registerWindow(window: DarwinWindow): void {
     this.windows.set(window.id, window);
   }
@@ -855,11 +877,13 @@ class DarwinLibrary implements Library {
   }
 
   openWindow(x = 0, y = 0, w = 800, h = 600): DarwinWindow {
+    this.assertMainThread();
     if (this.#closed) throw new Error("winding(darwin): library is closed");
     return new DarwinWindow(this, x, y, w, h);
   }
 
   event(): UIEvent | undefined {
+    this.assertMainThread();
     if (this.#closed) return undefined;
     this.nativeClasses.throwIfCallbackFailed();
     const { getClass, sel, send } = this.ffi;
@@ -925,6 +949,7 @@ class DarwinLibrary implements Library {
   }
   close(): void {
     if (this.#closed) return;
+    this.assertMainThread();
     this.#closed = true;
     this.#queue.close();
 
