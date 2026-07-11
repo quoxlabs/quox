@@ -32,6 +32,7 @@ import {
   x11KeyEditDisposition,
   type X11ModifierMapping,
   x11ModifierSnapshot,
+  X11PointerButtonState,
 } from "./input.ts";
 import { NativeXImage } from "./native_image.ts";
 import { XimContext, XimManager } from "./xim.ts";
@@ -101,6 +102,7 @@ class X11Window implements Window {
   readonly id: bigint;
   readonly input: XimContext;
   readonly pressedKeys = new PressedLogicalKeyCache<number>();
+  readonly pointerButtons = new X11PointerButtonState();
   readonly #gc: Deno.PointerObject;
   #image: NativeXImage;
   #width: number;
@@ -1059,14 +1061,14 @@ function importEvent(
   switch (type) {
     case XEventType.ButtonPress: {
       const btn = view.getUint32(84, true);
-      const wheelPointer = x11PointerSnapshot(view, eventClock, modifierMapping);
+      const wheelPointer = x11PointerSnapshot(view, eventClock, modifierMapping, window.pointerButtons);
       if (btn === 4) return { type: "wheel", deltaX: 0, deltaY: -1, deltaMode: 1, ...wheelPointer, window };
       if (btn === 5) return { type: "wheel", deltaX: 0, deltaY: 1, deltaMode: 1, ...wheelPointer, window };
       if (btn === 6) return { type: "wheel", deltaX: -1, deltaY: 0, deltaMode: 1, ...wheelPointer, window };
       if (btn === 7) return { type: "wheel", deltaX: 1, deltaY: 0, deltaMode: 1, ...wheelPointer, window };
       const button = x11MouseButton(btn);
       if (button === undefined) return undefined;
-      const pointer = x11PointerSnapshot(view, eventClock, modifierMapping, button, true);
+      const pointer = x11PointerSnapshot(view, eventClock, modifierMapping, window.pointerButtons, button, true);
       return {
         type: "mousedown",
         button,
@@ -1080,7 +1082,7 @@ function importEvent(
       if (btn >= 4 && btn <= 7) return undefined; // wheel has no release
       const button = x11MouseButton(btn);
       if (button === undefined) return undefined;
-      const pointer = x11PointerSnapshot(view, eventClock, modifierMapping, button, false);
+      const pointer = x11PointerSnapshot(view, eventClock, modifierMapping, window.pointerButtons, button, false);
       return {
         type: "mouseup",
         button,
@@ -1092,7 +1094,7 @@ function importEvent(
     case XEventType.MotionNotify:
       return {
         type: "mousemove",
-        ...x11PointerSnapshot(view, eventClock, modifierMapping),
+        ...x11PointerSnapshot(view, eventClock, modifierMapping, window.pointerButtons),
         window,
       };
     case XEventType.ClientMessage: {
@@ -1111,7 +1113,7 @@ function importEvent(
       return view.getInt32(80, true) === NotifyNormal && view.getInt32(84, true) !== NotifyInferior
         ? {
           type: "mouseenter",
-          ...x11PointerSnapshot(view, eventClock, modifierMapping, undefined, undefined, 96),
+          ...x11PointerSnapshot(view, eventClock, modifierMapping, window.pointerButtons, undefined, undefined, 96),
           window,
         }
         : undefined;
@@ -1119,7 +1121,7 @@ function importEvent(
       return view.getInt32(80, true) === NotifyNormal && view.getInt32(84, true) !== NotifyInferior
         ? {
           type: "mouseleave",
-          ...x11PointerSnapshot(view, eventClock, modifierMapping, undefined, undefined, 96),
+          ...x11PointerSnapshot(view, eventClock, modifierMapping, window.pointerButtons, undefined, undefined, 96),
           window,
         }
         : undefined;
@@ -1136,6 +1138,7 @@ function x11PointerSnapshot(
   view: DataView<ArrayBuffer>,
   eventClock: NativeEventClock,
   modifierMapping: X11ModifierMapping,
+  buttonState: X11PointerButtonState,
   changedButton?: MouseButton,
   pressed?: boolean,
   stateOffset = 80,
@@ -1150,11 +1153,7 @@ function x11PointerSnapshot(
   metaKey: boolean;
 } {
   const state = view.getUint32(stateOffset, true);
-  let buttons = x11Buttons(state);
-  if (changedButton !== undefined && pressed !== undefined) {
-    const mask = mouseButtonMask(changedButton);
-    buttons = pressed ? buttons | mask : buttons & ~mask;
-  }
+  const buttons = buttonState.snapshot(state, changedButton, pressed);
   return {
     x: view.getInt32(64, true),
     y: view.getInt32(68, true),
@@ -1162,12 +1161,6 @@ function x11PointerSnapshot(
     timeStamp: eventClock.timeStamp(view.getUint32(56, true)),
     ...pointerModifiers(x11ModifierSnapshot(state, 0, false, modifierMapping)),
   };
-}
-
-function x11Buttons(state: number): number {
-  return (state & (1 << 8) ? 1 : 0) |
-    (state & (1 << 10) ? 2 : 0) |
-    (state & (1 << 9) ? 4 : 0);
 }
 
 function x11MouseButton(button: number): MouseButton | undefined {
@@ -1194,10 +1187,6 @@ function pointerModifiers(modifiers: ReturnType<typeof x11ModifierSnapshot>): Po
     altKey: modifiers.altKey,
     metaKey: modifiers.metaKey,
   };
-}
-
-function mouseButtonMask(button: MouseButton): number {
-  return button === "left" ? 1 : button === "right" ? 2 : button === "middle" ? 4 : button === "back" ? 8 : 16;
 }
 
 export const load: LoadLibrary = () => {

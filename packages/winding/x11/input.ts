@@ -1,4 +1,4 @@
-import type { KeyEditDisposition, KeyModifiers } from "../types.ts";
+import type { KeyEditDisposition, KeyModifiers, MouseButton } from "../types.ts";
 import { normalizeKeyboardText } from "../input/mod.ts";
 import { NotifyInferior, NotifyNormal, NotifyWhileGrabbed, XEventType } from "./ffi.ts";
 
@@ -11,6 +11,40 @@ export interface X11ModifierMapping {
   readonly altGraphMask: number;
   readonly maskByKeycode: ReadonlyMap<number, number>;
   readonly toggleKeycodes: ReadonlySet<number>;
+}
+
+/**
+ * Retain the buttons which core X11 cannot represent in an event's state mask.
+ *
+ * Buttons 1-3 remain authoritative in every native event. Back and forward use
+ * protocol ordinals 8 and 9, however, while XButtonEvent.state only has masks
+ * for ordinals 1-5. Their transitions therefore have to be retained locally so
+ * later motion, wheel, and chord events expose a complete DOM-style snapshot.
+ */
+export class X11PointerButtonState {
+  #extendedButtons = 0;
+
+  snapshot(state: number, changedButton?: MouseButton, pressed?: boolean): number {
+    let buttons = x11CoreButtons(state) | this.#extendedButtons;
+    if (changedButton === undefined || pressed === undefined) return buttons;
+
+    const changedMask = mouseButtonMask(changedButton);
+    buttons = pressed ? buttons | changedMask : buttons & ~changedMask;
+    if (changedButton === "back" || changedButton === "forward") {
+      this.#extendedButtons = pressed ? this.#extendedButtons | changedMask : this.#extendedButtons & ~changedMask;
+    }
+    return buttons;
+  }
+}
+
+function x11CoreButtons(state: number): number {
+  return (state & (1 << 8) ? 1 : 0) |
+    (state & (1 << 10) ? 2 : 0) |
+    (state & (1 << 9) ? 4 : 0);
+}
+
+function mouseButtonMask(button: MouseButton): number {
+  return button === "left" ? 1 : button === "right" ? 2 : button === "middle" ? 4 : button === "back" ? 8 : 16;
 }
 
 /** Convert XKeyEvent's pre-transition state to a DOM-style current snapshot. */

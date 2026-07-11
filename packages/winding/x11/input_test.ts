@@ -8,6 +8,7 @@ import {
   x11CommittedText,
   x11KeyEditDisposition,
   x11ModifierSnapshot,
+  X11PointerButtonState,
 } from "./input.ts";
 import { decodeXimTextLayout } from "./xim_abi.ts";
 import {
@@ -243,6 +244,28 @@ Deno.test("X11 modifier snapshots apply the reported transition", () => {
   assertEquals(x11ModifierSnapshot(1, 50, false, mapping).shiftKey, false);
   assertEquals(x11ModifierSnapshot(0, 66, true, mapping).capsLock, true);
   assertEquals(x11ModifierSnapshot(2, 66, false, mapping).capsLock, true);
+});
+
+Deno.test("X11 pointer snapshots retain extended-button chords", () => {
+  const buttons = new X11PointerButtonState();
+
+  assertEquals(buttons.snapshot(0, "back", true), 8);
+  assertEquals(buttons.snapshot(0), 8);
+  assertEquals(buttons.snapshot(0, "left", true), 9);
+  assertEquals(buttons.snapshot(1 << 8), 9);
+  assertEquals(buttons.snapshot(1 << 8, "forward", true), 25);
+  assertEquals(buttons.snapshot(1 << 8), 25);
+});
+
+Deno.test("X11 pointer snapshots remove only the released extended button", () => {
+  const buttons = new X11PointerButtonState();
+  buttons.snapshot(0, "back", true);
+  buttons.snapshot(0, "forward", true);
+
+  assertEquals(buttons.snapshot(1 << 10, "back", false), 18);
+  assertEquals(buttons.snapshot(1 << 10), 18);
+  assertEquals(buttons.snapshot(1 << 10, "forward", false), 2);
+  assertEquals(buttons.snapshot(0), 0);
 });
 
 Deno.test("X11 pixels follow the server visual masks and byte order", () => {
