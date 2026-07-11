@@ -444,6 +444,15 @@ class X11Library implements Library {
           const filtered = this.input.filterEvent(eventPointer);
           this.input.throwIfCallbackFailed();
           if (filtered) {
+            if (keycode === 0) {
+              if (lookupStaged) {
+                window.input.finishLookup();
+                lookupStaged = false;
+              }
+              const imeEvent = this.#events.shift();
+              if (imeEvent !== undefined) return imeEvent;
+              continue;
+            }
             let keyEvent: KeyDownEvent | KeyUpEvent;
             if (type === XEventType.KeyPress) {
               const repeat = window.pressedKeys.has(keycode);
@@ -478,6 +487,24 @@ class X11Library implements Library {
             // style wrapper still exposes the physical transition first.
             this.#events.prepend(keyEvent);
             return this.#events.shift();
+          }
+
+          // XIM reserves keycode zero as a synthetic notice that lookup data is
+          // ready. It has no physical key and normally has no matching release.
+          if (keycode === 0) {
+            if (type === XEventType.KeyPress) {
+              const lookup = this.input.lookup(window.input, eventPointer);
+              this.input.throwIfCallbackFailed();
+              const text = normalizeCommittedText(lookup.text ?? "");
+              if (text !== undefined) window.input.commit(text);
+            }
+            if (lookupStaged) {
+              window.input.finishLookup();
+              lookupStaged = false;
+            }
+            const imeEvent = this.#events.shift();
+            if (imeEvent !== undefined) return imeEvent;
+            continue;
           }
 
           if (type === XEventType.KeyRelease) {
