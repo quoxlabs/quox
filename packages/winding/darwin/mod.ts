@@ -25,7 +25,9 @@ import {
   type ScreenFrame,
   type SurfaceMetrics,
   surfaceMetrics,
+  validateAppKitWindowRect,
   validateDarwinGeometry,
+  validateDarwinScreenFrame,
 } from "./geometry.ts";
 import { DarwinInputState } from "./input_state.ts";
 import {
@@ -389,15 +391,26 @@ class DarwinWindow implements Window, DarwinNativeResponder {
     const { getClass, nsrect, sel, send } = lib.ffi;
     const windowClass = getClass("NSWindow");
     const styleMask = BigInt(NS_WINDOW_STYLE_MASK);
-    const frame = appKitWindowFrame(x, y, w, h, primaryScreenFrame(lib.ffi));
+    const primaryScreen = primaryScreenFrame(lib.ffi);
+    validateDarwinScreenFrame(primaryScreen);
+    const frame = appKitWindowFrame(x, y, w, h, primaryScreen);
+    // Window-server limits apply to these native screen coordinates, not only
+    // to Winding's already-validated top-left-primary source coordinates.
+    validateAppKitWindowRect(frame, "transformed AppKit outer frame");
     const contentRect = nsrect.rectU64Arg(
       windowClass,
       sel("contentRectForFrameRect:styleMask:"),
       frame,
       styleMask,
     );
+    const contentX = readStructF64(contentRect, 0);
+    const contentY = readStructF64(contentRect, 8);
     const contentWidth = readStructF64(contentRect, 16);
     const contentHeight = readStructF64(contentRect, 24);
+    validateAppKitWindowRect(
+      [contentX, contentY, contentWidth, contentHeight],
+      "converted AppKit content rectangle",
+    );
     const alloc = send.id(windowClass, sel("alloc"));
     const win = send.id_rectU64U64Bool(
       alloc,

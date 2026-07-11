@@ -8,6 +8,49 @@ export interface ScreenFrame {
 export const DARWIN_WINDOW_POSITION_LIMIT = 16_000;
 export const DARWIN_WINDOW_DIMENSION_LIMIT = 10_000;
 
+/** Validate the NSScreen data used to translate Winding's coordinate space. */
+export function validateDarwinScreenFrame(screen: ScreenFrame): void {
+  if (
+    !Number.isFinite(screen.x) || !Number.isFinite(screen.y) ||
+    !Number.isFinite(screen.width) || !Number.isFinite(screen.height) ||
+    screen.width <= 0 || screen.height <= 0
+  ) {
+    throw new RangeError(
+      "winding(darwin): primary screen frame must have finite coordinates and positive finite dimensions",
+    );
+  }
+}
+
+/** Validate the screen-space rectangle that will cross an AppKit boundary. */
+export function validateAppKitWindowRect(
+  rect: ArrayLike<number>,
+  description: string,
+): void {
+  const x = rect[0];
+  const y = rect[1];
+  const width = rect[2];
+  const height = rect[3];
+  if (
+    !Number.isFinite(x) || !Number.isFinite(y) ||
+    Math.abs(x) > DARWIN_WINDOW_POSITION_LIMIT ||
+    Math.abs(y) > DARWIN_WINDOW_POSITION_LIMIT
+  ) {
+    throw new RangeError(
+      `winding(darwin): ${description} position must be finite and within ±${DARWIN_WINDOW_POSITION_LIMIT} screen units`,
+    );
+  }
+  if (
+    !Number.isFinite(width) || !Number.isFinite(height) ||
+    width <= 0 || height <= 0 ||
+    width > DARWIN_WINDOW_DIMENSION_LIMIT ||
+    height > DARWIN_WINDOW_DIMENSION_LIMIT
+  ) {
+    throw new RangeError(
+      `winding(darwin): ${description} dimensions must be positive, finite, and no larger than ${DARWIN_WINDOW_DIMENSION_LIMIT} screen units`,
+    );
+  }
+}
+
 /** Validate Winding's logical outer frame before any AppKit window message. */
 export function validateDarwinGeometry(
   x: number,

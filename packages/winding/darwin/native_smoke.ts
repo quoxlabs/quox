@@ -27,6 +27,7 @@ import {
 import { REQUIRED_TEXT_INPUT_SELECTORS } from "./text_input.ts";
 import { POINTER_INPUT_SELECTORS, WINDOW_FRAMEBUFFER_SELECTORS, WINDOW_GEOMETRY_SELECTORS } from "./native_classes.ts";
 import { DarwinInputState } from "./input_state.ts";
+import { DARWIN_WINDOW_POSITION_LIMIT } from "./geometry.ts";
 
 // AppKit requires all window work on the process main thread. Deno.test runs
 // test bodies on worker threads, so this file must be invoked with `deno run`.
@@ -640,6 +641,10 @@ function testWindowGeometryValidation(): void {
     assertThrowsMessage(
       () => library.openWindow(0, 0, 64.5, 64),
       "outer window dimensions",
+    );
+    assertThrowsMessage(
+      () => library.openWindow(0, -DARWIN_WINDOW_POSITION_LIMIT, 64, 64),
+      "transformed AppKit outer frame position",
     );
 
     for (
