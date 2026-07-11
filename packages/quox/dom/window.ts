@@ -88,7 +88,7 @@ export class QuoxWindow implements Disposable {
   #disposed = false;
   #rendererFreed = false;
   #visible = true;
-  readonly #listeners: Array<(event: QuoxInputEvent) => void> = [];
+  readonly #inputListeners: Array<(event: QuoxInputEvent) => void> = [];
   readonly #inputRouter: QuoxInputRouter;
   readonly document: QuoxDocument;
 
@@ -233,13 +233,13 @@ export class QuoxWindow implements Disposable {
         const mapped = mapWindingEvent(ev);
 
         if (this.#inputRouter.route(mapped) === "close") {
-          // Notify listeners before tearing down so they can react.
-          this.#notifyListeners(mapped, listenerErrors);
+          // Notify raw input observers before tearing down so they can react.
+          this.#notifyInputListeners(mapped, listenerErrors);
           this[Symbol.dispose]();
           return;
         }
 
-        this.#notifyListeners(mapped, listenerErrors);
+        this.#notifyInputListeners(mapped, listenerErrors);
       }
     } finally {
       if (listenerErrors.length > 0) {
@@ -253,8 +253,8 @@ export class QuoxWindow implements Disposable {
     }
   }
 
-  #notifyListeners(event: QuoxInputEvent, errors: unknown[]): void {
-    notifyInputListeners(this.#listeners, event, (error) => errors.push(error));
+  #notifyInputListeners(event: QuoxInputEvent, errors: unknown[]): void {
+    notifyInputListeners(this.#inputListeners, event, (error) => errors.push(error));
   }
 
   #syncNativeImeRequests(): void {
@@ -326,15 +326,18 @@ export class QuoxWindow implements Disposable {
     }
   }
 
-  /** Register a callback that is invoked for every input event during a tick. */
-  addEventListener(callback: (event: QuoxInputEvent) => void): void {
-    this.#listeners.push(callback);
+  /**
+   * Observe every normalized native input record after Quox has routed it through the DOM
+   * engine. This is a non-cancelable diagnostic/input feed, not DOM `EventTarget` dispatch.
+   */
+  addInputListener(callback: (event: QuoxInputEvent) => void): void {
+    this.#inputListeners.push(callback);
   }
 
-  /** Remove a previously registered input event callback. */
-  removeEventListener(callback: (event: QuoxInputEvent) => void): void {
-    const idx = this.#listeners.indexOf(callback);
-    if (idx >= 0) this.#listeners.splice(idx, 1);
+  /** Remove one registration made by `addInputListener`. */
+  removeInputListener(callback: (event: QuoxInputEvent) => void): void {
+    const idx = this.#inputListeners.indexOf(callback);
+    if (idx >= 0) this.#inputListeners.splice(idx, 1);
   }
 
   /** Set the native window title via `document.title`. */
