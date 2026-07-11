@@ -1,8 +1,10 @@
 use super::{QuoxRenderer, QuoxRendererState};
 use crate::ffi_numbers::{NumericArgumentError, integer_range, uint32};
 use crate::form_controls::{TextControlSelectionDirection, restore_text_editor};
-use blitz_dom::{BaseDocument, DocumentMutator, LocalName, NodeData, QualName, ns};
+use blitz_dom::{BaseDocument, DocumentMutator, LocalName, NodeData, Point, QualName, ns};
 use style::computed_values::visibility::T as Visibility;
+use style::values::computed::Overflow;
+use style::values::specified::box_::DisplayInside;
 use wasm_bindgen::prelude::*;
 
 const ELEMENT_NODE: u8 = 1;
@@ -354,6 +356,192 @@ fn active_element_node_id(document: &BaseDocument) -> Option<usize> {
             })
         })
         .or(Some(root_id))
+}
+
+#[derive(Clone, Copy)]
+enum ScrollAxis {
+    Horizontal,
+    Vertical,
+}
+
+fn normalize_scroll_offset(value: f64) -> f64 {
+    if value.is_finite() { value } else { 0.0 }
+}
+
+fn has_layout_box(document: &BaseDocument, node_id: usize) -> bool {
+    let Some(node) = document.get_node(node_id) else {
+        return false;
+    };
+    if node.element_data().is_none() || !node.flags.is_in_document() {
+        return false;
+    }
+
+    // A connected descendant of `display:none` has no associated CSS box even if Blitz retains
+    // its previous layout values. Layout has already been resolved before public callers arrive.
+    let mut current_id = Some(node_id);
+    while let Some(id) = current_id {
+        let Some(current) = document.get_node(id) else {
+            return false;
+        };
+        if current.element_data().is_some() {
+            let Some(style) = current.primary_styles() else {
+                return false;
+            };
+            let display = style.clone_display();
+            if display.is_none() || (id == node_id && display.inside() == DisplayInside::Contents) {
+                return false;
+            }
+        }
+        current_id = current.parent;
+    }
+
+    true
+}
+
+fn finite_scroll_limit(value: f32) -> f64 {
+    let value = f64::from(value);
+    if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        0.0
+    }
+}
+
+fn body_overflow_propagates_to_viewport(document: &BaseDocument, node_id: usize) -> bool {
+    let Some(body) = document.get_node(node_id) else {
+        return false;
+    };
+    let Some(body_element) = body.element_data() else {
+        return false;
+    };
+    let Some(root) = document.try_root_element() else {
+        return false;
+    };
+    let Some(root_element) = root.element_data() else {
+        return false;
+    };
+    if body.parent != Some(root.id)
+        || body_element.name.ns != ns!(html)
+        || body_element.name.local.as_ref() != "body"
+        || root_element.name.ns != ns!(html)
+        || root_element.name.local.as_ref() != "html"
+    {
+        return false;
+    }
+
+    let Some(body_style) = body.primary_styles() else {
+        return false;
+    };
+    let Some(root_style) = root.primary_styles() else {
+        return false;
+    };
+    if !body_style.clone_contain().is_empty() || !root_style.clone_contain().is_empty() {
+        return false;
+    }
+    if root_style.clone_overflow_x() != Overflow::Visible
+        || root_style.clone_overflow_y() != Overflow::Visible
+    {
+        return false;
+    }
+
+    // HTML propagates only the first direct body child whose display is not none.
+    root.children.iter().copied().find(|child_id| {
+        document.get_node(*child_id).is_some_and(|child| {
+            child.element_data().is_some_and(|element| {
+                element.name.ns == ns!(html) && element.name.local.as_ref() == "body"
+            }) && child
+                .primary_styles()
+                .is_some_and(|style| !style.clone_display().is_none())
+        })
+    }) == Some(node_id)
+}
+
+fn element_scroll_limits(document: &BaseDocument, node_id: usize) -> Point<f64> {
+    let Some(node) = document
+        .get_node(node_id)
+        .filter(|_| has_layout_box(document, node_id))
+    else {
+        return Point::ZERO;
+    };
+    if body_overflow_propagates_to_viewport(document, node_id) {
+        return Point::ZERO;
+    }
+
+    Point {
+        x: if node.style.overflow.x.is_scroll_container() {
+            finite_scroll_limit(node.final_layout.scroll_width())
+        } else {
+            0.0
+        },
+        y: if node.style.overflow.y.is_scroll_container() {
+            finite_scroll_limit(node.final_layout.scroll_height())
+        } else {
+            0.0
+        },
+    }
+}
+
+fn clamp_scroll_offsets(offsets: Point<f64>, limits: Point<f64>) -> Point<f64> {
+    Point {
+        x: normalize_scroll_offset(offsets.x).clamp(0.0, limits.x),
+        y: normalize_scroll_offset(offsets.y).clamp(0.0, limits.y),
+    }
+}
+
+/// Return the live CSS-pixel scroll offsets for an element. In Quox's standards-mode document,
+/// the root element reflects the viewport; all other elements retain their own Blitz offset.
+fn element_scroll_offsets(document: &mut BaseDocument, node_id: usize) -> Point<f64> {
+    if document
+        .try_root_element()
+        .is_some_and(|root| root.id == node_id)
+    {
+        // `set_viewport_scroll` itself does not clamp, and layout may have changed the range since
+        // the last viewport update. A zero delta applies Blitz's current viewport bounds.
+        document.scroll_viewport_by(0.0, 0.0);
+        return document.viewport_scroll();
+    }
+
+    let limits = element_scroll_limits(document, node_id);
+    let offsets = document
+        .get_node(node_id)
+        .map_or(Point::ZERO, |node| node.scroll_offset);
+    let clamped = clamp_scroll_offsets(offsets, limits);
+    if let Some(node) = document.get_node_mut(node_id) {
+        // Blitz does not re-clamp element offsets when layout removes overflow. Correct retained
+        // values while servicing this layout-flushing CSSOM getter/setter.
+        node.scroll_offset = clamped;
+    }
+    clamped
+}
+
+fn set_element_scroll_offset(
+    document: &mut BaseDocument,
+    node_id: usize,
+    axis: ScrollAxis,
+    value: f64,
+) -> bool {
+    let current = element_scroll_offsets(document, node_id);
+    let mut requested = current;
+    let value = normalize_scroll_offset(value);
+    match axis {
+        ScrollAxis::Horizontal => requested.x = value,
+        ScrollAxis::Vertical => requested.y = value,
+    }
+
+    if document
+        .try_root_element()
+        .is_some_and(|root| root.id == node_id)
+    {
+        document.set_viewport_scroll(requested);
+        document.scroll_viewport_by(0.0, 0.0);
+        return document.viewport_scroll() != current;
+    }
+
+    let requested = clamp_scroll_offsets(requested, element_scroll_limits(document, node_id));
+    if let Some(node) = document.get_node_mut(node_id) {
+        node.scroll_offset = requested;
+    }
+    requested != current
 }
 
 /// Build the target-first DOM ancestor path for a synthetic event. The document itself has no
@@ -745,6 +933,59 @@ impl QuoxRenderer {
             .transpose()
     }
 
+    /// Return an element's live horizontal scroll offset in logical CSS pixels. The root element
+    /// reflects document viewport scrolling in Quox's standards-mode HTML document.
+    pub fn element_scroll_left(&self, node_handle: f64) -> Result<f64, JsValue> {
+        let node_handle =
+            uint32(node_handle, "nodeHandle").map_err(NumericArgumentError::into_js)?;
+        let mut state = self.state.borrow_mut();
+        let node_id = state.resolve_element(node_handle)?;
+        state.sync_layout();
+        Ok(element_scroll_offsets(&mut state.document, node_id).x)
+    }
+
+    /// Return an element's live vertical scroll offset in logical CSS pixels.
+    pub fn element_scroll_top(&self, node_handle: f64) -> Result<f64, JsValue> {
+        let node_handle =
+            uint32(node_handle, "nodeHandle").map_err(NumericArgumentError::into_js)?;
+        let mut state = self.state.borrow_mut();
+        let node_id = state.resolve_element(node_handle)?;
+        state.sync_layout();
+        Ok(element_scroll_offsets(&mut state.document, node_id).y)
+    }
+
+    /// Set an element's absolute horizontal scroll offset, returning whether its effective
+    /// position changed. Non-finite values follow CSSOM View and normalize to zero.
+    pub fn set_element_scroll_left(&self, node_handle: f64, value: f64) -> Result<bool, JsValue> {
+        let node_handle =
+            uint32(node_handle, "nodeHandle").map_err(NumericArgumentError::into_js)?;
+        let mut state = self.state.borrow_mut();
+        let node_id = state.resolve_element(node_handle)?;
+        state.sync_layout();
+        Ok(set_element_scroll_offset(
+            &mut state.document,
+            node_id,
+            ScrollAxis::Horizontal,
+            value,
+        ))
+    }
+
+    /// Set an element's absolute vertical scroll offset, returning whether its effective
+    /// position changed. Non-finite values follow CSSOM View and normalize to zero.
+    pub fn set_element_scroll_top(&self, node_handle: f64, value: f64) -> Result<bool, JsValue> {
+        let node_handle =
+            uint32(node_handle, "nodeHandle").map_err(NumericArgumentError::into_js)?;
+        let mut state = self.state.borrow_mut();
+        let node_id = state.resolve_element(node_handle)?;
+        state.sync_layout();
+        Ok(set_element_scroll_offset(
+            &mut state.document,
+            node_id,
+            ScrollAxis::Vertical,
+            value,
+        ))
+    }
+
     /// Remove an element attribute.
     pub fn remove_attribute(&self, node_handle: f64, name: &str) -> Result<(), JsValue> {
         let node_handle =
@@ -1026,15 +1267,17 @@ impl QuoxRenderer {
 #[cfg(test)]
 mod tests {
     use super::{
-        active_element_node_id, actual_focus_node_id, attr_name, attribute_value,
+        ScrollAxis, active_element_node_id, actual_focus_node_id, attr_name, attribute_value,
         clear_retained_focus_in_descendants, clear_retained_focus_in_subtree,
-        dropped_descendant_ids, retained_focus_node_id, synthetic_event_node_path,
+        dropped_descendant_ids, element_scroll_limits, element_scroll_offsets,
+        retained_focus_node_id, set_element_scroll_offset, synthetic_event_node_path,
     };
     use crate::form_controls::TextControlStates;
     use crate::node_handles::NodeHandles;
     use crate::{IME_REQUEST_ENABLED, ImeRequestMailbox, QuoxShellProvider};
     use blitz_dom::{DocumentConfig, NodeData};
     use blitz_html::{HtmlDocument, HtmlProvider};
+    use blitz_traits::shell::{ColorScheme, Viewport};
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
@@ -1079,6 +1322,20 @@ mod tests {
         )
         .into_inner();
         (document, ime_requests)
+    }
+
+    fn layout_document(body: &str, width: u32, height: u32) -> blitz_dom::BaseDocument {
+        let mut document = HtmlDocument::from_html(
+            &format!("<!doctype html><html><body>{body}</body></html>"),
+            DocumentConfig {
+                viewport: Some(Viewport::new(width, height, 1.0, ColorScheme::Light)),
+                html_parser_provider: Some(Arc::new(HtmlProvider)),
+                ..DocumentConfig::default()
+            },
+        )
+        .into_inner();
+        document.resolve(0.0);
+        document
     }
 
     #[allow(
@@ -1222,6 +1479,296 @@ mod tests {
             active_element_node_id(&frameset_document),
             Some(frameset_id)
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        clippy::too_many_lines,
+        reason = "one shared layout fixture covers every supported overflow mode and native updates"
+    )]
+    fn element_scroll_offsets_are_live_fractional_and_cssom_clamped() {
+        let mut document = layout_document(
+            "<div id='auto' style='overflow:auto;width:100px;height:80px'>\
+               <div id='auto-content' style='width:300px;height:240px'></div>\
+             </div>\
+             <div id='hidden' style='overflow:hidden;width:100px;height:80px'>\
+               <div style='width:300px;height:240px'></div>\
+             </div>\
+             <div id='scroll' style='overflow:scroll;width:100px;height:80px'>\
+               <div style='width:300px;height:240px'></div>\
+             </div>\
+             <div id='visible' style='overflow:visible;width:100px;height:80px'>\
+               <div style='width:300px;height:240px'></div>\
+             </div>\
+             <div id='clip' style='overflow:clip;width:100px;height:80px'>\
+               <div style='width:300px;height:240px'></div>\
+             </div>",
+            800,
+            600,
+        );
+        let auto = element_by_id(&document, "auto");
+
+        let limits = element_scroll_limits(&document, auto);
+        assert!(limits.x > 100.0);
+        assert!(limits.y > 100.0);
+        assert!(set_element_scroll_offset(
+            &mut document,
+            auto,
+            ScrollAxis::Horizontal,
+            25.5,
+        ));
+        assert!(set_element_scroll_offset(
+            &mut document,
+            auto,
+            ScrollAxis::Vertical,
+            30.25,
+        ));
+        assert_eq!(
+            element_scroll_offsets(&mut document, auto),
+            blitz_dom::Point { x: 25.5, y: 30.25 }
+        );
+        assert!(!set_element_scroll_offset(
+            &mut document,
+            auto,
+            ScrollAxis::Vertical,
+            30.25,
+        ));
+
+        assert!(set_element_scroll_offset(
+            &mut document,
+            auto,
+            ScrollAxis::Horizontal,
+            f64::MAX,
+        ));
+        assert_eq!(element_scroll_offsets(&mut document, auto).x, limits.x);
+        assert!(set_element_scroll_offset(
+            &mut document,
+            auto,
+            ScrollAxis::Horizontal,
+            -1.0,
+        ));
+        assert_eq!(element_scroll_offsets(&mut document, auto).x, 0.0);
+
+        assert!(set_element_scroll_offset(
+            &mut document,
+            auto,
+            ScrollAxis::Vertical,
+            f64::INFINITY,
+        ));
+        assert_eq!(element_scroll_offsets(&mut document, auto).y, 0.0);
+        assert!(!set_element_scroll_offset(
+            &mut document,
+            auto,
+            ScrollAxis::Vertical,
+            f64::NAN,
+        ));
+        assert!(!set_element_scroll_offset(
+            &mut document,
+            auto,
+            ScrollAxis::Vertical,
+            f64::NEG_INFINITY,
+        ));
+
+        // Blitz's wheel default uses this primitive. The public getter must observe its retained
+        // offset directly rather than a Quox-side mirror.
+        assert!(document.scroll_node_by_has_changed(auto, -9.5, -11.75, |_| {}));
+        assert_eq!(
+            element_scroll_offsets(&mut document, auto),
+            blitz_dom::Point { x: 9.5, y: 11.75 }
+        );
+
+        for id in ["hidden", "scroll"] {
+            let node_id = element_by_id(&document, id);
+            assert!(set_element_scroll_offset(
+                &mut document,
+                node_id,
+                ScrollAxis::Vertical,
+                17.5,
+            ));
+            assert_eq!(element_scroll_offsets(&mut document, node_id).y, 17.5);
+        }
+
+        for id in ["visible", "clip"] {
+            let node_id = element_by_id(&document, id);
+            assert!(!set_element_scroll_offset(
+                &mut document,
+                node_id,
+                ScrollAxis::Vertical,
+                17.5,
+            ));
+            assert_eq!(element_scroll_offsets(&mut document, node_id).y, 0.0);
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "zero is the exact CSSOM result for elements without a scrolling box"
+    )]
+    fn element_scroll_offsets_reclamp_for_layout_and_connectivity_changes() {
+        let mut document = layout_document(
+            "<div id='host'>\
+               <div id='scroller' style='overflow:auto;width:100px;height:80px'>\
+                 <div id='content' style='width:300px;height:240px'></div>\
+               </div>\
+             </div>\
+             <div id='none' style='display:none;overflow:scroll;width:100px;height:80px'>\
+               <div style='width:300px;height:240px'></div>\
+             </div>",
+            800,
+            600,
+        );
+        let body = element_by_tag(&document, "body");
+        let host = element_by_id(&document, "host");
+        let scroller = element_by_id(&document, "scroller");
+        let content = element_by_id(&document, "content");
+        let none = element_by_id(&document, "none");
+
+        assert!(set_element_scroll_offset(
+            &mut document,
+            scroller,
+            ScrollAxis::Vertical,
+            90.0,
+        ));
+        document
+            .mutate()
+            .set_attribute(content, attr_name("style"), "width:50px;height:40px");
+        document.resolve(0.0);
+        assert_eq!(element_scroll_offsets(&mut document, scroller).y, 0.0);
+        assert_eq!(document.get_node(scroller).unwrap().scroll_offset.y, 0.0);
+
+        assert!(!set_element_scroll_offset(
+            &mut document,
+            none,
+            ScrollAxis::Vertical,
+            20.0,
+        ));
+        assert_eq!(element_scroll_offsets(&mut document, none).y, 0.0);
+
+        document
+            .mutate()
+            .set_attribute(content, attr_name("style"), "width:300px;height:240px");
+        document.resolve(0.0);
+        assert!(set_element_scroll_offset(
+            &mut document,
+            scroller,
+            ScrollAxis::Vertical,
+            20.0,
+        ));
+
+        document.mutate().set_attribute(
+            scroller,
+            attr_name("style"),
+            "display:contents;overflow:auto;width:100px;height:80px",
+        );
+        document.resolve(0.0);
+        assert_eq!(element_scroll_offsets(&mut document, scroller).y, 0.0);
+        assert_eq!(document.get_node(scroller).unwrap().scroll_offset.y, 0.0);
+        assert!(!set_element_scroll_offset(
+            &mut document,
+            scroller,
+            ScrollAxis::Vertical,
+            20.0,
+        ));
+
+        // A contents element has no box of its own, but does not suppress descendant boxes.
+        document.mutate().set_attribute(
+            scroller,
+            attr_name("style"),
+            "overflow:auto;width:100px;height:80px",
+        );
+        document
+            .mutate()
+            .set_attribute(host, attr_name("style"), "display:contents");
+        document.resolve(0.0);
+        assert!(set_element_scroll_offset(
+            &mut document,
+            scroller,
+            ScrollAxis::Vertical,
+            20.0,
+        ));
+
+        document.mutate().remove_node(scroller);
+        assert_eq!(element_scroll_offsets(&mut document, scroller).y, 0.0);
+        assert!(!set_element_scroll_offset(
+            &mut document,
+            scroller,
+            ScrollAxis::Vertical,
+            20.0,
+        ));
+
+        document.mutate().append_children(body, &[scroller]);
+        document.resolve(0.0);
+        assert_eq!(element_scroll_offsets(&mut document, scroller).y, 0.0);
+    }
+
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "viewport and element offsets retain exactly representable input doubles"
+    )]
+    fn standards_root_proxies_viewport_while_body_keeps_an_element_offset() {
+        let mut body_document = layout_document("<div style='height:400px'></div>", 200, 100);
+        let root = element_by_tag(&body_document, "html");
+        let body = element_by_tag(&body_document, "body");
+
+        assert!(set_element_scroll_offset(
+            &mut body_document,
+            root,
+            ScrollAxis::Vertical,
+            37.5,
+        ));
+        assert_eq!(body_document.viewport_scroll().y, 37.5);
+        assert_eq!(element_scroll_offsets(&mut body_document, root).y, 37.5);
+        assert_eq!(body_document.get_node(root).unwrap().scroll_offset.y, 0.0);
+        assert!(!set_element_scroll_offset(
+            &mut body_document,
+            body,
+            ScrollAxis::Vertical,
+            20.0,
+        ));
+        assert_eq!(body_document.viewport_scroll().y, 37.5);
+
+        let mut scrolling_body = layout_document("<div style='height:400px'></div>", 200, 100);
+        let root = element_by_tag(&scrolling_body, "html");
+        let body = element_by_tag(&scrolling_body, "body");
+        scrolling_body.mutate().set_attribute(
+            body,
+            attr_name("style"),
+            "height:80px;margin:0;overflow:hidden",
+        );
+        scrolling_body.resolve(0.0);
+        assert!(!set_element_scroll_offset(
+            &mut scrolling_body,
+            body,
+            ScrollAxis::Vertical,
+            22.25,
+        ));
+        assert_eq!(element_scroll_offsets(&mut scrolling_body, body).y, 0.0);
+
+        // Default root overflow propagates the body's overflow to the viewport. Once the root
+        // establishes its own overflow behavior, the body keeps its ordinary element scroll box.
+        scrolling_body
+            .mutate()
+            .set_attribute(root, attr_name("style"), "overflow:hidden");
+        scrolling_body.resolve(0.0);
+        assert!(set_element_scroll_offset(
+            &mut scrolling_body,
+            body,
+            ScrollAxis::Vertical,
+            22.25,
+        ));
+        assert_eq!(element_scroll_offsets(&mut scrolling_body, body).y, 22.25);
+        assert_eq!(scrolling_body.viewport_scroll().y, 0.0);
+
+        assert!(set_element_scroll_offset(
+            &mut body_document,
+            root,
+            ScrollAxis::Vertical,
+            f64::INFINITY,
+        ));
+        assert_eq!(body_document.viewport_scroll().y, 0.0);
     }
 
     #[test]

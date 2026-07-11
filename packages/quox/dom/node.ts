@@ -15,6 +15,13 @@ type AttributeRenderer = {
   get_attribute(nodeHandle: number, name: string): string | undefined;
 };
 
+type LiveScrollRenderer = {
+  element_scroll_left(nodeHandle: number): number;
+  element_scroll_top(nodeHandle: number): number;
+  set_element_scroll_left(nodeHandle: number, value: number): boolean;
+  set_element_scroll_top(nodeHandle: number, value: number): boolean;
+};
+
 type LiveTextControlRenderer = {
   form_control_value(nodeHandle: number): string;
   set_form_control_value(nodeHandle: number, value: string): boolean;
@@ -151,6 +158,13 @@ function controlValueString(value: unknown): string {
   return value === null ? "" : boundaryString(value);
 }
 
+/** Web IDL `unrestricted double` conversion plus CSSOM View's non-finite normalization. */
+function scrollOffsetNumber(value: unknown): number {
+  // Unary plus performs ToNumber exactly once and throws for Symbol and BigInt.
+  const number = +(value as number);
+  return Number.isFinite(number) ? number : 0;
+}
+
 export class QuoxNode extends QuoxEventTarget {
   readonly ownerDocument: QuoxDocument;
   readonly #nodeId: number;
@@ -214,6 +228,32 @@ export class QuoxElement extends QuoxNode {
 
   blur(): void {
     documentInternals(this.ownerDocument).blurElement(this.nodeId);
+  }
+
+  get scrollLeft(): number {
+    const { renderer } = documentInternals(this.ownerDocument);
+    return (renderer as unknown as LiveScrollRenderer).element_scroll_left(this.nodeId);
+  }
+
+  set scrollLeft(value: number) {
+    const converted = scrollOffsetNumber(value);
+    const { renderer, requestRender } = documentInternals(this.ownerDocument);
+    if ((renderer as unknown as LiveScrollRenderer).set_element_scroll_left(this.nodeId, converted)) {
+      requestRender();
+    }
+  }
+
+  get scrollTop(): number {
+    const { renderer } = documentInternals(this.ownerDocument);
+    return (renderer as unknown as LiveScrollRenderer).element_scroll_top(this.nodeId);
+  }
+
+  set scrollTop(value: number) {
+    const converted = scrollOffsetNumber(value);
+    const { renderer, requestRender } = documentInternals(this.ownerDocument);
+    if ((renderer as unknown as LiveScrollRenderer).set_element_scroll_top(this.nodeId, converted)) {
+      requestRender();
+    }
   }
 
   set innerHTML(value: QuoxInnerHTML) {
