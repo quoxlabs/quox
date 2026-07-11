@@ -67,6 +67,19 @@ jobs:
         working-directory: packages/winding
       - run: deno test darwin
         working-directory: packages/winding
+      - name: Contain an uncaught AppKit exception in a child process
+        shell: bash
+        run: |
+          set +e
+          deno run --allow-ffi darwin/native_smoke.ts --uncaught-exception-probe
+          status=$?
+          set -e
+          if [[ $status -eq 0 ]]; then
+            echo "The Objective-C exception probe unexpectedly returned normally"
+            exit 1
+          fi
+        timeout-minutes: 1
+        working-directory: packages/winding
       - name: Test native AppKit input on the process main thread
         run: deno run --allow-ffi darwin/native_smoke.ts
         timeout-minutes: 2

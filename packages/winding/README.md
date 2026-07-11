@@ -12,6 +12,17 @@ Currently, it supports:
 
 Contributions are welcome!
 
+## Darwin exception boundary
+
+The Darwin backend validates public inputs and treats an AppKit `NSException` as a binding bug, not a recoverable
+application error. Objective-C exceptions cannot safely unwind through Deno FFI frames, so they remain process-fatal;
+JavaScript `try`/`catch` must not be used to recover from one. Native AppKit smoke and fault probes therefore run in
+dedicated child processes in CI.
+
+Winding intentionally does not ship a compiled Objective-C catch shim. The package otherwise talks directly to system
+frameworks, and a complete shim would need architecture-specific wrappers for every Objective-C message shape while
+still being unable to catch memory faults. Known AppKit preconditions should instead be enforced before crossing FFI.
+
 ## Usage
 
 Create `app.ts` with the following content.

@@ -1,6 +1,7 @@
 import { load } from "./mod.ts";
 import type { ImeEvent, Library, Window } from "../types.ts";
 import {
+  APPKIT,
   cfSymbols,
   classConformsToProtocol,
   CORE_FOUNDATION,
@@ -44,6 +45,7 @@ if (Deno.build.os !== "darwin") {
 }
 
 assertProcessMainThread();
+if (Deno.args.includes("--uncaught-exception-probe")) runUncaughtExceptionProbe();
 runCase(
   "NSString, attributed text, preedit, commit, and command callbacks preserve order",
   testTextCallbacks,
@@ -65,6 +67,32 @@ runCase(
 runCase("text input survives repeated library and window lifecycles", testRepeatedLifecycles);
 await runAsyncCase("duplicate module copies share one AppKit owner", testDuplicateModuleOwnership);
 console.log("Darwin native smoke: 11 passed");
+
+/**
+ * Deliberately violate an NSArray precondition. This must only be launched as
+ * a child process: NSException cannot safely unwind through Deno's FFI frames.
+ */
+function runUncaughtExceptionProbe(): never {
+  const handles: Closeable[] = [];
+  try {
+    const appKit = Deno.dlopen(APPKIT, {});
+    handles.push(appKit);
+    const runtime = Deno.dlopen(LIBOBJC, runtimeSymbols);
+    handles.push(runtime);
+    const sendId = openMessage(handles, ["pointer", "pointer"], "pointer");
+    const sendIdU64 = openMessage(handles, ["pointer", "pointer", "u64"], "pointer");
+    const emptyArray = sendId(getClass(runtime, "NSArray"), sel(runtime, "array"));
+    assert(emptyArray !== null, "NSArray.array returned nil");
+    sendIdU64(emptyArray, sel(runtime, "objectAtIndex:"), 0n);
+  } catch (error) {
+    console.error("Objective-C exception unexpectedly crossed FFI as JavaScript", error);
+  } finally {
+    closeAll(handles);
+  }
+  // Returning normally (or receiving a catchable JS error) means the probe did
+  // not exercise today's process-fatal boundary, so make the CI wrapper fail.
+  Deno.exit(0);
+}
 
 function testTextCallbacks(): void {
   withNativeWindow(64, 48, (library, window) => {
