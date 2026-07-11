@@ -333,8 +333,8 @@ export class WaylandWindow implements Window {
 
   #present(rgba: Uint8Array, width: number, height: number, configuration: WaylandConfiguration): void {
     if (!this.#surface) return;
-    const buffer = this.#shmBuffer.write(rgba, width, height);
-    if (!buffer) return;
+    const attachment = this.#shmBuffer.write(rgba, width, height);
+    if (!attachment) return;
     this.#ackConfiguration(configuration);
     const symbols = this.lib.wl.symbols;
     const version = symbols.wl_proxy_get_version(this.#surface);
@@ -344,7 +344,7 @@ export class WaylandWindow implements Window {
       null,
       version,
       0,
-      args(Deno.UnsafePointer.value(buffer), 0n, 0n),
+      args(Deno.UnsafePointer.value(attachment.buffer), 0n, 0n),
     );
     symbols.wl_proxy_marshal_array_flags(
       this.#surface,
@@ -352,7 +352,7 @@ export class WaylandWindow implements Window {
       null,
       version,
       0,
-      args(0n, 0n, BigInt(width), BigInt(height)),
+      args(0n, 0n, BigInt(attachment.layout.width), BigInt(attachment.layout.height)),
     );
     symbols.wl_proxy_marshal_array_flags(
       this.#surface,

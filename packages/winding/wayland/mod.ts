@@ -30,7 +30,7 @@ import {
 import { WaylandWindow } from "./window.ts";
 import { WaylandTextInputController } from "./text_input_controller.ts";
 import { WaylandKeyboardController } from "./keyboard_controller.ts";
-import { WaylandShmBuffer } from "./shm_buffer.ts";
+import { type WaylandShmAttachment, WaylandShmBuffer } from "./shm_buffer.ts";
 import { type WaylandShmFormatGeneration, WaylandShmFormatState } from "./shm_format.ts";
 import {
   type BoundWaylandGlobal,
@@ -85,7 +85,7 @@ class WaylandLibrary implements Library {
   #cursorShapeManager: Deno.PointerObject | null = null;
   #cursorShapeDevice: Deno.PointerObject | null = null;
   #coreCursorSurface: Deno.PointerObject | null = null;
-  #coreCursorBuffer: Deno.PointerObject | null = null;
+  #coreCursorAttachment: WaylandShmAttachment | null = null;
   #coreCursorBuffers: WaylandShmBuffer | null = null;
   #coreCursorCommitted = false;
   #coreCursorUnavailable = false;
@@ -449,8 +449,8 @@ class WaylandLibrary implements Library {
     if (!this.#pointer || !this.#ensureCoreCursor()) return;
     const pointer = this.#pointer;
     const cursorSurface = this.#coreCursorSurface;
-    const cursorBuffer = this.#coreCursorBuffer;
-    if (!pointer || !cursorSurface || !cursorBuffer) return;
+    const cursorAttachment = this.#coreCursorAttachment;
+    if (!pointer || !cursorSurface || !cursorAttachment) return;
     sym.wl_proxy_marshal_array_flags(
       pointer,
       WlOp.POINTER_SET_CURSOR,
@@ -472,7 +472,7 @@ class WaylandLibrary implements Library {
       null,
       surfaceVersion,
       0,
-      args(Deno.UnsafePointer.value(cursorBuffer), 0n, 0n),
+      args(Deno.UnsafePointer.value(cursorAttachment.buffer), 0n, 0n),
     );
     sym.wl_proxy_marshal_array_flags(
       cursorSurface,
@@ -480,7 +480,7 @@ class WaylandLibrary implements Library {
       null,
       surfaceVersion,
       0,
-      args(0n, 0n, BigInt(DEFAULT_CURSOR_WIDTH), BigInt(DEFAULT_CURSOR_HEIGHT)),
+      args(0n, 0n, BigInt(cursorAttachment.layout.width), BigInt(cursorAttachment.layout.height)),
     );
     sym.wl_proxy_marshal_array_flags(
       cursorSurface,
@@ -494,7 +494,7 @@ class WaylandLibrary implements Library {
   }
 
   #ensureCoreCursor(): boolean {
-    if (this.#coreCursorSurface && this.#coreCursorBuffer) return true;
+    if (this.#coreCursorSurface && this.#coreCursorAttachment) return true;
     if (this.#coreCursorUnavailable || !this.compositor || !this.shm) return false;
     const symbols = this.wl.symbols;
     let surface: Deno.PointerObject | null = null;
@@ -510,14 +510,14 @@ class WaylandLibrary implements Library {
       );
       if (!surface) throw new Error("winding failed to create the Wayland cursor surface");
       buffers = new WaylandShmBuffer(this);
-      const buffer = buffers.write(
+      const attachment = buffers.write(
         createDefaultCursorPixels(),
         DEFAULT_CURSOR_WIDTH,
         DEFAULT_CURSOR_HEIGHT,
       );
-      if (!buffer) throw new Error("winding failed to allocate the Wayland cursor buffer");
+      if (!attachment) throw new Error("winding failed to allocate the Wayland cursor buffer");
       this.#coreCursorSurface = surface;
-      this.#coreCursorBuffer = buffer;
+      this.#coreCursorAttachment = attachment;
       this.#coreCursorBuffers = buffers;
       return true;
     } catch {
@@ -1124,7 +1124,7 @@ class WaylandLibrary implements Library {
 
     const coreCursorSurface = this.#coreCursorSurface;
     this.#coreCursorSurface = null;
-    this.#coreCursorBuffer = null;
+    this.#coreCursorAttachment = null;
     this.#coreCursorCommitted = false;
     if (coreCursorSurface) {
       collectCleanupError(errors, () => {

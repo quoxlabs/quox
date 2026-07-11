@@ -34,7 +34,7 @@ import {
   readWlArrayU32,
   waylandConnectionError,
 } from "./protocol.ts";
-import { createOpaqueBlackFrame } from "./shm_buffer.ts";
+import { createOpaqueBlackFrame, validateWaylandShmFrame, validateWaylandShmLayout } from "./shm_buffer.ts";
 import { MISSING_ARGB8888_SHM_FORMAT, type WaylandShmFormatGeneration, WaylandShmFormatState } from "./shm_format.ts";
 import { damageOpcodeForSurfaceVersion, frameMatchesConfiguration, WaylandConfigureState } from "./window.ts";
 import { type WaylandGlobalInterface, WaylandGlobalRegistry } from "./global_registry.ts";
@@ -235,6 +235,67 @@ Deno.test("Wayland initial window frames are opaque black", () => {
     0,
     255,
   ]);
+});
+
+Deno.test("Wayland SHM layouts stay within every signed 32-bit protocol field", () => {
+  const int32Max = 0x7fff_ffff;
+  const largestStrideWidth = Math.floor(int32Max / 4);
+  assertEquals(validateWaylandShmLayout(largestStrideWidth, 1), {
+    width: largestStrideWidth,
+    height: 1,
+    stride: int32Max - 3,
+    size: int32Max - 3,
+  });
+  assertThrowsMessage(
+    () => validateWaylandShmLayout(largestStrideWidth + 1, 1),
+    "winding Wayland SHM stride exceeds the positive signed 32-bit protocol range",
+  );
+
+  const largestOnePixelRowCount = Math.floor(int32Max / 4);
+  assertEquals(validateWaylandShmLayout(1, largestOnePixelRowCount), {
+    width: 1,
+    height: largestOnePixelRowCount,
+    stride: 4,
+    size: int32Max - 3,
+  });
+  assertThrowsMessage(
+    () => validateWaylandShmLayout(1, largestOnePixelRowCount + 1),
+    "winding Wayland SHM pool size exceeds the positive signed 32-bit protocol range",
+  );
+  assertThrowsMessage(
+    () => validateWaylandShmLayout(int32Max + 1, 1),
+    "winding Wayland SHM width exceeds the positive signed 32-bit protocol range",
+  );
+  assertThrowsMessage(
+    () => validateWaylandShmLayout(1, int32Max + 1),
+    "winding Wayland SHM height exceeds the positive signed 32-bit protocol range",
+  );
+});
+
+Deno.test("Wayland SHM layouts reject non-integral and unsafe dimensions", () => {
+  const invalid = [0, -1, 0.5, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 2 ** 53];
+  for (const width of invalid) {
+    assertThrowsMessage(
+      () => validateWaylandShmLayout(width, 1),
+      "winding Wayland SHM width must be a positive safe integer",
+    );
+  }
+  for (const height of invalid) {
+    assertThrowsMessage(
+      () => validateWaylandShmLayout(1, height),
+      "winding Wayland SHM height must be a positive safe integer",
+    );
+  }
+});
+
+Deno.test("Wayland SHM frames require exact complete RGBA storage", () => {
+  assertEquals(validateWaylandShmFrame(2, 2, 16), { width: 2, height: 2, stride: 8, size: 16 });
+  for (const byteLength of [12, 15, 17, 20]) {
+    assertThrowsMessage(
+      () => validateWaylandShmFrame(2, 2, byteLength),
+      `winding Wayland blit needs exactly 16 RGBA bytes, received ${byteLength}`,
+    );
+  }
 });
 
 Deno.test("Wayland connection errors retain protocol object details", () => {

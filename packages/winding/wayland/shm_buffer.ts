@@ -27,10 +27,62 @@ export interface WaylandShmHost {
 }
 
 const MAX_BUFFERS = 3;
+const RGBA_BYTES_PER_PIXEL = 4;
+const WAYLAND_INT32_MAX = 0x7fff_ffff;
+
+export interface WaylandShmLayout {
+  readonly width: number;
+  readonly height: number;
+  readonly stride: number;
+  readonly size: number;
+}
+
+export interface WaylandShmAttachment {
+  readonly buffer: Deno.PointerObject;
+  readonly layout: WaylandShmLayout;
+}
+
+/** Validate every image value that crosses a signed 32-bit Wayland argument. */
+export function validateWaylandShmLayout(width: number, height: number): WaylandShmLayout {
+  validateDimension(width, "width");
+  validateDimension(height, "height");
+  if (width > Math.floor(WAYLAND_INT32_MAX / RGBA_BYTES_PER_PIXEL)) {
+    throw new RangeError("winding Wayland SHM stride exceeds the positive signed 32-bit protocol range");
+  }
+  const stride = width * RGBA_BYTES_PER_PIXEL;
+  if (height > Math.floor(WAYLAND_INT32_MAX / stride)) {
+    throw new RangeError("winding Wayland SHM pool size exceeds the positive signed 32-bit protocol range");
+  }
+  return { width, height, stride, size: stride * height };
+}
+
+/** Validate an exact public RGBA frame without allocating its native storage. */
+export function validateWaylandShmFrame(
+  width: number,
+  height: number,
+  sourceByteLength: number,
+): WaylandShmLayout {
+  const layout = validateWaylandShmLayout(width, height);
+  if (sourceByteLength !== layout.size) {
+    throw new RangeError(
+      `winding Wayland blit needs exactly ${layout.size} RGBA bytes, received ${sourceByteLength}`,
+    );
+  }
+  return layout;
+}
+
+function validateDimension(value: number, name: "width" | "height"): void {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new RangeError(`winding Wayland SHM ${name} must be a positive safe integer`);
+  }
+  if (value > WAYLAND_INT32_MAX) {
+    throw new RangeError(`winding Wayland SHM ${name} exceeds the positive signed 32-bit protocol range`);
+  }
+}
 
 /** Create a public-format frame that maps a new surface as opaque black. */
 export function createOpaqueBlackFrame(width: number, height: number): Uint8Array {
-  const rgba = new Uint8Array(checkedImageSize(width, height));
+  const rgba = new Uint8Array(validateWaylandShmLayout(width, height).size);
   for (let index = 3; index < rgba.byteLength; index += 4) rgba[index] = 0xff;
   return rgba;
 }
@@ -68,21 +120,18 @@ export class WaylandShmBuffer {
 
   constructor(readonly host: WaylandShmHost) {}
 
-  write(rgba: Uint8Array, width: number, height: number): Deno.PointerObject | null {
+  write(rgba: Uint8Array, width: number, height: number): WaylandShmAttachment | null {
     this.host.requireArgb8888ShmFormat();
-    const size = checkedImageSize(width, height);
-    if (rgba.byteLength < size) {
-      throw new RangeError(`winding Wayland blit needs ${size} RGBA bytes, received ${rgba.byteLength}`);
-    }
+    const layout = validateWaylandShmFrame(width, height, rgba.byteLength);
 
-    let slot = this.#slots.find((candidate) => !candidate.busy && candidate.matches(width, height));
+    let slot = this.#slots.find((candidate) => !candidate.busy && candidate.matches(layout.width, layout.height));
     slot ??= this.#slots.find((candidate) => !candidate.busy);
     if (!slot && this.#slots.length < MAX_BUFFERS) {
       slot = new WaylandShmBufferSlot(this.host);
       this.#slots.push(slot);
     }
     if (!slot) return null;
-    return slot.write(rgba, width, height, size);
+    return { buffer: slot.write(rgba, layout), layout };
   }
 
   close(): void {
@@ -116,22 +165,23 @@ class WaylandShmBufferSlot {
     return this.#buffer !== null && this.#width === width && this.#height === height;
   }
 
-  write(rgba: Uint8Array, width: number, height: number, size: number): Deno.PointerObject {
+  write(rgba: Uint8Array, layout: WaylandShmLayout): Deno.PointerObject {
     if (this.#busy) throw new Error("winding attempted to rewrite a busy Wayland SHM buffer");
-    if (!this.#buffer || width !== this.#width || height !== this.#height) {
-      this.#replace(width, height, size);
+    if (!this.#buffer || layout.width !== this.#width || layout.height !== this.#height) {
+      this.#replace(layout);
     }
 
     const destination = new Uint8Array(
-      new Deno.UnsafePointerView(this.#mapping!).getArrayBuffer(size),
+      new Deno.UnsafePointerView(this.#mapping!).getArrayBuffer(layout.size),
     );
     copyStraightRgbaToPremultipliedBgra(rgba, destination);
     this.#busy = true;
     return this.#buffer!;
   }
 
-  #replace(width: number, height: number, size: number): void {
+  #replace(layout: WaylandShmLayout): void {
     this.close();
+    const { width, height, stride, size } = layout;
     const { host } = this;
     const symbols = host.wl.symbols;
     let fd = -1;
@@ -173,7 +223,7 @@ class WaylandShmBufferSlot {
         host.ifaces.buffer,
         symbols.wl_proxy_get_version(pool),
         0,
-        args(0n, 0n, BigInt(width), BigInt(height), BigInt(width * 4), BigInt(WlShmFormat.ARGB8888)),
+        args(0n, 0n, BigInt(width), BigInt(height), BigInt(stride), BigInt(WlShmFormat.ARGB8888)),
       );
       if (!buffer) throw new Error("winding wl_shm_pool_create_buffer failed");
 
@@ -293,13 +343,4 @@ class WaylandShmBufferSlot {
     if (release) collectCleanupError(errors, () => release.close());
     throwCleanupErrors("winding failed to close Wayland SHM buffer", errors);
   }
-}
-
-function checkedImageSize(width: number, height: number): number {
-  if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width <= 0 || height <= 0) {
-    throw new RangeError("winding Wayland blit dimensions must be positive safe integers");
-  }
-  const size = width * height * 4;
-  if (!Number.isSafeInteger(size)) throw new RangeError("winding Wayland blit dimensions overflow");
-  return size;
 }
