@@ -97,6 +97,10 @@ class FakeRenderer {
     return this.#text.has(nodeHandle) ? 3 : 1;
   }
 
+  synthetic_event_path(nodeHandle: number): Uint32Array {
+    return Uint32Array.of(nodeHandle);
+  }
+
   setHitNodeId(id: number | undefined): void {
     this.#hitNodeId = id;
   }

@@ -21,14 +21,16 @@ class FakeAttributeRenderer {
 function createElement(attributes: Record<string, string>): QuoxElement {
   const document = {} as QuoxDocument;
   const renderer = new FakeAttributeRenderer(attributes);
+  const element = new QuoxElement(document, 1);
   attachDocumentInternals(document, {
     renderer: renderer as unknown as WasmRenderer,
     requestRender: () => undefined,
     assertActive: () => undefined,
     invalidateNodeHandles: () => undefined,
     isDispatching: () => false,
+    syntheticEventPath: () => [element],
   });
-  return new QuoxElement(document, 1);
+  return element;
 }
 
 Deno.test("element attribute reads distinguish absent and empty values", () => {

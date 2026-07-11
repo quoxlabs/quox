@@ -121,6 +121,7 @@ class FakeInputRenderer {
       cancelable: false,
       composed: true,
       timeStamp: 1,
+      payload: { data: null, inputType: "", isComposing: false },
     };
   }
 }

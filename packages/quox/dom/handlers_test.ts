@@ -1,7 +1,9 @@
 import { assertEquals, assertStrictEquals } from "@std/assert";
+import type { QuoxRenderer as WasmRenderer } from "../lib/quox.js";
 import type { QuoxDocument } from "./document.ts";
 import { QuoxEvent } from "./event.ts";
 import { setElementFunctionProp } from "./handlers.ts";
+import { attachDocumentInternals } from "./internals.ts";
 import { QuoxElement } from "./node.ts";
 import { DOM_DISPATCH_EVENT_TYPES, type DomDispatchEventType } from "./renderer_port.ts";
 
@@ -38,7 +40,17 @@ const EVENT_TYPE_TO_PROP = {
 let nextNodeId = 1;
 
 function createElement(): QuoxElement {
-  return new QuoxElement({} as QuoxDocument, nextNodeId++);
+  const document = {} as QuoxDocument;
+  const element = new QuoxElement(document, nextNodeId++);
+  attachDocumentInternals(document, {
+    renderer: {} as WasmRenderer,
+    requestRender: () => undefined,
+    assertActive: () => undefined,
+    invalidateNodeHandles: () => undefined,
+    isDispatching: () => false,
+    syntheticEventPath: () => [element],
+  });
+  return element;
 }
 
 Deno.test("every staged DOM event has live JSX bubble and capture props", () => {
