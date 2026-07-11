@@ -25,6 +25,13 @@ export const hitoolboxSymbols = {
   KBGetLayoutType: { parameters: ["i16"], result: "u32" },
 } as const satisfies Deno.ForeignLibraryInterface;
 
+// AppKit publishes its process-wide shared application through NSApp. Deno
+// exposes the static's address, which callers dereference to detect an existing
+// host application without sending +sharedApplication and creating it.
+export const appKitSymbols = {
+  NSApp: { type: "pointer" },
+} as const satisfies Deno.ForeignLibraryInterface;
+
 export type DarwinSystem = Deno.DynamicLibrary<typeof systemSymbols>;
 
 /** AppKit objects and event dispatch are confined to the process main thread. */

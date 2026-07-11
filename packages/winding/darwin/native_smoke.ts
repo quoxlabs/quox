@@ -2,6 +2,7 @@ import { load } from "./mod.ts";
 import type { ImeEvent, Library, ResizeEvent, Window } from "../types.ts";
 import {
   APPKIT,
+  appKitSymbols,
   cfSymbols,
   classConformsToProtocol,
   CORE_FOUNDATION,
@@ -45,6 +46,7 @@ if (Deno.build.os !== "darwin") {
 }
 
 assertProcessMainThread();
+if (Deno.args.includes("--host-application-probe")) runHostApplicationProbe();
 if (Deno.args.includes("--uncaught-exception-probe")) runUncaughtExceptionProbe();
 runCase(
   "NSString, attributed text, preedit, commit, and command callbacks preserve order",
@@ -66,8 +68,49 @@ runCase(
   testProtocolAndStructAbis,
 );
 runCase("text input survives repeated library and window lifecycles", testRepeatedLifecycles);
-await runAsyncCase("duplicate module copies share one AppKit owner", testDuplicateModuleOwnership);
+await runAsyncCase(
+  "duplicate module copies cannot adopt the AppKit owner",
+  testDuplicateModuleOwnership,
+);
 console.log("Darwin native smoke: 12 passed");
+
+/**
+ * Create AppKit's singleton outside Winding, then verify loading the backend
+ * refuses to adopt or mutate that host-owned application.
+ */
+function runHostApplicationProbe(): never {
+  const handles: Closeable[] = [];
+  try {
+    const appKit = Deno.dlopen(APPKIT, appKitSymbols);
+    handles.push(appKit);
+    const runtime = Deno.dlopen(LIBOBJC, runtimeSymbols);
+    handles.push(runtime);
+    const sendId = openMessage(handles, ["pointer", "pointer"], "pointer");
+    const sendBool = openMessage(handles, ["pointer", "pointer"], "bool");
+    const sendI64 = openMessage(handles, ["pointer", "pointer"], "i64");
+
+    const nsApp = sendId(getClass(runtime, "NSApplication"), sel(runtime, "sharedApplication"));
+    assert(nsApp !== null, "host NSApplication.sharedApplication returned nil");
+    const applicationStatic = appKit.symbols.NSApp;
+    assert(applicationStatic !== null, "AppKit NSApp static is unavailable");
+    const readNSApp = () => new Deno.UnsafePointerView(applicationStatic).getPointer();
+    assert(readNSApp() !== null, "sharedApplication did not publish NSApp");
+    const applicationPointer = Deno.UnsafePointer.value(nsApp);
+    const activationPolicy = sendI64(nsApp, sel(runtime, "activationPolicy"));
+    const running = sendBool(nsApp, sel(runtime, "isRunning"));
+
+    assertThrowsMessage(() => load(), "owned by the host or another module");
+
+    const applicationAfterRejection = readNSApp();
+    assert(applicationAfterRejection !== null, "host NSApplication disappeared after rejection");
+    assertEquals(Deno.UnsafePointer.value(applicationAfterRejection), applicationPointer);
+    assertEquals(sendI64(nsApp, sel(runtime, "activationPolicy")), activationPolicy);
+    assertEquals(sendBool(nsApp, sel(runtime, "isRunning")), running);
+  } finally {
+    closeAll(handles);
+  }
+  Deno.exit(0);
+}
 
 /**
  * Deliberately violate an NSArray precondition. This must only be launched as
@@ -642,25 +685,36 @@ function testClosedMethodGuards(): void {
 }
 
 function testSingleLibraryOwnership(): void {
-  const first = load();
+  const first = load() as Library & { nsApp: Deno.PointerValue };
+  const application = first.nsApp;
+  assert(application !== null, "first Darwin library has no NSApplication");
   try {
     assertThrowsMessage(() => load(), "only one Darwin library");
   } finally {
     first.close();
   }
 
-  const replacement = load();
-  replacement.close();
+  const replacement = load() as Library & { nsApp: Deno.PointerValue };
+  try {
+    assert(replacement.nsApp !== null, "replacement Darwin library has no NSApplication");
+    assertEquals(
+      Deno.UnsafePointer.value(replacement.nsApp),
+      Deno.UnsafePointer.value(application),
+    );
+  } finally {
+    replacement.close();
+  }
 }
 
 async function testDuplicateModuleOwnership(): Promise<void> {
   const first = load();
+  const duplicate = await import("./mod.ts?duplicate-native-smoke");
   try {
-    const duplicate = await import("./mod.ts?duplicate-native-smoke");
     assertThrowsMessage(() => duplicate.load(), "only one Darwin library");
   } finally {
     first.close();
   }
+  assertThrowsMessage(() => duplicate.load(), "owned by the host or another module");
 }
 
 function testActivationCallShapes(): void {

@@ -80,6 +80,10 @@ jobs:
           fi
         timeout-minutes: 1
         working-directory: packages/winding
+      - name: Reject a host-owned AppKit application
+        run: deno run --allow-ffi darwin/native_smoke.ts --host-application-probe
+        timeout-minutes: 1
+        working-directory: packages/winding
       - name: Test native AppKit input on the process main thread
         run: deno run --allow-ffi darwin/native_smoke.ts
         timeout-minutes: 2

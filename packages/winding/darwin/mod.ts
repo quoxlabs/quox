@@ -33,6 +33,7 @@ import {
   addProtocol as runtimeAddProtocol,
   allocateClassPair as runtimeAllocateClassPair,
   APPKIT,
+  appKitSymbols,
   assertMainThread,
   cfSymbols,
   cgSymbols,
@@ -57,6 +58,7 @@ import {
   selectorName as runtimeSelectorName,
   systemSymbols,
 } from "./ffi.ts";
+import { darwinApplicationAction, type DarwinApplicationOwnership } from "./application_state.ts";
 import {
   type DarwinNativeClasses,
   type DarwinNativeResponder,
@@ -179,9 +181,10 @@ function openDarwinFfi() {
     opened.push(system);
     assertMainThread(system);
 
-    // Load AppKit into the process so its Objective-C classes become resolvable;
-    // we never call anything through this handle directly.
-    const appKit = Deno.dlopen(APPKIT, {});
+    // Loading AppKit makes its Objective-C classes resolvable. NSApp is read
+    // before any class message so hosted application state can be rejected
+    // without changing it.
+    const appKit = Deno.dlopen(APPKIT, appKitSymbols);
     opened.push(appKit);
 
     const hitoolbox = Deno.dlopen(HITOOLBOX, hitoolboxSymbols);
@@ -237,6 +240,11 @@ function openDarwinFfi() {
 }
 
 type DarwinFfi = ReturnType<typeof openDarwinFfi>;
+
+// This claim is intentionally module-local. It permits load/close/load through
+// this module without allowing a Worker or separately evaluated module copy to
+// adopt process-wide AppKit state that it did not create.
+let ownedApplication: DarwinApplicationOwnership | undefined;
 
 function withAutoreleasePool<T>(ffi: DarwinFfi, operation: () => T): T {
   const { getClass, sel, send } = ffi;
@@ -1226,15 +1234,50 @@ class DarwinLibrary implements Library {
       colorSpace: Deno.PointerObject;
     };
     try {
+      const applicationStatic = this.ffi.appKit.symbols.NSApp;
+      if (applicationStatic === null) {
+        throw new Error("winding(darwin): AppKit NSApp static is unavailable");
+      }
+      const existingApplication = new Deno.UnsafePointerView(applicationStatic).getPointer();
+      const applicationAction = darwinApplicationAction(
+        existingApplication === null ? null : pointerId(existingApplication),
+        ownedApplication,
+      );
+      if (applicationAction === "reject") {
+        throw new Error(
+          "winding(darwin): an existing NSApplication is owned by the host or another module",
+        );
+      }
       initialized = withAutoreleasePool(this.ffi, () => {
         const { cg, getClass, sel, send } = this.ffi;
-        const nativeClasses = ensureNativeClasses(this.ffi);
-        const nsApp = send.id(getClass("NSApplication"), sel("sharedApplication"));
-        if (nsApp === null) throw new Error("winding(darwin): NSApplication.sharedApplication returned nil");
-        if (!send.bool_i64(nsApp, sel("setActivationPolicy:"), NS_APPLICATION_ACTIVATION_POLICY_REGULAR)) {
-          throw new Error("winding(darwin): NSApplication rejected the regular activation policy");
+        let nsApp = existingApplication;
+        if (applicationAction === "create") {
+          nsApp = send.id(getClass("NSApplication"), sel("sharedApplication"));
+          if (nsApp === null) {
+            throw new Error("winding(darwin): NSApplication.sharedApplication returned nil");
+          }
+          ownedApplication = { pointer: pointerId(nsApp), initialized: false };
         }
-        send.void(nsApp, sel("finishLaunching"));
+        if (nsApp === null) {
+          throw new Error("winding(darwin): owned NSApplication unexpectedly disappeared");
+        }
+        if (applicationAction !== "reuse") {
+          if (
+            !send.bool_i64(
+              nsApp,
+              sel("setActivationPolicy:"),
+              NS_APPLICATION_ACTIVATION_POLICY_REGULAR,
+            )
+          ) {
+            throw new Error("winding(darwin): NSApplication rejected the regular activation policy");
+          }
+          send.void(nsApp, sel("finishLaunching"));
+          if (ownedApplication === undefined) {
+            throw new Error("winding(darwin): NSApplication ownership was lost during initialization");
+          }
+          ownedApplication.initialized = true;
+        }
+        const nativeClasses = ensureNativeClasses(this.ffi);
         distantPast = send.id(send.id(getClass("NSDate"), sel("distantPast")), sel("retain"));
         if (distantPast === null) throw new Error("winding(darwin): failed to retain NSDate.distantPast");
         runLoopMode = makeNSString(this.ffi, "kCFRunLoopDefaultMode");
