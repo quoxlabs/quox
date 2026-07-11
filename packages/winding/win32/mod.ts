@@ -26,6 +26,7 @@ import {
   WM,
 } from "./ffi.ts";
 import {
+  completeWin32MouseMessage,
   decodeMouseLParam,
   decodeWin32ClientRect,
   decodeWin32QueuedMessage,
@@ -349,6 +350,7 @@ class Win32Library implements Library {
       win32WndProcDefinition,
       guardNativeCallback(this.#callbackErrors, (hWnd, uMsg, wParam, lParam) => {
         const win = this.windows.get(Deno.UnsafePointer.value(hWnd));
+        const defaultProcedure = () => this.user32.symbols.DefWindowProcW(hWnd, uMsg, wParam, lParam);
         let inputResult: bigint | undefined;
         const inSendMessageFlags = this.#translateMessageGuard.translating
           ? this.user32.symbols.InSendMessageEx(null)
@@ -440,13 +442,14 @@ class Win32Library implements Library {
             }
             break;
           case WM.CAPTURECHANGED:
-            if (win !== undefined) this.#mouseCapture.resetOwner(win.id);
-            break;
+            if (win === undefined) return completeWin32MouseMessage(uMsg, false, defaultProcedure);
+            this.#mouseCapture.resetOwner(win.id);
+            return completeWin32MouseMessage(uMsg, true, defaultProcedure);
           case WM.CANCELMODE:
             if (win !== undefined) this.#cancelMouseCapture(win);
             break;
           case WM.MOUSEMOVE: {
-            if (win === undefined) break;
+            if (win === undefined) return completeWin32MouseMessage(uMsg, false, defaultProcedure);
             const pointer = this.#pointerSnapshot(win, uMsg as WM, wParam, lParam);
             const inside = win.containsClientPoint(pointer.x, pointer.y);
             if (win.mouseTracking.needsLeaveTracking(inside)) {
@@ -461,10 +464,10 @@ class Win32Library implements Library {
               ...pointer,
               window: win,
             });
-            break;
+            return completeWin32MouseMessage(uMsg, true, defaultProcedure);
           }
           case WM.MOUSELEAVE:
-            if (win === undefined) break;
+            if (win === undefined) return completeWin32MouseMessage(uMsg, false, defaultProcedure);
             if (win.mouseTracking.observeLeave()) {
               const pointer = {
                 ...(win.pointerSnapshot ?? emptyPointerSnapshot(this.#messageTimeStamp())),
@@ -474,17 +477,17 @@ class Win32Library implements Library {
               win.pointerSnapshot = pointer;
               this.#events.push({ type: "mouseleave", ...pointer, window: win });
             }
-            break;
+            return completeWin32MouseMessage(uMsg, true, defaultProcedure);
           case WM.LBUTTONDOWN:
           case WM.MBUTTONDOWN:
           case WM.RBUTTONDOWN:
           case WM.XBUTTONDOWN: {
-            if (win === undefined) break;
+            if (win === undefined) return completeWin32MouseMessage(uMsg, false, defaultProcedure);
             // Capture the mouse so drags that leave the client area (e.g.
             // dragging a scrollbar thumb) still deliver the eventual button-up,
             // matching X11's implicit passive grab on button press.
             const button = uMsg === WM.XBUTTONDOWN ? win32XButton(wParam) : DOWN_BUTTON[uMsg as WM];
-            if (button === undefined) break;
+            if (button === undefined) return completeWin32MouseMessage(uMsg, false, defaultProcedure);
             this.#captureMouseButton(win, button);
             const pointer = this.#pointerSnapshot(win, uMsg as WM, wParam, lParam, button, true);
             this.#events.push({
@@ -494,16 +497,15 @@ class Win32Library implements Library {
               ...pointer,
               window: win,
             });
-            if (uMsg === WM.XBUTTONDOWN) return 1n;
-            break;
+            return completeWin32MouseMessage(uMsg, true, defaultProcedure);
           }
           case WM.LBUTTONUP:
           case WM.MBUTTONUP:
           case WM.RBUTTONUP:
           case WM.XBUTTONUP: {
-            if (win === undefined) break;
+            if (win === undefined) return completeWin32MouseMessage(uMsg, false, defaultProcedure);
             const button = uMsg === WM.XBUTTONUP ? win32XButton(wParam) : UP_BUTTON[uMsg as WM];
-            if (button === undefined) break;
+            if (button === undefined) return completeWin32MouseMessage(uMsg, false, defaultProcedure);
             this.#releaseMouseButton(win, button);
             const pointer = this.#pointerSnapshot(win, uMsg as WM, wParam, lParam, button, false);
             this.#events.push({
@@ -513,12 +515,11 @@ class Win32Library implements Library {
               ...pointer,
               window: win,
             });
-            if (uMsg === WM.XBUTTONUP) return 1n;
-            break;
+            return completeWin32MouseMessage(uMsg, true, defaultProcedure);
           }
           case WM.MOUSEWHEEL:
           case WM.MOUSEHWHEEL: {
-            if (win === undefined) break;
+            if (win === undefined) return completeWin32MouseMessage(uMsg, false, defaultProcedure);
             // wParam's high word is a *signed* 16-bit tilt/rotation amount, in
             // multiples of WHEEL_DELTA per notch (unlike the unsigned x/y words
             // read elsewhere in this file).
@@ -537,10 +538,10 @@ class Win32Library implements Library {
                 // no sign flip is needed here.
                 : { type: "wheel", deltaX: notches, deltaY: 0, deltaMode: 1, ...pointer, window: win },
             );
-            break;
+            return completeWin32MouseMessage(uMsg, true, defaultProcedure);
           }
         }
-        return this.user32.symbols.DefWindowProcW(hWnd, uMsg, wParam, lParam);
+        return defaultProcedure();
       }, (hWnd, uMsg, wParam, lParam) => {
         try {
           return this.user32.symbols.DefWindowProcW(hWnd, uMsg, wParam, lParam);

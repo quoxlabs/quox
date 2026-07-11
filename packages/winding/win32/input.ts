@@ -162,6 +162,18 @@ export function decodeMouseLParam(lParam: number | bigint): { x: number; y: numb
   };
 }
 
+/** Finish a mouse branch without accidentally invoking the default procedure. */
+export function completeWin32MouseMessage(
+  message: number,
+  consumed: boolean,
+  defaultProcedure: () => bigint,
+): bigint {
+  if (!consumed) return defaultProcedure();
+  // XBUTTON messages uniquely require TRUE when the application processes
+  // them; the other mouse-message contracts specify zero.
+  return message === WM.XBUTTONDOWN || message === WM.XBUTTONUP ? 1n : 0n;
+}
+
 /** Per-HWND boundary state for Win32's explicitly requested leave notifications. */
 export class Win32MouseTrackingState {
   #inside = false;

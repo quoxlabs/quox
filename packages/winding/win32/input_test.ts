@@ -2,6 +2,7 @@ import { assert, assertEquals, assertThrows } from "jsr:@std/assert@^1.0.19";
 import type { KeyDownEvent, UIEvent } from "../types.ts";
 import {
   AltGraphControlFilter,
+  completeWin32MouseMessage,
   CsInsertCharAssembler,
   decodeKeyLParam,
   decodeMouseLParam,
@@ -1042,6 +1043,40 @@ Deno.test("Win32 mouse coordinates sign-extend and leave tracking follows real c
   assertEquals(tracking.observeLeave(), false);
   assertEquals(tracking.needsLeaveTracking(false), false);
   assertEquals(tracking.needsLeaveTracking(true), true);
+});
+
+Deno.test("consumed Win32 mouse messages bypass default processing with documented results", () => {
+  let defaultCalls = 0;
+  const defaultProcedure = () => {
+    defaultCalls++;
+    return -77n;
+  };
+  for (
+    const message of [
+      WM.MOUSEMOVE,
+      WM.MOUSELEAVE,
+      WM.CAPTURECHANGED,
+      WM.LBUTTONDOWN,
+      WM.LBUTTONUP,
+      WM.MBUTTONDOWN,
+      WM.MBUTTONUP,
+      WM.RBUTTONDOWN,
+      WM.RBUTTONUP,
+      WM.MOUSEWHEEL,
+      WM.MOUSEHWHEEL,
+    ]
+  ) {
+    assertEquals(completeWin32MouseMessage(message, true, defaultProcedure), 0n);
+  }
+  assertEquals(completeWin32MouseMessage(WM.XBUTTONDOWN, true, defaultProcedure), 1n);
+  assertEquals(completeWin32MouseMessage(WM.XBUTTONUP, true, defaultProcedure), 1n);
+  assertEquals(defaultCalls, 0);
+
+  // A recognized mouse message for an HWND winding does not own remains on
+  // the host/default-procedure path.
+  assertEquals(completeWin32MouseMessage(WM.MOUSEMOVE, false, defaultProcedure), -77n);
+  assertEquals(completeWin32MouseMessage(WM.XBUTTONDOWN, false, defaultProcedure), -77n);
+  assertEquals(defaultCalls, 2);
 });
 
 Deno.test("Win32 mouse capture state follows one owner and complete button chords", () => {
