@@ -13,7 +13,7 @@ import {
 } from "../input/mod.ts";
 import { domCodeFromXkbName } from "../linux/mod.ts";
 import { utf8Bytes, utf8CString as cString } from "../text_encoding.ts";
-import { libcFunctions, NotifyNormal, x11functions, XEventMask, XEventType } from "./ffi.ts";
+import { libcFunctions, NotifyInferior, NotifyNormal, x11functions, XEventMask, XEventType } from "./ffi.ts";
 import {
   isAutoRepeatPair,
   isTopLevelFocusTransition,
@@ -49,7 +49,6 @@ const APPLICATION_X_EVENT_MASKS = BigInt(
     XEventMask.LeaveWindowMask |
     XEventMask.PointerMotionMask |
     XEventMask.ExposureMask |
-    XEventMask.VisibilityChangeMask |
     XEventMask.StructureNotifyMask |
     XEventMask.FocusChangeMask,
 );
@@ -77,6 +76,7 @@ class X11Window implements Window {
   #image: NativeXImage;
   #width: number;
   #height: number;
+  #visible = false;
   #closed = false;
 
   constructor(readonly lib: X11Library, x = 0, y = 0, w = 800, h = 600) {
@@ -109,7 +109,11 @@ class X11Window implements Window {
     // of forcibly killing the process when the user closes the window.
     if (lib.wmProtocols && lib.wmDeleteWindow) {
       const protocolsBuf = new BigUint64Array([lib.wmDeleteWindow]);
-      lib.X11.symbols.XSetWMProtocols(lib.display, window, protocolsBuf, 1);
+      if (lib.X11.symbols.XSetWMProtocols(lib.display, window, protocolsBuf, 1) === 0) {
+        lib.X11.symbols.XDestroyWindow(lib.display, window);
+        lib.X11.symbols.XFlush(lib.display);
+        throw new Error("winding(x11): failed to register WM_DELETE_WINDOW");
+      }
     }
 
     this.id = BigInt(window);
@@ -145,6 +149,7 @@ class X11Window implements Window {
         // Publish only after every fallible local and XIM resource exists.
         lib.X11.symbols.XMapWindow(lib.display, window);
         lib.X11.symbols.XFlush(lib.display);
+        this.#visible = true;
       } catch (error) {
         lib.windows.delete(this.id);
         input?.close();
@@ -176,7 +181,11 @@ class X11Window implements Window {
 
   setTitle(title: string): void {
     this.#assertOpen();
-    const titleBytes = utf8Bytes(title);
+    const normalizedTitle = title.replaceAll("\0", "�");
+    const titleBytes = utf8Bytes(normalizedTitle);
+    if (titleBytes.length > this.lib.maxTitleBytes) {
+      throw new RangeError(`winding(x11): title exceeds ${this.lib.maxTitleBytes} UTF-8 bytes`);
+    }
     const titleBuffer = titleBytes.length > 0 ? titleBytes : new Uint8Array(1);
     this.lib.X11.symbols.XChangeProperty(
       this.lib.display,
@@ -188,7 +197,7 @@ class X11Window implements Window {
       titleBuffer,
       titleBytes.length,
     );
-    this.lib.X11.symbols.XStoreName(this.lib.display, this.id, latin1CString(title));
+    this.lib.X11.symbols.XStoreName(this.lib.display, this.id, latin1CString(normalizedTitle));
     this.lib.X11.symbols.XFlush(this.lib.display);
   }
 
@@ -245,6 +254,12 @@ class X11Window implements Window {
     this.#image = image;
     this.#width = width;
     this.#height = height;
+    return true;
+  }
+
+  updateVisibility(visible: boolean): boolean {
+    if (visible === this.#visible) return false;
+    this.#visible = visible;
     return true;
   }
 
@@ -359,6 +374,7 @@ class X11Library implements Library {
   readonly wmDeleteWindow: bigint;
   readonly netWmName: bigint;
   readonly utf8String: bigint;
+  readonly maxTitleBytes: number;
   readonly input: XimManager;
   readonly #events = new EventQueue<UIEvent>();
   #modifierMapping: X11ModifierMapping = {
@@ -372,6 +388,7 @@ class X11Library implements Library {
     toggleKeycodes: new Set(),
   };
   #domCodes = new Map<number, string>();
+  #detectableAutoRepeat = false;
   #closed = false;
   constructor() {
     this.X11 = openX11Library();
@@ -396,6 +413,7 @@ class X11Library implements Library {
       throw new Error("winding(x11): failed to get default screen");
     }
     this.screen = screen;
+    this.maxTitleBytes = Math.max(0, Number(this.X11.symbols.XMaxRequestSize(display)) * 4 - 256);
     this.wmProtocols = BigInt(this.X11.symbols.XInternAtom(display, cString("WM_PROTOCOLS"), 0));
     this.wmDeleteWindow = BigInt(
       this.X11.symbols.XInternAtom(display, cString("WM_DELETE_WINDOW"), 0),
@@ -404,6 +422,9 @@ class X11Library implements Library {
     this.utf8String = BigInt(this.X11.symbols.XInternAtom(display, cString("UTF8_STRING"), 0));
     this.#refreshModifierMapping();
     this.#refreshDomCodes();
+    const detectable = new Int32Array(1);
+    this.#detectableAutoRepeat =
+      this.X11.symbols.XkbSetDetectableAutoRepeat(display, 1, detectable) !== 0 && detectable[0] !== 0;
     try {
       this.input = new XimManager(
         this.X11,
@@ -484,7 +505,10 @@ class X11Library implements Library {
       const type = view.getInt32(0, true);
       // XConfigureEvent distinguishes the event recipient from the drawable
       // whose geometry changed; all other routed events use XAnyEvent.window.
-      const windowId = type === XEventType.ConfigureNotify || type === XEventType.DestroyNotify
+      const structureEvent =
+        type === XEventType.ConfigureNotify || type === XEventType.DestroyNotify ||
+        type === XEventType.MapNotify || type === XEventType.UnmapNotify;
+      const windowId = structureEvent
         ? view.getBigUint64(40, true)
         : view.getBigUint64(32, true);
       const window = this.windows.get(windowId);
@@ -836,6 +860,7 @@ class X11Library implements Library {
   }
 
   #isAutoRepeatRelease(release: DataView<ArrayBuffer>): boolean {
+    if (this.#detectableAutoRepeat) return false;
     if (this.X11.symbols.XPending(this.display) === 0) return false;
     const peekPointer = Deno.UnsafePointer.of(this.#peekEvent)!;
     this.X11.symbols.XPeekEvent(this.display, peekPointer);
@@ -855,7 +880,7 @@ function importEvent(
   const type = view.getInt32(0, true);
   switch (type) {
     case XEventType.ButtonPress: {
-      const btn = view.getInt32(84, true);
+      const btn = view.getUint32(84, true);
       if (btn === 4) return { type: "wheel", deltaX: 0, deltaY: -1, window };
       if (btn === 5) return { type: "wheel", deltaX: 0, deltaY: 1, window };
       if (btn === 6) return { type: "wheel", deltaX: -1, deltaY: 0, window };
@@ -865,7 +890,7 @@ function importEvent(
       return { type: "mousedown", button, window };
     }
     case XEventType.ButtonRelease: {
-      const btn = view.getInt32(84, true);
+      const btn = view.getUint32(84, true);
       if (btn >= 4 && btn <= 7) return undefined; // wheel has no release
       const button = BUTTONS[btn];
       if (button === undefined) return undefined;
@@ -883,21 +908,25 @@ function importEvent(
       // Check for WM_DELETE_WINDOW sent via WM_PROTOCOLS.
       const msgType = view.getBigUint64(40, true);
       const data0 = view.getBigUint64(56, true);
-      if (msgType === wmProtocols && data0 === wmDeleteWindow) {
+      if (view.getInt32(48, true) === 32 && msgType === wmProtocols && data0 === wmDeleteWindow) {
         return { type: "close", window };
       }
       return undefined;
     }
     case XEventType.EnterNotify:
-      // XCrossingEvent: mode at offset 80. Only NotifyNormal is a real pointer-enter.
-      return view.getInt32(80, true) === NotifyNormal ? { type: "mouseenter", window } : undefined;
+      // Ignore transitions between the top-level and descendants; the pointer
+      // remains inside the browser-style window boundary.
+      return view.getInt32(80, true) === NotifyNormal && view.getInt32(84, true) !== NotifyInferior
+        ? { type: "mouseenter", window }
+        : undefined;
     case XEventType.LeaveNotify:
-      // XCrossingEvent: mode at offset 80. Only NotifyNormal is a real pointer-leave.
-      return view.getInt32(80, true) === NotifyNormal ? { type: "mouseleave", window } : undefined;
+      return view.getInt32(80, true) === NotifyNormal && view.getInt32(84, true) !== NotifyInferior
+        ? { type: "mouseleave", window }
+        : undefined;
     case XEventType.UnmapNotify:
-      return { type: "visibilitychange", visible: false, window };
+      return window.updateVisibility(false) ? { type: "visibilitychange", visible: false, window } : undefined;
     case XEventType.MapNotify:
-      return { type: "visibilitychange", visible: true, window };
+      return window.updateVisibility(true) ? { type: "visibilitychange", visible: true, window } : undefined;
     default:
       return undefined;
   }

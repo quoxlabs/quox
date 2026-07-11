@@ -84,9 +84,11 @@ export function isAutoRepeatPair(
   release: DataView<ArrayBuffer>,
   press: DataView<ArrayBuffer>,
 ): boolean {
+  const timestamp = release.getBigUint64(56, true);
   return press.getInt32(0, true) === XEventType.KeyPress &&
+    timestamp !== 0n &&
     press.getBigUint64(32, true) === release.getBigUint64(32, true) &&
-    press.getBigUint64(56, true) === release.getBigUint64(56, true) &&
+    press.getBigUint64(56, true) === timestamp &&
     press.getUint32(84, true) === release.getUint32(84, true);
 }
 

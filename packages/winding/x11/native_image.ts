@@ -2,13 +2,14 @@ import { libcFunctions, x11functions } from "./ffi.ts";
 
 type X11Library = Deno.DynamicLibrary<typeof x11functions>;
 type LibcLibrary = Deno.DynamicLibrary<typeof libcFunctions>;
+const MAX_IMAGE_BYTES = 512 * 1024 * 1024;
 
 function imageByteLength(width: number, height: number): number {
   if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) {
     throw new RangeError("winding(x11): image dimensions must be positive integers");
   }
   const length = width * height * 4;
-  if (!Number.isSafeInteger(length)) {
+  if (!Number.isSafeInteger(length) || length > MAX_IMAGE_BYTES) {
     throw new RangeError("winding(x11): image dimensions are too large");
   }
   return length;
@@ -137,7 +138,7 @@ export class NativeXImage implements Disposable {
       blueMask: view.getBigUint64(72),
     };
     const byteLength = format.bytesPerLine * height;
-    if (!Number.isSafeInteger(byteLength) || byteLength <= 0) {
+    if (!Number.isSafeInteger(byteLength) || byteLength <= 0 || byteLength > MAX_IMAGE_BYTES) {
       x11.XDestroyImage(image);
       throw new Error("winding(x11): XCreateImage returned an invalid stride");
     }

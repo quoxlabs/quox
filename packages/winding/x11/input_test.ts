@@ -142,6 +142,9 @@ Deno.test("X11 repeat detection requires an identical adjacent press", () => {
   assertEquals(isAutoRepeatPair(release, press), true);
   press.setBigUint64(56, 1235n, true);
   assertEquals(isAutoRepeatPair(release, press), false);
+  release.setBigUint64(56, 0n, true);
+  press.setBigUint64(56, 0n, true);
+  assertEquals(isAutoRepeatPair(release, press), false);
 });
 
 Deno.test("X11 focus includes grabbed moves but excludes descendants", () => {
