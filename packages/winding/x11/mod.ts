@@ -51,8 +51,7 @@ const APPLICATION_X_EVENT_MASKS = BigInt(
     XEventMask.ExposureMask |
     XEventMask.VisibilityChangeMask |
     XEventMask.StructureNotifyMask |
-    XEventMask.FocusChangeMask |
-    XEventMask.OwnerGrabButtonMask,
+    XEventMask.FocusChangeMask,
 );
 const X_SHIFT_MASK = 1 << 0;
 const X_CONTROL_MASK = 1 << 2;
