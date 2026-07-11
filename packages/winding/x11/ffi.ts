@@ -78,6 +78,7 @@ export const libcFunctions = {
   free: { parameters: ["pointer"], result: "void" },
   malloc: { parameters: ["usize"], result: "pointer" },
   memcpy: { parameters: ["pointer", "buffer", "usize"], result: "pointer" },
+  poll: { parameters: ["buffer", "usize", "i32"], result: "i32" },
   setlocale: { parameters: ["i32", "buffer"], result: "pointer" },
 } as const satisfies Deno.ForeignLibraryInterface;
 

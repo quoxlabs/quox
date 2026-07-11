@@ -398,6 +398,7 @@ class X11Library implements Library {
   #peekEvent = new ArrayBuffer(192);
   event(): UIEvent | undefined {
     if (this.#closed) return undefined;
+    this.#processInternalConnections();
     this.input.processDeferred();
     this.input.throwIfCallbackFailed();
     const queued = this.#events.shift();
@@ -722,6 +723,34 @@ class X11Library implements Library {
       }
     } finally {
       this.X11.symbols.XkbFreeKeyboard(keyboard, XKB_ALL_COMPONENTS_MASK, 1);
+    }
+  }
+
+  #processInternalConnections(): void {
+    const addresses = new BigUint64Array(1);
+    const countOutput = new Int32Array(1);
+    if (this.X11.symbols.XInternalConnectionNumbers(this.display, addresses, countOutput) === 0) return;
+    if (addresses[0] === 0n) return;
+    const nativeFds = Deno.UnsafePointer.create(addresses[0]);
+    if (nativeFds === null) return;
+    try {
+      const count = countOutput[0];
+      if (count <= 0) return;
+      const nativeView = new Deno.UnsafePointerView(nativeFds);
+      // struct pollfd is { int fd; short events; short revents } on Linux.
+      const pollBuffer = new ArrayBuffer(count * 8);
+      const pollView = new DataView(pollBuffer);
+      for (let index = 0; index < count; index++) {
+        pollView.setInt32(index * 8, nativeView.getInt32(index * 4), true);
+        pollView.setInt16(index * 8 + 4, 1, true); // POLLIN
+      }
+      if (this.libc.symbols.poll(pollBuffer, BigInt(count), 0) <= 0) return;
+      for (let index = 0; index < count; index++) {
+        if ((pollView.getInt16(index * 8 + 6, true) & 1) === 0) continue;
+        this.X11.symbols.XProcessInternalConnection(this.display, pollView.getInt32(index * 8, true));
+      }
+    } finally {
+      this.X11.symbols.XFree(nativeFds);
     }
   }
 
