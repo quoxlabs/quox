@@ -50,6 +50,9 @@ export const SHM_EVENT_SIGNATURES = [
 export const BUFFER_EVENT_SIGNATURES = [
   ["pointer", "pointer"],
 ] as const satisfies readonly WaylandEventSignature[];
+export const CALLBACK_EVENT_SIGNATURES = [
+  ["pointer", "pointer", "u32"],
+] as const satisfies readonly WaylandEventSignature[];
 export const OUTPUT_EVENT_SIGNATURES = [
   ["pointer", "pointer", "i32", "i32", "i32", "i32", "i32", "pointer", "pointer", "i32"],
   ["pointer", "pointer", "u32", "i32", "i32", "i32"],

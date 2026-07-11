@@ -20,6 +20,7 @@ import { emitWaylandTextInputEdits } from "./text_input_controller.ts";
 import type { WaylandWindow } from "./window.ts";
 import {
   BUFFER_EVENT_SIGNATURES,
+  CALLBACK_EVENT_SIGNATURES,
   clampWaylandBindVersion,
   createDefaultCursorPixels,
   decodeWaylandInterfaceVersion,
@@ -53,13 +54,23 @@ import {
   XDG_TOPLEVEL_EVENT_SIGNATURES,
   XDG_WM_BASE_EVENT_SIGNATURES,
 } from "./protocol.ts";
-import { createOpaqueBlackFrame, validateWaylandShmFrame, validateWaylandShmLayout } from "./shm_buffer.ts";
+import {
+  createOpaqueBlackFrame,
+  installWaylandBufferReleaseListener,
+  releaseWaylandShmRootsAfterDisconnect,
+  tryDestroyWaylandBufferBeforeStorage,
+  validateWaylandShmFrame,
+  validateWaylandShmLayout,
+  WaylandShmAttachmentTransaction,
+  WaylandShmSlotState,
+} from "./shm_buffer.ts";
 import { MISSING_ARGB8888_SHM_FORMAT, type WaylandShmFormatGeneration, WaylandShmFormatState } from "./shm_format.ts";
 import {
   damageOpcodeForSurfaceVersion,
   DEFAULT_WAYLAND_APP_ID,
   frameMatchesConfiguration,
   setDefaultWaylandAppIdBeforeInitialCommit,
+  teardownWaylandWindowNativeGraphInOrder,
   tryDestroyWaylandSurfaceWithListeners,
   WaylandConfigureState,
 } from "./window.ts";
@@ -94,6 +105,17 @@ import {
   WaylandWindowLifecycleGate,
   type WaylandWindowMutationName,
 } from "./window_lifecycle.ts";
+import {
+  addWaylandFrameCallbackListenerOrRollback,
+  copyWaylandFrame,
+  drainWaylandPendingFrame,
+  WAYLAND_PRESENTATION_DISABLED_MESSAGE,
+  WaylandDeferredFrameRetry,
+  type WaylandFrameCallbackActions,
+  WaylandFrameCallbackOwnership,
+  WaylandPendingFrameState,
+  WaylandPostDispatchQueue,
+} from "./frame_pacing.ts";
 
 Deno.test("required Wayland dependency failures identify the support boundary", () => {
   const nativeError = new Error("native loader failed");
@@ -510,6 +532,7 @@ Deno.test("Wayland listener metadata preserves every protocol callback shape", (
     registry: REGISTRY_EVENT_SIGNATURES,
     shm: SHM_EVENT_SIGNATURES,
     buffer: BUFFER_EVENT_SIGNATURES,
+    callback: CALLBACK_EVENT_SIGNATURES,
     output: OUTPUT_EVENT_SIGNATURES,
     surface: SURFACE_EVENT_SIGNATURES,
     seat: SEAT_EVENT_SIGNATURES,
@@ -527,6 +550,7 @@ Deno.test("Wayland listener metadata preserves every protocol callback shape", (
     ],
     shm: [["pointer", "pointer", "u32"]],
     buffer: [["pointer", "pointer"]],
+    callback: [["pointer", "pointer", "u32"]],
     output: [
       ["pointer", "pointer", "i32", "i32", "i32", "i32", "i32", "pointer", "pointer", "i32"],
       ["pointer", "pointer", "u32", "i32", "i32", "i32"],
@@ -610,6 +634,7 @@ Deno.test("Wayland vtables fill only unused slots with their exact signature", (
       REGISTRY_EVENT_SIGNATURES,
       SHM_EVENT_SIGNATURES,
       BUFFER_EVENT_SIGNATURES,
+      CALLBACK_EVENT_SIGNATURES,
       OUTPUT_EVENT_SIGNATURES,
       SURFACE_EVENT_SIGNATURES,
       SEAT_EVENT_SIGNATURES,
@@ -859,7 +884,641 @@ Deno.test("Wayland frame requests scale before attach and damage in supported co
   ]);
   assertEquals(WlOp.SURFACE_SET_BUFFER_SCALE, 8);
   assertEquals(WlOp.SURFACE_DAMAGE_BUFFER, 9);
+  assertEquals(WlOp.SURFACE_FRAME, 3);
   assertEquals(WlOp.OUTPUT_RELEASE, 0);
+});
+
+Deno.test("paced Wayland buffers arm one frame callback before attaching and committing", () => {
+  assertEquals(
+    planWaylandSurfaceFrame(4, 2, 800, 600, 1600, 1200, { requestFrameCallback: true }),
+    [
+      { kind: "set-buffer-scale", scale: 2 },
+      { kind: "frame" },
+      { kind: "attach" },
+      { kind: "damage-buffer", width: 1600, height: 1200 },
+      { kind: "commit" },
+    ],
+  );
+  assertEquals(
+    planWaylandSurfaceFrame(3, 2, 800, 600, 1600, 1200, { requestFrameCallback: true }),
+    [
+      { kind: "set-buffer-scale", scale: 2 },
+      { kind: "frame" },
+      { kind: "attach" },
+      { kind: "damage-surface", width: 800, height: 600 },
+      { kind: "commit" },
+    ],
+  );
+  assertEquals(
+    planWaylandSurfaceFrame(6, 1.5, 800, 600, 1200, 900, {
+      viewportAvailable: true,
+      fractionalScaleNumerator: 180,
+      requestFrameCallback: true,
+    }),
+    [
+      { kind: "set-buffer-scale", scale: 1 },
+      { kind: "set-viewport-destination", width: 800, height: 600 },
+      { kind: "frame" },
+      { kind: "attach" },
+      { kind: "damage-buffer", width: 1200, height: 900 },
+      { kind: "commit" },
+    ],
+  );
+});
+
+Deno.test("Wayland pacing owns only the newest valid pending frame", () => {
+  const source = new Uint8Array([1, 2, 3, 255]);
+  const first = copyWaylandFrame(source, 1, 1, 7);
+  source.fill(99);
+  assertEquals([...first.rgba], [1, 2, 3, 255]);
+
+  const pending = new WaylandPendingFrameState();
+  assertEquals(pending.replace(first), true);
+  assertThrowsMessage(
+    () => copyWaylandFrame(new Uint8Array(3), 1, 1, 7),
+    "needs exactly 4 RGBA bytes",
+  );
+  assert(pending.pending === first, "a malformed frame must not displace the valid pending frame");
+
+  const newest = copyWaylandFrame(new Uint8Array([4, 5, 6, 255]), 1, 1, 8);
+  assertEquals(pending.replace(newest), true);
+  assert(pending.take() === newest);
+  assertEquals(pending.take(), undefined);
+
+  pending.replace(first);
+  pending.disable();
+  assertEquals(pending.pending, undefined);
+  assertEquals(pending.replace(newest), false);
+  try {
+    pending.assertAvailable();
+  } catch (error) {
+    assert(error instanceof Error);
+    assertEquals(error.message, WAYLAND_PRESENTATION_DISABLED_MESSAGE);
+    return;
+  }
+  throw new Error("disabled Wayland presentation remained publicly usable");
+});
+
+Deno.test("Wayland pacing discards pending frames invalidated by configure generations", () => {
+  const configure = new WaylandConfigureState(1, 1);
+  const firstConfiguration = configure.complete(1).configuration;
+  const pending = new WaylandPendingFrameState();
+  const tokened = copyWaylandFrame(new Uint8Array(4), 1, 1, firstConfiguration.frameToken);
+  pending.replace(tokened);
+
+  const regenerated = configure.complete(2).configuration;
+  assertEquals(
+    pending.discardUnless((frame) =>
+      frameMatchesConfiguration(regenerated, frame.width, frame.height, frame.frameToken)
+    ),
+    true,
+  );
+  assertEquals(pending.pending, undefined);
+
+  const untokened = copyWaylandFrame(new Uint8Array(4), 1, 1, undefined);
+  pending.replace(untokened);
+  assertEquals(
+    pending.discardUnless((frame) =>
+      frameMatchesConfiguration(regenerated, frame.width, frame.height, frame.frameToken)
+    ),
+    false,
+  );
+  configure.stageToplevel(2, 1, false);
+  const resized = configure.complete(3).configuration;
+  assertEquals(
+    pending.discardUnless((frame) => frameMatchesConfiguration(resized, frame.width, frame.height, frame.frameToken)),
+    true,
+  );
+});
+
+Deno.test("Wayland SHM reservations distinguish cancellation from compositor release", () => {
+  const slot = new WaylandShmSlotState();
+  const uncommitted = slot.reserve();
+  assertEquals(slot.busy, true);
+  assertEquals(slot.cancel(uncommitted), true);
+  assertEquals(slot.busy, false);
+
+  const attached = slot.reserve();
+  assertEquals(slot.retainUntilRelease(attached), true);
+  assertEquals(slot.cancel(attached), false);
+  assertEquals(slot.busy, true);
+  assertEquals(slot.release(), true);
+  assertEquals(slot.busy, false);
+  assertEquals(slot.release(), false);
+});
+
+Deno.test("stranded Wayland SHM slots remain counted and target their original cleanup graph", () => {
+  const slot = new WaylandShmSlotState();
+  const originalGraph = {
+    buffer: "buffer-1",
+    mapping: "mapping-1",
+    fd: 17,
+  };
+  const cleanupTargets: typeof originalGraph[] = [];
+  const cleanupAfterDisconnect = () => cleanupTargets.push(originalGraph);
+
+  slot.strand();
+  assertEquals(slot.stranded, true);
+  assertEquals(slot.busy, true);
+  slot.reset();
+  assertEquals(slot.busy, true);
+  assertEquals(slot.release(), false);
+  assertEquals(slot.busy, true);
+  assertThrowsMessage(() => slot.reserve(), "busy Wayland SHM buffer");
+  cleanupAfterDisconnect();
+  assertEquals(cleanupTargets, [originalGraph]);
+  slot.releaseStrandedAfterDisconnect();
+  assertEquals(slot.stranded, false);
+  assertEquals(slot.busy, false);
+});
+
+Deno.test("Wayland attachment transactions settle every presentation failure boundary", () => {
+  const run = (
+    failure: "before-attach" | "after-attach" | "at-commit" | "after-commit",
+  ): { readonly settlement: string; readonly actions: string[] } => {
+    const actions: string[] = [];
+    const transaction = new WaylandShmAttachmentTransaction({
+      buffer: {} as Deno.PointerObject,
+      layout: { width: 1, height: 1, stride: 4, size: 4 },
+      retainUntilRelease: () => actions.push("retain"),
+      cancel: () => actions.push("cancel"),
+    });
+    if (failure !== "before-attach") transaction.markAttached();
+    if (failure === "after-commit") transaction.markCommitted();
+    return { settlement: transaction.fail(), actions };
+  };
+
+  assertEquals(run("before-attach"), { settlement: "cancelled", actions: ["cancel"] });
+  assertEquals(run("after-attach"), { settlement: "retained", actions: ["retain"] });
+  assertEquals(run("at-commit"), { settlement: "retained", actions: ["retain"] });
+  assertEquals(run("after-commit"), { settlement: "committed", actions: ["retain"] });
+});
+
+Deno.test("Wayland pacing retries only the newest owned frame after pool saturation", () => {
+  const slots = [new WaylandShmSlotState(), new WaylandShmSlotState(), new WaylandShmSlotState()];
+  for (const slot of slots) slot.retainUntilRelease(slot.reserve());
+
+  const pending = new WaylandPendingFrameState();
+  const first = copyWaylandFrame(new Uint8Array([1, 0, 0, 255]), 1, 1, 1);
+  const newest = copyWaylandFrame(new Uint8Array([2, 0, 0, 255]), 1, 1, 1);
+  pending.replace(first);
+  pending.replace(newest);
+  const submitted: number[][] = [];
+  const present = (frame: typeof newest): boolean => {
+    const slot = slots.find((candidate) => !candidate.busy);
+    if (slot === undefined) return false;
+    slot.retainUntilRelease(slot.reserve());
+    submitted.push([...frame.rgba]);
+    return true;
+  };
+
+  assertEquals(drainWaylandPendingFrame(pending, false, () => true, present), "busy");
+  assert(pending.pending === newest);
+  assertEquals(submitted, []);
+  assertEquals(slots[1].release(), true);
+  assertEquals(drainWaylandPendingFrame(pending, false, () => true, present), "presented");
+  assertEquals(pending.pending, undefined);
+  assertEquals(submitted, [[2, 0, 0, 255]]);
+});
+
+Deno.test("Wayland buffer release defers resize replacement off the native callback stack", () => {
+  const queue = new WaylandPostDispatchQueue();
+  const pending = new WaylandPendingFrameState();
+  const slot = new WaylandShmSlotState();
+  slot.retainUntilRelease(slot.reserve());
+  const actions: string[] = [];
+  let onNativeCallbackStack = false;
+  const retry = new WaylandDeferredFrameRetry(
+    () => {
+      assert(!onNativeCallbackStack, "presentation must not run on the wl_buffer.release callback stack");
+      drainWaylandPendingFrame(
+        pending,
+        false,
+        () => true,
+        (frame) => {
+          actions.push(`present:${frame.rgba[0]}`);
+          actions.push("replace-resized-slot");
+          actions.push("close-old-release-listener");
+          return true;
+        },
+      );
+    },
+    (action) => {
+      queue.defer(action);
+    },
+  );
+
+  onNativeCallbackStack = true;
+  assertEquals(slot.release(), true);
+  pending.replace(copyWaylandFrame(new Uint8Array([1, 0, 0, 255]), 1, 1, 1));
+  assertEquals(retry.request(), true);
+  pending.replace(copyWaylandFrame(new Uint8Array([2, 0, 0, 255]), 1, 1, 1));
+  assertEquals(retry.request(), false);
+  assertEquals(actions, []);
+  onNativeCallbackStack = false;
+
+  queue.drain();
+  assertEquals(actions, ["present:2", "replace-resized-slot", "close-old-release-listener"]);
+});
+
+Deno.test("Wayland frame-done teardown is deferred and queued disposal is inert", () => {
+  const queue = new WaylandPostDispatchQueue();
+  const owner = { kind: "window" };
+  const ownership = new WaylandFrameCallbackOwnership<string, string, string, Uint32Array, typeof owner>(owner);
+  ownership.installListener("frame-done-listener");
+  ownership.installVtable("frame-done-vtable");
+  const registration = ownership.arm("frame-proxy", 9n, new Uint32Array([1]));
+  const actions: string[] = [];
+  let onNativeCallbackStack = false;
+  const callbackActions: WaylandFrameCallbackActions<string, string, typeof owner> = {
+    destroyProxy: (proxy) => {
+      assert(!onNativeCallbackStack, "frame proxy destruction must be post-dispatch");
+      actions.push(`destroy:${proxy}`);
+    },
+    closeListener: (listener) => {
+      assert(!onNativeCallbackStack, "the executing frame listener must not self-close");
+      actions.push(`close:${listener}`);
+    },
+    retainListener: (listener) => actions.push(`retain:${listener}`),
+    retainOwner: () => actions.push("retain-owner"),
+    reportError: (error) => actions.push(`error:${String(error)}`),
+  };
+  const retry = new WaylandDeferredFrameRetry(
+    () => {
+      ownership.complete(9n, registration.generation, callbackActions);
+      try {
+        actions.push("present");
+        throw new Error("flush failed");
+      } catch {
+        ownership.close(callbackActions);
+      }
+    },
+    (action) => {
+      queue.defer(action);
+    },
+  );
+
+  onNativeCallbackStack = true;
+  assertEquals(retry.request(), true);
+  assertEquals(actions, []);
+  onNativeCallbackStack = false;
+  queue.drain();
+  assertEquals(actions, ["destroy:frame-proxy", "present", "close:frame-done-listener"]);
+
+  let disposedRetryCount = 0;
+  const disposed = new WaylandDeferredFrameRetry(
+    () => disposedRetryCount++,
+    (action) => {
+      queue.defer(action);
+    },
+  );
+  assertEquals(disposed.request(), true);
+  disposed.close();
+  queue.drain();
+  assertEquals(disposedRetryCount, 0);
+  assertEquals(disposed.request(), false);
+
+  let closedQueueCount = 0;
+  queue.defer(() => closedQueueCount++);
+  queue.close();
+  queue.drain();
+  assertEquals(closedQueueCount, 0);
+});
+
+Deno.test("failed Wayland buffer destruction strands every native storage owner", () => {
+  const destroyError = new Error("buffer destroy failed");
+  const actions: string[] = [];
+  const destroyed = tryDestroyWaylandBufferBeforeStorage(
+    "buffer",
+    () => {
+      actions.push("destroy-buffer");
+      throw destroyError;
+    },
+    () => {
+      actions.push("retain-release-listener");
+      actions.push("retain-vtable-and-slot");
+      actions.push("retain-disconnect-cleanup");
+    },
+    (error) => {
+      assert(error === destroyError);
+      actions.push("report-error");
+    },
+  );
+  if (destroyed) {
+    actions.push("close-listener");
+    actions.push("unmap");
+    actions.push("close-fd");
+  }
+  assertEquals(destroyed, false);
+  assertEquals(actions, [
+    "destroy-buffer",
+    "retain-release-listener",
+    "retain-vtable-and-slot",
+    "retain-disconnect-cleanup",
+    "report-error",
+  ]);
+
+  const success: string[] = [];
+  assertEquals(
+    tryDestroyWaylandBufferBeforeStorage(
+      "buffer",
+      () => success.push("destroy-buffer"),
+      () => success.push("retain"),
+      () => success.push("report-error"),
+    ),
+    true,
+  );
+  success.push("close-listener", "unmap", "close-fd");
+  assertEquals(success, ["destroy-buffer", "close-listener", "unmap", "close-fd"]);
+});
+
+Deno.test("stranded Wayland SHM roots release only after callbacks become inert at disconnect", () => {
+  const callbackError = new Error("callback close failed");
+  const cleanupError = new Error("backing cleanup failed");
+  const actions: string[] = [];
+  const errors: unknown[] = [];
+  releaseWaylandShmRootsAfterDisconnect(
+    ["first-listener", "second-listener"],
+    [
+      () => actions.push("unmap-and-close:first-slot"),
+      () => {
+        actions.push("unmap-and-close:second-slot");
+        throw cleanupError;
+      },
+    ],
+    (callback) => {
+      actions.push(`close:${callback}`);
+      if (callback === "first-listener") throw callbackError;
+    },
+    (error) => errors.push(error),
+  );
+  assertEquals(actions, [
+    "close:first-listener",
+    "close:second-listener",
+    "unmap-and-close:first-slot",
+    "unmap-and-close:second-slot",
+  ]);
+  assertEquals(errors, [callbackError, cleanupError]);
+});
+
+Deno.test("Wayland SHM listener construction closes callbacks on every partial failure", () => {
+  const vtableError = new Error("vtable failed");
+  const vtableActions: string[] = [];
+  assertThrowsMessage(
+    () =>
+      installWaylandBufferReleaseListener(
+        () => {
+          vtableActions.push("create-callback");
+          return "callback";
+        },
+        () => {
+          vtableActions.push("create-vtable");
+          throw vtableError;
+        },
+        () => {
+          vtableActions.push("add-listener");
+          return 0;
+        },
+        () => vtableActions.push("close-callback"),
+      ),
+    "vtable failed",
+  );
+  assertEquals(vtableActions, ["create-callback", "create-vtable", "close-callback"]);
+
+  const addActions: string[] = [];
+  assertThrowsMessage(
+    () =>
+      installWaylandBufferReleaseListener(
+        () => {
+          addActions.push("create-callback");
+          return "callback";
+        },
+        () => {
+          addActions.push("create-vtable");
+          return "vtable";
+        },
+        () => {
+          addActions.push("add-listener");
+          return -1;
+        },
+        () => addActions.push("close-callback"),
+      ),
+    "failed to listen for Wayland SHM buffer release",
+  );
+  assertEquals(addActions, ["create-callback", "create-vtable", "add-listener", "close-callback"]);
+});
+
+Deno.test("Wayland frame callbacks use pointer and generation identity with one shared listener", () => {
+  const owner = { kind: "window" };
+  const ownership = new WaylandFrameCallbackOwnership<string, string, string, Uint32Array, typeof owner>(owner);
+  ownership.installListener("done-listener");
+  ownership.installVtable("done-vtable");
+  assertEquals(ownership.listener, "done-listener");
+  assertEquals(ownership.vtable, "done-vtable");
+  const actions: string[] = [];
+  const callbackActions: WaylandFrameCallbackActions<string, string, typeof owner> = {
+    destroyProxy: (proxy) => actions.push(`destroy:${proxy}`),
+    closeListener: (listener) => actions.push(`close:${listener}`),
+    retainListener: (listener) => actions.push(`retain:${listener}`),
+    retainOwner: () => actions.push("retain-owner"),
+    reportError: (error) => actions.push(`error:${String(error)}`),
+  };
+
+  const first = ownership.arm("callback-1", 10n, new Uint32Array([1]));
+  assertEquals(first.generation, 1);
+  assertEquals([...first.generationToken], [1]);
+  assert(ownership.registration === first);
+  assertThrowsMessage(
+    () => ownership.arm("duplicate", 11n, new Uint32Array([2])),
+    "already outstanding",
+  );
+  assertEquals(ownership.complete(11n, first.generation, callbackActions), { kind: "ignored" });
+  assertEquals(ownership.complete(10n, first.generation + 1, callbackActions), { kind: "ignored" });
+  assertEquals(actions, []);
+  assertEquals(ownership.complete(10n, first.generation, callbackActions), {
+    kind: "completed",
+    registration: first,
+  });
+  assertEquals(actions, ["destroy:callback-1"]);
+  assertEquals(ownership.registration, undefined);
+  assertEquals(ownership.listener, "done-listener");
+  assertEquals(ownership.vtable, "done-vtable");
+
+  const reused = ownership.arm("callback-2", 10n, new Uint32Array([2]));
+  assertEquals(reused.generation, 2);
+  assertEquals(ownership.complete(10n, first.generation, callbackActions), { kind: "ignored" });
+  assertEquals(ownership.abort(reused, callbackActions), true);
+  assertEquals(ownership.registration, undefined);
+  const final = ownership.arm("callback-3", 12n, new Uint32Array([3]));
+  assertEquals(final.generation, 3);
+  assertEquals(ownership.close(callbackActions), true);
+  assertEquals(actions, [
+    "destroy:callback-1",
+    "destroy:callback-2",
+    "destroy:callback-3",
+    "close:done-listener",
+  ]);
+  assertEquals(ownership.registration, undefined);
+  assertEquals(ownership.listener, null);
+  assertEquals(ownership.vtable, undefined);
+});
+
+Deno.test("a failed Wayland frame listener disables retries while disposing its local proxy", () => {
+  const owner = { kind: "window" };
+  const ownership = new WaylandFrameCallbackOwnership<string, string, string, Uint32Array, typeof owner>(owner);
+  ownership.installListener("done-listener");
+  ownership.installVtable("done-vtable");
+  const registration = ownership.arm("marshalled-callback", 20n, new Uint32Array([1]));
+  const pacing = new WaylandPendingFrameState();
+  pacing.replace(copyWaylandFrame(new Uint8Array(4), 1, 1, 1));
+  const actions: string[] = [];
+  const callbackActions: WaylandFrameCallbackActions<string, string, typeof owner> = {
+    destroyProxy: (proxy) => actions.push(`destroy:${proxy}`),
+    closeListener: (listener) => actions.push(`close:${listener}`),
+    retainListener: (listener) => actions.push(`retain:${listener}`),
+    retainOwner: () => actions.push("retain-owner"),
+    reportError: (error) => actions.push(`error:${String(error)}`),
+  };
+
+  // The server-side frame request remains pending until a future surface
+  // commit, so listener failure must atomically disable commits and dispose
+  // the local proxy registered for that pending request.
+  assertThrowsMessage(
+    () =>
+      addWaylandFrameCallbackListenerOrRollback(
+        () => {
+          actions.push("add-listener");
+          return -1;
+        },
+        (error) => {
+          pacing.disable();
+          ownership.abort(registration, callbackActions);
+          throw error;
+        },
+      ),
+    "failed to listen to a Wayland frame callback",
+  );
+  assertEquals(ownership.outstanding, false);
+  assertEquals(actions, ["add-listener", "destroy:marshalled-callback"]);
+  assertThrowsMessage(() => pacing.assertAvailable(), WAYLAND_PRESENTATION_DISABLED_MESSAGE);
+});
+
+Deno.test("failed Wayland frame callback destruction strands an inert retained graph", () => {
+  const owner = { kind: "window" };
+  const ownership = new WaylandFrameCallbackOwnership<string, string, string, Uint32Array, typeof owner>(owner);
+  ownership.installListener("done-listener");
+  ownership.installVtable("done-vtable");
+  const registration = ownership.arm("callback", 44n, new Uint32Array([1]));
+  const destroyError = new Error("proxy destroy failed");
+  const actions: string[] = [];
+  const callbackActions: WaylandFrameCallbackActions<string, string, typeof owner> = {
+    destroyProxy: () => {
+      actions.push("destroy");
+      throw destroyError;
+    },
+    closeListener: () => actions.push("close-listener"),
+    retainListener: () => actions.push("retain-listener"),
+    retainOwner: (candidate) => {
+      assert(candidate === owner);
+      actions.push("retain-owner");
+    },
+    reportError: (error) => {
+      assert(error === destroyError);
+      actions.push("report-error");
+    },
+  };
+
+  assertEquals(ownership.complete(44n, registration.generation, callbackActions), {
+    kind: "stranded",
+    registration,
+  });
+  assert(ownership.registration === registration);
+  assertEquals(registration.proxy, "callback");
+  assertEquals([...registration.generationToken], [1]);
+  assertEquals(ownership.listener, "done-listener");
+  assertEquals(ownership.vtable, "done-vtable");
+  assert(ownership.owner === owner);
+  assertEquals(actions, ["destroy", "report-error", "retain-listener", "retain-owner"]);
+  assertEquals(ownership.complete(44n, registration.generation, callbackActions), { kind: "ignored" });
+  assertEquals(
+    teardownWaylandWindowNativeGraphInOrder(
+      () => {
+        actions.push("drop-pending");
+        assertEquals(ownership.close(callbackActions), false);
+      },
+      () => {
+        actions.push("destroy-optional-children");
+        return true;
+      },
+      () => actions.push("destroy-roles"),
+      () => actions.push("destroy-surface"),
+    ),
+    true,
+  );
+  assertEquals(actions, [
+    "destroy",
+    "report-error",
+    "retain-listener",
+    "retain-owner",
+    "drop-pending",
+    "destroy-optional-children",
+    "destroy-roles",
+    "destroy-surface",
+  ]);
+  assert(ownership.registration === registration);
+  assertEquals(ownership.listener, "done-listener");
+  assertEquals(ownership.vtable, "done-vtable");
+});
+
+Deno.test("Wayland window teardown removes frame pacing before children, roles, and surface", () => {
+  const owner = { kind: "window" };
+  const ownership = new WaylandFrameCallbackOwnership<string, string, string, Uint32Array, typeof owner>(owner);
+  ownership.installListener("done-listener");
+  ownership.installVtable("done-vtable");
+  ownership.arm("frame-proxy", 1n, new Uint32Array([1]));
+  const pending = new WaylandPendingFrameState();
+  pending.replace(copyWaylandFrame(new Uint8Array(4), 1, 1, 1));
+  const actions: string[] = [];
+  const callbackActions: WaylandFrameCallbackActions<string, string, typeof owner> = {
+    destroyProxy: (proxy) => actions.push(`destroy:${proxy}`),
+    closeListener: (listener) => actions.push(`close:${listener}`),
+    retainListener: (listener) => actions.push(`retain:${listener}`),
+    retainOwner: () => actions.push("retain-owner"),
+    reportError: (error) => actions.push(`error:${String(error)}`),
+  };
+
+  assertEquals(
+    teardownWaylandWindowNativeGraphInOrder(
+      () => {
+        pending.close();
+        actions.push("drop-pending");
+        ownership.close(callbackActions);
+      },
+      () => {
+        actions.push("unregister-window", "destroy-decoration", "destroy-fractional-scale");
+        return true;
+      },
+      () => actions.push("close-shm", "destroy-xdg-toplevel", "destroy-xdg-surface"),
+      () => actions.push("destroy-wl-surface"),
+    ),
+    true,
+  );
+  assertEquals(actions, [
+    "drop-pending",
+    "destroy:frame-proxy",
+    "close:done-listener",
+    "unregister-window",
+    "destroy-decoration",
+    "destroy-fractional-scale",
+    "close-shm",
+    "destroy-xdg-toplevel",
+    "destroy-xdg-surface",
+    "destroy-wl-surface",
+  ]);
+  assertEquals(pending.pending, undefined);
+  assertEquals(ownership.registration, undefined);
+  assertEquals(ownership.listener, null);
+  assertEquals(ownership.vtable, undefined);
 });
 
 Deno.test("failed Wayland surface destruction retains proxy listener ownership in order", () => {

@@ -155,11 +155,13 @@ export type WaylandSurfaceFrameRequest =
   | { readonly kind: "set-viewport-destination"; readonly width: number; readonly height: number }
   | { readonly kind: "attach" }
   | { readonly kind: "damage-buffer" | "damage-surface"; readonly width: number; readonly height: number }
+  | { readonly kind: "frame" }
   | { readonly kind: "commit" };
 
 export interface WaylandSurfaceFrameOptions {
   readonly viewportAvailable?: boolean;
   readonly fractionalScaleNumerator?: number;
+  readonly requestFrameCallback?: boolean;
 }
 
 export function planWaylandSurfaceFrame(
@@ -201,6 +203,7 @@ export function planWaylandSurfaceFrame(
       height: useFractionalScale ? logicalHeight : -1,
     });
   }
+  if (options.requestFrameCallback === true) requests.push({ kind: "frame" });
   requests.push({ kind: "attach" });
   requests.push(
     surfaceVersion >= 4

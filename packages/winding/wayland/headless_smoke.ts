@@ -28,8 +28,8 @@ Deno.test("Wayland negotiates SHM, maps on open, blits, and survives repeated li
         window.setImeCursorArea(4.25, 8.5, 12.75, 16.5);
         window.setImeSurroundingText("before after", 6, 6);
         window.setImeEnabled(true);
-        // Submit faster than the compositor can release buffers. The bounded
-        // pool must drop excess frames without rewriting committed storage.
+        // Submit faster than the compositor can schedule frames. Pacing keeps
+        // only the newest owned frame without rewriting committed storage.
         for (let frame = 0; frame < 5; frame++) {
           pixels[0] = frame;
           window.blit(pixels, WIDTH, HEIGHT);

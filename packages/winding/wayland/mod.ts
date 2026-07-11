@@ -39,7 +39,12 @@ import {
 import { WaylandWindow } from "./window.ts";
 import { WaylandTextInputController } from "./text_input_controller.ts";
 import { WaylandKeyboardController } from "./keyboard_controller.ts";
-import { type WaylandShmAttachment, WaylandShmBuffer } from "./shm_buffer.ts";
+import {
+  releaseWaylandShmRootsAfterDisconnect,
+  type WaylandShmAttachment,
+  WaylandShmAttachmentTransaction,
+  WaylandShmBuffer,
+} from "./shm_buffer.ts";
 import { type WaylandShmFormatGeneration, WaylandShmFormatState } from "./shm_format.ts";
 import {
   type BoundWaylandGlobal,
@@ -50,6 +55,7 @@ import {
 import { WaylandPointerFrameAccumulator, WaylandPointerPosition } from "./pointer.ts";
 import { type WaylandDecorationManagerBinding, WaylandDecorationManagerState } from "./decoration.ts";
 import { type WaylandFractionalScaleManagerPair, WaylandFractionalScaleManagerState } from "./fractional_scale.ts";
+import { WaylandPostDispatchQueue } from "./frame_pacing.ts";
 import {
   outputReleaseStrategy,
   type WaylandOutputBinding,
@@ -124,6 +130,7 @@ class WaylandLibrary implements Library {
     shm: Deno.PointerObject;
     shmPool: Deno.PointerObject;
     buffer: Deno.PointerObject;
+    callback: Deno.PointerObject;
     surface: Deno.PointerObject;
     output: Deno.PointerObject;
     seat: Deno.PointerObject;
@@ -177,6 +184,8 @@ class WaylandLibrary implements Library {
   #vtables: BigUint64Array<ArrayBuffer>[] = [];
   readonly #retainedCallbackRoots = new Set<AnyCallback>();
   readonly #retainedNativeResourceRoots = new Set<object>();
+  readonly #retainedNativeDisconnectCleanups = new Set<() => void>();
+  readonly #afterNativeCallbacks = new WaylandPostDispatchQueue();
   // pollfd buffer for non-blocking display read
   #pollFd = new Uint8Array(8) as Uint8Array<ArrayBuffer>; // struct pollfd {int fd; short events; short revents;}
   #initialized = false;
@@ -216,6 +225,7 @@ class WaylandLibrary implements Library {
         shm: dlsymRequired(this.libdl, wlHandle, "wl_shm_interface"),
         shmPool: dlsymRequired(this.libdl, wlHandle, "wl_shm_pool_interface"),
         buffer: dlsymRequired(this.libdl, wlHandle, "wl_buffer_interface"),
+        callback: dlsymRequired(this.libdl, wlHandle, "wl_callback_interface"),
         surface: dlsymRequired(this.libdl, wlHandle, "wl_surface_interface"),
         output: dlsymRequired(this.libdl, wlHandle, "wl_output_interface"),
         seat: dlsymRequired(this.libdl, wlHandle, "wl_seat_interface"),
@@ -752,46 +762,99 @@ class WaylandLibrary implements Library {
     const cursorSurface = this.#coreCursorSurface;
     const cursorAttachment = this.#coreCursorAttachment;
     if (!pointer || !cursorSurface || !cursorAttachment) return;
-    sym.wl_proxy_marshal_array_flags(
-      pointer,
-      WlOp.POINTER_SET_CURSOR,
-      null,
-      sym.wl_proxy_get_version(pointer),
-      0,
-      args(
-        BigInt(serial),
-        Deno.UnsafePointer.value(cursorSurface),
-        BigInt(DEFAULT_CURSOR_HOTSPOT_X),
-        BigInt(DEFAULT_CURSOR_HOTSPOT_Y),
-      ),
-    );
-    if (this.#coreCursorCommitted) return;
-    const surfaceVersion = sym.wl_proxy_get_version(cursorSurface);
-    sym.wl_proxy_marshal_array_flags(
-      cursorSurface,
-      WlOp.SURFACE_ATTACH,
-      null,
-      surfaceVersion,
-      0,
-      args(Deno.UnsafePointer.value(cursorAttachment.buffer), 0n, 0n),
-    );
-    sym.wl_proxy_marshal_array_flags(
-      cursorSurface,
-      WlOp.SURFACE_DAMAGE,
-      null,
-      surfaceVersion,
-      0,
-      args(0n, 0n, BigInt(cursorAttachment.layout.width), BigInt(cursorAttachment.layout.height)),
-    );
-    sym.wl_proxy_marshal_array_flags(
-      cursorSurface,
-      WlOp.SURFACE_COMMIT,
-      null,
-      surfaceVersion,
-      0,
-      args(),
-    );
-    this.#coreCursorCommitted = true;
+    if (this.#coreCursorCommitted) {
+      sym.wl_proxy_marshal_array_flags(
+        pointer,
+        WlOp.POINTER_SET_CURSOR,
+        null,
+        sym.wl_proxy_get_version(pointer),
+        0,
+        args(
+          BigInt(serial),
+          Deno.UnsafePointer.value(cursorSurface),
+          BigInt(DEFAULT_CURSOR_HOTSPOT_X),
+          BigInt(DEFAULT_CURSOR_HOTSPOT_Y),
+        ),
+      );
+      return;
+    }
+
+    const attachmentTransaction = new WaylandShmAttachmentTransaction(cursorAttachment);
+    try {
+      sym.wl_proxy_marshal_array_flags(
+        pointer,
+        WlOp.POINTER_SET_CURSOR,
+        null,
+        sym.wl_proxy_get_version(pointer),
+        0,
+        args(
+          BigInt(serial),
+          Deno.UnsafePointer.value(cursorSurface),
+          BigInt(DEFAULT_CURSOR_HOTSPOT_X),
+          BigInt(DEFAULT_CURSOR_HOTSPOT_Y),
+        ),
+      );
+      const surfaceVersion = sym.wl_proxy_get_version(cursorSurface);
+      sym.wl_proxy_marshal_array_flags(
+        cursorSurface,
+        WlOp.SURFACE_ATTACH,
+        null,
+        surfaceVersion,
+        0,
+        args(Deno.UnsafePointer.value(cursorAttachment.buffer), 0n, 0n),
+      );
+      attachmentTransaction.markAttached();
+      sym.wl_proxy_marshal_array_flags(
+        cursorSurface,
+        WlOp.SURFACE_DAMAGE,
+        null,
+        surfaceVersion,
+        0,
+        args(0n, 0n, BigInt(cursorAttachment.layout.width), BigInt(cursorAttachment.layout.height)),
+      );
+      sym.wl_proxy_marshal_array_flags(
+        cursorSurface,
+        WlOp.SURFACE_COMMIT,
+        null,
+        surfaceVersion,
+        0,
+        args(),
+      );
+      attachmentTransaction.markCommitted();
+      this.#coreCursorCommitted = true;
+    } catch {
+      attachmentTransaction.fail();
+      this.#disableCoreCursorFallback();
+    }
+  }
+
+  #disableCoreCursorFallback(): void {
+    const surface = this.#coreCursorSurface;
+    const buffers = this.#coreCursorBuffers;
+    this.#coreCursorSurface = null;
+    this.#coreCursorAttachment = null;
+    this.#coreCursorBuffers = null;
+    this.#coreCursorCommitted = false;
+    this.#coreCursorUnavailable = true;
+    if (surface) {
+      try {
+        this.wl.symbols.wl_proxy_marshal_array_flags(
+          surface,
+          WlOp.SURFACE_DESTROY,
+          null,
+          this.wl.symbols.wl_proxy_get_version(surface),
+          WL_MARSHAL_FLAG_DESTROY,
+          args(),
+        );
+      } catch {
+        this.retainNativeResourceRoot(surface);
+      }
+    }
+    try {
+      buffers?.close();
+    } catch {
+      // The cursor is optional; failed buffer destruction retains its own graph.
+    }
   }
 
   #ensureCoreCursor(): boolean {
@@ -1285,6 +1348,14 @@ class WaylandLibrary implements Library {
     return guardNativeCallback(this.#callbackErrors, callback, () => {});
   }
 
+  deferAfterNativeCallback(action: () => void): void {
+    this.#afterNativeCallbacks.defer(action);
+  }
+
+  #drainAfterNativeCallbacks(): void {
+    this.#afterNativeCallbacks.drain();
+  }
+
   retainNativeCallbackRoot(callback: AnyCallback): void {
     this.#retainedCallbackRoots.add(callback);
   }
@@ -1295,6 +1366,10 @@ class WaylandLibrary implements Library {
 
   retainNativeResourceRoot(resource: object): void {
     this.#retainedNativeResourceRoots.add(resource);
+  }
+
+  retainNativeDisconnectCleanup(cleanup: () => void): void {
+    this.#retainedNativeDisconnectCleanups.add(cleanup);
   }
 
   releaseNativeResourceRoot(resource: object): void {
@@ -1314,6 +1389,7 @@ class WaylandLibrary implements Library {
     if (this.wl.symbols.wl_display_roundtrip(this.display) < 0) {
       this.#failConnection(context);
     }
+    this.#drainAfterNativeCallbacks();
     this.#callbackErrors.throwIfPending();
   }
 
@@ -1383,6 +1459,9 @@ class WaylandLibrary implements Library {
     if (sym.wl_display_dispatch_pending(this.display) < 0) {
       this.#failConnection("dispatching display events");
     }
+    this.#drainAfterNativeCallbacks();
+    this.#callbackErrors.throwIfPending();
+    if (this.#closed) return undefined;
     this.#keyboardController.enqueueDueRepeat();
     const dispatched = this.#events.shift();
     if (dispatched !== undefined) return dispatched;
@@ -1438,7 +1517,6 @@ class WaylandLibrary implements Library {
     this.#coreCursorCommitted = false;
     const coreCursorBuffers = this.#coreCursorBuffers;
     this.#coreCursorBuffers = null;
-    if (coreCursorBuffers) collectCleanupError(errors, () => coreCursorBuffers.close());
     if (coreCursorSurface) {
       collectCleanupError(errors, () => {
         this.wl.symbols.wl_proxy_marshal_array_flags(
@@ -1451,6 +1529,7 @@ class WaylandLibrary implements Library {
         );
       });
     }
+    if (coreCursorBuffers) collectCleanupError(errors, () => coreCursorBuffers.close());
 
     collectCleanupError(errors, () => this.#outputs.close());
     this.#outputsByProxy.clear();
@@ -1474,6 +1553,7 @@ class WaylandLibrary implements Library {
     if (this.#closed) return;
     this.#closed = true;
     this.#initialized = false;
+    this.#afterNativeCallbacks.close();
     this.#events.close();
     const errors: unknown[] = [];
 
@@ -1494,7 +1574,14 @@ class WaylandLibrary implements Library {
     if (disconnected) {
       const retainedCallbackRoots = [...this.#retainedCallbackRoots];
       this.#retainedCallbackRoots.clear();
-      for (const callback of retainedCallbackRoots) collectCleanupError(errors, () => callback.close());
+      const retainedDisconnectCleanups = [...this.#retainedNativeDisconnectCleanups];
+      this.#retainedNativeDisconnectCleanups.clear();
+      releaseWaylandShmRootsAfterDisconnect(
+        retainedCallbackRoots,
+        retainedDisconnectCleanups,
+        (callback) => callback.close(),
+        (error) => errors.push(error),
+      );
       this.#retainedNativeResourceRoots.clear();
       collectCleanupError(errors, () => this.noops.close());
     } else if (this.#retainedNativeResourceRoots.size === 0) {
