@@ -58,6 +58,7 @@ import {
 } from "./ffi.ts";
 import { Win32InputController, type Win32InputWindow } from "./input_controller.ts";
 import { decodeWin32DpiChange, scaleWin32OuterGeometry, Win32DpiAwareness, Win32DpiState } from "./dpi.ts";
+import { describeWin32Error, WIN32_SYSTEM_MESSAGE_FLAGS } from "./error.ts";
 import {
   ImeActivationState,
   keyLocationForCode,
@@ -86,6 +87,16 @@ Deno.test("Win32 key lParam decoding preserves repeat, scan, extended, context, 
     isRepeat: true,
   });
   assertEquals(decodeKeyLParam(makeKeyLParam(0x1e)).isRepeat, false);
+});
+
+Deno.test("Win32 system errors suppress inserts and retain the numeric code when formatting fails", () => {
+  assertEquals(WIN32_SYSTEM_MESSAGE_FLAGS, 0x1000 | 0x0200);
+  assertEquals(
+    describeWin32Error(87, "The parameter %1!d! is incorrect.\r\n"),
+    "The parameter %1!d! is incorrect. (87)",
+  );
+  assertEquals(describeWin32Error(0xdeadbeef), "Win32 error (3735928559)");
+  assertEquals(describeWin32Error(317, " \r\n\t"), "Win32 error (317)");
 });
 
 Deno.test({

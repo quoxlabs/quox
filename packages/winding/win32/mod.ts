@@ -10,6 +10,7 @@ import {
   Win32DpiState,
   type Win32OuterGeometry,
 } from "./dpi.ts";
+import { describeWin32Error, WIN32_SYSTEM_MESSAGE_FLAGS } from "./error.ts";
 import {
   gdi32functions,
   imm32functions,
@@ -939,25 +940,25 @@ class Win32Library implements Library {
   #lastErrorBuffer = new ArrayBuffer(4096);
   getLastError(code = this.kernel32.symbols.GetLastError()) {
     const bufU16 = new Uint16Array(this.#lastErrorBuffer);
-    const bytesWritten = this.kernel32.symbols.FormatMessageW(
-      0x1000,
-      null,
-      code,
-      0,
-      Deno.UnsafePointer.of(this.#lastErrorBuffer),
-      this.#lastErrorBuffer.byteLength / 2,
-      null,
-    );
-    if (bytesWritten == 0) {
-      throw new Error(
-        "Failed to get error information for error code: " + code,
+    let charactersWritten = 0;
+    try {
+      charactersWritten = this.kernel32.symbols.FormatMessageW(
+        WIN32_SYSTEM_MESSAGE_FLAGS,
+        null,
+        code,
+        0,
+        Deno.UnsafePointer.of(this.#lastErrorBuffer),
+        this.#lastErrorBuffer.byteLength / 2,
+        null,
       );
+    } catch {
+      return describeWin32Error(code);
     }
     let s = "";
-    for (let i = 0; i < bytesWritten; i++) {
+    for (let i = 0; i < charactersWritten; i++) {
       s += String.fromCharCode(bufU16[i]);
     }
-    return s.trim() + " (" + code + ")";
+    return describeWin32Error(code, s);
   }
   [Symbol.dispose]() {
     this.close();
