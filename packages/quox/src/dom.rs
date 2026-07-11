@@ -53,6 +53,13 @@ fn unsupported_form_control_value(node_handle: u32) -> JsValue {
     .into()
 }
 
+fn unsupported_input_checkedness(node_handle: u32) -> JsValue {
+    js_sys::TypeError::new(&format!(
+        "DOM node handle does not identify an HTML input: {node_handle}"
+    ))
+    .into()
+}
+
 fn selection_offset(value: usize) -> Result<u32, JsValue> {
     u32::try_from(value).map_err(|_| {
         js_sys::RangeError::new("quox: text-control selection offset exceeds unsigned long").into()
@@ -706,6 +713,8 @@ impl QuoxRendererState {
         self.clear_focus_in_descendants(parent_id);
         let dropped = dropped_descendant_ids(&self.document, parent_id);
         self.text_controls.invalidate_nodes(dropped.iter().copied());
+        self.checked_controls
+            .invalidate_nodes(dropped.iter().copied());
         self.node_handles.invalidate_nodes(dropped)
     }
 
@@ -732,8 +741,9 @@ impl QuoxRendererState {
         }
     }
 
-    fn reconcile_text_controls(&mut self) {
+    fn reconcile_form_controls(&mut self) {
         self.text_controls.reconcile_document(&mut self.document);
+        self.checked_controls.reconcile_document(&mut self.document);
     }
 
     fn child_element_by_tag(&self, parent_id: usize, tag_name: &str) -> Result<usize, JsValue> {
@@ -797,7 +807,7 @@ impl QuoxRenderer {
             mutator.remove_node(node_id);
             Ok(())
         })?;
-        state.reconcile_text_controls();
+        state.reconcile_form_controls();
         Ok(())
     }
 
@@ -818,7 +828,7 @@ impl QuoxRenderer {
             mutator.append_children(parent_id, &[child_id]);
             Ok(())
         })?;
-        state.reconcile_text_controls();
+        state.reconcile_form_controls();
         Ok(())
     }
 
@@ -871,7 +881,7 @@ impl QuoxRenderer {
         });
         restore_text_editor(&mut state.document, node_id, editor);
         result?;
-        state.reconcile_text_controls();
+        state.reconcile_form_controls();
         state.reconcile_native_ime_after_editor_mutation(ime_before);
         Ok(())
     }
@@ -891,7 +901,7 @@ impl QuoxRenderer {
         let node_id = state.mutate_document(|mutator| {
             Ok(mutator.create_element(html_name(&tag_name.to_ascii_lowercase()), Vec::new()))
         })?;
-        state.reconcile_text_controls();
+        state.reconcile_form_controls();
         state.expose_node(node_id)
     }
 
@@ -906,7 +916,7 @@ impl QuoxRenderer {
             mutator.set_inner_html(node_id, html);
             Ok(())
         })?;
-        state.reconcile_text_controls();
+        state.reconcile_form_controls();
         Ok(invalidated_handles.into_boxed_slice())
     }
 
@@ -1009,7 +1019,7 @@ impl QuoxRenderer {
         });
         restore_text_editor(&mut state.document, node_id, editor);
         result?;
-        state.reconcile_text_controls();
+        state.reconcile_form_controls();
         state.reconcile_native_ime_after_editor_mutation(ime_before);
         Ok(())
     }
@@ -1047,7 +1057,7 @@ impl QuoxRenderer {
 
             Ok(())
         })?;
-        state.reconcile_text_controls();
+        state.reconcile_form_controls();
         Ok(invalidated_handles.into_boxed_slice())
     }
 
@@ -1082,7 +1092,7 @@ impl QuoxRenderer {
 
             Ok(())
         })?;
-        state.reconcile_text_controls();
+        state.reconcile_form_controls();
         Ok(invalidated_handles.into_boxed_slice())
     }
 
@@ -1168,6 +1178,44 @@ impl QuoxRenderer {
         };
         state.reconcile_native_ime_after_editor_mutation(ime_before);
         Ok(changed)
+    }
+
+    /// Return the current checkedness of an HTML input, including states whose current type does
+    /// not render a checkbox. Checkedness is retained across later type transitions.
+    pub fn form_control_checked(&self, node_handle: f64) -> Result<bool, JsValue> {
+        let node_handle =
+            uint32(node_handle, "nodeHandle").map_err(NumericArgumentError::into_js)?;
+        let mut state = self.state.borrow_mut();
+        let node_id = state.resolve_element(node_handle)?;
+        let QuoxRendererState {
+            document,
+            checked_controls,
+            ..
+        } = &mut *state;
+        checked_controls
+            .checked(document, node_id)
+            .ok_or_else(|| unsupported_input_checkedness(node_handle))
+    }
+
+    /// Set script checkedness without dispatching `input`, `change`, or `click`. The result only
+    /// reports a renderer-visible change; an identical assignment still makes checkedness dirty.
+    pub fn set_form_control_checked(
+        &self,
+        node_handle: f64,
+        checked: bool,
+    ) -> Result<bool, JsValue> {
+        let node_handle =
+            uint32(node_handle, "nodeHandle").map_err(NumericArgumentError::into_js)?;
+        let mut state = self.state.borrow_mut();
+        let node_id = state.resolve_element(node_handle)?;
+        let QuoxRendererState {
+            document,
+            checked_controls,
+            ..
+        } = &mut *state;
+        checked_controls
+            .set_checked(document, node_id, checked)
+            .ok_or_else(|| unsupported_input_checkedness(node_handle))
     }
 
     /// Return `[selectionStart, selectionEnd, direction]` for a selectable text control. Input

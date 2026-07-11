@@ -27,6 +27,11 @@ type LiveTextControlRenderer = {
   set_form_control_value(nodeHandle: number, value: string): boolean;
 };
 
+type LiveCheckedControlRenderer = {
+  form_control_checked(nodeHandle: number): boolean;
+  set_form_control_checked(nodeHandle: number, checked: boolean): boolean;
+};
+
 type TextControlSelectionRenderer = {
   form_control_selection(nodeHandle: number): Uint32Array | undefined;
   set_form_control_selection(
@@ -307,6 +312,31 @@ export class QuoxInputElement extends QuoxElement {
 
   set defaultValue(value: string) {
     this.setAttribute("value", boundaryString(value));
+  }
+
+  get checked(): boolean {
+    const { renderer } = documentInternals(this.ownerDocument);
+    return (renderer as unknown as LiveCheckedControlRenderer).form_control_checked(this.nodeId);
+  }
+
+  set checked(value: boolean) {
+    const { renderer, requestRender } = documentInternals(this.ownerDocument);
+    const changed = (renderer as unknown as LiveCheckedControlRenderer).set_form_control_checked(
+      this.nodeId,
+      Boolean(value),
+    );
+    if (changed) requestRender();
+  }
+
+  get defaultChecked(): boolean {
+    return this.hasAttribute("checked");
+  }
+
+  set defaultChecked(value: boolean) {
+    const checked = Boolean(value);
+    if (checked === this.hasAttribute("checked")) return;
+    if (checked) this.setAttribute("checked", "");
+    else this.removeAttribute("checked");
   }
 
   get selectionStart(): number | null {

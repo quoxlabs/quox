@@ -7,7 +7,7 @@ use crate::ffi_numbers::{
     NumericArgumentError, finite_f32, finite_f64, integer_range, known_mask, nonnegative_f64,
     uint32, wasm_usize,
 };
-use crate::form_controls::TextControlStates;
+use crate::form_controls::{CheckedControlStates, TextControlStates};
 use crate::node_handles::NodeHandles;
 use crate::{QuoxRenderer, QuoxRendererState, sync_document_layout};
 use blitz_dom::BaseDocument;
@@ -366,9 +366,14 @@ struct ResolvedInputLayout<'a> {
 }
 
 impl<'a> ResolvedInputLayout<'a> {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "input resolution owns both browser-state facades and the logical/physical viewport contract"
+    )]
     fn new(
         document: &'a mut BaseDocument,
         text_controls: &mut TextControlStates,
+        checked_controls: &mut CheckedControlStates,
         width: u32,
         height: u32,
         framebuffer_width: u32,
@@ -376,6 +381,7 @@ impl<'a> ResolvedInputLayout<'a> {
         device_pixel_ratio: f32,
     ) -> Self {
         text_controls.reconcile_document(document);
+        checked_controls.reconcile_document(document);
         sync_document_layout(
             document,
             framebuffer_width,
@@ -608,6 +614,7 @@ impl DispatchStack {
         &mut self,
         document: &mut BaseDocument,
         text_controls: &mut TextControlStates,
+        checked_controls: &mut CheckedControlStates,
         handles: &mut NodeHandles,
         redraw: &AtomicBool,
         request: DispatchRequest,
@@ -637,7 +644,7 @@ impl DispatchStack {
             return Err(error);
         }
 
-        let result = self.advance(document, text_controls, handles, redraw);
+        let result = self.advance(document, text_controls, checked_controls, handles, redraw);
         if result.is_err() {
             self.discard_failed_frame(frame_id, redraw);
         }
@@ -652,6 +659,7 @@ impl DispatchStack {
         &mut self,
         document: &mut BaseDocument,
         text_controls: &mut TextControlStates,
+        checked_controls: &mut CheckedControlStates,
         handles: &mut NodeHandles,
         redraw: &AtomicBool,
         frame_id: u32,
@@ -691,7 +699,13 @@ impl DispatchStack {
         match pending.resume {
             ResumeAction::Normal { suppress_default } => {
                 if !cancelled && !suppress_default {
-                    self.run_default(document, text_controls, handles, pending.guarded)?;
+                    self.run_default(
+                        document,
+                        text_controls,
+                        checked_controls,
+                        handles,
+                        pending.guarded,
+                    )?;
                 }
             }
             ResumeAction::PointerLead {
@@ -714,17 +728,29 @@ impl DispatchStack {
                             ResumeAction::PointerMouse { pointer_default },
                         );
                     }
-                    self.run_default(document, text_controls, handles, pointer_default)?;
+                    self.run_default(
+                        document,
+                        text_controls,
+                        checked_controls,
+                        handles,
+                        pointer_default,
+                    )?;
                 }
             }
             ResumeAction::PointerMouse { pointer_default } => {
                 if !cancelled {
-                    self.run_default(document, text_controls, handles, pointer_default)?;
+                    self.run_default(
+                        document,
+                        text_controls,
+                        checked_controls,
+                        handles,
+                        pointer_default,
+                    )?;
                 }
             }
         }
 
-        self.advance(document, text_controls, handles, redraw)
+        self.advance(document, text_controls, checked_controls, handles, redraw)
     }
 
     fn abort(&mut self, redraw: &AtomicBool, frame_id: u32) -> bool {
@@ -861,6 +887,7 @@ impl DispatchStack {
         &mut self,
         document: &mut BaseDocument,
         text_controls: &mut TextControlStates,
+        checked_controls: &mut CheckedControlStates,
         handles: &mut NodeHandles,
         redraw: &AtomicBool,
     ) -> Result<DispatchStep, DispatchError> {
@@ -1001,7 +1028,13 @@ impl DispatchStack {
                     if let Some(event) =
                         guard_planned_event(document, handles, target, data, metadata)?
                     {
-                        self.run_default(document, text_controls, handles, event)?;
+                        self.run_default(
+                            document,
+                            text_controls,
+                            checked_controls,
+                            handles,
+                            event,
+                        )?;
                     }
                 }
                 PlannedWork::Action(action) => {
@@ -1047,6 +1080,7 @@ impl DispatchStack {
         &mut self,
         document: &mut BaseDocument,
         text_controls: &mut TextControlStates,
+        checked_controls: &mut CheckedControlStates,
         handles: &mut NodeHandles,
         mut guarded: GuardedDomEvent,
     ) -> Result<(), DispatchError> {
@@ -1083,6 +1117,26 @@ impl DispatchStack {
             run_wheel_default(document, guarded.default_target.raw, event, &mut generated);
         } else {
             document.handle_dom_event(&mut guarded.event, |event| generated.push(event));
+        }
+        // Blitz mutates checkbox/radio render data before queuing `input`. Import the generated
+        // target now, then repair radio peers from Quox's stricter tree/form/name group model so
+        // the first JavaScript listener observes the new live checkedness.
+        let activated_inputs = generated
+            .iter()
+            .filter_map(|event| {
+                matches!(&event.data, DomEventData::Input(_)).then_some(event.target)
+            })
+            .collect::<Vec<_>>();
+        let mut checkedness_changed = false;
+        for target in activated_inputs {
+            checkedness_changed =
+                checked_controls.import_user_activation(document, target) || checkedness_changed;
+        }
+        if checkedness_changed {
+            self.frames
+                .last_mut()
+                .expect("defaults run only for an active frame")
+                .redraw_requested = true;
         }
         // Blitz mutates Parley before returning generated events. Capture the live editor value
         // now so the first JavaScript `input` listener observes the edit which caused it.
@@ -2329,11 +2383,13 @@ fn resolve_input_layout(state: &mut QuoxRendererState) -> ResolvedInputLayout<'_
     let QuoxRendererState {
         document,
         text_controls,
+        checked_controls,
         ..
     } = state;
     ResolvedInputLayout::new(
         document,
         text_controls,
+        checked_controls,
         width,
         height,
         framebuffer_width,
@@ -2349,6 +2405,7 @@ fn begin_request(
     let QuoxRendererState {
         document,
         text_controls,
+        checked_controls,
         redraw_requested,
         node_handles,
         dispatch_stack,
@@ -2357,6 +2414,7 @@ fn begin_request(
     dispatch_stack.begin(
         document,
         text_controls,
+        checked_controls,
         node_handles,
         redraw_requested.as_ref(),
         request,
@@ -2372,6 +2430,7 @@ fn resume_request(
     let QuoxRendererState {
         document,
         text_controls,
+        checked_controls,
         redraw_requested,
         node_handles,
         dispatch_stack,
@@ -2380,6 +2439,7 @@ fn resume_request(
     dispatch_stack.resume(
         document,
         text_controls,
+        checked_controls,
         node_handles,
         redraw_requested.as_ref(),
         frame_id,
@@ -2759,6 +2819,7 @@ mod tests {
     struct TestContext {
         document: BaseDocument,
         text_controls: TextControlStates,
+        checked_controls: CheckedControlStates,
         handles: NodeHandles,
         stack: DispatchStack,
         redraw: Arc<AtomicBool>,
@@ -2783,9 +2844,12 @@ mod tests {
             .into_inner();
             let mut text_controls = TextControlStates::default();
             text_controls.reconcile_document(&mut document);
+            let mut checked_controls = CheckedControlStates::default();
+            checked_controls.reconcile_document(&mut document);
             let mut context = Self {
                 document,
                 text_controls,
+                checked_controls,
                 handles: NodeHandles::default(),
                 stack: DispatchStack::default(),
                 redraw,
@@ -2801,6 +2865,7 @@ mod tests {
                 .begin(
                     &mut self.document,
                     &mut self.text_controls,
+                    &mut self.checked_controls,
                     &mut self.handles,
                     self.redraw.as_ref(),
                     request,
@@ -2813,6 +2878,7 @@ mod tests {
                 .resume(
                     &mut self.document,
                     &mut self.text_controls,
+                    &mut self.checked_controls,
                     &mut self.handles,
                     self.redraw.as_ref(),
                     event.frame_id,
@@ -2982,6 +3048,7 @@ mod tests {
             let request = ResolvedInputLayout::new(
                 &mut self.document,
                 &mut self.text_controls,
+                &mut self.checked_controls,
                 800,
                 600,
                 800,
@@ -3007,6 +3074,7 @@ mod tests {
             let request = ResolvedInputLayout::new(
                 &mut self.document,
                 &mut self.text_controls,
+                &mut self.checked_controls,
                 800,
                 600,
                 800,
@@ -3038,6 +3106,7 @@ mod tests {
             ResolvedInputLayout::new(
                 &mut self.document,
                 &mut self.text_controls,
+                &mut self.checked_controls,
                 800,
                 600,
                 800,
@@ -3201,6 +3270,7 @@ mod tests {
                 .advance(
                     &mut context.document,
                     &mut context.text_controls,
+                    &mut context.checked_controls,
                     &mut context.handles,
                     context.redraw.as_ref(),
                 )
@@ -4396,6 +4466,7 @@ mod tests {
                 .resume(
                     &mut context.document,
                     &mut context.text_controls,
+                    &mut context.checked_controls,
                     &mut context.handles,
                     context.redraw.as_ref(),
                     inner.frame_id,
@@ -4465,6 +4536,7 @@ mod tests {
                 .advance(
                     &mut context.document,
                     &mut context.text_controls,
+                    &mut context.checked_controls,
                     &mut context.handles,
                     context.redraw.as_ref(),
                 )
@@ -4606,6 +4678,7 @@ mod tests {
                 .resume(
                     &mut context.document,
                     &mut context.text_controls,
+                    &mut context.checked_controls,
                     &mut context.handles,
                     context.redraw.as_ref(),
                     1,
@@ -4633,6 +4706,7 @@ mod tests {
                 .resume(
                     &mut context.document,
                     &mut context.text_controls,
+                    &mut context.checked_controls,
                     &mut context.handles,
                     context.redraw.as_ref(),
                     pending.frame_id + 1,
@@ -4648,6 +4722,7 @@ mod tests {
                 .resume(
                     &mut context.document,
                     &mut context.text_controls,
+                    &mut context.checked_controls,
                     &mut context.handles,
                     context.redraw.as_ref(),
                     pending.frame_id,
@@ -4690,6 +4765,7 @@ mod tests {
         let nested = context.stack.begin(
             &mut context.document,
             &mut context.text_controls,
+            &mut context.checked_controls,
             &mut context.handles,
             context.redraw.as_ref(),
             DispatchRequest::Pointer {
@@ -4716,6 +4792,7 @@ mod tests {
         let result = context.stack.begin(
             &mut context.document,
             &mut context.text_controls,
+            &mut context.checked_controls,
             &mut context.handles,
             context.redraw.as_ref(),
             DispatchRequest::Pointer {
@@ -4995,6 +5072,13 @@ mod tests {
                 }
                 "input" => {
                     saw_input = true;
+                    assert!(
+                        context
+                            .checked_controls
+                            .checked(&mut context.document, checkbox)
+                            .unwrap(),
+                        "live checkedness must be synchronized before input is staged",
+                    );
                     assert_eq!(
                         current.payload.as_deref(),
                         Some(&DispatchEventPayload::Input)
@@ -5023,6 +5107,43 @@ mod tests {
             step = context.resume(&current, false);
         }
         assert!(saw_pointer_up && saw_mouse_up && saw_click && saw_input && saw_blur && saw_focus);
+    }
+
+    #[test]
+    fn already_focused_checkable_activation_reports_redraw_on_completion() {
+        for (input_type, extra_attribute) in [("checkbox", ""), ("radio", " name='group'")] {
+            let mut context = TestContext::new(&format!(
+                "<input id='control' type='{input_type}'{extra_attribute} \
+                 style='display:block;width:24px;height:24px'>"
+            ));
+            let control = context.element("control");
+            assert!(context.document.set_focus_to(control));
+            let _ = context.redraw.swap(false, Ordering::Relaxed);
+            let (x, y) = context.center(control);
+            let click = stage_generated_with_metadata(
+                &mut context,
+                control,
+                DomEventData::Click(pointer(
+                    x,
+                    y,
+                    MouseEventButton::Main,
+                    MouseEventButtons::None,
+                )),
+                EventMetadata::pointer(
+                    12.0,
+                    native_pointer_coordinates(f64::from(x), f64::from(y), 0.0, 0.0),
+                    1,
+                ),
+            );
+
+            let step = context.resume(&click, false);
+            let (types, _, redraw_requested) = drain(&mut context, step);
+            assert!(types.iter().any(|event_type| event_type == "input"));
+            assert!(
+                redraw_requested,
+                "{input_type} checkedness changed without a focus edge must still repaint",
+            );
+        }
     }
 
     #[test]
@@ -5168,6 +5289,7 @@ mod tests {
             .advance(
                 &mut context.document,
                 &mut context.text_controls,
+                &mut context.checked_controls,
                 &mut context.handles,
                 context.redraw.as_ref(),
             )

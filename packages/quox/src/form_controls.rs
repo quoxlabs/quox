@@ -1,6 +1,428 @@
 use blitz_dom::node::{SpecialElementData, TextInputData};
 use blitz_dom::{BaseDocument, NodeData, QualName, local_name, ns};
 use std::collections::HashMap;
+use style::invalidation::element::restyle_hints::RestyleHint;
+
+/// Browser-facing checkedness which Blitz's render-only checkbox data cannot own correctly.
+///
+/// Checkedness exists on every HTML input, including while its current type is not checkbox or
+/// radio. Keeping that state here preserves the dirty flag and current value across type changes.
+/// Raw node ids remain safe only because every Quox destruction path invalidates this map before
+/// Blitz can recycle its slab slot; detached inputs intentionally retain their state.
+#[derive(Default)]
+pub(crate) struct CheckedControlStates {
+    controls: HashMap<usize, CheckedControlState>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CheckedInputKind {
+    Other,
+    Checkbox,
+    Radio,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CheckedInputDescriptor {
+    kind: CheckedInputKind,
+    name: Option<String>,
+    tree_root: usize,
+    form_owner: Option<usize>,
+    connected: bool,
+}
+
+impl CheckedInputDescriptor {
+    fn radio_group(&self) -> Option<RadioGroupKey> {
+        if self.kind != CheckedInputKind::Radio {
+            return None;
+        }
+        let name = self.name.as_ref().filter(|name| !name.is_empty())?;
+        Some(RadioGroupKey {
+            name: name.clone(),
+            tree_root: self.tree_root,
+            form_owner: self.form_owner,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RadioGroupKey {
+    name: String,
+    tree_root: usize,
+    form_owner: Option<usize>,
+}
+
+struct CheckedControlState {
+    checked: bool,
+    default_checked: bool,
+    dirty_checkedness: bool,
+    descriptor: CheckedInputDescriptor,
+}
+
+impl CheckedControlStates {
+    /// Reconcile content attributes, input-type/group transitions, connectivity, and Blitz's
+    /// render facade. The text-control owner must reconcile first so a type transition has
+    /// already released any obsolete Parley editor before this installs checkbox data.
+    pub(crate) fn reconcile_document(&mut self, document: &mut BaseDocument) -> bool {
+        self.controls
+            .retain(|node_id, _| input_checked_descriptor(document, *node_id).is_some());
+
+        let inputs = dom_child_preorder(document)
+            .into_iter()
+            .filter_map(|node_id| {
+                let descriptor = input_checked_descriptor(document, node_id)?;
+                let default_checked = input_checked_attribute(document, node_id);
+                Some((node_id, descriptor, default_checked))
+            })
+            .collect::<Vec<_>>();
+
+        // Record every input before enforcing groups. An initial fragment can contain multiple
+        // checked radios; replaying set-to-true actions in actual child preorder makes the later
+        // DOM radio win even when Blitz has reused slab slots in a different numeric order.
+        let mut set_true = Vec::new();
+        for (node_id, descriptor, default_checked) in inputs {
+            match self.controls.entry(node_id) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(CheckedControlState {
+                        checked: default_checked,
+                        default_checked,
+                        dirty_checkedness: false,
+                        descriptor,
+                    });
+                    if default_checked {
+                        set_true.push(node_id);
+                    }
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let state = entry.get_mut();
+                    let old_group = state.descriptor.radio_group();
+                    let became_connected = !state.descriptor.connected && descriptor.connected;
+                    let group_changed = old_group != descriptor.radio_group();
+                    let default_changed = state.default_checked != default_checked;
+
+                    state.default_checked = default_checked;
+                    state.descriptor = descriptor;
+                    if default_changed && !state.dirty_checkedness {
+                        state.checked = default_checked;
+                        if default_checked {
+                            set_true.push(node_id);
+                        }
+                    } else if state.checked
+                        && state.descriptor.kind == CheckedInputKind::Radio
+                        && (group_changed || became_connected)
+                    {
+                        set_true.push(node_id);
+                    }
+                }
+            }
+        }
+
+        for node_id in set_true {
+            self.set_true_and_enforce_group(node_id);
+        }
+        self.project_document(document)
+    }
+
+    /// Return the current checkedness of any HTML input, irrespective of its current type.
+    pub(crate) fn checked(&mut self, document: &mut BaseDocument, node_id: usize) -> Option<bool> {
+        self.reconcile_document(document);
+        self.controls.get(&node_id).map(|state| state.checked)
+    }
+
+    /// Set script checkedness without dispatching an event. An identical assignment still makes
+    /// the dirty flag true, while the return value reports only an observable renderer change.
+    pub(crate) fn set_checked(
+        &mut self,
+        document: &mut BaseDocument,
+        node_id: usize,
+        checked: bool,
+    ) -> Option<bool> {
+        let mut rendered_changed = self.reconcile_document(document);
+        let state = self.controls.get_mut(&node_id)?;
+        state.dirty_checkedness = true;
+        state.checked = checked;
+        if checked {
+            self.set_true_and_enforce_group(node_id);
+        }
+        rendered_changed |= self.project_document(document);
+        Some(rendered_changed)
+    }
+
+    /// Import a checkedness mutation made inside pinned Blitz's click default before the generated
+    /// `input` record is exposed to JavaScript. Quox then reprojects every state, repairing Blitz's
+    /// name-only radio grouping (which can otherwise uncheck unrelated radios and checkboxes).
+    pub(crate) fn import_user_activation(
+        &mut self,
+        document: &mut BaseDocument,
+        node_id: usize,
+    ) -> bool {
+        let Some(descriptor) = input_checked_descriptor(document, node_id) else {
+            return false;
+        };
+        if !matches!(
+            descriptor.kind,
+            CheckedInputKind::Checkbox | CheckedInputKind::Radio
+        ) {
+            return false;
+        }
+        let Some(blitz_checked) = document
+            .get_node(node_id)
+            .and_then(blitz_dom::Node::element_data)
+            .and_then(blitz_dom::ElementData::checkbox_input_checked)
+        else {
+            return false;
+        };
+        let previous_checkedness = self
+            .controls
+            .iter()
+            .map(|(node_id, state)| (*node_id, state.checked))
+            .collect::<HashMap<_, _>>();
+
+        let default_checked = input_checked_attribute(document, node_id);
+        let state = self
+            .controls
+            .entry(node_id)
+            .or_insert_with(|| CheckedControlState {
+                checked: default_checked,
+                default_checked,
+                dirty_checkedness: false,
+                descriptor: descriptor.clone(),
+            });
+        state.default_checked = default_checked;
+        state.descriptor = descriptor;
+        if state.checked != blitz_checked {
+            state.checked = blitz_checked;
+            state.dirty_checkedness = true;
+        }
+        if blitz_checked {
+            self.set_true_and_enforce_group(node_id);
+        }
+        let logically_changed = self
+            .controls
+            .iter()
+            .filter_map(|(node_id, state)| {
+                (previous_checkedness.get(node_id) != Some(&state.checked)).then_some(*node_id)
+            })
+            .collect::<Vec<_>>();
+        for changed_id in &logically_changed {
+            mark_checkedness_restyle(document, *changed_id);
+        }
+        self.project_document(document) || !logically_changed.is_empty()
+    }
+
+    /// Purge before Blitz destroys nodes because its slab may immediately reuse their ids.
+    pub(crate) fn invalidate_nodes(&mut self, node_ids: impl IntoIterator<Item = usize>) {
+        for node_id in node_ids {
+            self.controls.remove(&node_id);
+        }
+    }
+
+    fn set_true_and_enforce_group(&mut self, node_id: usize) {
+        let Some(state) = self.controls.get_mut(&node_id) else {
+            return;
+        };
+        state.checked = true;
+        let Some(group) = state.descriptor.radio_group() else {
+            return;
+        };
+
+        for (other_id, other) in &mut self.controls {
+            if *other_id != node_id && other.descriptor.radio_group().as_ref() == Some(&group) {
+                // Radio-group maintenance changes current checkedness, not the peer's dirty flag.
+                other.checked = false;
+            }
+        }
+    }
+
+    fn project_document(&self, document: &mut BaseDocument) -> bool {
+        let controls = self
+            .controls
+            .iter()
+            .map(|(node_id, state)| (*node_id, state.descriptor.kind, state.checked))
+            .collect::<Vec<_>>();
+        controls
+            .into_iter()
+            .fold(false, |changed, (node_id, kind, checked)| {
+                project_checkedness(document, node_id, kind, checked) || changed
+            })
+    }
+
+    #[cfg(test)]
+    fn state(&self, node_id: usize) -> Option<&CheckedControlState> {
+        self.controls.get(&node_id)
+    }
+}
+
+fn input_checked_descriptor(
+    document: &BaseDocument,
+    node_id: usize,
+) -> Option<CheckedInputDescriptor> {
+    let node = document.get_node(node_id)?;
+    let element = node.element_data()?;
+    if element.name.ns != ns!(html) || element.name.local.as_ref() != "input" {
+        return None;
+    }
+
+    let kind = match element
+        .attr(local_name!("type"))
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "checkbox" => CheckedInputKind::Checkbox,
+        "radio" => CheckedInputKind::Radio,
+        _ => CheckedInputKind::Other,
+    };
+    let tree_root = input_tree_root(document, node_id);
+    Some(CheckedInputDescriptor {
+        kind,
+        name: element.attr(local_name!("name")).map(str::to_owned),
+        tree_root,
+        form_owner: input_form_owner(document, node_id, tree_root),
+        connected: node.flags.is_in_document(),
+    })
+}
+
+/// Return every live DOM node in child preorder within each connected or detached tree. Root
+/// ordering is immaterial to radio exclusivity because distinct roots are distinct groups.
+fn dom_child_preorder(document: &BaseDocument) -> Vec<usize> {
+    let roots = document
+        .tree()
+        .iter()
+        .filter_map(|(node_id, node)| node.parent.is_none().then_some(node_id))
+        .collect::<Vec<_>>();
+    let mut preorder = Vec::new();
+    for root_id in roots {
+        let mut pending = vec![root_id];
+        while let Some(node_id) = pending.pop() {
+            let Some(node) = document.get_node(node_id) else {
+                continue;
+            };
+            preorder.push(node_id);
+            pending.extend(node.children.iter().rev().copied());
+        }
+    }
+    preorder
+}
+
+fn input_checked_attribute(document: &BaseDocument, node_id: usize) -> bool {
+    document
+        .get_node(node_id)
+        .and_then(blitz_dom::Node::element_data)
+        .is_some_and(|element| element.has_attr(local_name!("checked")))
+}
+
+fn input_tree_root(document: &BaseDocument, mut node_id: usize) -> usize {
+    while let Some(parent) = document.get_node(node_id).and_then(|node| node.parent) {
+        node_id = parent;
+    }
+    node_id
+}
+
+fn input_form_owner(document: &BaseDocument, node_id: usize, tree_root: usize) -> Option<usize> {
+    let node = document.get_node(node_id)?;
+    let element = node.element_data()?;
+    if node.flags.is_in_document()
+        && let Some(form_id) = element.attr(local_name!("form"))
+    {
+        if form_id.is_empty() {
+            return None;
+        }
+        // The first element with the requested id decides association, even when it is not a
+        // form. Explicit reassociation applies only while the control is connected.
+        let owner = first_element_with_id(document, tree_root, form_id)?;
+        return is_html_form(document, owner).then_some(owner);
+    }
+
+    let mut ancestor = document.get_node(node_id).and_then(|node| node.parent);
+    while let Some(ancestor_id) = ancestor {
+        if is_html_form(document, ancestor_id) {
+            return Some(ancestor_id);
+        }
+        ancestor = document.get_node(ancestor_id).and_then(|node| node.parent);
+    }
+    None
+}
+
+fn first_element_with_id(
+    document: &BaseDocument,
+    root_id: usize,
+    requested_id: &str,
+) -> Option<usize> {
+    let mut pending = vec![root_id];
+    while let Some(node_id) = pending.pop() {
+        let node = document.get_node(node_id)?;
+        if node
+            .element_data()
+            .and_then(|element| element.attr(local_name!("id")))
+            == Some(requested_id)
+        {
+            return Some(node_id);
+        }
+        pending.extend(node.children.iter().rev().copied());
+    }
+    None
+}
+
+fn is_html_form(document: &BaseDocument, node_id: usize) -> bool {
+    document
+        .get_node(node_id)
+        .and_then(blitz_dom::Node::element_data)
+        .is_some_and(|element| {
+            element.name.ns == ns!(html) && element.name.local.as_ref() == "form"
+        })
+}
+
+fn project_checkedness(
+    document: &mut BaseDocument,
+    node_id: usize,
+    kind: CheckedInputKind,
+    checked: bool,
+) -> bool {
+    let changed = {
+        let Some(node) = document.get_node_mut(node_id) else {
+            return false;
+        };
+        let Some(element) = node.element_data_mut() else {
+            return false;
+        };
+        if matches!(kind, CheckedInputKind::Checkbox | CheckedInputKind::Radio) {
+            if let SpecialElementData::CheckboxInput(rendered_checked) = &mut element.special_data {
+                if *rendered_checked == checked {
+                    false
+                } else {
+                    *rendered_checked = checked;
+                    true
+                }
+            } else {
+                element.special_data = SpecialElementData::CheckboxInput(checked);
+                true
+            }
+        } else if matches!(element.special_data, SpecialElementData::CheckboxInput(_)) {
+            element.special_data = SpecialElementData::None;
+            true
+        } else {
+            false
+        }
+    };
+    if changed {
+        mark_checkedness_restyle(document, node_id);
+    }
+    changed
+}
+
+fn mark_checkedness_restyle(document: &mut BaseDocument, node_id: usize) {
+    let parent_id = document.get_node(node_id).and_then(|node| node.parent);
+    if let Some(node) = document.get_node_mut(node_id) {
+        node.set_restyle_hint(RestyleHint::restyle_subtree());
+    }
+    // `:checked` can select later siblings. Match Blitz's attribute invalidation by rematching the
+    // parent subtree too; the input hint remains necessary for a detached root without a parent.
+    if let Some(parent_id) = parent_id
+        && let Some(parent) = document.get_node_mut(parent_id)
+    {
+        parent.set_restyle_hint(RestyleHint::restyle_subtree());
+    }
+}
 
 /// Browser-facing state which Blitz's render-only text editor does not retain itself.
 ///
@@ -1057,7 +1479,8 @@ fn byte_offset_for_utf16(value: &str, utf16_offset: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        TextControlSelection, TextControlSelectionDirection, TextControlStates, restore_text_editor,
+        CheckedControlStates, CheckedInputKind, SpecialElementData, TextControlSelection,
+        TextControlSelectionDirection, TextControlStates, restore_text_editor,
     };
     use blitz_dom::{BaseDocument, DocumentConfig, LocalName, QualName, local_name, ns};
     use blitz_html::{HtmlDocument, HtmlProvider};
@@ -1102,6 +1525,30 @@ mod tests {
         }
     }
 
+    fn checked_attribute() -> QualName {
+        QualName {
+            prefix: None,
+            ns: ns!(),
+            local: local_name!("checked"),
+        }
+    }
+
+    fn name_attribute() -> QualName {
+        QualName {
+            prefix: None,
+            ns: ns!(),
+            local: local_name!("name"),
+        }
+    }
+
+    fn form_attribute() -> QualName {
+        QualName {
+            prefix: None,
+            ns: ns!(),
+            local: local_name!("form"),
+        }
+    }
+
     fn set_input_type(document: &mut BaseDocument, node_id: usize, input_type: &str) {
         document
             .mutate()
@@ -1128,6 +1575,514 @@ mod tests {
             .editor
             .raw_selection();
         (selection.anchor().index(), selection.focus().index())
+    }
+
+    fn rendered_checked(document: &BaseDocument, node_id: usize) -> Option<bool> {
+        document
+            .get_node(node_id)
+            .and_then(blitz_dom::Node::element_data)
+            .and_then(blitz_dom::ElementData::checkbox_input_checked)
+    }
+
+    fn set_rendered_checked(document: &mut BaseDocument, node_id: usize, checked: bool) {
+        let element = document
+            .get_node_mut(node_id)
+            .and_then(blitz_dom::Node::element_data_mut)
+            .expect("test input should remain an element");
+        element.special_data = SpecialElementData::CheckboxInput(checked);
+    }
+
+    #[test]
+    fn checked_attribute_follows_current_state_only_while_clean() {
+        let mut document =
+            document("<input id='clean' type='checkbox'><input id='dirty' type='checkbox'>");
+        let clean = element(&document, "clean");
+        let dirty = element(&document, "dirty");
+        let mut controls = CheckedControlStates::default();
+        controls.reconcile_document(&mut document);
+
+        document
+            .mutate()
+            .set_attribute(clean, checked_attribute(), "false");
+        controls.reconcile_document(&mut document);
+        assert!(controls.checked(&mut document, clean).unwrap());
+        assert!(controls.state(clean).unwrap().default_checked);
+        assert_eq!(rendered_checked(&document, clean), Some(true));
+
+        document
+            .mutate()
+            .clear_attribute(clean, checked_attribute());
+        controls.reconcile_document(&mut document);
+        assert!(!controls.checked(&mut document, clean).unwrap());
+
+        assert_eq!(
+            controls.set_checked(&mut document, dirty, false),
+            Some(false)
+        );
+        assert!(controls.state(dirty).unwrap().dirty_checkedness);
+        document
+            .mutate()
+            .set_attribute(dirty, checked_attribute(), "");
+        controls.reconcile_document(&mut document);
+        let dirty_state = controls.state(dirty).unwrap();
+        assert!(dirty_state.default_checked);
+        assert!(!dirty_state.checked);
+        assert_eq!(rendered_checked(&document, dirty), Some(false));
+
+        document
+            .mutate()
+            .clear_attribute(dirty, checked_attribute());
+        controls.reconcile_document(&mut document);
+        assert!(!controls.state(dirty).unwrap().default_checked);
+        assert!(!controls.state(dirty).unwrap().checked);
+    }
+
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "the CSS pixel widths are copied exactly in this regression"
+    )]
+    fn checkedness_restyles_sibling_selectors() {
+        let mut document = document(
+            "<style>\
+               #label { display: block; width: 10px; height: 1px }\
+               #check:checked + #label { width: 20px }\
+             </style>\
+             <input id='check' type='checkbox'>\
+             <label id='label'></label>",
+        );
+        let check = element(&document, "check");
+        let label = element(&document, "label");
+        let mut controls = CheckedControlStates::default();
+        controls.reconcile_document(&mut document);
+        document.resolve(0.0);
+        assert_eq!(
+            document.get_node(label).unwrap().final_layout.size.width,
+            10.0
+        );
+
+        assert_eq!(controls.set_checked(&mut document, check, true), Some(true));
+        document.resolve(1.0);
+        assert_eq!(
+            document.get_node(label).unwrap().final_layout.size.width,
+            20.0
+        );
+    }
+
+    #[test]
+    fn checkedness_and_dirty_state_survive_every_input_type_transition() {
+        let mut document = document("<input id='field' checked>");
+        let field = element(&document, "field");
+        let mut controls = CheckedControlStates::default();
+        controls.reconcile_document(&mut document);
+
+        assert!(controls.checked(&mut document, field).unwrap());
+        assert_eq!(
+            controls.state(field).unwrap().descriptor.kind,
+            CheckedInputKind::Other
+        );
+        assert!(!matches!(
+            document
+                .get_node(field)
+                .unwrap()
+                .element_data()
+                .unwrap()
+                .special_data,
+            SpecialElementData::CheckboxInput(_)
+        ));
+
+        assert_eq!(
+            controls.set_checked(&mut document, field, false),
+            Some(false)
+        );
+        set_input_type(&mut document, field, "checkbox");
+        controls.reconcile_document(&mut document);
+        assert!(!controls.checked(&mut document, field).unwrap());
+        assert_eq!(rendered_checked(&document, field), Some(false));
+
+        set_input_type(&mut document, field, "text");
+        controls.reconcile_document(&mut document);
+        assert!(!controls.checked(&mut document, field).unwrap());
+        assert!(!matches!(
+            document
+                .get_node(field)
+                .unwrap()
+                .element_data()
+                .unwrap()
+                .special_data,
+            SpecialElementData::CheckboxInput(_)
+        ));
+        document
+            .mutate()
+            .set_attribute(field, checked_attribute(), "");
+        controls.reconcile_document(&mut document);
+        assert!(!controls.checked(&mut document, field).unwrap());
+
+        set_input_type(&mut document, field, "radio");
+        controls.reconcile_document(&mut document);
+        assert!(!controls.checked(&mut document, field).unwrap());
+        assert_eq!(rendered_checked(&document, field), Some(false));
+        assert!(controls.state(field).unwrap().dirty_checkedness);
+    }
+
+    #[test]
+    fn radio_groups_use_exact_name_tree_and_form_owner_without_dirtying_peers() {
+        let mut document = document(
+            "<form id='first'>\
+               <input id='a' type='radio' name='group' checked disabled>\
+               <input id='b' type='radio' name='group' checked>\
+             </form>\
+             <form id='second'><input id='other-form' type='radio' name='group' checked></form>\
+             <input id='case' type='radio' name='Group' checked>\
+             <input id='box' type='checkbox' name='group' checked>\
+             <input id='nameless-a' type='radio' checked>\
+             <input id='nameless-b' type='radio' checked>\
+             <input id='empty-a' type='radio' name='' checked>\
+             <input id='empty-b' type='radio' name='' checked>",
+        );
+        let [
+            a,
+            b,
+            other_form,
+            case,
+            checkbox,
+            nameless_a,
+            nameless_b,
+            empty_a,
+            empty_b,
+        ] = [
+            "a",
+            "b",
+            "other-form",
+            "case",
+            "box",
+            "nameless-a",
+            "nameless-b",
+            "empty-a",
+            "empty-b",
+        ]
+        .map(|id| element(&document, id));
+        let mut controls = CheckedControlStates::default();
+        controls.reconcile_document(&mut document);
+
+        assert!(!controls.checked(&mut document, a).unwrap());
+        assert!(controls.checked(&mut document, b).unwrap());
+        assert!(controls.checked(&mut document, other_form).unwrap());
+        assert!(controls.checked(&mut document, case).unwrap());
+        assert!(controls.checked(&mut document, checkbox).unwrap());
+        assert!(controls.checked(&mut document, nameless_a).unwrap());
+        assert!(controls.checked(&mut document, nameless_b).unwrap());
+        assert!(controls.checked(&mut document, empty_a).unwrap());
+        assert!(controls.checked(&mut document, empty_b).unwrap());
+
+        controls.set_checked(&mut document, a, true);
+        assert!(controls.checked(&mut document, a).unwrap());
+        assert!(!controls.checked(&mut document, b).unwrap());
+        assert!(!controls.state(b).unwrap().dirty_checkedness);
+        assert!(controls.checked(&mut document, other_form).unwrap());
+        assert!(controls.checked(&mut document, case).unwrap());
+        assert!(controls.checked(&mut document, checkbox).unwrap());
+
+        controls.set_checked(&mut document, nameless_b, true);
+        controls.set_checked(&mut document, empty_b, true);
+        assert!(controls.checked(&mut document, nameless_a).unwrap());
+        assert!(controls.checked(&mut document, nameless_b).unwrap());
+        assert!(controls.checked(&mut document, empty_a).unwrap());
+        assert!(controls.checked(&mut document, empty_b).unwrap());
+    }
+
+    #[test]
+    fn connected_form_attributes_override_ancestors_only_when_the_id_resolves() {
+        let mut document = document(
+            "<form id='ancestor'>\
+               <input id='missing' type='radio' name='group' checked>\
+               <input id='empty' type='radio' name='group' form='' checked>\
+               <input id='nonexistent' type='radio' name='group' form='missing-form' checked>\
+               <input id='explicit' type='radio' name='group' form='sibling' checked>\
+             </form>\
+             <form id='sibling'>\
+               <input id='sibling-member' type='radio' name='group' checked>\
+             </form>",
+        );
+        let ancestor = element(&document, "ancestor");
+        let sibling = element(&document, "sibling");
+        let missing = element(&document, "missing");
+        let empty = element(&document, "empty");
+        let nonexistent = element(&document, "nonexistent");
+        let explicit = element(&document, "explicit");
+        let sibling_member = element(&document, "sibling-member");
+        let mut controls = CheckedControlStates::default();
+        controls.reconcile_document(&mut document);
+
+        assert_eq!(
+            controls.state(missing).unwrap().descriptor.form_owner,
+            Some(ancestor)
+        );
+        assert_eq!(controls.state(empty).unwrap().descriptor.form_owner, None);
+        assert_eq!(
+            controls.state(nonexistent).unwrap().descriptor.form_owner,
+            None
+        );
+        assert_eq!(
+            controls.state(explicit).unwrap().descriptor.form_owner,
+            Some(sibling)
+        );
+        assert_eq!(
+            controls
+                .state(sibling_member)
+                .unwrap()
+                .descriptor
+                .form_owner,
+            Some(sibling)
+        );
+
+        assert!(controls.checked(&mut document, missing).unwrap());
+        assert!(!controls.checked(&mut document, empty).unwrap());
+        assert!(controls.checked(&mut document, nonexistent).unwrap());
+        assert!(!controls.checked(&mut document, explicit).unwrap());
+        assert!(controls.checked(&mut document, sibling_member).unwrap());
+    }
+
+    #[test]
+    fn disconnected_inputs_ignore_form_ids_and_fall_back_to_ancestor_forms() {
+        let mut document = document(
+            "<div id='detached-root'>\
+               <form id='ancestor'>\
+                 <input id='missing' type='radio' name='inside' checked>\
+                 <input id='empty' type='radio' name='inside' form='' checked>\
+                 <input id='nonexistent' type='radio' name='inside' form='missing-form' checked>\
+                 <input id='explicit-sibling' type='radio' name='inside' form='sibling' checked>\
+               </form>\
+               <form id='sibling'><input id='sibling-member' type='radio' name='inside' checked></form>\
+               <input id='outside-explicit' type='radio' name='outside' form='sibling' checked>\
+               <input id='outside-missing' type='radio' name='outside' checked>\
+             </div>",
+        );
+        let detached_root = element(&document, "detached-root");
+        let ancestor = element(&document, "ancestor");
+        let sibling = element(&document, "sibling");
+        let missing = element(&document, "missing");
+        let empty = element(&document, "empty");
+        let nonexistent = element(&document, "nonexistent");
+        let explicit_sibling = element(&document, "explicit-sibling");
+        let sibling_member = element(&document, "sibling-member");
+        let outside_explicit = element(&document, "outside-explicit");
+        let outside_missing = element(&document, "outside-missing");
+        document.mutate().remove_node(detached_root);
+        let mut controls = CheckedControlStates::default();
+        controls.reconcile_document(&mut document);
+
+        for input in [missing, empty, nonexistent, explicit_sibling] {
+            assert_eq!(
+                controls.state(input).unwrap().descriptor.form_owner,
+                Some(ancestor),
+                "every disconnected descendant falls back to its ancestor form",
+            );
+        }
+        assert_eq!(
+            controls
+                .state(sibling_member)
+                .unwrap()
+                .descriptor
+                .form_owner,
+            Some(sibling)
+        );
+        assert_eq!(
+            controls
+                .state(outside_explicit)
+                .unwrap()
+                .descriptor
+                .form_owner,
+            None,
+            "a detached sibling form cannot be selected through the form attribute",
+        );
+        assert_eq!(
+            controls
+                .state(outside_missing)
+                .unwrap()
+                .descriptor
+                .form_owner,
+            None
+        );
+
+        assert!(!controls.checked(&mut document, missing).unwrap());
+        assert!(!controls.checked(&mut document, empty).unwrap());
+        assert!(!controls.checked(&mut document, nonexistent).unwrap());
+        assert!(controls.checked(&mut document, explicit_sibling).unwrap());
+        assert!(controls.checked(&mut document, sibling_member).unwrap());
+        assert!(!controls.checked(&mut document, outside_explicit).unwrap());
+        assert!(controls.checked(&mut document, outside_missing).unwrap());
+    }
+
+    #[test]
+    fn initial_radio_replay_uses_dom_preorder_after_inner_html_reuses_slots() {
+        let mut document = document("<div id='host'><i></i><b></b></div>");
+        let host = element(&document, "host");
+        document.mutate().set_inner_html(
+            host,
+            "<input id='tree-first' type='radio' name='group' checked>\
+             <input id='tree-last' type='radio' name='group' checked>",
+        );
+        let tree_first = element(&document, "tree-first");
+        let tree_last = element(&document, "tree-last");
+        {
+            let mut mutator = document.mutate();
+            mutator.remove_node(tree_last);
+            mutator.remove_node(tree_first);
+            mutator.append_children(host, &[tree_last, tree_first]);
+        }
+        assert_eq!(
+            document.get_node(host).unwrap().children,
+            [tree_last, tree_first],
+        );
+        let slab_order = document
+            .tree()
+            .iter()
+            .filter_map(|(node_id, _)| {
+                matches!(node_id, id if id == tree_first || id == tree_last).then_some(node_id)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            slab_order,
+            [tree_first, tree_last],
+            "the fixture must make raw slab order disagree with DOM child order",
+        );
+
+        let mut controls = CheckedControlStates::default();
+        controls.reconcile_document(&mut document);
+        assert!(!controls.checked(&mut document, tree_last).unwrap());
+        assert!(controls.checked(&mut document, tree_first).unwrap());
+    }
+
+    #[test]
+    fn checked_radios_reconcile_name_type_form_and_connection_changes() {
+        let mut document = document(
+            "<div id='host'>\
+               <form id='first'><input id='a' type='radio' name='one' checked></form>\
+               <form id='second'><input id='b' type='radio' name='two' checked></form>\
+               <input id='external' type='radio' name='one' form='first'>\
+               <input id='moving' type='radio' name='move' checked>\
+               <input id='resident' type='radio' name='move' checked>\
+             </div>",
+        );
+        let host = element(&document, "host");
+        let a = element(&document, "a");
+        let b = element(&document, "b");
+        let external = element(&document, "external");
+        let moving = element(&document, "moving");
+        let resident = element(&document, "resident");
+        document.mutate().remove_node(moving);
+        let mut controls = CheckedControlStates::default();
+        controls.reconcile_document(&mut document);
+
+        assert!(controls.checked(&mut document, moving).unwrap());
+        assert!(controls.checked(&mut document, resident).unwrap());
+        document.mutate().append_children(host, &[moving]);
+        controls.reconcile_document(&mut document);
+        assert!(controls.checked(&mut document, moving).unwrap());
+        assert!(!controls.checked(&mut document, resident).unwrap());
+
+        document.mutate().set_attribute(b, name_attribute(), "one");
+        controls.reconcile_document(&mut document);
+        // Different form owners prevent the renamed checked radio from affecting `a`.
+        assert!(controls.checked(&mut document, a).unwrap());
+        assert!(controls.checked(&mut document, b).unwrap());
+
+        controls.set_checked(&mut document, external, true);
+        assert!(controls.checked(&mut document, external).unwrap());
+        assert!(!controls.checked(&mut document, a).unwrap());
+        assert!(controls.checked(&mut document, b).unwrap());
+
+        document
+            .mutate()
+            .set_attribute(external, form_attribute(), "second");
+        controls.reconcile_document(&mut document);
+        assert!(controls.checked(&mut document, external).unwrap());
+        assert!(!controls.checked(&mut document, b).unwrap());
+
+        set_input_type(&mut document, a, "text");
+        controls.set_checked(&mut document, a, true);
+        set_input_type(&mut document, a, "radio");
+        controls.reconcile_document(&mut document);
+        assert!(controls.checked(&mut document, a).unwrap());
+    }
+
+    #[test]
+    fn detached_inputs_retain_state_and_group_only_with_their_current_tree() {
+        let mut document = document(
+            "<div id='detached'>\
+               <input id='left' type='radio' name='choice'>\
+               <input id='right' type='radio' name='choice'>\
+             </div>\
+             <input id='separate-a' type='radio' name='choice'>\
+             <input id='separate-b' type='radio' name='choice'>",
+        );
+        let container = element(&document, "detached");
+        let left = element(&document, "left");
+        let right = element(&document, "right");
+        let separate_a = element(&document, "separate-a");
+        let separate_b = element(&document, "separate-b");
+        let mut controls = CheckedControlStates::default();
+        controls.reconcile_document(&mut document);
+
+        document.mutate().remove_node(container);
+        document.mutate().remove_node(separate_a);
+        document.mutate().remove_node(separate_b);
+        controls.reconcile_document(&mut document);
+        controls.set_checked(&mut document, left, true);
+        controls.set_checked(&mut document, right, true);
+        assert!(!controls.checked(&mut document, left).unwrap());
+        assert!(controls.checked(&mut document, right).unwrap());
+
+        controls.set_checked(&mut document, separate_a, true);
+        controls.set_checked(&mut document, separate_b, true);
+        assert!(controls.checked(&mut document, separate_a).unwrap());
+        assert!(controls.checked(&mut document, separate_b).unwrap());
+
+        controls.invalidate_nodes([left]);
+        assert!(controls.state(left).is_none());
+        assert!(controls.state(right).is_some());
+    }
+
+    #[test]
+    fn native_activation_imports_target_state_and_repairs_blitz_radio_damage() {
+        let mut document = document(
+            "<input id='check' type='checkbox'>\
+             <form id='first'>\
+               <input id='radio-a' type='radio' name='group' checked>\
+               <input id='radio-b' type='radio' name='group'>\
+             </form>\
+             <form id='second'><input id='other-radio' type='radio' name='group' checked></form>\
+             <input id='same-name-box' type='checkbox' name='group' checked>",
+        );
+        let check = element(&document, "check");
+        let radio_a = element(&document, "radio-a");
+        let radio_b = element(&document, "radio-b");
+        let other_radio = element(&document, "other-radio");
+        let same_name_box = element(&document, "same-name-box");
+        let mut controls = CheckedControlStates::default();
+        controls.reconcile_document(&mut document);
+
+        set_rendered_checked(&mut document, check, true);
+        controls.import_user_activation(&mut document, check);
+        assert!(controls.checked(&mut document, check).unwrap());
+        assert!(controls.state(check).unwrap().dirty_checkedness);
+
+        // Model pinned Blitz's name-only radio sweep, including unrelated controls.
+        set_rendered_checked(&mut document, radio_a, false);
+        set_rendered_checked(&mut document, radio_b, true);
+        set_rendered_checked(&mut document, other_radio, false);
+        set_rendered_checked(&mut document, same_name_box, false);
+        controls.import_user_activation(&mut document, radio_b);
+
+        assert!(!controls.checked(&mut document, radio_a).unwrap());
+        assert!(controls.checked(&mut document, radio_b).unwrap());
+        assert!(controls.state(radio_b).unwrap().dirty_checkedness);
+        assert!(!controls.state(radio_a).unwrap().dirty_checkedness);
+        assert!(controls.checked(&mut document, other_radio).unwrap());
+        assert!(controls.checked(&mut document, same_name_box).unwrap());
+        assert_eq!(rendered_checked(&document, other_radio), Some(true));
+        assert_eq!(rendered_checked(&document, same_name_box), Some(true));
     }
 
     #[test]

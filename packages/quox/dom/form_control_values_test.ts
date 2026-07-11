@@ -9,6 +9,8 @@ interface ControlState {
   defaultText: string;
   value: string;
   dirty: boolean;
+  checked: boolean;
+  dirtyCheckedness: boolean;
   selectionStart: number;
   selectionEnd: number;
   selectionDirection: 0 | 1 | 2;
@@ -97,6 +99,8 @@ class FakeLiveControlRenderer {
       defaultText: "",
       value: "",
       dirty: false,
+      checked: false,
+      dirtyCheckedness: false,
       selectionStart: 0,
       selectionEnd: 0,
       selectionDirection: 0,
@@ -166,6 +170,22 @@ class FakeLiveControlRenderer {
     return changed;
   }
 
+  form_control_checked(nodeHandle: number): boolean {
+    const control = this.#control(nodeHandle);
+    if (control.tagName !== "input") throw new TypeError("fake node is not an input");
+    return control.checked;
+  }
+
+  set_form_control_checked(nodeHandle: number, checked: boolean): boolean {
+    const control = this.#control(nodeHandle);
+    if (control.tagName !== "input") throw new TypeError("fake node is not an input");
+    const changed = control.checked !== checked;
+    control.checked = checked;
+    control.dirtyCheckedness = true;
+    const type = (control.attributes.get("type") ?? "").toLowerCase();
+    return changed && (type === "checkbox" || type === "radio");
+  }
+
   form_control_selection(nodeHandle: number): Uint32Array | undefined {
     const control = this.#control(nodeHandle);
     if (!supportsSelectionRange(control)) return undefined;
@@ -221,6 +241,7 @@ class FakeLiveControlRenderer {
     name = name.toLowerCase();
     const previousMode = control.tagName === "input" && name === "type" ? inputValueMode(control) : undefined;
     const previouslySelectable = supportsSelectionRange(control);
+    const hadChecked = control.attributes.has("checked");
     control.attributes.set(name, value);
     if (previousMode !== undefined) {
       this.#applyTypeTransition(control, previousMode);
@@ -229,6 +250,12 @@ class FakeLiveControlRenderer {
       isValueMode(inputValueMode(control)) && !control.dirty
     ) {
       control.value = value;
+    }
+    if (
+      control.tagName === "input" && name === "checked" && !hadChecked &&
+      !control.dirtyCheckedness
+    ) {
+      control.checked = true;
     }
     if (!previouslySelectable && supportsSelectionRange(control)) {
       control.selectionStart = 0;
@@ -242,6 +269,7 @@ class FakeLiveControlRenderer {
     name = name.toLowerCase();
     const previousMode = control.tagName === "input" && name === "type" ? inputValueMode(control) : undefined;
     const previouslySelectable = supportsSelectionRange(control);
+    const hadChecked = control.attributes.has("checked");
     control.attributes.delete(name);
     if (previousMode !== undefined) {
       this.#applyTypeTransition(control, previousMode);
@@ -250,6 +278,12 @@ class FakeLiveControlRenderer {
       isValueMode(inputValueMode(control)) && !control.dirty
     ) {
       control.value = "";
+    }
+    if (
+      control.tagName === "input" && name === "checked" && hadChecked &&
+      !control.dirtyCheckedness
+    ) {
+      control.checked = false;
     }
     if (!previouslySelectable && supportsSelectionRange(control)) {
       control.selectionStart = 0;
@@ -504,6 +538,68 @@ Deno.test("checkbox and radio value modes use on only for a missing attribute", 
     assertEquals(inputEvents, 0);
     assertEquals(changeEvents, 0);
   }
+});
+
+Deno.test("checked and defaultChecked keep browser dirty-checkedness semantics", () => {
+  const { document, renders } = createDocument();
+  const input = document.createElement("input");
+  input.setAttribute("type", "checkbox");
+  const setupRenders = renders.count;
+  let inputs = 0;
+  let changes = 0;
+  input.addEventListener("input", () => inputs++);
+  input.addEventListener("change", () => changes++);
+
+  assertEquals(input.checked, false);
+  assertEquals(input.defaultChecked, false);
+  input.defaultChecked = true;
+  assertEquals(input.getAttribute("checked"), "");
+  assertEquals(input.defaultChecked, true);
+  assertEquals(input.checked, true, "a clean current value follows attribute presence");
+  assertEquals(renders.count, setupRenders + 1);
+
+  input.defaultChecked = true;
+  assertEquals(renders.count, setupRenders + 1, "an identical boolean reflection is inert");
+  input.checked = false;
+  assertEquals(input.checked, false);
+  assertEquals(input.defaultChecked, true);
+  assertEquals(renders.count, setupRenders + 2);
+
+  input.checked = false;
+  assertEquals(renders.count, setupRenders + 2, "identical checked assignment does not repaint");
+  input.defaultChecked = false;
+  input.defaultChecked = true;
+  assertEquals(input.checked, false, "attribute changes stop following after any script assignment");
+  assertEquals(input.defaultChecked, true);
+  assertEquals(inputs, 0);
+  assertEquals(changes, 0);
+});
+
+Deno.test("checked uses Web IDL boolean conversion and survives non-checkable input types", () => {
+  const { document, renders } = createDocument();
+  const input = document.createElement("input");
+
+  (input as unknown as { checked: unknown }).checked = { valueOf: () => 0 };
+  assertEquals(input.checked, true, "Boolean conversion does not invoke object coercion hooks");
+  assertEquals(renders.count, 0, "checkedness on the Text state has no rendered effect");
+
+  input.setAttribute("type", "radio");
+  assertEquals(input.checked, true, "type changes retain the current checkedness");
+  const afterType = renders.count;
+  (input as unknown as { checked: unknown }).checked = 0;
+  assertEquals(input.checked, false);
+  assertEquals(renders.count, afterType + 1);
+  (input as unknown as { checked: unknown }).checked = Symbol("truthy");
+  assertEquals(input.checked, true);
+  assertEquals(renders.count, afterType + 2);
+
+  const clean = document.createElement("input");
+  (clean as unknown as { defaultChecked: unknown }).defaultChecked = "false";
+  assertEquals(clean.defaultChecked, true, "nonempty strings convert to true");
+  assertEquals(clean.checked, true);
+  (clean as unknown as { defaultChecked: unknown }).defaultChecked = 0n;
+  assertEquals(clean.defaultChecked, false);
+  assertEquals(clean.checked, false);
 });
 
 Deno.test("input type changes transfer values between value and attribute modes", () => {

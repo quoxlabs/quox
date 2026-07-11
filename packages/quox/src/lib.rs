@@ -10,7 +10,7 @@ use blitz_html::{HtmlDocument, HtmlProvider};
 use blitz_traits::net::DummyNetProvider;
 use blitz_traits::shell::{ColorScheme, ShellProvider, Viewport};
 use ffi_numbers::{NumericArgumentError, positive_f32, uint32};
-use form_controls::TextControlStates;
+use form_controls::{CheckedControlStates, TextControlStates};
 use interaction::staged_dispatch::DispatchStack;
 use linebender_resource_handle::Blob;
 use node_handles::NodeHandles;
@@ -63,6 +63,8 @@ struct QuoxRendererState {
     node_handles: NodeHandles,
     /// Browser-facing live value/dirty state for Blitz-backed text controls.
     text_controls: TextControlStates,
+    /// Browser-facing checkedness/dirty state for every HTML input.
+    checked_controls: CheckedControlStates,
 }
 
 const IME_REQUEST_CURSOR_AREA: u8 = 1 << 0;
@@ -368,6 +370,7 @@ impl QuoxRendererState {
     /// clobber Blitz's own wheel-driven scroll updates.
     fn sync_layout(&mut self) {
         self.text_controls.reconcile_document(&mut self.document);
+        self.checked_controls.reconcile_document(&mut self.document);
         sync_document_layout(
             &mut self.document,
             self.framebuffer_width,
@@ -462,6 +465,8 @@ impl QuoxRenderer {
         .into_inner();
         let mut text_controls = TextControlStates::default();
         text_controls.reconcile_document(&mut document);
+        let mut checked_controls = CheckedControlStates::default();
+        checked_controls.reconcile_document(&mut document);
 
         Ok(QuoxRenderer {
             state: RefCell::new(QuoxRendererState {
@@ -479,6 +484,7 @@ impl QuoxRenderer {
                 dispatch_stack: DispatchStack::default(),
                 node_handles: NodeHandles::default(),
                 text_controls,
+                checked_controls,
             }),
         })
     }
