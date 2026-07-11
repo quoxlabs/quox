@@ -50,7 +50,13 @@ import {
 } from "./protocol.ts";
 import { createOpaqueBlackFrame, validateWaylandShmFrame, validateWaylandShmLayout } from "./shm_buffer.ts";
 import { MISSING_ARGB8888_SHM_FORMAT, type WaylandShmFormatGeneration, WaylandShmFormatState } from "./shm_format.ts";
-import { damageOpcodeForSurfaceVersion, frameMatchesConfiguration, WaylandConfigureState } from "./window.ts";
+import {
+  damageOpcodeForSurfaceVersion,
+  DEFAULT_WAYLAND_APP_ID,
+  frameMatchesConfiguration,
+  setDefaultWaylandAppIdBeforeInitialCommit,
+  WaylandConfigureState,
+} from "./window.ts";
 import { type WaylandGlobalInterface, WaylandGlobalRegistry } from "./global_registry.ts";
 import {
   WaylandPointerAxis,
@@ -398,6 +404,18 @@ Deno.test("Wayland core cursor fallback has a visible in-bounds hotspot", () => 
   assert(DEFAULT_CURSOR_HOTSPOT_Y >= 0 && DEFAULT_CURSOR_HOTSPOT_Y < DEFAULT_CURSOR_HEIGHT);
   const hotspot = (DEFAULT_CURSOR_HOTSPOT_Y * DEFAULT_CURSOR_WIDTH + DEFAULT_CURSOR_HOTSPOT_X) * 4;
   assertEquals([...pixels.slice(hotspot, hotspot + 4)], [0, 0, 0, 255]);
+});
+
+Deno.test("Wayland sends its stable default app ID before the initial surface commit", () => {
+  const requests: string[] = [];
+  setDefaultWaylandAppIdBeforeInitialCommit(
+    (appId) => requests.push(`app-id:${appId}`),
+    () => requests.push("surface-commit"),
+  );
+
+  assertEquals(DEFAULT_WAYLAND_APP_ID, "winding");
+  assertEquals(WlOp.XDG_TOPLEVEL_SET_APP_ID, 3);
+  assertEquals(requests, ["app-id:winding", "surface-commit"]);
 });
 
 Deno.test("Wayland surface damage uses only requests supported by the bound version", () => {

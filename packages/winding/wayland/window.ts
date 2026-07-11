@@ -18,6 +18,16 @@ import {
 } from "./protocol.ts";
 import { createOpaqueBlackFrame, WaylandShmBuffer, type WaylandShmHost } from "./shm_buffer.ts";
 
+export const DEFAULT_WAYLAND_APP_ID = "winding";
+
+export function setDefaultWaylandAppIdBeforeInitialCommit(
+  setAppId: (appId: string) => void,
+  commitSurface: () => void,
+): void {
+  setAppId(DEFAULT_WAYLAND_APP_ID);
+  commitSurface();
+}
+
 export function damageOpcodeForSurfaceVersion(version: number): number {
   return version >= 4 ? WlOp.SURFACE_DAMAGE_BUFFER : WlOp.SURFACE_DAMAGE;
 }
@@ -172,13 +182,17 @@ export class WaylandWindow implements Window {
       this.setTitle("winding");
       lib.registerWindow(this.#surface, this);
       this.#registered = true;
-      symbols.wl_proxy_marshal_array_flags(
-        this.#surface,
-        WlOp.SURFACE_COMMIT,
-        null,
-        symbols.wl_proxy_get_version(this.#surface),
-        0,
-        args(),
+      setDefaultWaylandAppIdBeforeInitialCommit(
+        (appId) => this.#setAppId(appId),
+        () =>
+          symbols.wl_proxy_marshal_array_flags(
+            this.#surface!,
+            WlOp.SURFACE_COMMIT,
+            null,
+            symbols.wl_proxy_get_version(this.#surface!),
+            0,
+            args(),
+          ),
       );
       lib.roundtripDisplay("initial window configure");
       lib.throwCallbackError();
@@ -287,6 +301,19 @@ export class WaylandWindow implements Window {
       args(BigInt(configuration.serial)),
     );
     this.#acknowledgedFrameToken = configuration.frameToken;
+  }
+
+  #setAppId(appId: string): void {
+    const symbols = this.lib.wl.symbols;
+    const appIdBuffer = cStr(appId);
+    symbols.wl_proxy_marshal_array_flags(
+      this.#xdgToplevel!,
+      WlOp.XDG_TOPLEVEL_SET_APP_ID,
+      null,
+      symbols.wl_proxy_get_version(this.#xdgToplevel!),
+      0,
+      args(Deno.UnsafePointer.value(Deno.UnsafePointer.of(appIdBuffer))),
+    );
   }
 
   setTitle(title: string): void {
