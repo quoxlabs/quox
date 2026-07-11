@@ -19,6 +19,8 @@ const BITMAPINFOHEADER_SIZE = 40;
 const BI_RGB = 0;
 const DIB_RGB_COLORS = 0;
 const ERROR_CLASS_DOES_NOT_EXIST = 1411;
+const SW_SHOW = 5;
+const WS_OVERLAPPEDWINDOW = 0x00CF0000;
 
 // TRACKMOUSEEVENT: cbSize(4) + dwFlags(4) + hwndTrack(8, 8-byte aligned) +
 // dwHoverTime(4) + 4 bytes trailing padding to the struct's 8-byte alignment = 24 bytes.
@@ -67,6 +69,8 @@ class Win32Window implements Window {
   #bmi = new ArrayBuffer(BITMAPINFOHEADER_SIZE);
   /** Tracks minimized state so `WM_SIZE` transitions map to a single `visibilitychange` event instead of firing on every resize message. */
   minimized = false;
+  #clientWidth: number | undefined;
+  #clientHeight: number | undefined;
   #closing = false;
   #destroyed = false;
 
@@ -75,7 +79,7 @@ class Win32Window implements Window {
       0,
       classNameBuf,
       null,
-      0x10CF0000,
+      WS_OVERLAPPEDWINDOW,
       0x80000000,
       0x80000000,
       0x80000000,
@@ -91,6 +95,8 @@ class Win32Window implements Window {
     lib.windows.set(this.id, this);
     try {
       lib.input.attach(this);
+      lib.publishInitialWindowState(this);
+      lib.user32.symbols.ShowWindow(window, SW_SHOW);
     } catch (error) {
       const errors = [error];
       try {
@@ -106,6 +112,13 @@ class Win32Window implements Window {
 
   get hwnd(): Deno.PointerObject {
     return this.#hwnd;
+  }
+
+  observeClientSize(width: number, height: number): boolean {
+    if (this.#clientWidth === width && this.#clientHeight === height) return false;
+    this.#clientWidth = width;
+    this.#clientHeight = height;
+    return true;
   }
 
   setTitle(title: string): void {
@@ -286,7 +299,7 @@ class Win32Library implements Library {
             if (win !== undefined && minimized !== win.minimized) {
               win.minimized = minimized;
               this.#events.push({ type: "visibilitychange", visible: !minimized, window: win });
-            } else if (w > 0 && h > 0) {
+            } else if (w > 0 && h > 0 && win.observeClientSize(w, h)) {
               this.#events.push({ type: "resize", width: w, height: h, window: win });
             }
             break;
@@ -435,6 +448,23 @@ class Win32Library implements Library {
 
   purgeWindowEvents(window: Win32Window): void {
     this.#events.purgeWindow(window);
+  }
+
+  publishInitialWindowState(window: Win32Window): void {
+    const clientRect = new ArrayBuffer(16);
+    if (this.user32.symbols.GetClientRect(window.hwnd, clientRect) === 0) {
+      throw new Error(this.getLastError());
+    }
+    const rect = new DataView(clientRect);
+    const width = Math.max(0, rect.getInt32(8, true) - rect.getInt32(0, true));
+    const height = Math.max(0, rect.getInt32(12, true) - rect.getInt32(4, true));
+    if (window.observeClientSize(width, height)) {
+      this.#events.push({ type: "resize", width, height, window });
+    }
+
+    const focus = this.user32.symbols.GetFocus();
+    const focused = focus !== null && BigInt(Deno.UnsafePointer.value(focus)) === window.id;
+    this.input.observeNativeFocus(window, focused);
   }
 
   readonly windows = new Map<bigint, Win32Window>();

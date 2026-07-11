@@ -216,6 +216,24 @@ export class Win32InputController {
     };
   }
 
+  /** Synchronize focus queried during construction or reported by the WndProc. */
+  observeNativeFocus(window: Win32InputWindow, focused: boolean): void {
+    const state = this.#state(window);
+    if (state.activation.focused === focused) return;
+    if (focused) {
+      this.#enqueue({ type: "focus", window });
+      state.activation.setFocused(true);
+      this.#reconcileIme(window, state);
+      return;
+    }
+    this.#cancelComposition(window, state);
+    state.activation.setFocused(false);
+    this.#reconcileIme(window, state);
+    state.logicalKeys.clear();
+    state.altGraphControlFilter.reset();
+    this.#enqueue({ type: "blur", window });
+  }
+
   /** Process input-owned WndProc messages; undefined means continue with DefWindowProcW. */
   handleMessage(
     window: Win32InputWindow | undefined,
@@ -227,19 +245,12 @@ export class Win32InputController {
     switch (message) {
       case WM.SETFOCUS:
         if (window !== undefined && state !== undefined) {
-          this.#enqueue({ type: "focus", window });
-          state.activation.setFocused(true);
-          this.#reconcileIme(window, state);
+          this.observeNativeFocus(window, true);
         }
         return undefined;
       case WM.KILLFOCUS:
         if (window !== undefined && state !== undefined) {
-          this.#cancelComposition(window, state);
-          state.activation.setFocused(false);
-          this.#reconcileIme(window, state);
-          state.logicalKeys.clear();
-          state.altGraphControlFilter.reset();
-          this.#enqueue({ type: "blur", window });
+          this.observeNativeFocus(window, false);
         }
         return undefined;
       case WM.KEYDOWN:

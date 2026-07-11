@@ -50,6 +50,7 @@ function runLifecycle(user32: Deno.DynamicLibrary<typeof testUser32Functions>, d
   try {
     const window = library.openWindow(0, 0, 64, 48) as NativeWin32Window;
     try {
+      assertSingleInitialResize(library, window);
       // Keep hosted CI independent of foreground-window and desktop behavior.
       user32.symbols.ShowWindow(window.hwnd, 0);
       window.setImeCursorArea(4, 8, 2, 16);
@@ -88,6 +89,16 @@ function runLifecycle(user32: Deno.DynamicLibrary<typeof testUser32Functions>, d
 
 function drainEvents(library: Library): void {
   for (let count = 0; count < 64 && library.event() !== undefined; count++);
+}
+
+function assertSingleInitialResize(library: Library, window: Window): void {
+  let resizeCount = 0;
+  for (let count = 0; count < 64; count++) {
+    const event = library.event();
+    if (event === undefined) break;
+    if (event.type === "resize" && event.window === window) resizeCount++;
+  }
+  if (resizeCount !== 1) throw new Error(`Expected one initial Win32 resize event, received ${resizeCount}`);
 }
 
 function nextImeEdit(library: Library, window: Window): ImeEvent | undefined {

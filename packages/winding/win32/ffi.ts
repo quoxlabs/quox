@@ -29,6 +29,7 @@ export const gdi32functions = {
 
 export const user32functions = {
   GetDC: { parameters: ["pointer"], result: "pointer" },
+  GetFocus: { parameters: [], result: "pointer" },
   GetKeyState: { parameters: ["i32"], result: "i16" },
   GetKeyboardState: { parameters: ["buffer"], result: "i32" },
   GetKeyboardLayout: { parameters: ["u32"], result: "pointer" },
@@ -43,6 +44,7 @@ export const user32functions = {
   ReleaseCapture: { parameters: [], result: "i32" },
   SetWindowTextW: { parameters: ["pointer", "buffer"], result: "i32" },
   DestroyWindow: { parameters: ["pointer"], result: "i32" },
+  ShowWindow: { parameters: ["pointer", "i32"], result: "i32" },
   LoadCursorW: { parameters: ["pointer", "usize"], result: "usize" },
   TrackMouseEvent: { parameters: ["buffer"], result: "i32" },
   RegisterClassExW: {
