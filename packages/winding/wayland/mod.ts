@@ -31,6 +31,12 @@ import { WaylandWindow } from "./window.ts";
 import { WaylandTextInputController } from "./text_input_controller.ts";
 import { WaylandKeyboardController } from "./keyboard_controller.ts";
 import { WaylandShmBuffer } from "./shm_buffer.ts";
+import {
+  type BoundWaylandGlobal,
+  isWaylandGlobalInterface,
+  type WaylandGlobalOffer,
+  WaylandGlobalRegistry,
+} from "./global_registry.ts";
 
 // WaylandLibrary coordinates globals and the extracted native controllers.
 class WaylandLibrary implements Library {
@@ -78,6 +84,8 @@ class WaylandLibrary implements Library {
   #coreCursorCommitted = false;
   #coreCursorUnavailable = false;
   #seat: Deno.PointerObject | null = null;
+  #seatListeners: AnyCallback[] = [];
+  #seatVtable: BigUint64Array<ArrayBuffer> | undefined;
   #pointer: Deno.PointerObject | null = null;
   #pointerFocus: WaylandWindow | null = null;
   #pointerX = 0;
@@ -88,6 +96,9 @@ class WaylandLibrary implements Library {
   #pointerListeners: AnyCallback[] = [];
   #pointerVtable: BigUint64Array<ArrayBuffer> | undefined;
   readonly #textInputController: WaylandTextInputController;
+  readonly #globals: WaylandGlobalRegistry<Deno.PointerObject>;
+  #xdgWmBaseListener: AnyCallback | null = null;
+  #xdgWmBaseVtable: BigUint64Array<ArrayBuffer> | undefined;
   // Event queue filled by listener callbacks, drained by event()
   readonly #events = new EventQueue<UIEvent>();
   readonly #callbackErrors = new DeferredNativeError();
@@ -173,6 +184,10 @@ class WaylandLibrary implements Library {
       resetLocalCompose: () => this.#keyboardController.resetCompose(),
       flushDisplay: (context) => this.flushDisplay(context),
     });
+    this.#globals = new WaylandGlobalRegistry(
+      (offer) => this.#bindGlobal(offer),
+      (global) => this.#releaseGlobal(global),
+    );
 
     // Set up pollfd for display fd
     const fd = sym.wl_display_get_fd(display);
@@ -182,7 +197,9 @@ class WaylandLibrary implements Library {
     // revents at offset 6 is zeroed by default
 
     this.#initGlobals();
-    this.#initSeat();
+    // A second roundtrip makes the initially selected seat's capabilities available before the
+    // constructor returns. Seats announced later are initialized directly by their bind callback.
+    if (this.#seat) this.roundtripDisplay("seat initialization");
     this.#callbackErrors.throwIfPending();
   }
 
@@ -201,18 +218,24 @@ class WaylandLibrary implements Library {
     if (!registry) throw new Error("winding failed to get Wayland registry");
     this.#registry = registry;
 
-    // Registry global callback: bind compositor, shm, seat, xdg_wm_base
+    // Registry callbacks retain each advertised name so removals and replacements can be
+    // correlated with the exact proxy that owns listeners and child input objects.
     const globalCb = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer", "u32", "pointer", "u32"], result: "void" },
       this.guardCallback((_data, reg, name, ifacePtr, version) => {
+        if (this.#registry !== registry) return;
         if (!ifacePtr || !reg) return;
         const iface = new Deno.UnsafePointerView(ifacePtr).getCString();
-        this.#bindGlobal(reg, name, iface, version);
+        if (!isWaylandGlobalInterface(iface)) return;
+        this.#globals.announce({ name, interface: iface, offeredVersion: version });
       }),
     );
     const globalRemoveCb = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer", "u32"], result: "void" },
-      this.guardCallback(() => {}),
+      this.guardCallback((_data, _registry, name) => {
+        if (this.#registry !== registry) return;
+        this.#globals.remove(name);
+      }),
     );
     this.#listeners.push(globalCb, globalRemoveCb);
 
@@ -223,35 +246,35 @@ class WaylandLibrary implements Library {
     this.roundtripDisplay("registry initialization");
   }
 
-  #bindGlobal(registry: Deno.PointerObject, name: number, iface: string, offered: number): void {
+  #bindGlobal(offer: WaylandGlobalOffer): Deno.PointerObject | null {
     const sym = this.wl.symbols;
+    const registry = this.#registry;
+    if (!registry) return null;
 
-    let ifacePtr: Deno.PointerObject | null = null;
+    let ifacePtr: Deno.PointerObject;
     let version = 1;
 
-    if (iface === "wl_compositor") {
+    if (offer.interface === "wl_compositor") {
       ifacePtr = this.ifaces.compositor;
-      version = Math.min(offered, 4);
-    } else if (iface === "wl_shm") {
+      version = Math.min(offer.offeredVersion, 4);
+    } else if (offer.interface === "wl_shm") {
       ifacePtr = this.ifaces.shm;
-      version = Math.min(offered, 1);
-    } else if (iface === "wl_seat") {
+      version = Math.min(offer.offeredVersion, 1);
+    } else if (offer.interface === "wl_seat") {
       ifacePtr = this.ifaces.seat;
-      version = Math.min(offered, 5);
-    } else if (iface === "xdg_wm_base") {
+      version = Math.min(offer.offeredVersion, 5);
+    } else if (offer.interface === "xdg_wm_base") {
       ifacePtr = this.xdgWmBaseIface;
-      version = Math.min(offered, 7);
-    } else if (iface === "wp_cursor_shape_manager_v1") {
+      version = Math.min(offer.offeredVersion, 7);
+    } else if (offer.interface === "wp_cursor_shape_manager_v1") {
       ifacePtr = this.wpCursorShapeManagerIface;
-      version = Math.min(offered, 1);
-    } else if (iface === "zwp_text_input_manager_v3") {
-      ifacePtr = this.zwpTextInputManagerIface;
-      version = Math.min(offered, 1);
+      version = Math.min(offer.offeredVersion, 1);
     } else {
-      return;
+      ifacePtr = this.zwpTextInputManagerIface;
+      version = Math.min(offer.offeredVersion, 1);
     }
 
-    const ifaceName = cStr(iface);
+    const ifaceName = cStr(offer.interface);
     const proxy = sym.wl_proxy_marshal_array_flags(
       registry,
       WlOp.REGISTRY_BIND,
@@ -259,26 +282,113 @@ class WaylandLibrary implements Library {
       version,
       0,
       args(
-        BigInt(name),
+        BigInt(offer.name),
         Deno.UnsafePointer.value(Deno.UnsafePointer.of(ifaceName)),
         BigInt(version),
         0n,
       ),
     );
-    if (!proxy) return;
+    if (!proxy) return null;
 
-    if (iface === "wl_compositor") this.compositor = proxy;
-    else if (iface === "wl_shm") this.shm = proxy;
-    else if (iface === "wl_seat") this.#seat = proxy;
-    else if (iface === "xdg_wm_base") {
-      this.xdgWmBase = proxy;
-      this.#setupXdgWmBaseListener(proxy);
-    } else if (iface === "wp_cursor_shape_manager_v1") {
-      this.#cursorShapeManager = proxy;
-      this.#ensureCursorShapeDevice();
-    } else if (iface === "zwp_text_input_manager_v3") {
-      this.#textInputController.bindManager(proxy);
+    try {
+      if (offer.interface === "wl_compositor") {
+        this.compositor = proxy;
+        this.#coreCursorUnavailable = false;
+      } else if (offer.interface === "wl_shm") {
+        this.shm = proxy;
+        this.#coreCursorUnavailable = false;
+      } else if (offer.interface === "wl_seat") {
+        this.#seat = proxy;
+        this.#setupSeat(proxy);
+      } else if (offer.interface === "xdg_wm_base") {
+        this.xdgWmBase = proxy;
+        this.#setupXdgWmBaseListener(proxy);
+      } else if (offer.interface === "wp_cursor_shape_manager_v1") {
+        this.#cursorShapeManager = proxy;
+        this.#ensureCursorShapeDevice();
+      } else if (!this.#textInputController.bindManager(proxy)) return null;
+      return proxy;
+    } catch (error) {
+      try {
+        this.#releaseGlobal({ ...offer, binding: proxy });
+      } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], `failed to bind and unwind ${offer.interface}`);
+      }
+      if (
+        offer.interface === "wp_cursor_shape_manager_v1" ||
+        offer.interface === "zwp_text_input_manager_v3"
+      ) return null;
+      throw error;
     }
+  }
+
+  #releaseGlobal(global: BoundWaylandGlobal<Deno.PointerObject>): void {
+    const proxy = global.binding;
+    if (global.interface === "wl_compositor") {
+      if (this.compositor === proxy) this.compositor = null;
+      this.wl.symbols.wl_proxy_destroy(proxy);
+      return;
+    }
+    if (global.interface === "wl_shm") {
+      if (this.shm === proxy) this.shm = null;
+      this.wl.symbols.wl_proxy_destroy(proxy);
+      return;
+    }
+    if (global.interface === "wl_seat") {
+      this.#releaseSeat(proxy);
+      return;
+    }
+    if (global.interface === "xdg_wm_base") {
+      if (this.xdgWmBase === proxy) this.xdgWmBase = null;
+      const listener = this.#xdgWmBaseListener;
+      this.#xdgWmBaseListener = null;
+      this.#xdgWmBaseVtable = undefined;
+      const errors: unknown[] = [];
+      collectCleanupError(errors, () => {
+        this.wl.symbols.wl_proxy_marshal_array_flags(
+          proxy,
+          WlOp.XDG_WM_BASE_DESTROY,
+          null,
+          this.wl.symbols.wl_proxy_get_version(proxy),
+          WL_MARSHAL_FLAG_DESTROY,
+          args(),
+        );
+      });
+      if (listener) collectCleanupError(errors, () => listener.close());
+      throwCleanupErrors("winding failed to release the Wayland window factory", errors);
+      return;
+    }
+    if (global.interface === "wp_cursor_shape_manager_v1") {
+      if (this.#cursorShapeManager === proxy) this.#cursorShapeManager = null;
+      const device = this.#cursorShapeDevice;
+      this.#cursorShapeDevice = null;
+      const errors: unknown[] = [];
+      if (device) {
+        collectCleanupError(errors, () => {
+          this.wl.symbols.wl_proxy_marshal_array_flags(
+            device,
+            WlOp.WP_CURSOR_SHAPE_DEVICE_DESTROY,
+            null,
+            this.wl.symbols.wl_proxy_get_version(device),
+            WL_MARSHAL_FLAG_DESTROY,
+            args(),
+          );
+        });
+      }
+      collectCleanupError(errors, () => {
+        this.wl.symbols.wl_proxy_marshal_array_flags(
+          proxy,
+          WlOp.WP_CURSOR_SHAPE_MANAGER_DESTROY,
+          null,
+          this.wl.symbols.wl_proxy_get_version(proxy),
+          WL_MARSHAL_FLAG_DESTROY,
+          args(),
+        );
+      });
+      throwCleanupErrors("winding failed to release the Wayland cursor-shape manager", errors);
+      return;
+    }
+    this.#textInputController.unbindManager(proxy);
   }
 
   #setDefaultCursor(serial: number): void {
@@ -397,88 +507,123 @@ class WaylandLibrary implements Library {
   #ensureCursorShapeDevice(): void {
     if (!this.#cursorShapeManager || !this.#pointer || this.#cursorShapeDevice) return;
     const symbols = this.wl.symbols;
-    this.#cursorShapeDevice = symbols.wl_proxy_marshal_array_flags(
-      this.#cursorShapeManager,
-      WlOp.WP_CURSOR_SHAPE_MANAGER_GET_POINTER,
-      this.wpCursorShapeDeviceIface,
-      symbols.wl_proxy_get_version(this.#cursorShapeManager),
-      0,
-      args(0n, Deno.UnsafePointer.value(this.#pointer)),
-    );
+    try {
+      this.#cursorShapeDevice = symbols.wl_proxy_marshal_array_flags(
+        this.#cursorShapeManager,
+        WlOp.WP_CURSOR_SHAPE_MANAGER_GET_POINTER,
+        this.wpCursorShapeDeviceIface,
+        symbols.wl_proxy_get_version(this.#cursorShapeManager),
+        0,
+        args(0n, Deno.UnsafePointer.value(this.#pointer)),
+      );
+    } catch {
+      // cursor-shape-v1 is optional; the core cursor surface remains the fallback.
+      this.#cursorShapeDevice = null;
+    }
   }
 
   #setupXdgWmBaseListener(wmBase: Deno.PointerObject): void {
     const sym = this.wl.symbols;
-    const pingCb = new Deno.UnsafeCallback(
-      { parameters: ["pointer", "pointer", "u32"], result: "void" },
-      this.guardCallback((_data, wmb, serial) => {
-        // Respond to ping to avoid being killed for being unresponsive
-        sym.wl_proxy_marshal_array_flags(
-          wmb!,
-          WlOp.XDG_WM_BASE_PONG,
-          null,
-          sym.wl_proxy_get_version(wmb!),
-          0,
-          args(BigInt(serial)),
-        );
-      }),
-    );
-    this.#listeners.push(pingCb);
-    const vtable = makeVtable([pingCb], 1, this.noop);
-    this.#vtables.push(vtable);
-    sym.wl_proxy_add_listener(wmBase, Deno.UnsafePointer.of(vtable), null);
+    let pingCb: AnyCallback | null = null;
+    try {
+      pingCb = new Deno.UnsafeCallback(
+        { parameters: ["pointer", "pointer", "u32"], result: "void" },
+        this.guardCallback((_data, _wmb, serial) => {
+          if (this.xdgWmBase !== wmBase) return;
+          // Respond to ping to avoid being killed for being unresponsive
+          sym.wl_proxy_marshal_array_flags(
+            wmBase,
+            WlOp.XDG_WM_BASE_PONG,
+            null,
+            sym.wl_proxy_get_version(wmBase),
+            0,
+            args(BigInt(serial)),
+          );
+        }),
+      );
+      const vtable = makeVtable([pingCb], 1, this.noop);
+      if (sym.wl_proxy_add_listener(wmBase, Deno.UnsafePointer.of(vtable), null) !== 0) {
+        throw new Error("winding failed to listen to the Wayland window factory");
+      }
+      this.#xdgWmBaseListener = pingCb;
+      this.#xdgWmBaseVtable = vtable;
+    } catch (error) {
+      if (pingCb) {
+        try {
+          pingCb.close();
+        } catch (cleanupError) {
+          throw new AggregateError([error, cleanupError], "failed to unwind the Wayland window factory listener");
+        }
+      }
+      throw error;
+    }
   }
 
-  #initSeat(): void {
-    if (!this.#seat) return;
+  #setupSeat(seat: Deno.PointerObject): void {
     const sym = this.wl.symbols;
-
-    const capCb = new Deno.UnsafeCallback(
-      { parameters: ["pointer", "pointer", "u32"], result: "void" },
-      this.guardCallback((_data, _seat, caps) => {
-        const pointerAction = pointerCapabilityAction(
-          (caps & WlSeatCap.POINTER) !== 0,
-          this.#pointer !== null,
-        );
-        if (pointerAction === "acquire") this.#initPointer();
-        else if (pointerAction === "release") this.#releasePointer(true);
-        if ((caps & WlSeatCap.KEYBOARD) && !this.#keyboardController.active) {
-          this.#keyboardController.acquire(this.#seat!);
-        }
-        if (!(caps & WlSeatCap.KEYBOARD) && this.#keyboardController.active) {
-          this.#keyboardController.release();
-        }
-      }),
-    );
-    const nameCb = new Deno.UnsafeCallback(
-      { parameters: ["pointer", "pointer", "pointer"], result: "void" },
-      this.guardCallback(() => {}),
-    );
-    this.#listeners.push(capCb, nameCb);
-    const seatVtable = makeVtable(
-      [capCb, nameCb],
-      readEventCount(Deno.UnsafePointer.value(this.ifaces.seat)),
-      this.noop,
-    );
-    this.#vtables.push(seatVtable);
-    sym.wl_proxy_add_listener(this.#seat, Deno.UnsafePointer.of(seatVtable), null);
-    this.#textInputController.setSeat(this.#seat);
-    this.roundtripDisplay("seat initialization");
+    const callbacks: AnyCallback[] = [];
+    let installed = false;
+    try {
+      const capCb = new Deno.UnsafeCallback(
+        { parameters: ["pointer", "pointer", "u32"], result: "void" },
+        this.guardCallback((_data, _seat, caps) => {
+          if (this.#seat !== seat) return;
+          const pointerAction = pointerCapabilityAction(
+            (caps & WlSeatCap.POINTER) !== 0,
+            this.#pointer !== null,
+          );
+          if (pointerAction === "acquire") this.#acquirePointer(seat);
+          else if (pointerAction === "release") this.#releasePointer(true);
+          if ((caps & WlSeatCap.KEYBOARD) && !this.#keyboardController.active) {
+            this.#keyboardController.acquire(seat);
+          }
+          if (!(caps & WlSeatCap.KEYBOARD) && this.#keyboardController.active) {
+            this.#keyboardController.release();
+          }
+        }),
+      );
+      callbacks.push(capCb);
+      const nameCb = new Deno.UnsafeCallback(
+        { parameters: ["pointer", "pointer", "pointer"], result: "void" },
+        this.guardCallback(() => {
+          if (this.#seat !== seat) return;
+        }),
+      );
+      callbacks.push(nameCb);
+      const seatVtable = makeVtable(
+        callbacks,
+        readEventCount(Deno.UnsafePointer.value(this.ifaces.seat)),
+        this.noop,
+      );
+      if (sym.wl_proxy_add_listener(seat, Deno.UnsafePointer.of(seatVtable), null) !== 0) {
+        throw new Error("winding failed to listen to the selected Wayland seat");
+      }
+      installed = true;
+      this.#seatListeners = callbacks;
+      this.#seatVtable = seatVtable;
+      this.#textInputController.setSeat(seat);
+    } catch (error) {
+      if (installed) throw error;
+      const errors: unknown[] = [error];
+      for (const callback of callbacks) collectCleanupError(errors, () => callback.close());
+      if (errors.length > 1) throw new AggregateError(errors, "failed to unwind the Wayland seat listeners");
+      throw error;
+    }
   }
 
-  #initPointer(): void {
+  #initPointer(seat: Deno.PointerObject): void {
+    if (this.#seat !== seat || this.#pointer) return;
     const sym = this.wl.symbols;
     const pointer = sym.wl_proxy_marshal_array_flags(
-      this.#seat!,
+      seat,
       WlOp.SEAT_GET_POINTER,
       this.ifaces.pointer,
-      sym.wl_proxy_get_version(this.#seat!),
+      sym.wl_proxy_get_version(seat),
       0,
       args(0n),
     );
     if (!pointer) return;
     this.#pointer = pointer;
-
     this.#ensureCursorShapeDevice();
 
     // wl_pointer events (indices):
@@ -487,6 +632,7 @@ class WaylandLibrary implements Library {
       // (data, pointer, serial, surface, surface_x_fixed, surface_y_fixed)
       { parameters: ["pointer", "pointer", "u32", "pointer", "i32", "i32"], result: "void" },
       this.guardCallback((_data, _ptr, serial, surface, xFixed, yFixed) => {
+        if (this.#pointer !== pointer) return;
         const window = this.#windowForSurface(surface);
         if (!window) return;
         this.#pointerFocus = window;
@@ -496,20 +642,24 @@ class WaylandLibrary implements Library {
         this.#events.push({ type: "mouseenter", ...this.#pointerSnapshot(), window });
       }),
     );
+    this.#pointerListeners.push(enterCb);
     const leaveCb = new Deno.UnsafeCallback(
       // (data, pointer, serial, surface)
       { parameters: ["pointer", "pointer", "u32", "pointer"], result: "void" },
       this.guardCallback((_data, _ptr, _serial, surface) => {
+        if (this.#pointer !== pointer) return;
         const window = this.#windowForSurface(surface);
         if (!window || window !== this.#pointerFocus) return;
         this.#pointerFocus = null;
         this.#events.push({ type: "mouseleave", ...this.#pointerSnapshot(), window });
       }),
     );
+    this.#pointerListeners.push(leaveCb);
     const motionCb = new Deno.UnsafeCallback(
       // (data, pointer, time, surface_x_fixed, surface_y_fixed)
       { parameters: ["pointer", "pointer", "u32", "i32", "i32"], result: "void" },
       this.guardCallback((_data, _ptr, time, xFixed, yFixed) => {
+        if (this.#pointer !== pointer) return;
         const window = this.#pointerFocus;
         if (!window) return;
         this.#pointerX = xFixed / 256;
@@ -517,10 +667,12 @@ class WaylandLibrary implements Library {
         this.#events.push({ type: "mousemove", ...this.#pointerSnapshot(time), window });
       }),
     );
+    this.#pointerListeners.push(motionCb);
     const buttonCb = new Deno.UnsafeCallback(
       // (data, pointer, serial, time, button, state)
       { parameters: ["pointer", "pointer", "u32", "u32", "u32", "u32"], result: "void" },
       this.guardCallback((_data, _ptr, _serial, time, button, state) => {
+        if (this.#pointer !== pointer) return;
         const window = this.#pointerFocus;
         if (!window) return;
         const btnMap: Record<number, MouseButton> = {
@@ -536,20 +688,22 @@ class WaylandLibrary implements Library {
         if (b === undefined) return;
         const mask = mouseButtonMask(b);
         this.#pointerButtons = state ? this.#pointerButtons | mask : this.#pointerButtons & ~mask;
-        const pointer = this.#pointerSnapshot(time);
+        const snapshot = this.#pointerSnapshot(time);
         this.#events.push({
           type: state ? "mousedown" : "mouseup",
           button: b,
-          detail: this.#clickCounter.detail(b, state !== 0, pointer.timeStamp, pointer.x, pointer.y),
-          ...pointer,
+          detail: this.#clickCounter.detail(b, state !== 0, snapshot.timeStamp, snapshot.x, snapshot.y),
+          ...snapshot,
           window,
         });
       }),
     );
+    this.#pointerListeners.push(buttonCb);
     const axisCb = new Deno.UnsafeCallback(
       // (data, pointer, time, axis, value_fixed)
       { parameters: ["pointer", "pointer", "u32", "u32", "i32"], result: "void" },
       this.guardCallback((_data, _ptr, time, axis, value) => {
+        if (this.#pointer !== pointer) return;
         const window = this.#pointerFocus;
         if (!window) return;
         const delta = value >> 8;
@@ -574,7 +728,7 @@ class WaylandLibrary implements Library {
         }
       }),
     );
-    this.#pointerListeners = [enterCb, leaveCb, motionCb, buttonCb, axisCb];
+    this.#pointerListeners.push(axisCb);
     const ptrEventCount = readEventCount(Deno.UnsafePointer.value(this.ifaces.pointer));
     const pointerVtable = makeVtable(
       this.#pointerListeners,
@@ -582,7 +736,53 @@ class WaylandLibrary implements Library {
       this.noop,
     );
     this.#pointerVtable = pointerVtable;
-    sym.wl_proxy_add_listener(pointer, Deno.UnsafePointer.of(pointerVtable), null);
+    if (sym.wl_proxy_add_listener(pointer, Deno.UnsafePointer.of(pointerVtable), null) !== 0) {
+      throw new Error("winding failed to listen to the Wayland pointer");
+    }
+  }
+
+  #acquirePointer(seat: Deno.PointerObject): void {
+    try {
+      this.#initPointer(seat);
+    } catch (error) {
+      try {
+        this.#releasePointer(false);
+      } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], "failed to acquire and unwind the Wayland pointer");
+      }
+      // Pointer input is an optional seat capability; keep the selected seat usable for keyboard.
+    }
+  }
+
+  #releaseSeat(seat: Deno.PointerObject): void {
+    if (this.#seat === seat) this.#seat = null;
+    const listeners = this.#seatListeners;
+    this.#seatListeners = [];
+    this.#seatVtable = undefined;
+
+    const errors: unknown[] = [];
+    collectCleanupError(errors, () => this.#textInputController.setSeat(null));
+    collectCleanupError(errors, () => this.#releasePointer(true));
+    collectCleanupError(errors, () => this.#keyboardController.release());
+    collectCleanupError(errors, () => {
+      const version = this.wl.symbols.wl_proxy_get_version(seat);
+      if (version >= 5) {
+        this.wl.symbols.wl_proxy_marshal_array_flags(
+          seat,
+          WlOp.SEAT_RELEASE,
+          null,
+          version,
+          WL_MARSHAL_FLAG_DESTROY,
+          args(),
+        );
+      } else {
+        this.wl.symbols.wl_proxy_destroy(seat);
+      }
+    });
+    for (const listener of listeners) {
+      collectCleanupError(errors, () => listener.close());
+    }
+    throwCleanupErrors("winding failed to release the Wayland seat", errors);
   }
 
   #releasePointer(emitLeave: boolean): void {
@@ -837,8 +1037,6 @@ class WaylandLibrary implements Library {
     }
     this.windows.clear();
     this.#windowsBySurface.clear();
-    collectCleanupError(errors, () => this.#textInputController.close());
-
     collectCleanupError(errors, () => this.#releasePointer(false));
 
     const coreCursorSurface = this.#coreCursorSurface;
@@ -861,63 +1059,13 @@ class WaylandLibrary implements Library {
     this.#coreCursorBuffers = null;
     if (coreCursorBuffers) collectCleanupError(errors, () => coreCursorBuffers.close());
 
-    const cursorShapeManager = this.#cursorShapeManager;
-    this.#cursorShapeManager = null;
-    if (cursorShapeManager) {
-      collectCleanupError(errors, () => {
-        this.wl.symbols.wl_proxy_marshal_array_flags(
-          cursorShapeManager,
-          WlOp.WP_CURSOR_SHAPE_MANAGER_DESTROY,
-          null,
-          1,
-          WL_MARSHAL_FLAG_DESTROY,
-          args(),
-        );
-      });
-    }
-
+    collectCleanupError(errors, () => this.#globals.close());
+    collectCleanupError(errors, () => this.#textInputController.close());
     collectCleanupError(errors, () => this.#keyboardController.close());
 
-    const seat = this.#seat;
-    this.#seat = null;
-    if (seat) {
-      collectCleanupError(errors, () => {
-        const version = this.wl.symbols.wl_proxy_get_version(seat);
-        if (version >= 5) {
-          this.wl.symbols.wl_proxy_marshal_array_flags(
-            seat,
-            WlOp.SEAT_RELEASE,
-            null,
-            version,
-            WL_MARSHAL_FLAG_DESTROY,
-            args(),
-          );
-        } else {
-          this.wl.symbols.wl_proxy_destroy(seat);
-        }
-      });
+    if (this.#registry) {
+      collectCleanupError(errors, () => this.wl.symbols.wl_proxy_destroy(this.#registry!));
     }
-
-    const xdgWmBase = this.xdgWmBase;
-    this.xdgWmBase = null;
-    if (xdgWmBase) {
-      collectCleanupError(errors, () => {
-        this.wl.symbols.wl_proxy_marshal_array_flags(
-          xdgWmBase,
-          WlOp.XDG_WM_BASE_DESTROY,
-          null,
-          1,
-          WL_MARSHAL_FLAG_DESTROY,
-          args(),
-        );
-      });
-    }
-
-    for (const proxy of [this.compositor, this.shm, this.#registry]) {
-      if (proxy) collectCleanupError(errors, () => this.wl.symbols.wl_proxy_destroy(proxy));
-    }
-    this.compositor = null;
-    this.shm = null;
     this.#registry = null;
 
     for (const callback of this.#listeners) {

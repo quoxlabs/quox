@@ -57,8 +57,8 @@ export class WaylandKeyboardController {
     return this.#input.modifiers;
   }
 
-  acquire(seat: Deno.PointerObject): void {
-    if (this.#closed || this.#keyboard) return;
+  acquire(seat: Deno.PointerObject): boolean {
+    if (this.#closed || this.#keyboard) return false;
     const symbols = this.host.wl.symbols;
     const keyboard = symbols.wl_proxy_marshal_array_flags(
       seat,
@@ -68,9 +68,19 @@ export class WaylandKeyboardController {
       0,
       args(0n),
     );
-    if (!keyboard) return;
+    if (!keyboard) return false;
     this.#keyboard = keyboard;
-    this.#installListeners(keyboard);
+    try {
+      this.#installListeners(keyboard);
+      return true;
+    } catch (error) {
+      try {
+        this.release();
+      } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], "failed to acquire and unwind the Wayland keyboard");
+      }
+      return false;
+    }
   }
 
   resetCompose(): void {
@@ -149,12 +159,18 @@ export class WaylandKeyboardController {
     const keymap = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer", "u32", "i32", "u32"], result: "void" },
       this.host.guardCallback((_data, _keyboard, format, fd, size) => {
+        if (this.#keyboard !== keyboard) {
+          if (fd >= 0) this.host.libc.symbols.close(fd);
+          return;
+        }
         this.#input.loadKeymap(format, fd, size);
       }),
     );
+    this.#listeners.push(keymap);
     const enter = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer", "u32", "pointer", "pointer"], result: "void" },
       this.host.guardCallback((_data, _keyboard, _serial, surface) => {
+        if (this.#keyboard !== keyboard) return;
         const window = this.host.windowForSurface(surface);
         if (!window || this.#focus === window) return;
         if (this.#focus) {
@@ -173,9 +189,11 @@ export class WaylandKeyboardController {
         this.host.syncTextInput(window);
       }),
     );
+    this.#listeners.push(enter);
     const leave = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer", "u32", "pointer"], result: "void" },
       this.host.guardCallback((_data, _keyboard, _serial, surface) => {
+        if (this.#keyboard !== keyboard) return;
         const window = this.host.windowForSurface(surface);
         if (!window || this.#focus !== window) return;
         this.#input.resetTransientState();
@@ -188,9 +206,11 @@ export class WaylandKeyboardController {
         this.host.pushEvent({ type: "blur", window });
       }),
     );
+    this.#listeners.push(leave);
     const key = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer", "u32", "u32", "u32", "u32"], result: "void" },
       this.host.guardCallback((_data, _keyboard, _serial, _time, rawKeycode, state) => {
+        if (this.#keyboard !== keyboard) return;
         if (state) {
           if (!this.#focus) return;
           this.#emitKey(rawKeycode, "press");
@@ -201,25 +221,31 @@ export class WaylandKeyboardController {
         }
       }),
     );
+    this.#listeners.push(key);
     const modifiers = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer", "u32", "u32", "u32", "u32", "u32"], result: "void" },
       this.host.guardCallback((_data, _keyboard, _serial, depressed, latched, locked, group) => {
+        if (this.#keyboard !== keyboard) return;
         this.#input.updateModifiers(depressed, latched, locked, group);
       }),
     );
+    this.#listeners.push(modifiers);
     const repeatInfo = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer", "i32", "i32"], result: "void" },
       this.host.guardCallback((_data, _keyboard, rate, delay) => {
+        if (this.#keyboard !== keyboard) return;
         this.#input.setRepeatInfo(rate, delay);
       }),
     );
-    this.#listeners = [keymap, enter, leave, key, modifiers, repeatInfo];
+    this.#listeners.push(repeatInfo);
     this.#vtable = makeVtable(
       this.#listeners,
       readEventCount(Deno.UnsafePointer.value(this.host.keyboardIface)),
       this.host.noop,
     );
-    this.host.wl.symbols.wl_proxy_add_listener(keyboard, Deno.UnsafePointer.of(this.#vtable), null);
+    if (this.host.wl.symbols.wl_proxy_add_listener(keyboard, Deno.UnsafePointer.of(this.#vtable), null) !== 0) {
+      throw new Error("winding failed to listen to the Wayland keyboard");
+    }
   }
 
   #emitKey(rawKeycode: number, phase: "press" | "release" | "repeat"): void {

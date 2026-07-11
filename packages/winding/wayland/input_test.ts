@@ -28,6 +28,94 @@ import {
   waylandConnectionError,
 } from "./protocol.ts";
 import { damageOpcodeForSurfaceVersion, frameMatchesConfiguration, WaylandConfigureState } from "./window.ts";
+import { type WaylandGlobalInterface, WaylandGlobalRegistry } from "./global_registry.ts";
+
+Deno.test("Wayland globals keep one owner and promote a deterministic replacement", () => {
+  const actions: string[] = [];
+  const registry = new WaylandGlobalRegistry<string>(
+    (offer) => {
+      const binding = `${offer.interface}@${offer.name}`;
+      actions.push(`bind ${binding}`);
+      return binding;
+    },
+    (global) => actions.push(`release ${global.binding}`),
+  );
+
+  registry.announce({ name: 9, interface: "wl_seat", offeredVersion: 5 });
+  registry.announce({ name: 4, interface: "wl_seat", offeredVersion: 3 });
+  registry.announce({ name: 7, interface: "wl_seat", offeredVersion: 4 });
+
+  assertEquals(registry.active("wl_seat")?.name, 9);
+  assertEquals(actions, ["bind wl_seat@9"]);
+
+  registry.remove(4);
+  assertEquals(registry.active("wl_seat")?.name, 9);
+  assertEquals(actions, ["bind wl_seat@9"]);
+
+  registry.remove(9);
+  assertEquals(registry.active("wl_seat")?.name, 7);
+  assertEquals(actions, ["bind wl_seat@9", "release wl_seat@9", "bind wl_seat@7"]);
+});
+
+Deno.test("Wayland global lifecycle supports late arrivals, failed binds, and independent interfaces", () => {
+  const released: string[] = [];
+  const attempts: number[] = [];
+  const rejected = new Set([2]);
+  const registry = new WaylandGlobalRegistry<string>(
+    (offer) => {
+      attempts.push(offer.name);
+      return rejected.has(offer.name) ? null : `${offer.interface}@${offer.name}`;
+    },
+    (global) => released.push(global.binding),
+  );
+
+  registry.announce({ name: 2, interface: "wp_cursor_shape_manager_v1", offeredVersion: 1 });
+  assertEquals(registry.active("wp_cursor_shape_manager_v1"), undefined);
+
+  registry.announce({ name: 8, interface: "wp_cursor_shape_manager_v1", offeredVersion: 1 });
+  registry.announce({ name: 3, interface: "zwp_text_input_manager_v3", offeredVersion: 1 });
+  assertEquals(registry.active("wp_cursor_shape_manager_v1")?.name, 8);
+  assertEquals(registry.active("zwp_text_input_manager_v3")?.name, 3);
+  assertEquals(attempts, [2, 2, 8, 3]);
+
+  registry.remove(8);
+  assertEquals(registry.active("wp_cursor_shape_manager_v1"), undefined);
+  assertEquals(released, ["wp_cursor_shape_manager_v1@8"]);
+
+  rejected.delete(2);
+  registry.announce({ name: 11, interface: "wp_cursor_shape_manager_v1", offeredVersion: 1 });
+  registry.announce({ name: 10, interface: "wl_compositor", offeredVersion: 4 });
+  assertEquals(registry.active("wp_cursor_shape_manager_v1")?.name, 2);
+  assertEquals(registry.active("wl_compositor")?.name, 10);
+
+  registry.close();
+  assertEquals(released.sort(), [
+    "wl_compositor@10",
+    "wp_cursor_shape_manager_v1@2",
+    "wp_cursor_shape_manager_v1@8",
+    "zwp_text_input_manager_v3@3",
+  ]);
+});
+
+Deno.test("Wayland global candidates are selected independently per interface", () => {
+  const active = new Map<WaylandGlobalInterface, number>();
+  const registry = new WaylandGlobalRegistry<number>(
+    (offer) => {
+      active.set(offer.interface, offer.name);
+      return offer.name;
+    },
+    (global) => active.delete(global.interface),
+  );
+
+  registry.announce({ name: 12, interface: "wl_compositor", offeredVersion: 4 });
+  registry.announce({ name: 13, interface: "wl_shm", offeredVersion: 1 });
+  registry.announce({ name: 14, interface: "wl_compositor", offeredVersion: 4 });
+  assertEquals([...active.entries()], [["wl_compositor", 12], ["wl_shm", 13]]);
+
+  registry.remove(12);
+  assertEquals(registry.active("wl_compositor")?.name, 14);
+  assertEquals(active.get("wl_compositor"), 14);
+});
 
 Deno.test("cursor-shape manager metadata includes the version-1 tablet request", () => {
   assertEquals(CURSOR_SHAPE_MANAGER_V1_REQUESTS, [

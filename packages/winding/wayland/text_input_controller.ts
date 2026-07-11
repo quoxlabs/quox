@@ -51,21 +51,33 @@ export class WaylandTextInputController {
 
   constructor(readonly host: WaylandTextInputHost) {}
 
-  bindManager(manager: Deno.PointerObject): void {
+  bindManager(manager: Deno.PointerObject): boolean {
     if (this.#closed) {
       this.#destroyManager(manager);
-      return;
+      return false;
     }
     if (this.#manager) {
       this.#destroyManager(manager);
-      return;
+      return false;
     }
     this.#manager = manager;
     this.#maybeInitialize();
+    return true;
   }
 
-  setSeat(seat: Deno.PointerObject): void {
+  unbindManager(manager: Deno.PointerObject): void {
+    if (this.#manager !== manager) return;
+    this.#manager = null;
+    const errors: unknown[] = [];
+    collectCleanupError(errors, () => this.#releaseInput());
+    collectCleanupError(errors, () => this.#destroyManager(manager));
+    throwCleanupErrors("winding failed to release the Wayland text-input manager", errors);
+  }
+
+  setSeat(seat: Deno.PointerObject | null): void {
     if (this.#closed) return;
+    if (this.#seat === seat) return;
+    this.#releaseInput();
     this.#seat = seat;
     this.#maybeInitialize();
   }
@@ -117,34 +129,59 @@ export class WaylandTextInputController {
     if (this.#closed) return;
     this.#closed = true;
     const errors: unknown[] = [];
+    this.#seat = null;
+    collectCleanupError(errors, () => this.#releaseInput());
+    const manager = this.#manager;
+    this.#manager = null;
+    if (manager) collectCleanupError(errors, () => this.#destroyManager(manager));
+    throwCleanupErrors("winding failed to close Wayland text input", errors);
+  }
+
+  #releaseInput(): void {
+    const input = this.#input;
+    const affectedWindow = this.#enabledWindow ?? this.#focus;
+    this.#input = null;
     this.#focus = null;
     this.#enabledWindow = null;
-    this.#seat = null;
-    collectCleanupError(errors, () => this.#batch.resetEdits());
+    const listeners = this.#listeners.splice(0);
+    this.#vtable = undefined;
 
-    const input = this.#input;
-    this.#input = null;
+    const errors: unknown[] = [];
+    if (affectedWindow) {
+      collectCleanupError(errors, () => this.#emitEdits(affectedWindow, this.#batch.resetEdits()));
+      collectCleanupError(errors, () => {
+        const clear = affectedWindow.composition.cancel();
+        if (clear !== undefined) {
+          this.host.pushEvent(createImePreeditEvent(affectedWindow, clear.text, clear.cursorRange));
+        }
+      });
+    } else {
+      collectCleanupError(errors, () => this.#batch.resetEdits());
+    }
+    for (const window of this.host.windows()) {
+      collectCleanupError(errors, () => window.imeActivation.setFocused(false));
+      collectCleanupError(errors, () => window.imeActivation.setAvailable(false));
+      collectCleanupError(errors, () => {
+        const transition = window.imeActivation.forceInactive();
+        if (transition !== undefined) this.host.pushEvent(createImeActivationEvent(window, transition));
+      });
+    }
     if (input) {
       collectCleanupError(errors, () => {
         this.host.wl.symbols.wl_proxy_marshal_array_flags(
           input,
           WlOp.ZWP_TEXT_INPUT_DESTROY,
           null,
-          1,
+          this.host.wl.symbols.wl_proxy_get_version(input),
           WL_MARSHAL_FLAG_DESTROY,
           args(),
         );
       });
     }
-    const manager = this.#manager;
-    this.#manager = null;
-    if (manager) collectCleanupError(errors, () => this.#destroyManager(manager));
-    for (const callback of this.#listeners) {
+    for (const callback of listeners) {
       collectCleanupError(errors, () => callback.close());
     }
-    this.#listeners.length = 0;
-    this.#vtable = undefined;
-    throwCleanupErrors("winding failed to close Wayland text input", errors);
+    throwCleanupErrors("winding failed to release Wayland text input", errors);
   }
 
   #maybeInitialize(): void {
@@ -168,6 +205,7 @@ export class WaylandTextInputController {
     const enter = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer", "pointer"], result: "void" },
       this.host.guardCallback((_data, _input, surface) => {
+        if (this.#input !== input) return;
         const window = this.host.windowForSurface(surface);
         if (window !== null && window === this.#focus) {
           this.syncWindow(window, true);
@@ -181,41 +219,51 @@ export class WaylandTextInputController {
         if (window) this.syncWindow(window, true);
       }),
     );
+    this.#listeners.push(enter);
     const leave = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer", "pointer"], result: "void" },
       this.host.guardCallback((_data, _input, surface) => {
+        if (this.#input !== input) return;
         const window = this.host.windowForSurface(surface);
         if (!window || window !== this.#focus) return;
         this.#focus = null;
         this.syncWindow(window, false);
       }),
     );
+    this.#listeners.push(leave);
     const preedit = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer", "pointer", "i32", "i32"], result: "void" },
       this.host.guardCallback((_data, _input, text, cursorBegin, cursorEnd) => {
+        if (this.#input !== input) return;
         if (!this.#focus || this.#enabledWindow !== this.#focus) return;
         const value = nullableCString(text);
         this.#batch.setPreedit(value, cursorBegin, cursorEnd);
         if (value !== null && value.length > 0) this.#focus.composition.start();
       }),
     );
+    this.#listeners.push(preedit);
     const commit = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer", "pointer"], result: "void" },
       this.host.guardCallback((_data, _input, text) => {
+        if (this.#input !== input) return;
         if (!this.#focus || this.#enabledWindow !== this.#focus) return;
         this.#batch.setCommit(nullableCString(text));
       }),
     );
+    this.#listeners.push(commit);
     const deletion = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer", "u32", "u32"], result: "void" },
       this.host.guardCallback((_data, _input, beforeBytes, afterBytes) => {
+        if (this.#input !== input) return;
         if (!this.#focus || this.#enabledWindow !== this.#focus) return;
         this.#batch.setDeleteSurrounding(beforeBytes, afterBytes);
       }),
     );
+    this.#listeners.push(deletion);
     const done = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer", "u32"], result: "void" },
       this.host.guardCallback((_data, _input, serial) => {
+        if (this.#input !== input) return;
         const window = this.#enabledWindow;
         if (!window || window !== this.#focus) {
           this.#batch.resetEdits();
@@ -224,13 +272,15 @@ export class WaylandTextInputController {
         this.#emitEdits(window, this.#batch.done(serial).edits);
       }),
     );
-    this.#listeners.push(enter, leave, preedit, commit, deletion, done);
+    this.#listeners.push(done);
     this.#vtable = makeVtable(
       [enter, leave, preedit, commit, deletion, done],
       readEventCount(Deno.UnsafePointer.value(this.host.zwpTextInputIface)),
       this.host.noop,
     );
-    this.host.wl.symbols.wl_proxy_add_listener(input, Deno.UnsafePointer.of(this.#vtable), null);
+    if (this.host.wl.symbols.wl_proxy_add_listener(input, Deno.UnsafePointer.of(this.#vtable), null) !== 0) {
+      throw new Error("winding failed to listen to Wayland text input");
+    }
   }
 
   #reconcile(window: WaylandWindow, sendProtocol: boolean): void {
