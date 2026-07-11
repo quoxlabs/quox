@@ -1,7 +1,7 @@
 export type ImeActivationTransition = "enabled" | "disabled" | undefined;
 
 export interface ImeActivationActions {
-  /** Return true only when native activation succeeded. */
+  /** Return true only when the backend accepted and applied the activation request. */
   activate(): boolean;
   deactivate(): void;
 }
@@ -45,7 +45,7 @@ export class ImeActivationState {
     this.#available = available;
   }
 
-  /** Apply the desired state to a native context and report a real transition. */
+  /** Apply the desired state to a native context and report the backend transition. */
   reconcile(actions: ImeActivationActions): ImeActivationTransition {
     if (this.shouldBeActive === this.#active) return undefined;
     if (this.shouldBeActive) {

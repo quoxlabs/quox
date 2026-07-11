@@ -61,15 +61,20 @@ Keydown events also describe who owns their editing behavior:
 - `text-input` suppresses that default because native text input or an AppKit command owns the edit.
 - `platform` suppresses it because the operating system owns the action.
 
-Committed text is never duplicated on a keyboard event. A normal character press is delivered as a `text-input` keydown
-followed by one nonempty `ime` commit. Composition updates use UTF-8 byte cursor ranges; cancellation is an empty
-preedit with a `null` cursor. A commit ends preedit atomically, so it is not preceded by a synthetic empty preedit.
-AppKit editing selectors remain observable as `apple-standard-keybinding` events.
+Committed text is never duplicated on a keyboard event. An ordinary delivered character press is a `text-input` keydown
+followed by one nonempty `ime` commit. On Wayland, a key consumed by the compositor's text service can instead produce
+preedit or commit events without a matching Winding keydown because text-input-v3 does not expose that physical key.
+Ordinary `wl_keyboard` events remain the local XKB/Compose fallback for keys the text service did not consume.
+Composition updates use UTF-8 byte cursor ranges; cancellation is an empty preedit with a `null` cursor. A commit ends
+preedit atomically, so it is not preceded by a synthetic empty preedit. AppKit editing selectors remain observable as
+`apple-standard-keybinding` events.
 
 Call `window.setImeEnabled(true)` when a text editor wants native composition and
 `window.setImeCursorArea(x, y, width, height)` to position its candidate window in top-left-origin logical client
-coordinates. The setter records desired permission; `ime/enabled` and `ime/disabled` events report actual activation on
-the focused native window. Non-finite cursor geometry is ignored, while negative dimensions become zero.
+coordinates. The setter records desired permission; `ime/enabled` and `ime/disabled` events report the state applied by
+the backend on the focused native window. On Wayland, `enabled` means the enable request was locally committed, not that
+an input-method daemon acknowledged or consumed it. Non-finite cursor geometry is ignored, while negative dimensions
+become zero.
 
 ### Wayland environment permission
 

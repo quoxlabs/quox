@@ -56,6 +56,7 @@ struct QuoxRendererState {
 
 const IME_REQUEST_CURSOR_AREA: u8 = 1 << 0;
 const IME_REQUEST_ENABLED: u8 = 1 << 1;
+const IME_REQUEST_CONTEXT_RESTART: u8 = 1 << 2;
 const IME_REQUEST_SNAPSHOT_LEN: usize = 6;
 
 #[derive(Default)]
@@ -64,6 +65,7 @@ struct ImeRequestState {
     delivered_enabled: Option<bool>,
     desired_cursor_area: Option<[f32; 4]>,
     delivered_cursor_area: Option<[f32; 4]>,
+    context_restart_pending: bool,
 }
 
 /// Thread-safe hand-off for shell requests produced synchronously inside Blitz. The host
@@ -76,10 +78,21 @@ struct ImeRequestMailbox {
 
 impl ImeRequestMailbox {
     fn request_enabled(&self, enabled: bool) {
-        self.state
+        let mut state = self
+            .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .desired_enabled = Some(enabled);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if enabled {
+            // Blitz identifies a new logical editor by disabling the old editor before enabling
+            // the new one. Preserve that edge even when both requests arrive before the host can
+            // drain the mailbox and the final boolean is unchanged.
+            if state.desired_enabled == Some(false) && state.delivered_enabled == Some(true) {
+                state.context_restart_pending = true;
+            }
+        } else {
+            state.context_restart_pending = false;
+        }
+        state.desired_enabled = Some(enabled);
     }
 
     fn request_cursor_area(&self, mut cursor_area: [f32; 4]) {
@@ -98,7 +111,8 @@ impl ImeRequestMailbox {
     ///
     /// The compact WASM-friendly snapshot is `[flags, x, y, width, height, enabled]`.
     /// Cursor geometry and enabled state have independent presence bits, allowing the host to
-    /// apply geometry before an accompanying enable without racing two mailbox drains.
+    /// apply geometry before an accompanying enable without racing two mailbox drains. A restart
+    /// bit preserves a coalesced disable/enable handoff while the final enabled value stays true.
     fn take_snapshot(&self) -> Option<[f32; IME_REQUEST_SNAPSHOT_LEN]> {
         let mut state = self
             .state
@@ -106,7 +120,10 @@ impl ImeRequestMailbox {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cursor_area_changed = state.desired_cursor_area != state.delivered_cursor_area;
         let enabled_changed = state.desired_enabled != state.delivered_enabled;
-        if !cursor_area_changed && !enabled_changed {
+        let context_restart = state.context_restart_pending
+            && state.desired_enabled == Some(true)
+            && state.delivered_enabled == Some(true);
+        if !cursor_area_changed && !enabled_changed && !context_restart {
             return None;
         }
 
@@ -128,6 +145,11 @@ impl ImeRequestMailbox {
             };
             state.delivered_enabled = state.desired_enabled;
         }
+        if context_restart {
+            flags |= IME_REQUEST_CONTEXT_RESTART;
+            snapshot[5] = 1.0;
+        }
+        state.context_restart_pending = false;
         snapshot[0] = f32::from(flags);
         Some(snapshot)
     }
@@ -324,7 +346,8 @@ impl QuoxRenderer {
 #[cfg(test)]
 mod tests {
     use super::{
-        IME_REQUEST_CURSOR_AREA, IME_REQUEST_ENABLED, ImeRequestMailbox, focused_ime_cursor_area,
+        IME_REQUEST_CONTEXT_RESTART, IME_REQUEST_CURSOR_AREA, IME_REQUEST_ENABLED,
+        ImeRequestMailbox, focused_ime_cursor_area,
     };
     use blitz_dom::{DocumentConfig, Point};
     use blitz_html::HtmlDocument;
@@ -370,6 +393,62 @@ mod tests {
             mailbox.take_snapshot(),
             Some([f32::from(IME_REQUEST_CURSOR_AREA), 5.0, 6.0, 0.0, 0.0, 0.0])
         );
+    }
+
+    #[test]
+    fn ime_request_mailbox_preserves_same_surface_editor_restarts() {
+        let mailbox = ImeRequestMailbox::default();
+
+        mailbox.request_enabled(true);
+        assert_eq!(
+            mailbox.take_snapshot(),
+            Some([f32::from(IME_REQUEST_ENABLED), 0.0, 0.0, 0.0, 0.0, 1.0])
+        );
+
+        // A blur/focus handoff can happen synchronously inside one Blitz event dispatch. The
+        // final boolean remains true, but the host still needs to restart the native context.
+        mailbox.request_enabled(false);
+        mailbox.request_cursor_area([10.0, 20.0, 3.0, 4.0]);
+        mailbox.request_enabled(true);
+        assert_eq!(
+            mailbox.take_snapshot(),
+            Some([
+                f32::from(IME_REQUEST_CURSOR_AREA | IME_REQUEST_CONTEXT_RESTART),
+                10.0,
+                20.0,
+                3.0,
+                4.0,
+                1.0,
+            ])
+        );
+        assert_eq!(mailbox.take_snapshot(), None);
+
+        // Multiple handoffs before a drain only need one restart for the final editor.
+        mailbox.request_enabled(false);
+        mailbox.request_enabled(true);
+        mailbox.request_enabled(false);
+        mailbox.request_enabled(true);
+        assert_eq!(
+            mailbox.take_snapshot(),
+            Some([
+                f32::from(IME_REQUEST_CONTEXT_RESTART),
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+            ])
+        );
+
+        // If the final editor is disabled, the ordinary disable supersedes a pending restart.
+        mailbox.request_enabled(false);
+        mailbox.request_enabled(true);
+        mailbox.request_enabled(false);
+        assert_eq!(
+            mailbox.take_snapshot(),
+            Some([f32::from(IME_REQUEST_ENABLED), 0.0, 0.0, 0.0, 0.0, 0.0])
+        );
+        assert_eq!(mailbox.take_snapshot(), None);
     }
 
     #[test]

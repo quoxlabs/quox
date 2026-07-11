@@ -9,7 +9,7 @@ import {
   KeyRepeatController,
   resolveComposeLocale,
   type TranslatedKey,
-  translateKey,
+  translateWlKeyboardKey,
   type XkbKeyTranslator,
 } from "./keyboard.ts";
 import {
@@ -66,7 +66,14 @@ export class WaylandXkbController {
     return this.#modifiers;
   }
 
-  translate(rawKeycode: number, phase: WaylandKeyPhase, useCompose: boolean): TranslatedKey {
+  /**
+   * Translate a key delivered through wl_keyboard.
+   *
+   * A compositor text service keeps consumed keys and only forwards its edits through
+   * text-input-v3. An ordinary wl_keyboard event is therefore the unconsumed fallback path
+   * and must still pass through the client's Compose state.
+   */
+  translateDeliveredKey(rawKeycode: number, phase: WaylandKeyPhase): TranslatedKey {
     const translator = this.#translator();
     if (!translator) {
       return {
@@ -77,7 +84,7 @@ export class WaylandXkbController {
         isComposing: false,
       };
     }
-    return translateKey(rawKeycode, phase, translator, useCompose ? this.#composeAdapter() : undefined);
+    return translateWlKeyboardKey(rawKeycode, phase, translator, this.#composeAdapter());
   }
 
   pressLogical(rawKeycode: number, logicalKey: string): string {

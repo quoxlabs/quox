@@ -6,13 +6,16 @@ import {
   resolveComposeLocale,
   toXkbKeycode,
   translateKey,
+  translateWlKeyboardKey,
   waylandKeyEditDisposition,
   type XkbKeyTranslator,
 } from "./keyboard.ts";
 import { CURSOR_SHAPE_MANAGER_V1_REQUESTS, WlOp } from "./ffi.ts";
 import { createWaylandSurroundingTextState, TextInputV3Batch, TextInputV3SerialGate } from "./text_input.ts";
-import { keyLocationForCode, normalizeImeCursorArea, validateImeCursorRange } from "../input/mod.ts";
+import { CompositionState, keyLocationForCode, normalizeImeCursorArea, validateImeCursorRange } from "../input/mod.ts";
 import { logicalKeyFromKeysym } from "../linux/mod.ts";
+import { emitWaylandTextInputEdits } from "./text_input_controller.ts";
+import type { WaylandWindow } from "./window.ts";
 import {
   createDefaultCursorPixels,
   DEFAULT_CURSOR_HEIGHT,
@@ -346,6 +349,21 @@ Deno.test("Compose NOTHING falls back to the active xkb layout text", () => {
   assertEquals(result.isComposing, false);
 });
 
+Deno.test("ordinary wl_keyboard events remain the local Compose fallback path", () => {
+  const translator = translatorFor({ keysym: 0x65, keyText: "e", text: "e" });
+  const compose = new FakeCompose(ComposeFeedResult.ACCEPTED, ComposeStatus.COMPOSED, "é");
+
+  assertEquals(translateWlKeyboardKey(18, "press", translator, compose), {
+    rawKeycode: 18,
+    xkbKeycode: 26,
+    keysym: 0x65,
+    key: "é",
+    text: "é",
+    isComposing: false,
+  });
+  assertEquals(compose.feedCount, 1);
+});
+
 Deno.test("xkb control strings stay named keys and are not committed as text", () => {
   const controls = [
     { keysym: 0xff08, keyText: "\b", text: "\b", key: "Backspace" },
@@ -564,6 +582,31 @@ Deno.test("text-input preserves exact nonempty native commit strings", () => {
 
   // The commit itself atomically removes old preedit in the public API.
   assertEquals(batch.done(0).edits, [{ type: "commit", text: "line one\nline two\u0003" }]);
+});
+
+Deno.test("native text-input edits reset pending local Compose before emission", () => {
+  const order: string[] = [];
+  const window = { composition: new CompositionState() } as unknown as WaylandWindow;
+
+  emitWaylandTextInputEdits(
+    {
+      resetLocalCompose: () => order.push("reset-compose"),
+      pushEvent: (event) => order.push(`${event.type}/${event.type === "ime" ? event.kind : ""}`),
+    },
+    window,
+    [{ type: "commit", text: "native" }],
+  );
+  assertEquals(order, ["reset-compose", "ime/commit"]);
+
+  emitWaylandTextInputEdits(
+    {
+      resetLocalCompose: () => order.push("unexpected-reset"),
+      pushEvent: () => order.push("unexpected-event"),
+    },
+    window,
+    [],
+  );
+  assertEquals(order, ["reset-compose", "ime/commit"]);
 });
 
 Deno.test("bare, delete-only, null, and empty batches all clear old preedit", () => {

@@ -110,6 +110,16 @@ export function translateKey(
   }
 }
 
+/** Translate an ordinary wl_keyboard event through local Compose when it is available. */
+export function translateWlKeyboardKey(
+  rawKeycode: number,
+  phase: KeyPhase,
+  translator: XkbKeyTranslator,
+  compose?: ComposeAdapter,
+): TranslatedKey {
+  return translateKey(rawKeycode, phase, translator, compose);
+}
+
 function translatedKeyWithText(base: TranslatedKey, text: string): TranslatedKey {
   const committed = normalizeCommittedText(text);
   return committed === undefined ? base : { ...base, text: committed };

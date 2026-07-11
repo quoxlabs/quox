@@ -43,6 +43,46 @@ export interface WaylandTextInputHost {
   flushDisplay(context: string): void;
 }
 
+/** Apply one compositor-owned text-input batch and abandon any pending local key composition. */
+export function emitWaylandTextInputEdits(
+  host: Pick<WaylandTextInputHost, "pushEvent" | "resetLocalCompose">,
+  window: WaylandWindow,
+  edits: readonly TextInputEdit[],
+): void {
+  // A native edit means the text service owned the corresponding key sequence. Drop any
+  // locally pending dead-key sequence before applying it, while continuing to use local
+  // Compose for ordinary wl_keyboard events that the text service did not consume.
+  if (edits.length > 0) host.resetLocalCompose();
+  for (const edit of edits) {
+    switch (edit.type) {
+      case "preedit": {
+        const update = edit.text.length === 0
+          ? window.composition.cancel()
+          : window.composition.update(edit.text, edit.cursorRange);
+        if (update !== undefined) {
+          host.pushEvent(createImePreeditEvent(window, update.text, update.cursorRange));
+        }
+        break;
+      }
+      case "deleteSurrounding": {
+        const event = createImeDeleteSurroundingEvent(window, edit.beforeBytes, edit.afterBytes);
+        if (event !== undefined) host.pushEvent(event);
+        break;
+      }
+      case "commit": {
+        const event = createImeCommitEvent(window, edit.text);
+        if (event !== undefined) {
+          window.composition.commit();
+          host.pushEvent(event);
+        }
+        break;
+      }
+      default:
+        assertNever(edit);
+    }
+  }
+}
+
 export class WaylandTextInputController {
   #manager: Deno.PointerObject | null = null;
   #seat: Deno.PointerObject | null = null;
@@ -417,34 +457,7 @@ export class WaylandTextInputController {
   }
 
   #emitEdits(window: WaylandWindow, edits: TextInputEdit[]): void {
-    for (const edit of edits) {
-      switch (edit.type) {
-        case "preedit": {
-          const update = edit.text.length === 0
-            ? window.composition.cancel()
-            : window.composition.update(edit.text, edit.cursorRange);
-          if (update !== undefined) {
-            this.host.pushEvent(createImePreeditEvent(window, update.text, update.cursorRange));
-          }
-          break;
-        }
-        case "deleteSurrounding": {
-          const event = createImeDeleteSurroundingEvent(window, edit.beforeBytes, edit.afterBytes);
-          if (event !== undefined) this.host.pushEvent(event);
-          break;
-        }
-        case "commit": {
-          const event = createImeCommitEvent(window, edit.text);
-          if (event !== undefined) {
-            window.composition.commit();
-            this.host.pushEvent(event);
-          }
-          break;
-        }
-        default:
-          assertNever(edit);
-      }
-    }
+    emitWaylandTextInputEdits(this.host, window, edits);
   }
 
   #destroyManager(manager: Deno.PointerObject): void {

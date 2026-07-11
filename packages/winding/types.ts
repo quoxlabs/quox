@@ -84,7 +84,13 @@ export type ImeCursorRange = readonly [start: number, end: number];
 
 /** Native text-input offsets and lengths are UTF-8 byte counts. */
 export type ImeEvent =
-  | (WindowEvent<"ime"> & { kind: "enabled" | "disabled" })
+  | (WindowEvent<"ime"> & {
+    /**
+     * Reports the backend's focused native-text-input state. Wayland reports a locally
+     * committed protocol request because text-input-v3 has no input-method acknowledgement.
+     */
+    kind: "enabled" | "disabled";
+  })
   | (WindowEvent<"ime"> & {
     kind: "preedit";
     text: string;

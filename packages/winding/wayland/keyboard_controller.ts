@@ -252,8 +252,7 @@ export class WaylandKeyboardController {
     const window = this.#focus;
     if (!window) return;
     const wasComposing = window.composition.active;
-    const nativeTextInput = window.imeActivation.active;
-    const translated = this.#input.translate(rawKeycode, phase, !nativeTextInput);
+    const translated = this.#input.translateDeliveredKey(rawKeycode, phase);
     const modifiers = this.#input.modifiers;
     const code = domCodeFromEvdev(rawKeycode);
     if (phase === "release") {
@@ -286,7 +285,6 @@ export class WaylandKeyboardController {
       ...modifiers,
     }));
 
-    if (nativeTextInput) return;
     if (translated.isComposing) {
       window.composition.start();
       return;

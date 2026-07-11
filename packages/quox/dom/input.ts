@@ -9,9 +9,10 @@ import type {
   ResizeEvent as WindingResizeEvent,
   UIEvent as WindingUIEvent,
   WheelEvent as WindingWheelEvent,
-  Window as WindingWindow,
 } from "@quoxlabs/winding";
 import { KeyEventFlag, KeyModifierMask, PointerModifierMask } from "../lib/quox.js";
+
+export { applyImeRequestSnapshot, IME_REQUEST_FLAG } from "./ime_requests.ts";
 
 type WithoutWindow<Event> = Event extends { window: unknown } ? Omit<Event, "window"> : never;
 
@@ -350,27 +351,5 @@ export function notifyInputListeners(
     } catch (error) {
       reportError(error);
     }
-  }
-}
-
-export const IME_REQUEST_FLAG = {
-  cursorArea: 1 << 0,
-  enabled: 1 << 1,
-} as const;
-
-/** Apply one atomic Rust IME-request snapshot, always placing geometry before enabling. */
-export function applyImeRequestSnapshot(window: WindingWindow, snapshot: Float32Array): void {
-  if (snapshot.length !== 6) {
-    throw new RangeError(`invalid IME request snapshot length: ${snapshot.length}`);
-  }
-  const flags = Math.trunc(snapshot[0]);
-  if (!Number.isFinite(snapshot[0]) || flags !== snapshot[0] || (flags & ~3) !== 0) {
-    throw new RangeError(`invalid IME request flags: ${snapshot[0]}`);
-  }
-  if (flags & IME_REQUEST_FLAG.cursorArea) {
-    window.setImeCursorArea(snapshot[1], snapshot[2], snapshot[3], snapshot[4]);
-  }
-  if (flags & IME_REQUEST_FLAG.enabled) {
-    window.setImeEnabled(snapshot[5] !== 0);
   }
 }
