@@ -900,6 +900,18 @@ Deno.test("authoritative IMM result commits over fallback and suppresses its WM_
   ]);
 });
 
+Deno.test("authoritative IMM results preserve control-containing text", () => {
+  const text = "line\r\n\t\u0003tail";
+  const compositionData = new Map<number, Uint8Array | number>([
+    [GCS_RESULTSTR, utf16Le(text)],
+  ]);
+  const harness = createInputControllerHarness({ compositionData });
+  startImeComposition(harness);
+  harness.controller.handleMessage(harness.window, WM.IME_COMPOSITION, 0n, GCS_RESULTSTR);
+
+  assertEquals(textImeEvents(harness.events), [{ kind: "commit", text }]);
+});
+
 Deno.test("explicit IMM cancellation discards fallback text before END", () => {
   const harness = createInputControllerHarness();
   startImeComposition(harness);

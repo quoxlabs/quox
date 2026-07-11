@@ -1,4 +1,4 @@
-import { normalizeCommittedText } from "../input/keyboard.ts";
+import { normalizeKeyboardText } from "../input/keyboard.ts";
 
 export type LinuxKeysym = number | bigint;
 
@@ -139,7 +139,7 @@ export function logicalKeyFromKeysym(keysym: LinuxKeysym, lookupText = ""): stri
   if (value === undefined) return "Unidentified";
 
   if (KEYPAD_PRINTABLE_KEYSYMS.has(value)) {
-    const layoutText = normalizeCommittedText(lookupText);
+    const layoutText = normalizeKeyboardText(lookupText);
     if (layoutText !== undefined) return layoutText;
   }
   const named = NAMED_KEYSYMS.get(value);
@@ -147,8 +147,8 @@ export function logicalKeyFromKeysym(keysym: LinuxKeysym, lookupText = ""): stri
   if (value >= 0xffbe && value <= 0xffe0) return `F${value - 0xffbd}`;
   if (isDeadKeysym(value)) return "Dead";
 
-  return normalizeCommittedText(lookupText) ??
-    normalizeCommittedText(unicodeTextFromKeysym(value)) ??
+  return normalizeKeyboardText(lookupText) ??
+    normalizeKeyboardText(unicodeTextFromKeysym(value)) ??
     "Unidentified";
 }
 

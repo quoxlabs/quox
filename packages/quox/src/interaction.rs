@@ -174,9 +174,6 @@ fn logical_key(key: &str) -> Key {
 
 fn is_insertable_text(text: &str) -> bool {
     !text.is_empty()
-        && !text
-            .chars()
-            .any(|character| character <= '\u{1f}' || ('\u{7f}'..='\u{9f}').contains(&character))
 }
 
 fn key_location(location: u32) -> Location {
@@ -873,10 +870,9 @@ mod tests {
     }
 
     #[test]
-    fn committed_text_rejects_control_ranges() {
+    fn native_commits_preserve_nonempty_control_text() {
         assert!(!is_insertable_text(""));
-        assert!(!is_insertable_text("\u{3}"));
-        assert!(!is_insertable_text("\u{85}"));
+        assert!(is_insertable_text("line\nfeed\t\u{3}\u{85}"));
         assert!(is_insertable_text("ß日本"));
     }
 

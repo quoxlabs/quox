@@ -1,4 +1,4 @@
-import { keyLocationForCode, normalizeCommittedText } from "./keyboard.ts";
+import { keyLocationForCode, normalizeKeyboardText } from "./keyboard.ts";
 
 Deno.test("key locations distinguish sided modifiers, keypad keys, and arrows", () => {
   assertEquals(keyLocationForCode("ShiftLeft"), 1);
@@ -12,13 +12,13 @@ Deno.test("key locations distinguish sided modifiers, keypad keys, and arrows", 
 });
 
 Deno.test("committed text rejects C0, C1, and DEL without rejecting Unicode text", () => {
-  assertEquals(normalizeCommittedText(""), undefined);
-  assertEquals(normalizeCommittedText("\u0003"), undefined);
-  assertEquals(normalizeCommittedText("line\nfeed"), undefined);
-  assertEquals(normalizeCommittedText("\u007f"), undefined);
-  assertEquals(normalizeCommittedText("\u0085"), undefined);
-  assertEquals(normalizeCommittedText("ß"), "ß");
-  assertEquals(normalizeCommittedText("👩‍💻"), "👩‍💻");
+  assertEquals(normalizeKeyboardText(""), undefined);
+  assertEquals(normalizeKeyboardText("\u0003"), undefined);
+  assertEquals(normalizeKeyboardText("line\nfeed"), undefined);
+  assertEquals(normalizeKeyboardText("\u007f"), undefined);
+  assertEquals(normalizeKeyboardText("\u0085"), undefined);
+  assertEquals(normalizeKeyboardText("ß"), "ß");
+  assertEquals(normalizeKeyboardText("👩‍💻"), "👩‍💻");
 });
 
 function assertEquals<T>(actual: T, expected: T): void {

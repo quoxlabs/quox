@@ -19,7 +19,7 @@ import {
   EventQueue,
   keyLocationForCode,
   NativeEventClock,
-  normalizeCommittedText,
+  normalizeKeyboardText,
   PressedLogicalKeyCache,
 } from "../input/mod.ts";
 import { domCodeFromXkbName } from "../linux/mod.ts";
@@ -672,7 +672,7 @@ class X11Library implements Library {
             if (type === XEventType.KeyPress) {
               const lookup = this.input.lookup(window.input, eventPointer);
               this.input.throwIfCallbackFailed();
-              const text = normalizeCommittedText(lookup.text ?? "");
+              const text = normalizeKeyboardText(lookup.text ?? "");
               if (text !== undefined) window.input.commit(text);
             }
             if (lookupStaged) {
@@ -704,7 +704,7 @@ class X11Library implements Library {
           const repeat = window.pressedKeys.has(keycode);
           const key = window.pressedKeys.press(keycode, lookup.key);
           const text = x11CommittedText(
-            normalizeCommittedText(lookup.text ?? ""),
+            normalizeKeyboardText(lookup.text ?? ""),
             modifiers,
             wasComposing,
             window.input.composing,

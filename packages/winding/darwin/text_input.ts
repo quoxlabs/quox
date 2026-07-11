@@ -1,4 +1,4 @@
-import { normalizeCommittedText } from "../input/mod.ts";
+import { normalizeKeyboardText } from "../input/mod.ts";
 
 /** Selectors implemented by WindingContentView's NSTextInputClient bridge. */
 export const REQUIRED_TEXT_INPUT_SELECTORS = [
@@ -131,7 +131,7 @@ export function domKeyText(value: string): string | undefined {
 
 /** Return printable text only; control and AppKit private-use key values are not text. */
 export function printableText(value: string): string | undefined {
-  const normalized = normalizeCommittedText(value);
+  const normalized = normalizeKeyboardText(value);
   if (normalized === undefined) return undefined;
   for (const character of value) {
     const scalar = character.codePointAt(0)!;

@@ -1,7 +1,7 @@
 /** Pure Win32 keyboard, AltGr, and WM_CHAR helpers. This module performs no FFI. */
 
 import type { KeyEditDisposition, KeyEvent } from "../types.ts";
-import { normalizeCommittedText } from "../input/keyboard.ts";
+import { normalizeKeyboardText } from "../input/keyboard.ts";
 import { WM } from "./ffi.ts";
 
 const INT32_MIN = -0x80000000;
@@ -746,7 +746,7 @@ export function normalizeWin32PrintableLogicalKey(candidate: string | undefined)
 
 function acceptedWin32TranslationText(text: string | undefined): string | undefined {
   if (text === undefined || !isUnicodeScalarText(text)) return undefined;
-  return normalizeCommittedText(text);
+  return normalizeKeyboardText(text);
 }
 
 /** Translate a native key using the active Windows keyboard layout. */
@@ -899,7 +899,7 @@ export function logicalKeyFromVirtualKey(
 
 /** Text accepted from WM_CHAR/ToUnicodeEx. Key controls are dispatched separately. */
 export function isCommitText(text: string): boolean {
-  return normalizeCommittedText(text) !== undefined;
+  return normalizeKeyboardText(text) !== undefined;
 }
 
 export function win32KeyIdentity(virtualKey: number, lParam: number | bigint): string {

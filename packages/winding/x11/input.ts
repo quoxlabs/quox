@@ -1,5 +1,5 @@
 import type { KeyEditDisposition, KeyModifiers } from "../types.ts";
-import { normalizeCommittedText } from "../input/mod.ts";
+import { normalizeKeyboardText } from "../input/mod.ts";
 import { NotifyInferior, NotifyNormal, NotifyWhileGrabbed, XEventType } from "./ffi.ts";
 
 export interface X11ModifierMapping {
@@ -45,13 +45,13 @@ export function x11ModifierSnapshot(
 export function fallbackLookupText(bytes: Uint8Array, keysymText: string): string | undefined {
   if (bytes.length > 0) {
     try {
-      return normalizeCommittedText(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+      return normalizeKeyboardText(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
     } catch {
       // XLookupString can return legacy single-byte text. The keysym is a more
       // reliable Unicode source for that case.
     }
   }
-  return normalizeCommittedText(keysymText);
+  return normalizeKeyboardText(keysymText);
 }
 
 /** Decide whether XIM owns the edit associated with an unfiltered key press. */

@@ -1,4 +1,4 @@
-import { normalizeCommittedText } from "../input/mod.ts";
+import { normalizeKeyboardText } from "../input/mod.ts";
 import { logicalKeyFromKeysym } from "../linux/mod.ts";
 import { XEventType } from "./ffi.ts";
 import {
@@ -54,11 +54,11 @@ Deno.test("X11 logical keys use KeySym names for controls and named keys", () =>
 });
 
 Deno.test("X11 committed text rejects shortcut control bytes", () => {
-  assertEquals(normalizeCommittedText(""), undefined);
-  assertEquals(normalizeCommittedText("\u0003"), undefined);
-  assertEquals(normalizeCommittedText("line\nfeed"), undefined);
-  assertEquals(normalizeCommittedText("ß"), "ß");
-  assertEquals(normalizeCommittedText("👩‍💻"), "👩‍💻");
+  assertEquals(normalizeKeyboardText(""), undefined);
+  assertEquals(normalizeKeyboardText("\u0003"), undefined);
+  assertEquals(normalizeKeyboardText("line\nfeed"), undefined);
+  assertEquals(normalizeKeyboardText("ß"), "ß");
+  assertEquals(normalizeKeyboardText("👩‍💻"), "👩‍💻");
 });
 
 Deno.test("X11 fallback lookup keeps controls out while retaining layout text", () => {

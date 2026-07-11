@@ -1,7 +1,7 @@
 /** Pure Wayland keyboard, XKB Compose, and repeat state. */
 
 import type { KeyEditDisposition, KeyModifiers } from "../types.ts";
-import { normalizeCommittedText, PressedLogicalKeyCache } from "../input/mod.ts";
+import { normalizeKeyboardText, PressedLogicalKeyCache } from "../input/mod.ts";
 import { logicalKeyFromKeysym } from "../linux/mod.ts";
 
 export type EnvironmentReader = (name: "LC_ALL" | "LC_CTYPE" | "LANG") => string | undefined;
@@ -284,7 +284,7 @@ export function translateKey(
     case ComposeStatus.COMPOSED: {
       const text = compose.utf8();
       compose.reset();
-      const committed = normalizeCommittedText(text);
+      const committed = normalizeKeyboardText(text);
       return committed === undefined ? base : { ...base, key: committed, text: committed };
     }
     case ComposeStatus.CANCELLED:
@@ -306,7 +306,7 @@ export function translateWlKeyboardKey(
 }
 
 function translatedKeyWithText(base: TranslatedKey, text: string): TranslatedKey {
-  const committed = normalizeCommittedText(text);
+  const committed = normalizeKeyboardText(text);
   return committed === undefined ? base : { ...base, text: committed };
 }
 

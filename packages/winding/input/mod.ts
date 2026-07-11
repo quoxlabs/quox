@@ -10,7 +10,7 @@ export {
   validateImeCursorArea,
   validateImeCursorRange,
 } from "./ime.ts";
-export { keyLocationForCode, normalizeCommittedText } from "./keyboard.ts";
+export { keyLocationForCode, normalizeKeyboardText } from "./keyboard.ts";
 export { PressedLogicalKeyCache } from "./pressed_keys.ts";
 export { type ImeActivationActions, ImeActivationState, type ImeActivationTransition } from "./activation.ts";
 export { CompositionState, discardTrailingPreeditClear, type PreeditUpdate } from "./composition.ts";

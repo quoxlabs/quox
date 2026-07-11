@@ -14,10 +14,10 @@ export function keyLocationForCode(code: string): KeyLocation {
 }
 
 /**
- * Return non-empty committed keyboard text while rejecting shortcut/control
- * results. C0, C1, and DEL code points are filtered.
+ * Return non-empty text derived from an ordinary keyboard lookup while rejecting
+ * shortcut/control results. Native IME commits do not pass through this filter.
  */
-export function normalizeCommittedText(text: string): string | undefined {
+export function normalizeKeyboardText(text: string): string | undefined {
   if (text.length === 0) return undefined;
   for (const character of text) {
     const codePoint = character.codePointAt(0)!;

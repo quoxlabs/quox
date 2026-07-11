@@ -806,7 +806,7 @@ export class Win32InputController {
   }
 
   #applyImeUpdate(window: Win32InputWindow, state: WindowInputState, update: ImeCompositionUpdate): void {
-    if (update.result !== undefined && isCommitText(update.result)) {
+    if (update.result !== undefined && update.result.length > 0) {
       state.insertCharAssembler.reset();
       state.insertOnType.authoritative();
       state.composition.commit();
