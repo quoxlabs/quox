@@ -49,12 +49,13 @@ withAutoreleasePool(() => {
   runCase("modifier transitions never query key-only character properties", testModifierTransitions);
   runCase("blit copies pixels into storage retained by Core Graphics", testBlitStorageLifetime);
   runCase("windows opt into ordinary mouse-move delivery", testMouseMoveDeliveryEnabled);
+  runCase("closed windows and libraries reject every native operation", testClosedMethodGuards);
   runCase(
     "NSTextInputClient protocol and struct-return ABIs work through Objective-C dispatch",
     testProtocolAndStructAbis,
   );
   runCase("text input survives repeated library and window lifecycles", testRepeatedLifecycles);
-  console.log("Darwin native smoke: 7 passed");
+  console.log("Darwin native smoke: 8 passed");
 });
 
 function testTextCallbacks(): void {
@@ -402,6 +403,31 @@ function testMouseMoveDeliveryEnabled(): void {
   });
 }
 
+function testClosedMethodGuards(): void {
+  const library = load();
+  const window = library.openWindow(0, 0, 2, 1) as NativeWindow & { cancelComposition(): void };
+  window.close();
+
+  const closedWindowOperations = [
+    () => window.setTitle("closed"),
+    () => window.blit(new Uint8Array(8), 2, 1),
+    () => window.setImeEnabled(true),
+    () => window.setImeCursorArea(0, 0, 0, 0),
+    () => window.setImeSurroundingText("", 0, 0),
+    () => window.cancelComposition(),
+  ];
+  for (const operation of closedWindowOperations) {
+    assertThrowsMessage(operation, "window is closed");
+  }
+  window.close();
+
+  library.close();
+  assertThrowsMessage(() => library.openWindow(), "library is closed");
+  assertThrowsMessage(() => library.event(), "library is closed");
+  assertThrowsMessage(() => window.setTitle("library closed"), "window is closed");
+  library.close();
+}
+
 function testProtocolAndStructAbis(): void {
   withNativeWindow(64, 48, (_library, window) => {
     const handles: Closeable[] = [];
@@ -658,6 +684,19 @@ function closeAll(handles: Closeable[]): void {
 
 function assert(condition: unknown, message = "assertion failed"): asserts condition {
   if (!condition) throw new Error(message);
+}
+
+function assertThrowsMessage(operation: () => unknown, expected: string): void {
+  let thrown: unknown;
+  try {
+    operation();
+  } catch (error) {
+    thrown = error;
+  }
+  assert(
+    thrown instanceof Error && thrown.message.includes(expected),
+    `expected error containing ${JSON.stringify(expected)}, got ${String(thrown)}`,
+  );
 }
 
 function assertEquals(actual: unknown, expected: unknown): void {

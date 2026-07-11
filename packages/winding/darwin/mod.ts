@@ -722,16 +722,15 @@ class DarwinWindow implements Window, DarwinNativeResponder {
   }
 
   setImeEnabled(enabled: boolean): void {
-    this.lib.assertMainThread();
-    if (this.#closed || enabled === this.inputState.imeEnabled) return;
+    this.#assertOpen();
+    if (enabled === this.inputState.imeEnabled) return;
     this.inputState.setImeEnabled(enabled);
     this.#flushInputState();
     if (!enabled) this.#discardNativeMarkedText();
   }
 
   setImeCursorArea(x: number, y: number, width: number, height: number): void {
-    this.lib.assertMainThread();
-    if (this.#closed) return;
+    this.#assertOpen();
     this.inputState.setCursorArea(x, y, width, height);
     const { sel, send } = this.lib.ffi;
     const inputContext = send.id(this.contentView, sel("inputContext"));
@@ -739,14 +738,12 @@ class DarwinWindow implements Window, DarwinNativeResponder {
   }
 
   setImeSurroundingText(text: string, selectionStartBytes: number, selectionEndBytes: number): void {
-    this.lib.assertMainThread();
-    if (this.#closed) return;
+    this.#assertOpen();
     this.inputState.setSurroundingText(text, selectionStartBytes, selectionEndBytes);
   }
 
   cancelComposition(): void {
-    this.lib.assertMainThread();
-    if (this.#closed) return;
+    this.#assertOpen();
     this.inputState.cancelComposition();
     this.#flushInputState();
     this.#discardNativeMarkedText();
@@ -815,7 +812,7 @@ class DarwinWindow implements Window, DarwinNativeResponder {
   }
 
   setTitle(title: string): void {
-    this.lib.assertMainThread();
+    this.#assertOpen();
     const { sel, send } = this.lib.ffi;
     const titleString = makeNSString(this.lib.ffi, title);
     send.void_id(this.nsWindow, sel("setTitle:"), titleString);
@@ -823,7 +820,7 @@ class DarwinWindow implements Window, DarwinNativeResponder {
   }
 
   blit(rgba: Uint8Array, width: number, height: number): void {
-    this.lib.assertMainThread();
+    this.#assertOpen();
     const { cf, cg, sel, send } = this.lib.ffi;
     // CFDataCreate copies the bytes into immutable native-owned storage. The
     // provider retains that storage until the last CGImage/CALayer reference
@@ -888,6 +885,11 @@ class DarwinWindow implements Window, DarwinNativeResponder {
       throw new AggregateError(errors, "winding(darwin): errors while closing window");
     }
   }
+
+  #assertOpen(): void {
+    if (this.#closed) throw new Error("winding(darwin): window is closed");
+    this.lib.assertOpen();
+  }
 }
 
 const BUTTONS = [, "left", "middle", "right"] as const;
@@ -922,6 +924,11 @@ class DarwinLibrary implements Library {
     this.ffi.assertMainThread();
   }
 
+  assertOpen(): void {
+    if (this.#closed) throw new Error("winding(darwin): library is closed");
+    this.assertMainThread();
+  }
+
   registerWindow(window: DarwinWindow): void {
     this.windows.set(window.id, window);
   }
@@ -944,14 +951,12 @@ class DarwinLibrary implements Library {
   }
 
   openWindow(x = 0, y = 0, w = 800, h = 600): DarwinWindow {
-    this.assertMainThread();
-    if (this.#closed) throw new Error("winding(darwin): library is closed");
+    this.assertOpen();
     return new DarwinWindow(this, x, y, w, h);
   }
 
   event(): UIEvent | undefined {
-    this.assertMainThread();
-    if (this.#closed) return undefined;
+    this.assertOpen();
     this.nativeClasses.throwIfCallbackFailed();
     const { getClass, sel, send } = this.ffi;
     if (this.#queue.length) return this.#queue.shift();
