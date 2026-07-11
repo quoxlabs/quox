@@ -336,6 +336,7 @@ export function matchesWin32KeyMessage(
 
 /** Virtual-key values used by the Win32 input implementation. */
 export const VK = {
+  CANCEL: 0x03,
   BACK: 0x08,
   TAB: 0x09,
   CLEAR: 0x0c,
@@ -595,6 +596,7 @@ export function translateLogicalKey(
   keyboardState: Uint8Array,
   adapter: ToUnicodeAdapter,
   preserveCtrlAlt = isAltGraphActive(keyboardState),
+  languageId?: number,
 ): LogicalKeyTranslation {
   const modifiers = keyboardModifiers(keyboardState);
   const state = keyboardStateForTranslation(keyboardState, preserveCtrlAlt);
@@ -604,7 +606,7 @@ export function translateLogicalKey(
   try {
     translation = adapter.toUnicode(virtualKey, scanCode, state, TO_UNICODE_NO_STATE_CHANGE);
   } catch {
-    return { key: logicalKeyFromVirtualKey(virtualKey), dead: false, modifiers };
+    return { key: logicalKeyFromVirtualKey(virtualKey, undefined, languageId), dead: false, modifiers };
   }
 
   if (translation.result < 0) return { key: "Dead", dead: true, modifiers };
@@ -621,16 +623,16 @@ export function translateLogicalKey(
       if (fallback.result < 0) return { key: "Dead", dead: true, modifiers };
       const fallbackText = fallback.result > 0 ? fallback.text.slice(0, fallback.result) : undefined;
       return {
-        key: logicalKeyFromVirtualKey(virtualKey, fallbackText),
+        key: logicalKeyFromVirtualKey(virtualKey, fallbackText, languageId),
         dead: false,
         modifiers,
       };
     } catch {
-      return { key: logicalKeyFromVirtualKey(virtualKey), dead: false, modifiers };
+      return { key: logicalKeyFromVirtualKey(virtualKey, undefined, languageId), dead: false, modifiers };
     }
   }
   return {
-    key: logicalKeyFromVirtualKey(virtualKey, translatedText),
+    key: logicalKeyFromVirtualKey(virtualKey, translatedText, languageId),
     ...(text === undefined ? {} : { text }),
     dead: false,
     modifiers,
@@ -638,6 +640,7 @@ export function translateLogicalKey(
 }
 
 const NAMED_VIRTUAL_KEYS = new Map<number, string>([
+  [VK.CANCEL, "Cancel"],
   [VK.BACK, "Backspace"],
   [VK.TAB, "Tab"],
   [VK.CLEAR, "Clear"],
@@ -647,10 +650,8 @@ const NAMED_VIRTUAL_KEYS = new Map<number, string>([
   [VK.MENU, "Alt"],
   [VK.PAUSE, "Pause"],
   [VK.CAPITAL, "CapsLock"],
-  [VK.KANA, "KanaMode"],
   [VK.JUNJA, "JunjaMode"],
   [VK.FINAL, "FinalMode"],
-  [VK.HANJA, "HanjaMode"],
   [VK.ESCAPE, "Escape"],
   [VK.CONVERT, "Convert"],
   [VK.NONCONVERT, "NonConvert"],
@@ -699,7 +700,7 @@ const NAMED_VIRTUAL_KEYS = new Map<number, string>([
   [VK.MEDIA_STOP, "MediaStop"],
   [VK.MEDIA_PLAY_PAUSE, "MediaPlayPause"],
   [VK.LAUNCH_MAIL, "LaunchMail"],
-  [VK.LAUNCH_MEDIA_SELECT, "MediaSelect"],
+  [VK.LAUNCH_MEDIA_SELECT, "LaunchMediaPlayer"],
   [VK.LAUNCH_APP1, "LaunchApplication1"],
   [VK.LAUNCH_APP2, "LaunchApplication2"],
   [VK.PROCESSKEY, "Process"],
@@ -713,8 +714,23 @@ const NAMED_VIRTUAL_KEYS = new Map<number, string>([
   [VK.OEM_CLEAR, "Clear"],
 ]);
 
+/** Extract the LANGID stored in an HKL's low word. */
+export function win32LanguageIdFromKeyboardLayout(layout: number | bigint | undefined): number | undefined {
+  return layout === undefined ? undefined : Number(BigInt.asUintN(16, BigInt(layout)));
+}
+
 /** Map a virtual key and optional ToUnicodeEx output to a DOM-style logical key. */
-export function logicalKeyFromVirtualKey(virtualKey: number, translatedText?: string): string {
+export function logicalKeyFromVirtualKey(
+  virtualKey: number,
+  translatedText?: string,
+  languageId?: number,
+): string {
+  if (virtualKey === VK.KANA || virtualKey === VK.HANJA) {
+    const primaryLanguage = languageId === undefined ? undefined : languageId & 0x03ff;
+    if (primaryLanguage === 0x11) return virtualKey === VK.KANA ? "KanaMode" : "KanjiMode";
+    if (primaryLanguage === 0x12) return virtualKey === VK.KANA ? "HangulMode" : "HanjaMode";
+    return "Unidentified";
+  }
   const named = NAMED_VIRTUAL_KEYS.get(virtualKey);
   if (named !== undefined) return named;
   if (virtualKey >= VK.F1 && virtualKey <= VK.F24) return `F${virtualKey - VK.F1 + 1}`;

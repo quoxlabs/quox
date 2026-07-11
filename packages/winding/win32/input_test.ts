@@ -25,6 +25,7 @@ import {
   Win32ImeAssociationState,
   win32KeyEditDisposition,
   win32KeyIdentity,
+  win32LanguageIdFromKeyboardLayout,
   Win32MessageQueueGate,
   Win32MouseCaptureState,
   Win32MouseTrackingState,
@@ -1073,10 +1074,130 @@ Deno.test("physical codes determine DOM key locations", () => {
 
 Deno.test("logical virtual-key mapping covers named, function, translated, and unknown keys", () => {
   assertEquals(logicalKeyFromVirtualKey(VK.BACK, "\b"), "Backspace");
+  assertEquals(logicalKeyFromVirtualKey(VK.CANCEL), "Cancel");
+  assertEquals(logicalKeyFromVirtualKey(VK.LAUNCH_MEDIA_SELECT), "LaunchMediaPlayer");
   assertEquals(logicalKeyFromVirtualKey(VK.F1 + 23), "F24");
   assertEquals(logicalKeyFromVirtualKey(0x59, "z"), "z");
   assertEquals(logicalKeyFromVirtualKey(0xba, "ö"), "ö");
   assertEquals(logicalKeyFromVirtualKey(VK.PACKET), "Unidentified");
+});
+
+Deno.test("Win32 language-mode keys use the active HKL LANGID without guessing unknown aliases", () => {
+  assertEquals(win32LanguageIdFromKeyboardLayout(0x7fff12340411n), 0x0411);
+  assertEquals(win32LanguageIdFromKeyboardLayout(BigInt.asIntN(64, 0xffffffffffff0412n)), 0x0412);
+  assertEquals(win32LanguageIdFromKeyboardLayout(undefined), undefined);
+
+  assertEquals(logicalKeyFromVirtualKey(VK.KANA, undefined, 0x0411), "KanaMode");
+  assertEquals(logicalKeyFromVirtualKey(VK.HANJA, undefined, 0x0411), "KanjiMode");
+  assertEquals(logicalKeyFromVirtualKey(VK.KANA, undefined, 0x0412), "HangulMode");
+  assertEquals(logicalKeyFromVirtualKey(VK.HANJA, undefined, 0x0412), "HanjaMode");
+  assertEquals(logicalKeyFromVirtualKey(VK.KANA, "x", 0x0409), "Unidentified");
+  assertEquals(logicalKeyFromVirtualKey(VK.HANJA), "Unidentified");
+});
+
+Deno.test("Win32 translation keeps alias language through zero and failed ToUnicode fallbacks", () => {
+  const state = new Uint8Array(256);
+  assertEquals(
+    translateLogicalKey(
+      VK.KANA,
+      makeKeyLParam(0x70),
+      state,
+      {
+        toUnicode: () => ({ result: 0, text: "" }),
+      },
+      false,
+      0x0412,
+    ).key,
+    "HangulMode",
+  );
+  assertEquals(
+    translateLogicalKey(
+      VK.HANJA,
+      makeKeyLParam(0x71),
+      state,
+      {
+        toUnicode: () => {
+          throw new Error("layout disappeared");
+        },
+      },
+      false,
+      0x0411,
+    ).key,
+    "KanjiMode",
+  );
+
+  const ctrlAlt = keyboardState([[VK.CONTROL, 0x80], [VK.MENU, 0x80]]);
+  assertEquals(
+    translateLogicalKey(
+      VK.KANA,
+      makeKeyLParam(0x72),
+      ctrlAlt,
+      {
+        toUnicode: () => ({ result: 0, text: "" }),
+      },
+      true,
+      0x0412,
+    ).key,
+    "HangulMode",
+  );
+});
+
+Deno.test("Win32 layout aliases retain keydown identity through repeats, release, and layout change", () => {
+  const behavior: FakeImmBehavior = { keyboardLayout: 0x0411n };
+  const harness = createInputControllerHarness(behavior);
+  harness.controller.attach(harness.window);
+  const initial = makeKeyLParam(0x70);
+  const repeated = makeKeyLParam(0x70, { previous: true });
+  harness.controller.handleMessage(harness.window, WM.KEYDOWN, VK.KANA, initial);
+  behavior.keyboardLayout = 0x0412n;
+  harness.controller.handleMessage(harness.window, WM.INPUTLANGCHANGE, 0n, 0n);
+  harness.controller.handleMessage(harness.window, WM.KEYDOWN, VK.KANA, repeated);
+  harness.controller.handleMessage(harness.window, WM.KEYUP, VK.KANA, repeated);
+  harness.controller.handleMessage(harness.window, WM.KEYDOWN, VK.KANA, initial);
+  harness.controller.handleMessage(harness.window, WM.KEYUP, VK.HANJA, makeKeyLParam(0x71));
+  behavior.keyboardLayout = 0x0411n;
+  harness.controller.handleMessage(harness.window, WM.KEYDOWN, VK.HANJA, makeKeyLParam(0x71));
+
+  assertEquals(
+    harness.events.filter((event) => event.type === "keydown" || event.type === "keyup").map((event) => ({
+      type: event.type,
+      key: event.key,
+      code: event.code,
+      location: event.location,
+      repeat: event.type === "keydown" ? event.repeat : undefined,
+    })),
+    [
+      { type: "keydown", key: "KanaMode", code: "KanaMode", location: 0, repeat: false },
+      { type: "keydown", key: "KanaMode", code: "KanaMode", location: 0, repeat: true },
+      { type: "keyup", key: "KanaMode", code: "KanaMode", location: 0, repeat: undefined },
+      { type: "keydown", key: "HangulMode", code: "KanaMode", location: 0, repeat: false },
+      { type: "keyup", key: "HanjaMode", code: "Lang2", location: 0, repeat: undefined },
+      { type: "keydown", key: "KanjiMode", code: "Lang2", location: 0, repeat: false },
+    ],
+  );
+});
+
+Deno.test("Win32 emits corrected Cancel and media logical keys with physical codes", () => {
+  const harness = createInputControllerHarness();
+  harness.controller.attach(harness.window);
+  harness.controller.handleMessage(harness.window, WM.KEYDOWN, VK.CANCEL, makeKeyLParam(0x45));
+  harness.controller.handleMessage(
+    harness.window,
+    WM.KEYDOWN,
+    VK.LAUNCH_MEDIA_SELECT,
+    makeKeyLParam(0x6d, { extended: true }),
+  );
+  assertEquals(
+    harness.events.filter((event) => event.type === "keydown").map((event) => ({
+      key: event.key,
+      code: event.code,
+      location: event.location,
+    })),
+    [
+      { key: "Cancel", code: "Pause", location: 0 },
+      { key: "LaunchMediaPlayer", code: "MediaSelect", location: 0 },
+    ],
+  );
 });
 
 Deno.test("injected ToUnicode translation follows the active layout and uses the non-mutating flag", () => {
@@ -1713,6 +1834,7 @@ interface FakeImmBehavior {
   onNotifyIme?: () => void;
   devicePixelRatio?: number;
   defaultWindowResult?: bigint;
+  keyboardLayout?: bigint;
 }
 
 function createInputControllerHarness(behavior: FakeImmBehavior = {}) {
@@ -1818,6 +1940,7 @@ function createInputControllerHarness(behavior: FakeImmBehavior = {}) {
         return copied;
       },
     }),
+    () => behavior.keyboardLayout,
   );
   return { calls, controller, events, window };
 }

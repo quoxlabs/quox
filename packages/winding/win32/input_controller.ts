@@ -65,6 +65,7 @@ import {
   Win32ImeAssociationState,
   win32KeyEditDisposition,
   win32KeyIdentity,
+  win32LanguageIdFromKeyboardLayout,
   WmCharDecoder,
 } from "./input.ts";
 import {
@@ -145,6 +146,7 @@ export class Win32InputController {
   readonly #enqueue: (event: UIEvent) => void;
   readonly #windowById: (id: bigint) => Win32InputWindow | undefined;
   readonly #compositionAdapterForContext?: (context: Deno.PointerObject) => ImmCompositionAdapter;
+  readonly #keyboardLayoutAddress: (layout: Deno.PointerValue) => bigint | undefined;
   #preparedKey: PreparedKeyEvent | undefined;
 
   constructor(
@@ -153,12 +155,15 @@ export class Win32InputController {
     enqueue: (event: UIEvent) => void,
     windowById: (id: bigint) => Win32InputWindow | undefined,
     compositionAdapterForContext?: (context: Deno.PointerObject) => ImmCompositionAdapter,
+    keyboardLayoutAddress: (layout: Deno.PointerValue) => bigint | undefined = (layout) =>
+      layout === null ? undefined : Deno.UnsafePointer.value(layout),
   ) {
     this.#user32 = user32;
     this.#imm32 = imm32;
     this.#enqueue = enqueue;
     this.#windowById = windowById;
     this.#compositionAdapterForContext = compositionAdapterForContext;
+    this.#keyboardLayoutAddress = keyboardLayoutAddress;
   }
 
   attach(window: Win32InputWindow): void {
@@ -498,13 +503,14 @@ export class Win32InputController {
     const type = message.message === WM.KEYDOWN || message.message === WM.SYSKEYDOWN ? "keydown" : "keyup";
     const keyboardState = this.#snapshotKeyboardState();
     const layout = this.#user32.symbols.GetKeyboardLayout(0);
+    const languageId = this.#keyboardLayoutLanguageId(layout);
     const layoutHasAltGraph = this.#layoutHasAltGraph(layout);
     const modifiers = keyboardModifiers(keyboardState);
     modifiers.altGraphKey = shouldExposeAltGraph(modifiers, layoutHasAltGraph, false);
 
     const code = getDomCode(message.lParam);
     const identity = win32KeyIdentity(message.virtualKey, message.lParam);
-    let key = logicalKeyFromVirtualKey(message.virtualKey);
+    let key = logicalKeyFromVirtualKey(message.virtualKey, undefined, languageId);
     let translatedText: string | undefined;
     if (type === "keydown") {
       const translated = translateLogicalKey(
@@ -513,6 +519,7 @@ export class Win32InputController {
         keyboardState,
         this.#toUnicodeAdapter(layout),
         layoutHasAltGraph && modifiers.ctrlKey && modifiers.altKey,
+        languageId,
       );
       key = translated.key;
       translatedText = translated.text;
@@ -667,6 +674,10 @@ export class Win32InputController {
     };
   }
 
+  #keyboardLayoutLanguageId(layout: Deno.PointerValue): number | undefined {
+    return win32LanguageIdFromKeyboardLayout(this.#keyboardLayoutAddress(layout));
+  }
+
   #layoutHasAltGraph(layout: Deno.PointerValue): boolean {
     if (layout === null) return false;
     const layoutId = Deno.UnsafePointer.value(layout);
@@ -744,12 +755,13 @@ export class Win32InputController {
 
     const keyboardState = this.#snapshotKeyboardState();
     const layout = this.#user32.symbols.GetKeyboardLayout(0);
+    const languageId = this.#keyboardLayoutLanguageId(layout);
     const layoutHasAltGraph = this.#layoutHasAltGraph(layout);
     const modifiers = keyboardModifiers(keyboardState);
     modifiers.altGraphKey = shouldExposeAltGraph(modifiers, layoutHasAltGraph, false);
     const code = getDomCode(lParam);
     const identity = win32KeyIdentity(Number(wParam), lParam);
-    let key = logicalKeyFromVirtualKey(Number(wParam));
+    let key = logicalKeyFromVirtualKey(Number(wParam), undefined, languageId);
     let translatedText: string | undefined;
     if (type === "keydown") {
       const translated = translateLogicalKey(
@@ -758,6 +770,7 @@ export class Win32InputController {
         keyboardState,
         this.#toUnicodeAdapter(layout),
         layoutHasAltGraph && modifiers.ctrlKey && modifiers.altKey,
+        languageId,
       );
       key = translated.key;
       translatedText = translated.text;
