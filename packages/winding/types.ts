@@ -129,6 +129,11 @@ export interface ResizeEvent extends WindowEvent<"resize"> {
   type: "resize";
   width: number;
   height: number;
+  /**
+   * Binds an asynchronous frame to the native configure generation that requested it.
+   * Backends without configure generations omit this value and ignore it on blit.
+   */
+  frameToken?: number;
 }
 export interface CloseEvent extends WindowEvent<"close"> {
   type: "close";
@@ -152,8 +157,11 @@ export interface Window {
   close(): void;
   /** Set the native window title. */
   setTitle(title: string): void;
-  /** Blit (bit-block transfer) an RGBA pixel buffer to the window. Width and height must match the window dimensions. */
-  blit(rgba: Uint8Array, width: number, height: number): void;
+  /**
+   * Blit an RGBA pixel buffer whose dimensions match the window. Pass a resize
+   * event's frame token when rendering asynchronously so stale frames can be dropped.
+   */
+  blit(rgba: Uint8Array, width: number, height: number, frameToken?: number): void;
   /** Set whether native composition is desired for this window. */
   setImeEnabled(enabled: boolean): void;
   /**

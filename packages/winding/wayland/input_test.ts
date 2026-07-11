@@ -12,6 +12,61 @@ import {
 import { TextInputV3Batch } from "./text_input.ts";
 import { keyLocationForCode, normalizeImeCursorArea, validateImeCursorRange } from "../input/mod.ts";
 import { logicalKeyFromKeysym } from "../linux/mod.ts";
+import { frameMatchesConfiguration, WaylandConfigureState } from "./window.ts";
+
+Deno.test("Wayland configurations latch role state and serial as one generation", () => {
+  const state = new WaylandConfigureState(640, 480);
+  state.stageToplevel(800, 600, false);
+  const first = state.complete(17);
+  state.stageToplevel(1920, 1080, true);
+  const second = state.complete(18);
+
+  assertEquals(first, {
+    configuration: {
+      serial: 17,
+      width: 800,
+      height: 600,
+      suspended: false,
+      frameToken: 1,
+    },
+    visibilityChanged: false,
+  });
+  assertEquals(second, {
+    configuration: {
+      serial: 18,
+      width: 1920,
+      height: 1080,
+      suspended: true,
+      frameToken: 2,
+    },
+    visibilityChanged: true,
+  });
+  assertEquals(frameMatchesConfiguration(second.configuration, 800, 600, 1), false);
+  assertEquals(frameMatchesConfiguration(second.configuration, 1920, 1080, 1), false);
+  assertEquals(frameMatchesConfiguration(second.configuration, 1920, 1080, 2), true);
+  assertEquals(frameMatchesConfiguration(second.configuration, 1920, 1080, undefined), true);
+});
+
+Deno.test("zero configure dimensions retain each client-selected axis independently", () => {
+  const state = new WaylandConfigureState(640, 480);
+  state.stageToplevel(1200, 0, false);
+  assertEquals(state.complete(0).configuration, {
+    serial: 0,
+    width: 1200,
+    height: 480,
+    suspended: false,
+    frameToken: 1,
+  });
+
+  state.stageToplevel(0, 900, false);
+  assertEquals(state.complete(1).configuration, {
+    serial: 1,
+    width: 1200,
+    height: 900,
+    suspended: false,
+    frameToken: 2,
+  });
+});
 
 Deno.test("Compose locale resolution follows the locale precedence and ignores empty values", () => {
   const environment = new Map([

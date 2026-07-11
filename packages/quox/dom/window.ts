@@ -66,6 +66,7 @@ export class QuoxWindow implements Disposable {
   readonly #win: WindingWindow;
   #width: number;
   #height: number;
+  #frameToken: number | undefined;
   readonly #renderer: WasmRenderer;
   #intervalId: ReturnType<typeof setInterval> | null = null;
   #rendering = false;
@@ -110,6 +111,7 @@ export class QuoxWindow implements Disposable {
       resize: (event) => {
         this.#width = event.width;
         this.#height = event.height;
+        this.#frameToken = event.frameToken;
         this.#renderer.resize(event.width, event.height);
         this.#requestRender();
       },
@@ -232,6 +234,7 @@ export class QuoxWindow implements Disposable {
     this.#needsRender = false;
     const renderWidth = this.#width;
     const renderHeight = this.#height;
+    const renderFrameToken = this.#frameToken;
     try {
       this.document.syncNativeTitle();
 
@@ -240,7 +243,7 @@ export class QuoxWindow implements Disposable {
 
       if (!this.#stopped && !this.#disposed) {
         // Blit RGBA buffer to the window (conversion to native pixel format is handled by winding).
-        this.#win.blit(rgba, renderWidth, renderHeight);
+        this.#win.blit(rgba, renderWidth, renderHeight, renderFrameToken);
       }
     } catch (err) {
       console.error("Quox render failed:", err);

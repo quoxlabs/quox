@@ -15,6 +15,76 @@ import {
 } from "./protocol.ts";
 import { WaylandShmBuffer, type WaylandShmHost } from "./shm_buffer.ts";
 
+export interface WaylandConfiguration {
+  readonly serial: number;
+  readonly width: number;
+  readonly height: number;
+  readonly suspended: boolean;
+  readonly frameToken: number;
+}
+
+export interface CompletedWaylandConfiguration {
+  readonly configuration: WaylandConfiguration;
+  readonly visibilityChanged: boolean;
+}
+
+interface StagedToplevelState {
+  readonly width: number;
+  readonly height: number;
+  readonly suspended: boolean;
+}
+
+export function frameMatchesConfiguration(
+  configuration: WaylandConfiguration,
+  width: number,
+  height: number,
+  frameToken: number | undefined,
+): boolean {
+  return width === configuration.width &&
+    height === configuration.height &&
+    (frameToken === undefined || frameToken === configuration.frameToken);
+}
+
+/** Latches role events with the following xdg_surface.configure serial. */
+export class WaylandConfigureState {
+  #width: number;
+  #height: number;
+  #suspended = false;
+  #nextFrameToken = 0;
+  #staged: StagedToplevelState | undefined;
+
+  constructor(width: number, height: number) {
+    this.#width = width;
+    this.#height = height;
+  }
+
+  stageToplevel(width: number, height: number, suspended: boolean): void {
+    this.#staged = { width, height, suspended };
+  }
+
+  complete(serial: number): CompletedWaylandConfiguration {
+    const staged = this.#staged;
+    this.#staged = undefined;
+    const previousSuspended = this.#suspended;
+    if (staged !== undefined) {
+      if (staged.width > 0) this.#width = staged.width;
+      if (staged.height > 0) this.#height = staged.height;
+      this.#suspended = staged.suspended;
+    }
+    this.#nextFrameToken++;
+    return {
+      configuration: {
+        serial: serial >>> 0,
+        width: this.#width,
+        height: this.#height,
+        suspended: this.#suspended,
+        frameToken: this.#nextFrameToken,
+      },
+      visibilityChanged: previousSuspended !== this.#suspended,
+    };
+  }
+}
+
 export interface WaylandWindowHost extends NativeCallbackHost, WaylandShmHost {
   readonly display: Deno.PointerObject;
   readonly compositor: Deno.PointerObject | null;
@@ -44,17 +114,18 @@ export class WaylandWindow implements Window {
   #toplevelConfigure: AnyCallback | null = null;
   #toplevelClose: AnyCallback | null = null;
   readonly #shmBuffer: WaylandShmBuffer;
-  #pendingSerial = 0;
-  #configured = false;
-  #suspended = false;
+  readonly #configureState: WaylandConfigureState;
+  #configuration: WaylandConfiguration | undefined;
+  #acknowledgedFrameToken: number | undefined;
   #registered = false;
   #closed = false;
   readonly imeActivation = new ImeActivationState();
   readonly composition = new CompositionState();
   #imeCursorArea: ImeCursorArea | undefined;
 
-  constructor(readonly lib: WaylandWindowHost, _width: number, _height: number) {
+  constructor(readonly lib: WaylandWindowHost, width: number, height: number) {
     this.#shmBuffer = new WaylandShmBuffer(lib);
+    this.#configureState = new WaylandConfigureState(width, height);
     const symbols = lib.wl.symbols;
     const errors: unknown[] = [];
     try {
@@ -102,7 +173,7 @@ export class WaylandWindow implements Window {
       );
       symbols.wl_display_roundtrip(lib.display);
       lib.throwCallbackError();
-      this.#ackPendingConfigure();
+      if (this.#configuration) this.#ackConfiguration(this.#configuration);
       return;
     } catch (error) {
       errors.push(error);
@@ -125,7 +196,22 @@ export class WaylandWindow implements Window {
     this.#xdgSurfaceConfigure = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer", "u32"], result: "void" },
       this.lib.guardCallback((_data, _surface, serial) => {
-        this.#pendingSerial = serial;
+        const completed = this.#configureState.complete(serial);
+        this.#configuration = completed.configuration;
+        this.lib.pushEvent({
+          type: "resize",
+          width: completed.configuration.width,
+          height: completed.configuration.height,
+          frameToken: completed.configuration.frameToken,
+          window: this,
+        });
+        if (completed.visibilityChanged) {
+          this.lib.pushEvent({
+            type: "visibilitychange",
+            visible: !completed.configuration.suspended,
+            window: this,
+          });
+        }
       }),
     );
     this.#surfaceVtable = makeVtable([this.#xdgSurfaceConfigure], 1, this.lib.noop);
@@ -138,14 +224,8 @@ export class WaylandWindow implements Window {
     this.#toplevelConfigure = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer", "i32", "i32", "pointer"], result: "void" },
       this.lib.guardCallback((_data, _toplevel, width, height, states) => {
-        if (width > 0 && height > 0) {
-          this.lib.pushEvent({ type: "resize", width, height, window: this });
-        }
         const suspended = hasXdgToplevelState(states, SUSPENDED_TOPLEVEL_STATE);
-        if (suspended !== this.#suspended) {
-          this.#suspended = suspended;
-          this.lib.pushEvent({ type: "visibilitychange", visible: !suspended, window: this });
-        }
+        this.#configureState.stageToplevel(width, height, suspended);
       }),
     );
     this.#toplevelClose = new Deno.UnsafeCallback(
@@ -164,8 +244,8 @@ export class WaylandWindow implements Window {
     );
   }
 
-  #ackPendingConfigure(): void {
-    if (this.#pendingSerial === 0 || !this.#xdgSurface) return;
+  #ackConfiguration(configuration: WaylandConfiguration): void {
+    if (!this.#xdgSurface || this.#acknowledgedFrameToken === configuration.frameToken) return;
     const symbols = this.lib.wl.symbols;
     symbols.wl_proxy_marshal_array_flags(
       this.#xdgSurface,
@@ -173,10 +253,9 @@ export class WaylandWindow implements Window {
       null,
       symbols.wl_proxy_get_version(this.#xdgSurface),
       0,
-      args(BigInt(this.#pendingSerial)),
+      args(BigInt(configuration.serial)),
     );
-    this.#pendingSerial = 0;
-    this.#configured = true;
+    this.#acknowledgedFrameToken = configuration.frameToken;
   }
 
   setTitle(title: string): void {
@@ -208,12 +287,13 @@ export class WaylandWindow implements Window {
     this.lib.updateWindowImeCursorArea(this);
   }
 
-  blit(rgba: Uint8Array, width: number, height: number): void {
+  blit(rgba: Uint8Array, width: number, height: number, frameToken?: number): void {
     if (this.#closed || !this.#surface) return;
-    this.#ackPendingConfigure();
-    if (!this.#configured) return;
+    const configuration = this.#configuration;
+    if (!configuration || !frameMatchesConfiguration(configuration, width, height, frameToken)) return;
     const buffer = this.#shmBuffer.write(rgba, width, height);
     if (!buffer) return;
+    this.#ackConfiguration(configuration);
     const symbols = this.lib.wl.symbols;
     const version = symbols.wl_proxy_get_version(this.#surface);
     symbols.wl_proxy_marshal_array_flags(

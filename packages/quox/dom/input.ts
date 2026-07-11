@@ -16,7 +16,7 @@ export type QuoxAppleStandardKeybindingEvent = WithoutWindow<WindingAppleStandar
 export type QuoxMouseMoveEvent = { type: "mousemove"; x: number; y: number };
 export type QuoxMouseButtonEvent = { type: "mousedown" | "mouseup"; button: number };
 export type QuoxMouseWheelEvent = { type: "wheel"; deltaX: number; deltaY: number };
-export type QuoxResizeEvent = { type: "resize"; width: number; height: number };
+export type QuoxResizeEvent = { type: "resize"; width: number; height: number; frameToken?: number };
 export type QuoxCloseEvent = { type: "close" };
 export type QuoxMouseEnterLeaveEvent = { type: "mouseenter" | "mouseleave" };
 export type QuoxFocusChangeEvent = { type: "focus" | "blur" };
@@ -202,7 +202,7 @@ export function mapWindingEvent(event: WindingUIEvent): QuoxInputEvent {
     case "apple-standard-keybinding":
       return { type: "apple-standard-keybinding", command: event.command };
     case "resize":
-      return { type: "resize", width: event.width, height: event.height };
+      return { type: "resize", width: event.width, height: event.height, frameToken: event.frameToken };
     case "close":
       return { type: "close" };
     case "mouseenter":
