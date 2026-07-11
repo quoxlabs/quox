@@ -415,6 +415,7 @@ class DarwinWindow implements Window, DarwinNativeResponder {
     kind:
       | "close"
       | "resize"
+      | "geometrychange"
       | "mouseenter"
       | "mouseleave"
       | "focus"
@@ -428,6 +429,9 @@ class DarwinWindow implements Window, DarwinNativeResponder {
         return;
       case "resize":
         this.handleResize();
+        return;
+      case "geometrychange":
+        this.invalidateCharacterCoordinates();
         return;
       case "mouseenter":
       case "mouseleave":
@@ -567,6 +571,7 @@ class DarwinWindow implements Window, DarwinNativeResponder {
     const width = Math.round(readStructF64(frame, 16));
     const height = Math.round(readStructF64(frame, 24));
     this.setSize(width, height);
+    this.invalidateCharacterCoordinates();
     this.lib.pushEvent({ type: "resize", width, height, window: this });
   }
 
@@ -744,10 +749,16 @@ class DarwinWindow implements Window, DarwinNativeResponder {
     const viewHeight = readStructF64(bounds, 24);
     const local = cocoaRectFromClient(this.inputState.cursorArea, viewHeight);
     if (zeroWidthCaret) local.width = 0;
+    const windowRect = nsrect.rectPointerArg(
+      this.contentView,
+      sel("convertRect:toView:"),
+      new Float64Array([local.x, local.y, local.width, local.height]),
+      null,
+    );
     return nsrect.rectArg(
       this.nsWindow,
       sel("convertRectToScreen:"),
-      new Float64Array([local.x, local.y, local.width, local.height]),
+      windowRect,
     );
   }
 
@@ -763,6 +774,11 @@ class DarwinWindow implements Window, DarwinNativeResponder {
   setImeCursorArea(x: number, y: number, width: number, height: number): void {
     this.#assertOpen();
     this.inputState.setCursorArea(x, y, width, height);
+    this.invalidateCharacterCoordinates();
+  }
+
+  invalidateCharacterCoordinates(): void {
+    if (this.#closed) return;
     const { sel, send } = this.lib.ffi;
     const inputContext = send.id(this.contentView, sel("inputContext"));
     if (inputContext !== null) send.void(inputContext, sel("invalidateCharacterCoordinates"));

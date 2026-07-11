@@ -176,6 +176,12 @@ export interface NSRectMsgSend {
     selector: Deno.PointerValue,
     rect: NSRectBuffer,
   ): Uint8Array;
+  rectPointerArg(
+    receiver: Deno.PointerValue,
+    selector: Deno.PointerValue,
+    rect: NSRectBuffer,
+    pointer: Deno.PointerValue,
+  ): Uint8Array;
   rangePointerArgs(
     receiver: Deno.PointerValue,
     selector: Deno.PointerValue,
@@ -223,7 +229,16 @@ export function openNSRectMsgSend(libraries: Closeable[]): NSRectMsgSend {
         },
       } as const,
     );
-    libraries.push(noArgsLib, rectArgLib, rangePointerArgsLib);
+    const rectPointerArgLib = Deno.dlopen(
+      LIBOBJC,
+      {
+        objc_msgSend_stret: {
+          parameters: ["buffer", "pointer", "pointer", NSRECT, "pointer"],
+          result: "void",
+        },
+      } as const,
+    );
+    libraries.push(noArgsLib, rectArgLib, rectPointerArgLib, rangePointerArgsLib);
     return {
       noArgs(receiver, selector) {
         const result = new Float64Array(4);
@@ -233,6 +248,11 @@ export function openNSRectMsgSend(libraries: Closeable[]): NSRectMsgSend {
       rectArg(receiver, selector, rect) {
         const result = new Float64Array(4);
         rectArgLib.symbols.objc_msgSend_stret(result, receiver, selector, rect);
+        return new Uint8Array(result.buffer);
+      },
+      rectPointerArg(receiver, selector, rect, pointer) {
+        const result = new Float64Array(4);
+        rectPointerArgLib.symbols.objc_msgSend_stret(result, receiver, selector, rect, pointer);
         return new Uint8Array(result.buffer);
       },
       rangePointerArgs(receiver, selector, range, actualRange) {
@@ -276,10 +296,21 @@ export function openNSRectMsgSend(libraries: Closeable[]): NSRectMsgSend {
       },
     } as const,
   );
-  libraries.push(noArgsLib, rectArgLib, rangePointerArgsLib);
+  const rectPointerArgLib = Deno.dlopen(
+    LIBOBJC,
+    {
+      objc_msgSend: {
+        parameters: ["pointer", "pointer", NSRECT, "pointer"],
+        result: NSRECT,
+      },
+    } as const,
+  );
+  libraries.push(noArgsLib, rectArgLib, rectPointerArgLib, rangePointerArgsLib);
   return {
     noArgs: (receiver, selector) => noArgsLib.symbols.objc_msgSend(receiver, selector) as Uint8Array,
     rectArg: (receiver, selector, rect) => rectArgLib.symbols.objc_msgSend(receiver, selector, rect) as Uint8Array,
+    rectPointerArg: (receiver, selector, rect, pointer) =>
+      rectPointerArgLib.symbols.objc_msgSend(receiver, selector, rect, pointer) as Uint8Array,
     rangePointerArgs: (receiver, selector, range, actualRange) =>
       rangePointerArgsLib.symbols.objc_msgSend(receiver, selector, range, actualRange) as Uint8Array,
   };

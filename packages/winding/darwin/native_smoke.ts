@@ -22,7 +22,7 @@ import {
   sel,
 } from "./ffi.ts";
 import { REQUIRED_TEXT_INPUT_SELECTORS } from "./text_input.ts";
-import { POINTER_INPUT_SELECTORS } from "./native_classes.ts";
+import { POINTER_INPUT_SELECTORS, WINDOW_GEOMETRY_SELECTORS } from "./native_classes.ts";
 import { DarwinInputState } from "./input_state.ts";
 
 // AppKit requires all window work on the process main thread. Deno.test runs
@@ -483,6 +483,17 @@ function testProtocolAndStructAbis(): void {
           `WindingContentView does not respond to ${selector}`,
         );
       }
+      const delegateClass = getClass(runtime, "WindingWindowDelegate");
+      for (const selector of WINDOW_GEOMETRY_SELECTORS) {
+        assert(
+          respondsToSelector(
+            delegateClass,
+            sel(runtime, "instancesRespondToSelector:"),
+            sel(runtime, selector),
+          ),
+          `WindingWindowDelegate does not respond to ${selector}`,
+        );
+      }
 
       const rangeSend = Deno.dlopen(
         LIBOBJC,
@@ -544,7 +555,12 @@ function testProtocolAndStructAbis(): void {
       const expectedScreenRect = rectSend.rectArg(
         window.nsWindow,
         sel(runtime, "convertRectToScreen:"),
-        new Float64Array([4, 28, 2, 14]),
+        rectSend.rectPointerArg(
+          window.contentView,
+          sel(runtime, "convertRect:toView:"),
+          new Float64Array([4, 28, 2, 14]),
+          null,
+        ),
       );
       for (const offset of [0, 8, 16, 24]) {
         assertClose(

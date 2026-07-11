@@ -31,6 +31,7 @@ export interface DarwinNativeResponder {
     kind:
       | "close"
       | "resize"
+      | "geometrychange"
       | "mouseenter"
       | "mouseleave"
       | "focus"
@@ -137,6 +138,14 @@ export class DarwinNativeClasses {
         () => undefined,
       ),
     );
+    const geometryChanged = new Deno.UnsafeCallback(
+      { parameters: ["pointer", "pointer", "pointer"], result: "void" },
+      guardNativeCallback(
+        this.#errors,
+        (self: Deno.PointerValue) => this.#delegate(self)?.handleNativeWindowEvent("geometrychange"),
+        () => undefined,
+      ),
+    );
     const mouseEntered = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer", "pointer"], result: "void" },
       guardNativeCallback(
@@ -188,6 +197,7 @@ export class DarwinNativeClasses {
     this.#callbacks.push(
       shouldClose,
       didResize,
+      geometryChanged,
       mouseEntered,
       mouseExited,
       didBecomeKey,
@@ -199,6 +209,9 @@ export class DarwinNativeClasses {
     const delegate = allocateClassPair(getClass("NSObject"), "WindingWindowDelegate");
     addMethod(delegate, sel("windowShouldClose:"), shouldClose.pointer, `${OBJC_BOOL_ENCODING}@:@`);
     addMethod(delegate, sel("windowDidResize:"), didResize.pointer, "v@:@");
+    for (const selector of WINDOW_GEOMETRY_SELECTORS) {
+      addMethod(delegate, sel(selector), geometryChanged.pointer, "v@:@");
+    }
     addMethod(delegate, sel("mouseEntered:"), mouseEntered.pointer, "v@:@");
     addMethod(delegate, sel("mouseExited:"), mouseExited.pointer, "v@:@");
     addMethod(delegate, sel("windowDidBecomeKey:"), didBecomeKey.pointer, "v@:@");
@@ -524,6 +537,12 @@ export const POINTER_INPUT_SELECTORS = [
   "rightMouseDragged:",
   "otherMouseDragged:",
   "scrollWheel:",
+] as const;
+
+export const WINDOW_GEOMETRY_SELECTORS = [
+  "windowDidMove:",
+  "windowDidChangeScreen:",
+  "windowDidChangeBackingProperties:",
 ] as const;
 
 let nativeClasses: DarwinNativeClasses | undefined;
