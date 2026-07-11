@@ -23,6 +23,7 @@ import {
 } from "./ffi.ts";
 import { REQUIRED_TEXT_INPUT_SELECTORS } from "./text_input.ts";
 import { POINTER_INPUT_SELECTORS } from "./native_classes.ts";
+import { DarwinInputState } from "./input_state.ts";
 
 // AppKit requires all window work on the process main thread. Deno.test runs
 // test bodies on worker threads, so this file must be invoked with `deno run`.
@@ -30,6 +31,7 @@ type Closeable = { close(): void };
 type NativeWindow = Window & {
   contentView: Deno.PointerValue;
   nsWindow: Deno.PointerValue;
+  inputState: DarwinInputState;
 };
 
 if (Deno.build.os !== "darwin") {
@@ -105,8 +107,7 @@ function testTextCallbacks(): void {
         );
         drainEvents(library);
         establishNativeFocus(library, window);
-        window.setImeEnabled(true);
-        assertIme(library.event(), "enabled");
+        enableTextInputForSmoke(library, window);
 
         sendVoidIdRangeRange(
           window.contentView,
@@ -228,8 +229,7 @@ function testKeydownOrdering(): void {
 
         drainEvents(library);
         establishNativeFocus(library, window);
-        window.setImeEnabled(true);
-        assertIme(library.event(), "enabled");
+        enableTextInputForSmoke(library, window);
         sendVoidId(window.contentView, sel(runtime, "keyDown:"), event);
 
         const key = library.event();
@@ -656,6 +656,16 @@ function establishNativeFocus(library: Library, window: NativeWindow): void {
   } finally {
     closeAll(handles);
   }
+}
+
+function enableTextInputForSmoke(library: Library, window: NativeWindow): void {
+  window.setImeEnabled(true);
+  // Crash-prone callback ABI tests use a synthetic focus notification because
+  // unbundled CI processes are not guaranteed foreground activation. Mark the
+  // context observed only inside this harness; production never synthesizes it.
+  window.inputState.setNativeAvailable(true);
+  window.inputState.observeNativeActive(true);
+  assertIme(library.event(), "enabled");
 }
 
 function withAutoreleasePool(fn: () => void): void {

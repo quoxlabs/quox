@@ -75,7 +75,6 @@ export class DarwinInputState {
   #closed = false;
 
   constructor(readonly window: Window) {
-    this.#activation.setAvailable(true);
   }
 
   get imeEnabled(): boolean {
@@ -222,21 +221,25 @@ export class DarwinInputState {
     if (enabled === this.#activation.desired || this.#closed) return;
     if (!enabled) this.cancelComposition();
     this.#activation.setDesired(enabled);
-    this.#syncActivation();
   }
 
   setNativeFocused(focused: boolean): void {
     if (focused === this.#activation.focused || this.#closed) return;
     if (!focused) this.cancelComposition();
     this.#activation.setFocused(focused);
-    this.#syncActivation();
   }
 
   setNativeAvailable(available: boolean): void {
     if (available === this.#activation.available || this.#closed) return;
     if (!available) this.cancelComposition();
     this.#activation.setAvailable(available);
-    this.#syncActivation();
+  }
+
+  /** Record the system-managed NSTextInputContext/client relationship. */
+  observeNativeActive(active: boolean): void {
+    if (this.#closed) return;
+    const transition = this.#activation.markActive(active);
+    if (transition !== undefined) this.#emit(createImeActivationEvent(this.window, transition));
   }
 
   beginKey(key: KeyDownEvent): void {
@@ -462,14 +465,6 @@ export class DarwinInputState {
     return true;
   }
 
-  #syncActivation(): void {
-    const transition = this.#activation.reconcile({
-      activate: () => true,
-      deactivate: () => undefined,
-    });
-    if (transition === undefined) return;
-    this.#emit(createImeActivationEvent(this.window, transition));
-  }
 }
 
 function validUtf16Range(

@@ -574,12 +574,14 @@ class DarwinWindow implements Window, DarwinNativeResponder {
     if (this.#closed) return;
     this.lib.pushEvent({ type: "focus", window: this });
     this.inputState.setNativeFocused(true);
+    this.observeNativeInputContext();
     this.#flushInputState();
   }
 
   handleFocusLost(): void {
     if (this.#closed) return;
     this.inputState.setNativeFocused(false);
+    this.inputState.observeNativeActive(false);
     this.#flushInputState();
     this.#discardNativeMarkedText();
     this.resetModifierState();
@@ -753,6 +755,7 @@ class DarwinWindow implements Window, DarwinNativeResponder {
     this.#assertOpen();
     if (enabled === this.inputState.imeEnabled) return;
     this.inputState.setImeEnabled(enabled);
+    this.observeNativeInputContext();
     this.#flushInputState();
     if (!enabled) this.#discardNativeMarkedText();
   }
@@ -775,6 +778,20 @@ class DarwinWindow implements Window, DarwinNativeResponder {
     this.inputState.cancelComposition();
     this.#flushInputState();
     this.#discardNativeMarkedText();
+  }
+
+  observeNativeInputContext(): void {
+    if (this.#closed) return;
+    const { getClass, sel, send } = this.lib.ffi;
+    const ownContext = send.id(this.contentView, sel("inputContext"));
+    this.inputState.setNativeAvailable(ownContext !== null);
+    const currentContext = send.id(
+      getClass("NSTextInputContext"),
+      sel("currentInputContext"),
+    );
+    const client = currentContext === null ? null : send.id(currentContext, sel("client"));
+    const ownsCurrentContext = client !== null && pointerId(client) === pointerId(this.contentView);
+    this.inputState.observeNativeActive(ownsCurrentContext);
   }
 
   #discardNativeMarkedText(): void {
@@ -997,6 +1014,9 @@ class DarwinLibrary implements Library {
     this.assertOpen();
     this.nativeClasses.throwIfCallbackFailed();
     const { getClass, sel, send } = this.ffi;
+    if (this.#queue.length) return this.#queue.shift();
+    for (const window of this.windows.values()) window.observeNativeInputContext();
+    this.nativeClasses.throwIfCallbackFailed();
     if (this.#queue.length) return this.#queue.shift();
     while (true) {
       const poolAlloc = send.id(getClass("NSAutoreleasePool"), sel("alloc"));

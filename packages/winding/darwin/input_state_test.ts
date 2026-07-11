@@ -157,6 +157,10 @@ Deno.test("Darwin unmark accepts composition while cancel and disable do not", (
   state.setImeEnabled(true);
   assertEquals(state.drainEvents(), []);
   state.setNativeFocused(true);
+  assertEquals(state.drainEvents(), []);
+  state.setNativeAvailable(true);
+  assertEquals(state.drainEvents(), []);
+  state.observeNativeActive(true);
   assertEquals(state.drainEvents(), [{ type: "ime", kind: "enabled", window: TEST_WINDOW }]);
 
   state.setMarkedText("日本", 1, 1);
@@ -176,6 +180,7 @@ Deno.test("Darwin unmark accepts composition while cancel and disable do not", (
   state.setMarkedText("also discard", 0, 0);
   state.drainEvents();
   state.setImeEnabled(false);
+  state.observeNativeActive(false);
   assertEquals(state.drainEvents(), [
     { type: "ime", kind: "preedit", text: "", cursorRange: null, window: TEST_WINDOW },
     { type: "ime", kind: "disabled", window: TEST_WINDOW },
