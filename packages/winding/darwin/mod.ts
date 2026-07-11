@@ -5,6 +5,8 @@ import type {
   KeyUpEvent,
   Library,
   LoadLibrary,
+  MouseButton,
+  PointerModifiers,
   UIEvent,
   Window,
 } from "../types.ts";
@@ -13,6 +15,7 @@ import {
   createKeyUpEvent,
   EventQueue,
   keyLocationForCode,
+  NativeEventClock,
   PressedLogicalKeyCache,
 } from "../input/mod.ts";
 import { getDomCode } from "./dom_code.ts";
@@ -147,6 +150,11 @@ function openMsgSendSymbols(libraries: Closeable[]) {
     void_bool: openMsgSend(libraries, ["pointer", "pointer", "bool"], "void"),
     bool_i64: openMsgSend(libraries, ["pointer", "pointer", "i64"], "bool"),
     point: openMsgSend(libraries, ["pointer", "pointer"], NSPOINT),
+    point_pointId: openMsgSend(
+      libraries,
+      ["pointer", "pointer", NSPOINT, "pointer"],
+      NSPOINT,
+    ),
     f64: openMsgSend(libraries, ["pointer", "pointer"], "f64"),
     u16: openMsgSend(libraries, ["pointer", "pointer"], "u16"),
     i64: openMsgSend(libraries, ["pointer", "pointer"], "i64"),
@@ -497,6 +505,7 @@ class DarwinWindow implements Window, DarwinNativeResponder {
       | "blur"
       | "hidden"
       | "visible",
+    event?: Deno.PointerValue,
   ): void {
     if (!this.#ready || this.#closed) return;
     switch (kind) {
@@ -511,7 +520,9 @@ class DarwinWindow implements Window, DarwinNativeResponder {
         return;
       case "mouseenter":
       case "mouseleave":
-        this.lib.pushEvent({ type: kind, window: this });
+        if (event !== undefined && event !== null) {
+          this.lib.pushEvent({ type: kind, ...pointerSnapshot(event, this), window: this });
+        }
         return;
       case "focus":
         this.handleFocusGained();
@@ -1103,7 +1114,7 @@ class DarwinWindow implements Window, DarwinNativeResponder {
   }
 }
 
-export function nativeMouseButton(buttonNumber: number | bigint): "left" | "middle" | "right" | undefined {
+export function nativeMouseButton(buttonNumber: number | bigint): MouseButton | undefined {
   switch (buttonNumber) {
     case 0:
     case 0n:
@@ -1114,6 +1125,12 @@ export function nativeMouseButton(buttonNumber: number | bigint): "left" | "midd
     case 2:
     case 2n:
       return "middle";
+    case 3:
+    case 3n:
+      return "back";
+    case 4:
+    case 4n:
+      return "forward";
     default:
       return undefined;
   }
@@ -1128,6 +1145,7 @@ class DarwinLibrary implements Library {
   readonly #distantPast: Deno.PointerValue;
   readonly #runLoopMode: Deno.PointerValue;
   readonly #queue = new EventQueue<UIEvent>();
+  readonly #eventClock = new NativeEventClock();
   #handledNativeEvent: bigint | undefined;
   #closed = false;
 
@@ -1217,6 +1235,10 @@ class DarwinLibrary implements Library {
 
   markNativeEventHandled(event: Deno.PointerValue): void {
     if (event !== null) this.#handledNativeEvent = pointerId(event);
+  }
+
+  pointerTimeStamp(nativeSeconds: number): number {
+    return this.#eventClock.timeStamp(nativeSeconds * 1000);
   }
 
   openWindow(x = 0, y = 0, w = 800, h = 600): DarwinWindow {
@@ -1340,30 +1362,33 @@ function importPointerEvent(event: Deno.PointerValue, window: DarwinWindow): UIE
 
   switch (type) {
     case NSEventType.LeftMouseDown:
-      return { type: "mousedown", button: "left", window };
     case NSEventType.LeftMouseUp:
-      return { type: "mouseup", button: "left", window };
     case NSEventType.RightMouseDown:
-      return { type: "mousedown", button: "right", window };
     case NSEventType.RightMouseUp:
-      return { type: "mouseup", button: "right", window };
     case NSEventType.OtherMouseDown:
     case NSEventType.OtherMouseUp: {
-      const buttonNumber = send.i64(event, sel("buttonNumber"));
+      const pressed = type === NSEventType.LeftMouseDown || type === NSEventType.RightMouseDown ||
+        type === NSEventType.OtherMouseDown;
+      const buttonNumber = type === NSEventType.LeftMouseDown || type === NSEventType.LeftMouseUp
+        ? 0n
+        : type === NSEventType.RightMouseDown || type === NSEventType.RightMouseUp
+        ? 1n
+        : send.i64(event, sel("buttonNumber"));
       const button = nativeMouseButton(buttonNumber);
       if (button === undefined) return undefined;
-      return { type: type === NSEventType.OtherMouseDown ? "mousedown" : "mouseup", button, window };
+      return {
+        type: pressed ? "mousedown" : "mouseup",
+        button,
+        detail: Math.max(0, Number(send.i64(event, sel("clickCount")))),
+        ...pointerSnapshot(event, window, button, pressed),
+        window,
+      };
     }
     case NSEventType.MouseMoved:
     case NSEventType.LeftMouseDragged:
     case NSEventType.RightMouseDragged:
     case NSEventType.OtherMouseDragged: {
-      const point = send.point(event, sel("locationInWindow")) as Uint8Array;
-      const x = readStructF64(point, 0);
-      const y = readStructF64(point, 8);
-      // Cocoa's window-local origin is bottom-left; flip to the top-left
-      // origin used by the other winding backends.
-      return { type: "mousemove", x, y: window.height - y, window };
+      return { type: "mousemove", ...pointerSnapshot(event, window), window };
     }
     case NSEventType.ScrollWheel: {
       const delta = browserWheelDelta(
@@ -1371,10 +1396,71 @@ function importPointerEvent(event: Deno.PointerValue, window: DarwinWindow): UIE
         send.f64(event, sel("scrollingDeltaY")),
         send.bool(event, sel("hasPreciseScrollingDeltas")),
       );
-      return { type: "wheel", ...delta, window };
+      return { type: "wheel", ...pointerSnapshot(event, window), ...delta, window };
     }
     default:
       return undefined;
+  }
+}
+
+function pointerSnapshot(
+  event: Deno.PointerValue,
+  window: DarwinWindow,
+  changedButton?: MouseButton,
+  pressed?: boolean,
+): {
+  x: number;
+  y: number;
+  buttons: number;
+  timeStamp: number;
+  shiftKey: boolean;
+  ctrlKey: boolean;
+  altKey: boolean;
+  metaKey: boolean;
+} {
+  const { getClass, sel, send } = window.lib.ffi;
+  const windowPoint = send.point(event, sel("locationInWindow")) as Uint8Array;
+  const point = send.point_pointId(
+    window.contentView,
+    sel("convertPoint:fromView:"),
+    windowPoint,
+    null,
+  ) as Uint8Array;
+  let buttons = Number(send.u64(getClass("NSEvent"), sel("pressedMouseButtons")) & 0x1fn);
+  if (changedButton !== undefined && pressed !== undefined) {
+    const mask = mouseButtonMask(changedButton);
+    buttons = pressed ? buttons | mask : buttons & ~mask;
+  }
+  return {
+    x: readStructF64(point, 0),
+    y: window.height - readStructF64(point, 8),
+    buttons,
+    timeStamp: window.lib.pointerTimeStamp(send.f64(event, sel("timestamp"))),
+    ...pointerModifiers(getModifiers(event, window.lib.ffi)),
+  };
+}
+
+function pointerModifiers(modifiers: KeyModifiers): PointerModifiers {
+  return {
+    shiftKey: modifiers.shiftKey,
+    ctrlKey: modifiers.ctrlKey,
+    altKey: modifiers.altKey,
+    metaKey: modifiers.metaKey,
+  };
+}
+
+function mouseButtonMask(button: MouseButton): number {
+  switch (button) {
+    case "left":
+      return 1;
+    case "right":
+      return 2;
+    case "middle":
+      return 4;
+    case "back":
+      return 8;
+    case "forward":
+      return 16;
   }
 }
 

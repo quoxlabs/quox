@@ -1,5 +1,6 @@
 import type { Window } from "../types.ts";
 import {
+  ClickCounter,
   createImeCommitEvent,
   createImeDeleteSurroundingEvent,
   createImePreeditEvent,
@@ -7,7 +8,27 @@ import {
   createKeyDownEvent,
   createKeyUpEvent,
   type KeyEventInit,
+  NativeEventClock,
 } from "./events.ts";
+
+Deno.test("click counters preserve releases and reset by button, time, or distance", () => {
+  const clicks = new ClickCounter<string>(500, 4);
+  assertEquals(clicks.detail("left", true, 100, 10, 10), 1);
+  assertEquals(clicks.detail("left", false, 110, 10, 10), 1);
+  assertEquals(clicks.detail("left", true, 200, 12, 13), 2);
+  assertEquals(clicks.detail("left", false, 210, 12, 13), 2);
+  assertEquals(clicks.detail("right", true, 220, 12, 13), 1);
+  assertEquals(clicks.detail("left", true, 800, 12, 13), 1);
+  assertEquals(clicks.detail("left", true, 900, 30, 13), 1);
+});
+
+Deno.test("native event clocks map monotonic time and unwrap 32-bit rollover", () => {
+  const clock = new NativeEventClock(2 ** 32, () => 250);
+  assertEquals(clock.timeStamp(0xffff_fff0), 250);
+  assertEquals(clock.timeStamp(0xffff_fff8), 258);
+  assertEquals(clock.timeStamp(8), 274);
+  assertEquals(clock.timeStamp(Number.NaN), 250);
+});
 
 const window = {} as Window;
 const key: KeyEventInit = {

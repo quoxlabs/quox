@@ -39,6 +39,7 @@ export interface DarwinNativeResponder {
       | "blur"
       | "hidden"
       | "visible",
+    event?: Deno.PointerValue,
   ): void;
   handleNativeKeyEvent(
     kind: "keydown" | "keyup" | "flagschanged",
@@ -170,7 +171,8 @@ export class DarwinNativeClasses {
         { parameters: ["pointer", "pointer", "pointer"], result: "void" },
         guardNativeCallback(
           this.#errors,
-          (self: Deno.PointerValue) => this.#delegate(self)?.handleNativeWindowEvent("mouseenter"),
+          (self: Deno.PointerValue, _selector: Deno.PointerValue, event: Deno.PointerValue) =>
+            this.#delegate(self)?.handleNativeWindowEvent("mouseenter", event),
           () => undefined,
         ),
       );
@@ -179,7 +181,8 @@ export class DarwinNativeClasses {
         { parameters: ["pointer", "pointer", "pointer"], result: "void" },
         guardNativeCallback(
           this.#errors,
-          (self: Deno.PointerValue) => this.#delegate(self)?.handleNativeWindowEvent("mouseleave"),
+          (self: Deno.PointerValue, _selector: Deno.PointerValue, event: Deno.PointerValue) =>
+            this.#delegate(self)?.handleNativeWindowEvent("mouseleave", event),
           () => undefined,
         ),
       );

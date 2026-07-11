@@ -101,10 +101,13 @@ export class QuoxWindow implements Disposable {
     );
     this.#inputRouter = new QuoxInputRouter(
       {
-        pointerMove: (x, y, buttons) => this.document.dispatchPointerMove(x, y, buttons),
-        pointerDown: (x, y, button, buttons) => this.document.dispatchPointerDown(x, y, button, buttons),
-        pointerUp: (x, y, button, buttons) => this.document.dispatchPointerUp(x, y, button, buttons),
-        wheel: (x, y, deltaX, deltaY, buttons) => this.document.dispatchWheel(x, y, deltaX, deltaY, buttons),
+        pointerMove: (x, y, buttons, modifiers) => this.document.dispatchPointerMove(x, y, buttons, modifiers),
+        pointerDown: (x, y, button, buttons, modifiers) =>
+          this.document.dispatchPointerDown(x, y, button, buttons, modifiers),
+        pointerUp: (x, y, button, buttons, modifiers) =>
+          this.document.dispatchPointerUp(x, y, button, buttons, modifiers),
+        wheel: (x, y, deltaX, deltaY, buttons, modifiers) =>
+          this.document.dispatchWheel(x, y, deltaX, deltaY, buttons, modifiers),
         key: (event) => this.document.dispatchKey(event),
         ime: (event) => this.document.dispatchIme(event),
         appleCommand: (event) => this.document.dispatchAppleStandardKeybinding(event),

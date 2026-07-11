@@ -1,6 +1,7 @@
-import type { Library, LoadLibrary, UIEvent, Window } from "../types.ts";
+import type { Library, LoadLibrary, MouseButton, PointerModifiers, UIEvent, Window } from "../types.ts";
 import { DeferredNativeError, guardNativeCallback } from "../input/callback.ts";
 import { EventQueue } from "../input/event_queue.ts";
+import { ClickCounter, NativeEventClock } from "../input/events.ts";
 import {
   gdi32functions,
   imm32functions,
@@ -50,6 +51,13 @@ const UP_BUTTON: Partial<Record<WM, Win32MouseButton>> = {
   [WM.RBUTTONUP]: "right",
 };
 
+interface Win32PointerSnapshot extends PointerModifiers {
+  x: number;
+  y: number;
+  buttons: number;
+  timeStamp: number;
+}
+
 function wideStringBuffer(value: string): ArrayBuffer {
   const buffer = new ArrayBuffer((value.length + 1) * 2);
   const view = new Uint16Array(buffer);
@@ -82,6 +90,7 @@ class Win32Window implements Window {
   #frameWidth: number | undefined;
   #frameHeight: number | undefined;
   readonly mouseTracking = new Win32MouseTrackingState();
+  pointerSnapshot: Win32PointerSnapshot | undefined;
   /** Tracks minimized state so `WM_SIZE` transitions map to a single `visibilitychange` event instead of firing on every resize message. */
   minimized = false;
   #clientWidth: number | undefined;
@@ -297,6 +306,8 @@ class Win32Library implements Library {
   readonly instance: Deno.PointerObject;
   readonly #instance: bigint;
   readonly #mouseCapture = new Win32MouseCaptureState();
+  readonly #eventClock = new NativeEventClock(2 ** 32);
+  readonly #clickCounter = new ClickCounter<MouseButton>();
   #classRegistered = false;
   #closing = false;
   #closed = false;
@@ -396,19 +407,18 @@ class Win32Library implements Library {
             break;
           case WM.MOUSEMOVE: {
             if (win === undefined) break;
-            const { x, y } = decodeMouseLParam(lParam);
-            const inside = win.containsClientPoint(x, y);
+            const pointer = this.#pointerSnapshot(win, uMsg as WM, wParam, lParam);
+            const inside = win.containsClientPoint(pointer.x, pointer.y);
             if (win.mouseTracking.needsLeaveTracking(inside)) {
               trackMouseLeave(this, win.hwnd);
               win.mouseTracking.markLeaveTrackingArmed();
             }
             if (win.mouseTracking.observeMove(inside)) {
-              this.#events.push({ type: "mouseenter", window: win });
+              this.#events.push({ type: "mouseenter", ...pointer, window: win });
             }
             this.#events.push({
               type: "mousemove",
-              x,
-              y,
+              ...pointer,
               window: win,
             });
             break;
@@ -416,28 +426,54 @@ class Win32Library implements Library {
           case WM.MOUSELEAVE:
             if (win === undefined) break;
             if (win.mouseTracking.observeLeave()) {
-              this.#events.push({ type: "mouseleave", window: win });
+              const pointer = {
+                ...(win.pointerSnapshot ?? emptyPointerSnapshot(this.#messageTimeStamp())),
+                timeStamp: this.#messageTimeStamp(),
+                ...this.#pointerModifiers(),
+              };
+              win.pointerSnapshot = pointer;
+              this.#events.push({ type: "mouseleave", ...pointer, window: win });
             }
             break;
           case WM.LBUTTONDOWN:
           case WM.MBUTTONDOWN:
-          case WM.RBUTTONDOWN: {
+          case WM.RBUTTONDOWN:
+          case WM.XBUTTONDOWN: {
             if (win === undefined) break;
             // Capture the mouse so drags that leave the client area (e.g.
             // dragging a scrollbar thumb) still deliver the eventual button-up,
             // matching X11's implicit passive grab on button press.
-            const button = DOWN_BUTTON[uMsg as WM]!;
+            const button = uMsg === WM.XBUTTONDOWN ? win32XButton(wParam) : DOWN_BUTTON[uMsg as WM];
+            if (button === undefined) break;
             this.#captureMouseButton(win, button);
-            this.#events.push({ type: "mousedown", button, window: win });
+            const pointer = this.#pointerSnapshot(win, uMsg as WM, wParam, lParam, button, true);
+            this.#events.push({
+              type: "mousedown",
+              button,
+              detail: this.#clickCounter.detail(button, true, pointer.timeStamp, pointer.x, pointer.y),
+              ...pointer,
+              window: win,
+            });
+            if (uMsg === WM.XBUTTONDOWN) return 1n;
             break;
           }
           case WM.LBUTTONUP:
           case WM.MBUTTONUP:
-          case WM.RBUTTONUP: {
+          case WM.RBUTTONUP:
+          case WM.XBUTTONUP: {
             if (win === undefined) break;
-            const button = UP_BUTTON[uMsg as WM]!;
+            const button = uMsg === WM.XBUTTONUP ? win32XButton(wParam) : UP_BUTTON[uMsg as WM];
+            if (button === undefined) break;
             this.#releaseMouseButton(win, button);
-            this.#events.push({ type: "mouseup", button, window: win });
+            const pointer = this.#pointerSnapshot(win, uMsg as WM, wParam, lParam, button, false);
+            this.#events.push({
+              type: "mouseup",
+              button,
+              detail: this.#clickCounter.detail(button, false, pointer.timeStamp, pointer.x, pointer.y),
+              ...pointer,
+              window: win,
+            });
+            if (uMsg === WM.XBUTTONUP) return 1n;
             break;
           }
           case WM.MOUSEWHEEL:
@@ -449,16 +485,17 @@ class Win32Library implements Library {
             const raw = Number((BigInt(wParam) >> 16n) & 0xFFFFn);
             const signed = raw > 0x7FFF ? raw - 0x10000 : raw;
             const notches = signed / WHEEL_DELTA;
+            const pointer = this.#pointerSnapshot(win, uMsg as WM, wParam, lParam);
             this.#events.push(
               uMsg === WM.MOUSEWHEEL
                 // Win32 reports a positive vertical delta for "rotated away from
                 // the user" (scroll up); every other winding backend uses the
                 // opposite convention (positive deltaY = scroll down), so flip it.
-                ? { type: "wheel", deltaX: 0, deltaY: -notches, deltaMode: 1, window: win }
+                ? { type: "wheel", deltaX: 0, deltaY: -notches, deltaMode: 1, ...pointer, window: win }
                 // Horizontal tilt-right is already positive in both Win32 and the
                 // other backends (see Wayland's unflipped axis===1 handling), so
                 // no sign flip is needed here.
-                : { type: "wheel", deltaX: notches, deltaY: 0, deltaMode: 1, window: win },
+                : { type: "wheel", deltaX: notches, deltaY: 0, deltaMode: 1, ...pointer, window: win },
             );
             break;
           }
@@ -574,6 +611,53 @@ class Win32Library implements Library {
   #nativeCaptureOwner(): bigint | undefined {
     const capture = this.user32.symbols.GetCapture();
     return capture === null ? undefined : BigInt(Deno.UnsafePointer.value(capture));
+  }
+
+  #messageTimeStamp(): number {
+    return this.#eventClock.timeStamp(this.user32.symbols.GetMessageTime() >>> 0);
+  }
+
+  #pointerModifiers(keyState?: number): PointerModifiers {
+    return {
+      shiftKey: keyState === undefined ? this.user32.symbols.GetKeyState(0x10) < 0 : (keyState & 0x0004) !== 0,
+      ctrlKey: keyState === undefined ? this.user32.symbols.GetKeyState(0x11) < 0 : (keyState & 0x0008) !== 0,
+      altKey: this.user32.symbols.GetKeyState(0x12) < 0,
+      metaKey: this.user32.symbols.GetKeyState(0x5b) < 0 || this.user32.symbols.GetKeyState(0x5c) < 0,
+    };
+  }
+
+  #pointerSnapshot(
+    window: Win32Window,
+    message: WM,
+    wParam: number | bigint,
+    lParam: number | bigint,
+    changedButton?: MouseButton,
+    pressed?: boolean,
+  ): Win32PointerSnapshot {
+    const point = decodeMouseLParam(lParam);
+    if (message === WM.MOUSEWHEEL || message === WM.MOUSEHWHEEL) {
+      const clientPoint = new Int32Array([point.x, point.y]);
+      if (this.user32.symbols.ScreenToClient(window.hwnd, clientPoint) === 0) {
+        throw new Error(this.getLastError());
+      }
+      point.x = clientPoint[0];
+      point.y = clientPoint[1];
+    }
+    const keyState = Number(BigInt(wParam) & 0xffffn);
+    let buttons = win32Buttons(keyState);
+    if (changedButton !== undefined && pressed !== undefined) {
+      const mask = mouseButtonMask(changedButton);
+      buttons = pressed ? buttons | mask : buttons & ~mask;
+    }
+    const snapshot: Win32PointerSnapshot = {
+      x: point.x,
+      y: point.y,
+      buttons,
+      timeStamp: this.#messageTimeStamp(),
+      ...this.#pointerModifiers(keyState),
+    };
+    window.pointerSnapshot = snapshot;
+    return snapshot;
   }
 
   #captureMouseButton(window: Win32Window, button: Win32MouseButton): void {
@@ -810,6 +894,36 @@ function throwCollected(errors: unknown[], message: string): void {
 
 function collectedError(errors: unknown[], message: string): unknown {
   return errors.length === 1 ? errors[0] : new AggregateError(errors, message);
+}
+
+function win32XButton(wParam: number | bigint): MouseButton | undefined {
+  const button = Number((BigInt(wParam) >> 16n) & 0xffffn);
+  return button === 1 ? "back" : button === 2 ? "forward" : undefined;
+}
+
+function win32Buttons(keyState: number): number {
+  return (keyState & 0x0001 ? 1 : 0) |
+    (keyState & 0x0002 ? 2 : 0) |
+    (keyState & 0x0010 ? 4 : 0) |
+    (keyState & 0x0020 ? 8 : 0) |
+    (keyState & 0x0040 ? 16 : 0);
+}
+
+function mouseButtonMask(button: MouseButton): number {
+  return button === "left" ? 1 : button === "right" ? 2 : button === "middle" ? 4 : button === "back" ? 8 : 16;
+}
+
+function emptyPointerSnapshot(timeStamp: number): Win32PointerSnapshot {
+  return {
+    x: 0,
+    y: 0,
+    buttons: 0,
+    timeStamp,
+    shiftKey: false,
+    ctrlKey: false,
+    altKey: false,
+    metaKey: false,
+  };
 }
 
 export const load: LoadLibrary = () => new Win32Library();

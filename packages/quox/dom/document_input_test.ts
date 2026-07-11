@@ -15,8 +15,8 @@ class FakeInputRenderer {
     return "";
   }
 
-  dispatch_pointer_move(x: number, y: number, buttons: number): boolean {
-    this.calls.push({ method: "pointerMove", args: [x, y, buttons] });
+  dispatch_pointer_move(x: number, y: number, buttons: number, modifierBits: number): boolean {
+    this.calls.push({ method: "pointerMove", args: [x, y, buttons, modifierBits] });
     if (this.throwOnPointerMove) throw new Error("pointer dispatch failed");
     return false;
   }
@@ -182,6 +182,6 @@ Deno.test("native IME requests are synchronized even when renderer dispatch thro
   renderer.throwOnPointerMove = true;
   const { document, syncs } = createDocument(renderer);
 
-  assertThrows(() => document.dispatchPointerMove(10, 20, 0), Error, "pointer dispatch failed");
+  assertThrows(() => document.dispatchPointerMove(10, 20, 0, 0), Error, "pointer dispatch failed");
   assertEquals(syncs.count, 1);
 });

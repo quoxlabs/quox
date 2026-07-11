@@ -62,7 +62,7 @@ export class Win32MouseTrackingState {
   }
 }
 
-export type Win32MouseButton = "left" | "middle" | "right";
+export type Win32MouseButton = "left" | "middle" | "right" | "back" | "forward";
 
 /** Tracks the one thread-global Win32 capture owner and its pressed-button chord. */
 export class Win32MouseCaptureState {

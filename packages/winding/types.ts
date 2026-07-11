@@ -111,16 +111,33 @@ export interface AppleStandardKeybindingEvent extends WindowEvent<"apple-standar
   /** Original AppKit action selector, for example `deleteBackward:`. */
   command: string;
 }
-export interface ButtonEvent extends WindowEvent<"mousedown" | "mouseup"> {
-  type: "mousedown" | "mouseup";
-  button: "left" | "middle" | "right";
+export type MouseButton = "left" | "middle" | "right" | "back" | "forward";
+export interface PointerModifiers {
+  shiftKey: boolean;
+  ctrlKey: boolean;
+  altKey: boolean;
+  metaKey: boolean;
 }
-export interface MoveEvent extends WindowEvent<"mousemove"> {
-  type: "mousemove";
+export interface PointerEventBase<Type extends string> extends WindowEvent<Type>, PointerModifiers {
+  /** DOM MouseEvent.x/clientX-compatible logical client coordinate. */
   x: number;
+  /** DOM MouseEvent.y/clientY-compatible logical client coordinate. */
   y: number;
+  /** DOM MouseEvent.buttons-compatible currently pressed button bitmask. */
+  buttons: number;
+  /** DOM Event.timeStamp-compatible milliseconds relative to the runtime time origin. */
+  timeStamp: number;
 }
-export interface WheelEvent extends WindowEvent<"wheel"> {
+export interface ButtonEvent extends PointerEventBase<"mousedown" | "mouseup"> {
+  type: "mousedown" | "mouseup";
+  button: MouseButton;
+  /** DOM UIEvent.detail-compatible native click count. */
+  detail: number;
+}
+export interface MoveEvent extends PointerEventBase<"mousemove"> {
+  type: "mousemove";
+}
+export interface WheelEvent extends PointerEventBase<"wheel"> {
   type: "wheel";
   /** Scroll right when positive, in `deltaMode` units. */
   deltaX: number;
@@ -143,7 +160,7 @@ export interface CloseEvent extends WindowEvent<"close"> {
   type: "close";
 }
 /** Fired when the pointer enters/leaves the window's bounds. */
-export interface EnterLeaveEvent extends WindowEvent<"mouseenter" | "mouseleave"> {
+export interface EnterLeaveEvent extends PointerEventBase<"mouseenter" | "mouseleave"> {
   type: "mouseenter" | "mouseleave";
 }
 /** Fired when the window (not a DOM element) gains/loses OS-level input focus. */

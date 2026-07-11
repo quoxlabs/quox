@@ -25,6 +25,79 @@ export interface KeyDownEventInit extends KeyEventInit {
   editDisposition: KeyEditDisposition;
 }
 
+/**
+ * Maps a native monotonic millisecond clock to DOMHighResTimeStamp values.
+ * A finite `wrapAt` unwraps 32-bit protocol clocks across their rollover.
+ */
+export class NativeEventClock {
+  #nativeOrigin: number | undefined;
+  #runtimeOrigin = 0;
+  #lastRaw: number | undefined;
+  #epoch = 0;
+
+  constructor(
+    readonly wrapAt = Number.POSITIVE_INFINITY,
+    readonly now: () => number = () => performance.now(),
+  ) {
+    if (!(wrapAt > 0)) throw new RangeError("native event clock wrap must be positive");
+  }
+
+  timeStamp(rawMilliseconds: number): number {
+    if (!Number.isFinite(rawMilliseconds)) return this.now();
+    let raw = rawMilliseconds;
+    if (Number.isFinite(this.wrapAt)) {
+      raw = ((raw % this.wrapAt) + this.wrapAt) % this.wrapAt;
+      if (
+        this.#lastRaw !== undefined && raw < this.#lastRaw &&
+        this.#lastRaw - raw > this.wrapAt / 2
+      ) {
+        this.#epoch += this.wrapAt;
+      }
+      this.#lastRaw = raw;
+    }
+    const unwrapped = raw + this.#epoch;
+    if (this.#nativeOrigin === undefined) {
+      this.#nativeOrigin = unwrapped;
+      this.#runtimeOrigin = this.now();
+    }
+    return this.#runtimeOrigin + unwrapped - this.#nativeOrigin;
+  }
+}
+
+/** Browser-style consecutive click counts for protocols without native metadata. */
+export class ClickCounter<Button> {
+  #lastPress:
+    | { button: Button; timeStamp: number; x: number; y: number; detail: number }
+    | undefined;
+  readonly #active = new Map<Button, number>();
+
+  constructor(readonly intervalMilliseconds = 500, readonly distance = 4) {}
+
+  detail(
+    button: Button,
+    pressed: boolean,
+    timeStamp: number,
+    x: number,
+    y: number,
+  ): number {
+    if (!pressed) {
+      const detail = this.#active.get(button) ?? 0;
+      this.#active.delete(button);
+      return detail;
+    }
+    const previous = this.#lastPress;
+    const consecutive = previous !== undefined && Object.is(previous.button, button) &&
+      timeStamp >= previous.timeStamp &&
+      timeStamp - previous.timeStamp <= this.intervalMilliseconds &&
+      Math.abs(x - previous.x) <= this.distance &&
+      Math.abs(y - previous.y) <= this.distance;
+    const detail = consecutive ? previous.detail + 1 : 1;
+    this.#lastPress = { button, timeStamp, x, y, detail };
+    this.#active.set(button, detail);
+    return detail;
+  }
+}
+
 /** Build a fully normalized public keydown event. */
 export function createKeyDownEvent(init: KeyDownEventInit): KeyDownEvent {
   const code = normalizeLogicalKey(init.code);

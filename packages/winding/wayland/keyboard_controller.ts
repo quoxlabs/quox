@@ -1,6 +1,6 @@
 /** wl_keyboard proxy, focus, repeat, and canonical semantic event routing. */
 
-import type { UIEvent } from "../types.ts";
+import type { KeyModifiers, UIEvent } from "../types.ts";
 import { createImeCommitEvent, createImePreeditEvent, createKeyDownEvent, createKeyUpEvent } from "../input/mod.ts";
 import { domCodeFromEvdev } from "../linux/mod.ts";
 import { WlOp, type xkbSymbols } from "./ffi.ts";
@@ -51,6 +51,10 @@ export class WaylandKeyboardController {
 
   get active(): boolean {
     return this.#keyboard !== null;
+  }
+
+  get modifiers(): KeyModifiers {
+    return this.#input.modifiers;
   }
 
   acquire(seat: Deno.PointerObject): void {

@@ -25,6 +25,16 @@ class FakeWindow implements WindingWindow {
 }
 
 const window = new FakeWindow();
+const pointer = {
+  x: 7,
+  y: 9,
+  buttons: 5,
+  timeStamp: 12,
+  shiftKey: true,
+  ctrlKey: false,
+  altKey: false,
+  metaKey: true,
+};
 
 Deno.test("wheel adapter preserves browser units and converts them only for Blitz", () => {
   const calls: number[][] = [];
@@ -51,21 +61,23 @@ Deno.test("wheel adapter preserves browser units and converts them only for Blit
     deltaX: 2.25,
     deltaY: -3.5,
     deltaMode: 0,
+    ...pointer,
   });
   assertEquals(precise, {
     type: "wheel",
     deltaX: 2.25,
     deltaY: -3.5,
     deltaMode: 0,
+    ...pointer,
   });
   router.route(precise);
-  router.route({ type: "wheel", deltaX: 1, deltaY: -2, deltaMode: 1 });
-  router.route({ type: "wheel", deltaX: 0.5, deltaY: -1, deltaMode: 2 });
+  router.route({ type: "wheel", deltaX: 1, deltaY: -2, deltaMode: 1, ...pointer });
+  router.route({ type: "wheel", deltaX: 0.5, deltaY: -1, deltaMode: 2, ...pointer });
 
   assertEquals(calls, [
-    [0, 0, 2.25, -3.5, 0],
-    [0, 0, 40, -80, 0],
-    [0, 0, 400, -600, 0],
+    [7, 9, 2.25, -3.5, 5, 9],
+    [7, 9, 40, -80, 5, 9],
+    [7, 9, 400, -600, 5, 9],
   ]);
 });
 

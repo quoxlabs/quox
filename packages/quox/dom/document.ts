@@ -107,23 +107,23 @@ export class QuoxDocument {
   }
 
   /** Feed a pointer-move event into Blitz. Drives hover/`:hover` and cursor resolution. */
-  dispatchPointerMove(x: number, y: number, buttons: number): void {
-    this.#dispatchInputEvent(() => this.#renderer.dispatch_pointer_move(x, y, buttons));
+  dispatchPointerMove(x: number, y: number, buttons: number, modifierBits: number): void {
+    this.#dispatchInputEvent(() => this.#renderer.dispatch_pointer_move(x, y, buttons, modifierBits));
   }
 
   /** Feed a pointer-down event into Blitz. Drives `:active`, click timing, and focus. */
-  dispatchPointerDown(x: number, y: number, button: number, buttons: number): void {
-    this.#dispatchInputEvent(() => this.#renderer.dispatch_pointer_down(x, y, button, buttons));
+  dispatchPointerDown(x: number, y: number, button: number, buttons: number, modifierBits: number): void {
+    this.#dispatchInputEvent(() => this.#renderer.dispatch_pointer_down(x, y, button, buttons, modifierBits));
   }
 
   /** Feed a pointer-up event into Blitz. Synthesizes `click`/`dblclick`/`contextmenu`. */
-  dispatchPointerUp(x: number, y: number, button: number, buttons: number): void {
-    this.#dispatchInputEvent(() => this.#renderer.dispatch_pointer_up(x, y, button, buttons));
+  dispatchPointerUp(x: number, y: number, button: number, buttons: number, modifierBits: number): void {
+    this.#dispatchInputEvent(() => this.#renderer.dispatch_pointer_up(x, y, button, buttons, modifierBits));
   }
 
   /** Feed a wheel event into Blitz, scrolling whatever's hovered (not just the viewport). */
-  dispatchWheel(x: number, y: number, deltaX: number, deltaY: number, buttons: number): void {
-    this.#dispatchInputEvent(() => this.#renderer.dispatch_wheel(x, y, deltaX, deltaY, buttons));
+  dispatchWheel(x: number, y: number, deltaX: number, deltaY: number, buttons: number, modifierBits: number): void {
+    this.#dispatchInputEvent(() => this.#renderer.dispatch_wheel(x, y, deltaX, deltaY, buttons, modifierBits));
   }
 
   /** Feed a canonical native key event into Blitz. Character insertion remains a later Commit. */

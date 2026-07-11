@@ -1,11 +1,16 @@
 import type {
   AppleStandardKeybindingEvent as WindingAppleStandardKeybindingEvent,
+  ButtonEvent as WindingButtonEvent,
+  EnterLeaveEvent as WindingEnterLeaveEvent,
   ImeEvent as WindingImeEvent,
   KeyEvent as WindingKeyEvent,
+  MoveEvent as WindingMoveEvent,
+  PointerModifiers as WindingPointerModifiers,
   UIEvent as WindingUIEvent,
+  WheelEvent as WindingWheelEvent,
   Window as WindingWindow,
 } from "@quoxlabs/winding";
-import { KeyEventFlag, KeyModifierMask } from "../lib/quox.js";
+import { KeyEventFlag, KeyModifierMask, PointerModifierMask } from "../lib/quox.js";
 
 type WithoutWindow<Event> = Event extends { window: unknown } ? Omit<Event, "window"> : never;
 
@@ -13,17 +18,14 @@ export type QuoxKeyboardEvent = WithoutWindow<WindingKeyEvent>;
 export type QuoxImeEvent = WithoutWindow<WindingImeEvent>;
 export type QuoxAppleStandardKeybindingEvent = WithoutWindow<WindingAppleStandardKeybindingEvent>;
 
-export type QuoxMouseMoveEvent = { type: "mousemove"; x: number; y: number };
-export type QuoxMouseButtonEvent = { type: "mousedown" | "mouseup"; button: number };
-export type QuoxMouseWheelEvent = {
-  type: "wheel";
-  deltaX: number;
-  deltaY: number;
-  deltaMode: 0 | 1 | 2;
+export type QuoxMouseMoveEvent = WithoutWindow<WindingMoveEvent>;
+export type QuoxMouseButtonEvent = Omit<WithoutWindow<WindingButtonEvent>, "button"> & {
+  button: number;
 };
+export type QuoxMouseWheelEvent = WithoutWindow<WindingWheelEvent>;
 export type QuoxResizeEvent = { type: "resize"; width: number; height: number; frameToken?: number };
 export type QuoxCloseEvent = { type: "close" };
-export type QuoxMouseEnterLeaveEvent = { type: "mouseenter" | "mouseleave" };
+export type QuoxMouseEnterLeaveEvent = WithoutWindow<WindingEnterLeaveEvent>;
 export type QuoxFocusChangeEvent = { type: "focus" | "blur" };
 export type QuoxVisibilityEvent = { type: "visibilitychange"; visible: boolean };
 
@@ -41,10 +43,10 @@ export type QuoxInputEvent =
   | QuoxVisibilityEvent;
 
 export interface QuoxInputRoutePort {
-  pointerMove(x: number, y: number, buttons: number): void;
-  pointerDown(x: number, y: number, button: number, buttons: number): void;
-  pointerUp(x: number, y: number, button: number, buttons: number): void;
-  wheel(x: number, y: number, deltaX: number, deltaY: number, buttons: number): void;
+  pointerMove(x: number, y: number, buttons: number, modifierBits: number): void;
+  pointerDown(x: number, y: number, button: number, buttons: number, modifierBits: number): void;
+  pointerUp(x: number, y: number, button: number, buttons: number, modifierBits: number): void;
+  wheel(x: number, y: number, deltaX: number, deltaY: number, buttons: number, modifierBits: number): void;
   key(event: QuoxKeyboardEvent): void;
   ime(event: QuoxImeEvent): void;
   appleCommand(event: QuoxAppleStandardKeybindingEvent): void;
@@ -53,14 +55,10 @@ export interface QuoxInputRoutePort {
   visibility(event: QuoxVisibilityEvent): void;
 }
 
-const BUTTON_INDEX_TO_BIT = [1, 4, 2] as const;
 const WHEEL_LINE_PIXELS = 40;
 
 /** Deterministic, native-independent routing from canonical Quox events to the document port. */
 export class QuoxInputRouter {
-  #buttons = 0;
-  #pointerX = 0;
-  #pointerY = 0;
   #viewportWidth: number;
   #viewportHeight: number;
 
@@ -72,27 +70,36 @@ export class QuoxInputRouter {
   route(event: QuoxInputEvent): "close" | undefined {
     switch (event.type) {
       case "mousemove":
-        this.#pointerX = event.x;
-        this.#pointerY = event.y;
-        this.port.pointerMove(event.x, event.y, this.#buttons);
+        this.port.pointerMove(event.x, event.y, event.buttons, encodePointerModifiers(event));
         return undefined;
       case "mousedown":
-        this.#buttons |= BUTTON_INDEX_TO_BIT[event.button] ?? 0;
-        this.port.pointerDown(this.#pointerX, this.#pointerY, event.button, this.#buttons);
+        this.port.pointerDown(
+          event.x,
+          event.y,
+          event.button,
+          event.buttons,
+          encodePointerModifiers(event),
+        );
         return undefined;
       case "mouseup":
-        this.port.pointerUp(this.#pointerX, this.#pointerY, event.button, this.#buttons);
-        this.#buttons &= ~(BUTTON_INDEX_TO_BIT[event.button] ?? 0);
+        this.port.pointerUp(
+          event.x,
+          event.y,
+          event.button,
+          event.buttons,
+          encodePointerModifiers(event),
+        );
         return undefined;
       case "wheel": {
         const scaleX = event.deltaMode === 0 ? 1 : event.deltaMode === 1 ? WHEEL_LINE_PIXELS : this.#viewportWidth;
         const scaleY = event.deltaMode === 0 ? 1 : event.deltaMode === 1 ? WHEEL_LINE_PIXELS : this.#viewportHeight;
         this.port.wheel(
-          this.#pointerX,
-          this.#pointerY,
+          event.x,
+          event.y,
           event.deltaX * scaleX,
           event.deltaY * scaleY,
-          this.#buttons,
+          event.buttons,
+          encodePointerModifiers(event),
         );
         return undefined;
       }
@@ -129,7 +136,42 @@ export class QuoxInputRouter {
   }
 }
 
-const BUTTON_INDEX: Record<"left" | "middle" | "right", number> = { left: 0, middle: 1, right: 2 };
+const BUTTON_INDEX: Record<WindingButtonEvent["button"], number> = {
+  left: 0,
+  middle: 1,
+  right: 2,
+  back: 3,
+  forward: 4,
+};
+
+function pointerFields(
+  event: WindingPointerModifiers & {
+    x: number;
+    y: number;
+    buttons: number;
+    timeStamp: number;
+  },
+) {
+  return {
+    x: event.x,
+    y: event.y,
+    buttons: event.buttons,
+    timeStamp: event.timeStamp,
+    shiftKey: event.shiftKey,
+    ctrlKey: event.ctrlKey,
+    altKey: event.altKey,
+    metaKey: event.metaKey,
+  };
+}
+
+export function encodePointerModifiers(event: WindingPointerModifiers): number {
+  let bits = 0;
+  if (event.shiftKey) bits |= PointerModifierMask.Shift;
+  if (event.ctrlKey) bits |= PointerModifierMask.Control;
+  if (event.altKey) bits |= PointerModifierMask.Alt;
+  if (event.metaKey) bits |= PointerModifierMask.Meta;
+  return bits;
+}
 
 function assertNever(_value: never): never {
   throw new TypeError("Unsupported Winding event");
@@ -139,17 +181,28 @@ function assertNever(_value: never): never {
 export function mapWindingEvent(event: WindingUIEvent): QuoxInputEvent {
   switch (event.type) {
     case "mousemove":
-      return { type: "mousemove", x: event.x, y: event.y };
+      return { type: "mousemove", ...pointerFields(event) };
     case "mousedown":
-      return { type: "mousedown", button: BUTTON_INDEX[event.button] };
+      return {
+        type: "mousedown",
+        button: BUTTON_INDEX[event.button],
+        detail: event.detail,
+        ...pointerFields(event),
+      };
     case "mouseup":
-      return { type: "mouseup", button: BUTTON_INDEX[event.button] };
+      return {
+        type: "mouseup",
+        button: BUTTON_INDEX[event.button],
+        detail: event.detail,
+        ...pointerFields(event),
+      };
     case "wheel":
       return {
         type: "wheel",
         deltaX: event.deltaX,
         deltaY: event.deltaY,
         deltaMode: event.deltaMode,
+        ...pointerFields(event),
       };
     case "keydown": {
       return {
@@ -226,9 +279,9 @@ export function mapWindingEvent(event: WindingUIEvent): QuoxInputEvent {
     case "close":
       return { type: "close" };
     case "mouseenter":
-      return { type: "mouseenter" };
+      return { type: "mouseenter", ...pointerFields(event) };
     case "mouseleave":
-      return { type: "mouseleave" };
+      return { type: "mouseleave", ...pointerFields(event) };
     case "focus":
       return { type: "focus" };
     case "blur":

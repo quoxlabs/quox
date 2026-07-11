@@ -1,5 +1,15 @@
-import type { KeyDownEvent, KeyUpEvent, Library, LoadLibrary, UIEvent, Window } from "../types.ts";
+import type {
+  KeyDownEvent,
+  KeyUpEvent,
+  Library,
+  LoadLibrary,
+  MouseButton,
+  PointerModifiers,
+  UIEvent,
+  Window,
+} from "../types.ts";
 import {
+  ClickCounter,
   createImeActivationEvent,
   createImeCommitEvent,
   createImeDeleteSurroundingEvent,
@@ -8,6 +18,7 @@ import {
   createKeyUpEvent,
   EventQueue,
   keyLocationForCode,
+  NativeEventClock,
   normalizeCommittedText,
   PressedLogicalKeyCache,
 } from "../input/mod.ts";
@@ -408,6 +419,8 @@ class X11Library implements Library {
   readonly maxTitleBytes: number;
   readonly input: XimManager;
   readonly #events = new EventQueue<UIEvent>();
+  readonly #eventClock = new NativeEventClock(2 ** 32);
+  readonly #clickCounter = new ClickCounter<MouseButton>();
   #modifierMapping: X11ModifierMapping = {
     shiftMask: X_SHIFT_MASK,
     controlMask: X_CONTROL_MASK,
@@ -761,7 +774,15 @@ class X11Library implements Library {
         return { type: "close", window };
       }
 
-      const event = importEvent(view, window, this.wmProtocols, this.wmDeleteWindow);
+      const event = importEvent(
+        view,
+        window,
+        this.#eventClock,
+        this.#clickCounter,
+        this.#modifierMapping,
+        this.wmProtocols,
+        this.wmDeleteWindow,
+      );
       if (event !== undefined) return event;
     }
     return undefined;
@@ -1016,10 +1037,12 @@ class X11Library implements Library {
   }
 }
 
-const BUTTONS = [, "left", "middle", "right"] as const;
 function importEvent(
   view: DataView<ArrayBuffer>,
   window: X11Window | undefined,
+  eventClock: NativeEventClock,
+  clickCounter: ClickCounter<MouseButton>,
+  modifierMapping: X11ModifierMapping,
   wmProtocols?: bigint,
   wmDeleteWindow?: bigint,
 ): UIEvent | undefined {
@@ -1028,26 +1051,40 @@ function importEvent(
   switch (type) {
     case XEventType.ButtonPress: {
       const btn = view.getUint32(84, true);
-      if (btn === 4) return { type: "wheel", deltaX: 0, deltaY: -1, deltaMode: 1, window };
-      if (btn === 5) return { type: "wheel", deltaX: 0, deltaY: 1, deltaMode: 1, window };
-      if (btn === 6) return { type: "wheel", deltaX: -1, deltaY: 0, deltaMode: 1, window };
-      if (btn === 7) return { type: "wheel", deltaX: 1, deltaY: 0, deltaMode: 1, window };
-      const button = BUTTONS[btn];
+      const wheelPointer = x11PointerSnapshot(view, eventClock, modifierMapping);
+      if (btn === 4) return { type: "wheel", deltaX: 0, deltaY: -1, deltaMode: 1, ...wheelPointer, window };
+      if (btn === 5) return { type: "wheel", deltaX: 0, deltaY: 1, deltaMode: 1, ...wheelPointer, window };
+      if (btn === 6) return { type: "wheel", deltaX: -1, deltaY: 0, deltaMode: 1, ...wheelPointer, window };
+      if (btn === 7) return { type: "wheel", deltaX: 1, deltaY: 0, deltaMode: 1, ...wheelPointer, window };
+      const button = x11MouseButton(btn);
       if (button === undefined) return undefined;
-      return { type: "mousedown", button, window };
+      const pointer = x11PointerSnapshot(view, eventClock, modifierMapping, button, true);
+      return {
+        type: "mousedown",
+        button,
+        detail: clickCounter.detail(button, true, pointer.timeStamp, pointer.x, pointer.y),
+        ...pointer,
+        window,
+      };
     }
     case XEventType.ButtonRelease: {
       const btn = view.getUint32(84, true);
       if (btn >= 4 && btn <= 7) return undefined; // wheel has no release
-      const button = BUTTONS[btn];
+      const button = x11MouseButton(btn);
       if (button === undefined) return undefined;
-      return { type: "mouseup", button, window };
+      const pointer = x11PointerSnapshot(view, eventClock, modifierMapping, button, false);
+      return {
+        type: "mouseup",
+        button,
+        detail: clickCounter.detail(button, false, pointer.timeStamp, pointer.x, pointer.y),
+        ...pointer,
+        window,
+      };
     }
     case XEventType.MotionNotify:
       return {
         type: "mousemove",
-        x: view.getInt32(64, true),
-        y: view.getInt32(68, true),
+        ...x11PointerSnapshot(view, eventClock, modifierMapping),
         window,
       };
     case XEventType.ClientMessage: {
@@ -1064,11 +1101,19 @@ function importEvent(
       // Ignore transitions between the top-level and descendants; the pointer
       // remains inside the browser-style window boundary.
       return view.getInt32(80, true) === NotifyNormal && view.getInt32(84, true) !== NotifyInferior
-        ? { type: "mouseenter", window }
+        ? {
+          type: "mouseenter",
+          ...x11PointerSnapshot(view, eventClock, modifierMapping, undefined, undefined, 96),
+          window,
+        }
         : undefined;
     case XEventType.LeaveNotify:
       return view.getInt32(80, true) === NotifyNormal && view.getInt32(84, true) !== NotifyInferior
-        ? { type: "mouseleave", window }
+        ? {
+          type: "mouseleave",
+          ...x11PointerSnapshot(view, eventClock, modifierMapping, undefined, undefined, 96),
+          window,
+        }
         : undefined;
     case XEventType.UnmapNotify:
       return window.updateVisibility(false) ? { type: "visibilitychange", visible: false, window } : undefined;
@@ -1077,6 +1122,74 @@ function importEvent(
     default:
       return undefined;
   }
+}
+
+function x11PointerSnapshot(
+  view: DataView<ArrayBuffer>,
+  eventClock: NativeEventClock,
+  modifierMapping: X11ModifierMapping,
+  changedButton?: MouseButton,
+  pressed?: boolean,
+  stateOffset = 80,
+): {
+  x: number;
+  y: number;
+  buttons: number;
+  timeStamp: number;
+  shiftKey: boolean;
+  ctrlKey: boolean;
+  altKey: boolean;
+  metaKey: boolean;
+} {
+  const state = view.getUint32(stateOffset, true);
+  let buttons = x11Buttons(state);
+  if (changedButton !== undefined && pressed !== undefined) {
+    const mask = mouseButtonMask(changedButton);
+    buttons = pressed ? buttons | mask : buttons & ~mask;
+  }
+  return {
+    x: view.getInt32(64, true),
+    y: view.getInt32(68, true),
+    buttons,
+    timeStamp: eventClock.timeStamp(view.getUint32(56, true)),
+    ...pointerModifiers(x11ModifierSnapshot(state, 0, false, modifierMapping)),
+  };
+}
+
+function x11Buttons(state: number): number {
+  return (state & (1 << 8) ? 1 : 0) |
+    (state & (1 << 10) ? 2 : 0) |
+    (state & (1 << 9) ? 4 : 0);
+}
+
+function x11MouseButton(button: number): MouseButton | undefined {
+  switch (button) {
+    case 1:
+      return "left";
+    case 2:
+      return "middle";
+    case 3:
+      return "right";
+    case 8:
+      return "back";
+    case 9:
+      return "forward";
+    default:
+      return undefined;
+  }
+}
+
+function pointerModifiers(modifiers: ReturnType<typeof x11ModifierSnapshot>): PointerModifiers {
+  return {
+    shiftKey: modifiers.shiftKey,
+    ctrlKey: modifiers.ctrlKey,
+    altKey: modifiers.altKey,
+    metaKey: modifiers.metaKey,
+  };
+}
+
+function mouseButtonMask(button: MouseButton): number {
+  return button === "left" ? 1 : button === "right" ? 2 : button === "middle" ? 4 : button === "back" ? 8 : 16;
 }
 
 export const load: LoadLibrary = () => {

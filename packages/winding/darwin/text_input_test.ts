@@ -47,12 +47,13 @@ Deno.test("NSRange helpers preserve ordinary ranges and NSNotFound", () => {
   });
 });
 
-Deno.test("Darwin native mouse numbers map only the three public buttons", () => {
+Deno.test("Darwin native mouse numbers map all browser mouse buttons", () => {
   assertEquals(nativeMouseButton(0n), "left");
   assertEquals(nativeMouseButton(1n), "right");
   assertEquals(nativeMouseButton(2n), "middle");
-  assertEquals(nativeMouseButton(3n), undefined);
-  assertEquals(nativeMouseButton(4n), undefined);
+  assertEquals(nativeMouseButton(3n), "back");
+  assertEquals(nativeMouseButton(4n), "forward");
+  assertEquals(nativeMouseButton(5n), undefined);
 });
 
 Deno.test("logical keys come from AppKit text rather than the physical key position", () => {

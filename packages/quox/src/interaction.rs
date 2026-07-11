@@ -61,6 +61,14 @@ pub enum KeyEventFlag {
     PreventDefault = 8,
 }
 
+#[wasm_bindgen]
+pub enum PointerModifierMask {
+    Shift = 1,
+    Control = 2,
+    Alt = 4,
+    Meta = 8,
+}
+
 const KEY_MOD_SHIFT: u32 = KeyModifierMask::Shift as u32;
 const KEY_MOD_ALT: u32 = KeyModifierMask::Alt as u32;
 const KEY_MOD_META: u32 = KeyModifierMask::Meta as u32;
@@ -80,6 +88,12 @@ const KEY_EVENT_COMPOSING: u32 = KeyEventFlag::Composing as u32;
 const KEY_EVENT_PREVENT_DEFAULT: u32 = KeyEventFlag::PreventDefault as u32;
 const KEY_EVENT_KNOWN: u32 =
     KEY_EVENT_PRESSED | KEY_EVENT_REPEAT | KEY_EVENT_COMPOSING | KEY_EVENT_PREVENT_DEFAULT;
+const POINTER_MOD_SHIFT: u32 = PointerModifierMask::Shift as u32;
+const POINTER_MOD_CONTROL: u32 = PointerModifierMask::Control as u32;
+const POINTER_MOD_ALT: u32 = PointerModifierMask::Alt as u32;
+const POINTER_MOD_META: u32 = PointerModifierMask::Meta as u32;
+const POINTER_MOD_KNOWN: u32 =
+    POINTER_MOD_SHIFT | POINTER_MOD_CONTROL | POINTER_MOD_ALT | POINTER_MOD_META;
 
 /// Build the modifier set used by Blitz's editor defaults. Quox itself exposes the exact
 /// physical flags to JS; this projection deliberately maps the runtime platform accelerator to
@@ -105,6 +119,28 @@ fn build_editor_modifiers(bits: u32) -> Modifiers {
     }
     if bits & KEY_MOD_ACCEL != 0 {
         mods |= Modifiers::CONTROL;
+    }
+    mods
+}
+
+fn build_pointer_modifiers(bits: u32) -> Modifiers {
+    assert_eq!(
+        bits & !POINTER_MOD_KNOWN,
+        0,
+        "unknown pointer modifier bits"
+    );
+    let mut mods = Modifiers::empty();
+    if bits & POINTER_MOD_SHIFT != 0 {
+        mods |= Modifiers::SHIFT;
+    }
+    if bits & POINTER_MOD_CONTROL != 0 {
+        mods |= Modifiers::CONTROL;
+    }
+    if bits & POINTER_MOD_ALT != 0 {
+        mods |= Modifiers::ALT;
+    }
+    if bits & POINTER_MOD_META != 0 {
+        mods |= Modifiers::META;
     }
     mods
 }
@@ -197,6 +233,7 @@ fn pointer_event(
     y: f32,
     button: MouseEventButton,
     buttons: u8,
+    modifier_bits: u32,
 ) -> Option<BlitzPointerEvent> {
     let scroll = state.document.viewport_scroll();
     let (page_x, page_y) =
@@ -208,7 +245,7 @@ fn pointer_event(
         coords: pointer_coords(x, y, page_x, page_y),
         button,
         buttons: MouseEventButtons::from_bits_truncate(buttons),
-        mods: Modifiers::empty(),
+        mods: build_pointer_modifiers(modifier_bits),
         details: PointerDetails::default(),
         // Overwritten internally by Blitz (relative to the hit target's bounding rect)
         // before it's read anywhere, so the value passed in here is irrelevant.
@@ -388,9 +425,11 @@ impl QuoxRenderer {
     /// cadence) would be a real perf regression; staleness is bounded to about one frame.
     /// `buttons` is a `MouseEventButtons` bitmask (`Primary=1, Secondary=2, Auxiliary=4`).
     /// Returns whether a redraw was requested.
-    pub fn dispatch_pointer_move(&self, x: f32, y: f32, buttons: u8) -> bool {
+    pub fn dispatch_pointer_move(&self, x: f32, y: f32, buttons: u8, modifier_bits: u32) -> bool {
         let mut state = self.state.borrow_mut();
-        let Some(event) = pointer_event(&state, x, y, MouseEventButton::Main, buttons) else {
+        let Some(event) =
+            pointer_event(&state, x, y, MouseEventButton::Main, buttons, modifier_bits)
+        else {
             return false;
         };
         state.dispatch(UiEvent::PointerMove(event))
@@ -401,9 +440,17 @@ impl QuoxRenderer {
     /// `MouseEventButton`'s discriminants (`Main=0, Auxiliary=1, Secondary=2, Fourth=3,
     /// Fifth=4`); `buttons` is the currently-held bitmask. Returns whether a redraw was
     /// requested.
-    pub fn dispatch_pointer_down(&self, x: f32, y: f32, button: u8, buttons: u8) -> bool {
+    pub fn dispatch_pointer_down(
+        &self,
+        x: f32,
+        y: f32,
+        button: u8,
+        buttons: u8,
+        modifier_bits: u32,
+    ) -> bool {
         let mut state = self.state.borrow_mut();
-        let Some(event) = pointer_event(&state, x, y, mouse_button(button), buttons) else {
+        let Some(event) = pointer_event(&state, x, y, mouse_button(button), buttons, modifier_bits)
+        else {
             return false;
         };
         state.dispatch(UiEvent::PointerDown(event))
@@ -412,9 +459,17 @@ impl QuoxRenderer {
     /// Feed a pointer-up event into Blitz (clears `:active`, ends drag/selection, and is
     /// the trigger Blitz uses internally to synthesize `click`/`contextmenu`/`dblclick`).
     /// Returns whether a redraw was requested.
-    pub fn dispatch_pointer_up(&self, x: f32, y: f32, button: u8, buttons: u8) -> bool {
+    pub fn dispatch_pointer_up(
+        &self,
+        x: f32,
+        y: f32,
+        button: u8,
+        buttons: u8,
+        modifier_bits: u32,
+    ) -> bool {
         let mut state = self.state.borrow_mut();
-        let Some(event) = pointer_event(&state, x, y, mouse_button(button), buttons) else {
+        let Some(event) = pointer_event(&state, x, y, mouse_button(button), buttons, modifier_bits)
+        else {
             return false;
         };
         state.dispatch(UiEvent::PointerUp(event))
@@ -426,7 +481,15 @@ impl QuoxRenderer {
     /// caller) — passed as `BlitzWheelDelta::Pixels`, which Blitz applies directly (unlike
     /// `Lines`, which it internally multiplies ×20). Returns whether a redraw was
     /// requested.
-    pub fn dispatch_wheel(&self, x: f32, y: f32, delta_x: f64, delta_y: f64, buttons: u8) -> bool {
+    pub fn dispatch_wheel(
+        &self,
+        x: f32,
+        y: f32,
+        delta_x: f64,
+        delta_y: f64,
+        buttons: u8,
+        modifier_bits: u32,
+    ) -> bool {
         let mut state = self.state.borrow_mut();
         let scroll = state.document.viewport_scroll();
         let Some((page_x, page_y)) =
@@ -439,7 +502,7 @@ impl QuoxRenderer {
             delta: BlitzWheelDelta::Pixels(delta_x, delta_y),
             coords: pointer_coords(x, y, page_x, page_y),
             buttons: MouseEventButtons::from_bits_truncate(buttons),
-            mods: Modifiers::empty(),
+            mods: build_pointer_modifiers(modifier_bits),
         };
         state.dispatch(UiEvent::Wheel(event))
     }
@@ -577,8 +640,8 @@ mod tests {
     use super::{
         KEY_EVENT_COMPOSING, KEY_EVENT_PRESSED, KEY_EVENT_REPEAT, KEY_MOD_ACCEL, KEY_MOD_ALT,
         KEY_MOD_ALT_GRAPH, KEY_MOD_META, KEY_MOD_SHIFT, RecordedEvents, RecordingEventHandler,
-        build_editor_modifiers, drive_ime_commit, is_insertable_text, key_event, preedit_cursor,
-        validate_key_abi, viewport_point_to_page,
+        build_editor_modifiers, build_pointer_modifiers, drive_ime_commit, is_insertable_text,
+        key_event, preedit_cursor, validate_key_abi, viewport_point_to_page,
     };
     use blitz_dom::{BaseDocument, DocumentConfig, EventDriver};
     use blitz_html::HtmlDocument;
@@ -772,6 +835,17 @@ mod tests {
         assert!(alt_graph.contains(Modifiers::ALT));
         assert!(alt_graph.contains(Modifiers::ALT_GRAPH));
         assert!(!alt_graph.contains(Modifiers::CONTROL));
+    }
+
+    #[test]
+    fn pointer_modifiers_preserve_browser_control_and_meta_independently() {
+        let modifiers = build_pointer_modifiers(
+            super::POINTER_MOD_SHIFT | super::POINTER_MOD_CONTROL | super::POINTER_MOD_META,
+        );
+        assert!(modifiers.contains(Modifiers::SHIFT));
+        assert!(modifiers.contains(Modifiers::CONTROL));
+        assert!(modifiers.contains(Modifiers::META));
+        assert!(!modifiers.contains(Modifiers::ALT));
     }
 
     #[test]

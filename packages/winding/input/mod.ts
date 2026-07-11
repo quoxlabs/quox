@@ -15,6 +15,7 @@ export { PressedLogicalKeyCache } from "./pressed_keys.ts";
 export { type ImeActivationActions, ImeActivationState, type ImeActivationTransition } from "./activation.ts";
 export { CompositionState, discardTrailingPreeditClear, type PreeditUpdate } from "./composition.ts";
 export {
+  ClickCounter,
   createImeActivationEvent,
   createImeCommitEvent,
   createImeDeleteSurroundingEvent,
@@ -24,6 +25,7 @@ export {
   createKeyUpEvent,
   type KeyDownEventInit,
   type KeyEventInit,
+  NativeEventClock,
 } from "./events.ts";
 export { DeferredNativeError, guardNativeCallback } from "./callback.ts";
 export { EventQueue } from "./event_queue.ts";

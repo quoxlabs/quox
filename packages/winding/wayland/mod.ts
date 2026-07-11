@@ -1,5 +1,5 @@
-import type { Library, LoadLibrary, UIEvent } from "../types.ts";
-import { DeferredNativeError, EventQueue, guardNativeCallback } from "../input/mod.ts";
+import type { Library, LoadLibrary, MouseButton, PointerModifiers, UIEvent } from "../types.ts";
+import { ClickCounter, DeferredNativeError, EventQueue, guardNativeCallback, NativeEventClock } from "../input/mod.ts";
 import { utf8CString as cStr } from "../text_encoding.ts";
 import { buildXdgIfaces, libdlSymbols, waylandSymbols, WlCursorShape, WlOp, WlSeatCap, xkbSymbols } from "./ffi.ts";
 import {
@@ -80,6 +80,11 @@ class WaylandLibrary implements Library {
   #seat: Deno.PointerObject | null = null;
   #pointer: Deno.PointerObject | null = null;
   #pointerFocus: WaylandWindow | null = null;
+  #pointerX = 0;
+  #pointerY = 0;
+  #pointerButtons = 0;
+  readonly #pointerClock = new NativeEventClock(2 ** 32);
+  readonly #clickCounter = new ClickCounter<MouseButton>();
   #pointerListeners: AnyCallback[] = [];
   #pointerVtable: BigUint64Array<ArrayBuffer> | undefined;
   readonly #textInputController: WaylandTextInputController;
@@ -481,12 +486,14 @@ class WaylandLibrary implements Library {
     const enterCb = new Deno.UnsafeCallback(
       // (data, pointer, serial, surface, surface_x_fixed, surface_y_fixed)
       { parameters: ["pointer", "pointer", "u32", "pointer", "i32", "i32"], result: "void" },
-      this.guardCallback((_data, _ptr, serial, surface) => {
+      this.guardCallback((_data, _ptr, serial, surface, xFixed, yFixed) => {
         const window = this.#windowForSurface(surface);
         if (!window) return;
         this.#pointerFocus = window;
+        this.#pointerX = xFixed / 256;
+        this.#pointerY = yFixed / 256;
         this.#setDefaultCursor(serial);
-        this.#events.push({ type: "mouseenter", window });
+        this.#events.push({ type: "mouseenter", ...this.#pointerSnapshot(), window });
       }),
     );
     const leaveCb = new Deno.UnsafeCallback(
@@ -496,42 +503,74 @@ class WaylandLibrary implements Library {
         const window = this.#windowForSurface(surface);
         if (!window || window !== this.#pointerFocus) return;
         this.#pointerFocus = null;
-        this.#events.push({ type: "mouseleave", window });
+        this.#events.push({ type: "mouseleave", ...this.#pointerSnapshot(), window });
       }),
     );
     const motionCb = new Deno.UnsafeCallback(
       // (data, pointer, time, surface_x_fixed, surface_y_fixed)
       { parameters: ["pointer", "pointer", "u32", "i32", "i32"], result: "void" },
-      this.guardCallback((_data, _ptr, _time, xFixed, yFixed) => {
+      this.guardCallback((_data, _ptr, time, xFixed, yFixed) => {
         const window = this.#pointerFocus;
         if (!window) return;
-        this.#events.push({ type: "mousemove", x: xFixed >> 8, y: yFixed >> 8, window });
+        this.#pointerX = xFixed / 256;
+        this.#pointerY = yFixed / 256;
+        this.#events.push({ type: "mousemove", ...this.#pointerSnapshot(time), window });
       }),
     );
     const buttonCb = new Deno.UnsafeCallback(
       // (data, pointer, serial, time, button, state)
       { parameters: ["pointer", "pointer", "u32", "u32", "u32", "u32"], result: "void" },
-      this.guardCallback((_data, _ptr, _serial, _time, button, state) => {
+      this.guardCallback((_data, _ptr, _serial, time, button, state) => {
         const window = this.#pointerFocus;
         if (!window) return;
-        // Linux input codes: BTN_LEFT=0x110, BTN_RIGHT=0x111, BTN_MIDDLE=0x112
-        const btnMap: Record<number, "left" | "right" | "middle"> = { 0x110: "left", 0x111: "right", 0x112: "middle" };
+        const btnMap: Record<number, MouseButton> = {
+          0x110: "left",
+          0x111: "right",
+          0x112: "middle",
+          0x113: "back",
+          0x114: "forward",
+          0x115: "forward",
+          0x116: "back",
+        };
         const b = btnMap[button];
         if (b === undefined) return;
-        this.#events.push({ type: state ? "mousedown" : "mouseup", button: b, window });
+        const mask = mouseButtonMask(b);
+        this.#pointerButtons = state ? this.#pointerButtons | mask : this.#pointerButtons & ~mask;
+        const pointer = this.#pointerSnapshot(time);
+        this.#events.push({
+          type: state ? "mousedown" : "mouseup",
+          button: b,
+          detail: this.#clickCounter.detail(b, state !== 0, pointer.timeStamp, pointer.x, pointer.y),
+          ...pointer,
+          window,
+        });
       }),
     );
     const axisCb = new Deno.UnsafeCallback(
       // (data, pointer, time, axis, value_fixed)
       { parameters: ["pointer", "pointer", "u32", "u32", "i32"], result: "void" },
-      this.guardCallback((_data, _ptr, _time, axis, value) => {
+      this.guardCallback((_data, _ptr, time, axis, value) => {
         const window = this.#pointerFocus;
         if (!window) return;
         const delta = value >> 8;
         if (axis === 0) {
-          this.#events.push({ type: "wheel", deltaX: 0, deltaY: delta, deltaMode: 0, window });
+          this.#events.push({
+            type: "wheel",
+            deltaX: 0,
+            deltaY: delta,
+            deltaMode: 0,
+            ...this.#pointerSnapshot(time),
+            window,
+          });
         } else if (axis === 1) {
-          this.#events.push({ type: "wheel", deltaX: delta, deltaY: 0, deltaMode: 0, window });
+          this.#events.push({
+            type: "wheel",
+            deltaX: delta,
+            deltaY: 0,
+            deltaMode: 0,
+            ...this.#pointerSnapshot(time),
+            window,
+          });
         }
       }),
     );
@@ -554,11 +593,12 @@ class WaylandLibrary implements Library {
     this.#pointerFocus = null;
     this.#cursorShapeDevice = null;
     this.#pointer = null;
+    this.#pointerButtons = 0;
     this.#pointerListeners = [];
     this.#pointerVtable = undefined;
 
     if (emitLeave && focusedWindow) {
-      this.#events.push({ type: "mouseleave", window: focusedWindow });
+      this.#events.push({ type: "mouseleave", ...this.#pointerSnapshot(), window: focusedWindow });
     }
 
     const errors: unknown[] = [];
@@ -595,6 +635,25 @@ class WaylandLibrary implements Library {
       collectCleanupError(errors, () => listener.close());
     }
     throwCleanupErrors("winding failed to release Wayland pointer", errors);
+  }
+
+  #pointerSnapshot(time?: number): {
+    x: number;
+    y: number;
+    buttons: number;
+    timeStamp: number;
+    shiftKey: boolean;
+    ctrlKey: boolean;
+    altKey: boolean;
+    metaKey: boolean;
+  } {
+    return {
+      x: this.#pointerX,
+      y: this.#pointerY,
+      buttons: this.#pointerButtons,
+      timeStamp: time === undefined ? performance.now() : this.#pointerClock.timeStamp(time),
+      ...pointerModifiers(this.#keyboardController.modifiers),
+    };
   }
 
   #windowForSurface(surface: Deno.PointerValue): WaylandWindow | null {
@@ -880,6 +939,24 @@ class WaylandLibrary implements Library {
     collectCleanupError(errors, () => this.#callbackErrors.throwIfPending());
     throwCleanupErrors("winding failed to close Wayland library", errors);
   }
+}
+
+function pointerModifiers(modifiers: {
+  shiftKey: boolean;
+  ctrlKey: boolean;
+  altKey: boolean;
+  metaKey: boolean;
+}): PointerModifiers {
+  return {
+    shiftKey: modifiers.shiftKey,
+    ctrlKey: modifiers.ctrlKey,
+    altKey: modifiers.altKey,
+    metaKey: modifiers.metaKey,
+  };
+}
+
+function mouseButtonMask(button: MouseButton): number {
+  return button === "left" ? 1 : button === "right" ? 2 : button === "middle" ? 4 : button === "back" ? 8 : 16;
 }
 
 export const load: LoadLibrary = () => new WaylandLibrary();
