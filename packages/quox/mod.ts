@@ -3,6 +3,25 @@ import { openWindow } from "./dom/window.ts";
 export * from "./dom/document.ts";
 export { QuoxEvent, type QuoxEventInit, type QuoxEventPhase } from "./dom/event.ts";
 export {
+  QuoxCompositionEvent,
+  type QuoxCompositionEventInit,
+  QuoxDOMInputEvent,
+  QuoxDOMKeyboardEvent,
+  type QuoxEventModifierInit,
+  QuoxFocusEvent,
+  type QuoxFocusEventInit,
+  type QuoxInputEventInit,
+  type QuoxKeyboardEventInit,
+  QuoxMouseEvent,
+  type QuoxMouseEventInit,
+  QuoxPointerEvent,
+  type QuoxPointerEventInit,
+  QuoxUIEvent,
+  type QuoxUIEventInit,
+  QuoxWheelEvent,
+  type QuoxWheelEventInit,
+} from "./dom/ui_event.ts";
+export {
   type QuoxAddEventListenerOptions,
   type QuoxEventHandler,
   type QuoxEventListener,
