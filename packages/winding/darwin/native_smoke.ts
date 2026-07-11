@@ -3,6 +3,8 @@ import type { ImeEvent, Library, Window } from "../types.ts";
 import {
   APPKIT,
   classConformsToProtocol,
+  CORE_FOUNDATION,
+  CORE_GRAPHICS,
   cStr,
   getClass,
   getProtocol,
@@ -42,12 +44,13 @@ withAutoreleasePool(() => {
     testKeydownOrdering,
   );
   runCase("modifier transitions never query key-only character properties", testModifierTransitions);
+  runCase("blit copies pixels into storage retained by Core Graphics", testBlitStorageLifetime);
   runCase(
     "NSTextInputClient protocol and struct-return ABIs work through Objective-C dispatch",
     testProtocolAndStructAbis,
   );
   runCase("text input survives repeated library and window lifecycles", testRepeatedLifecycles);
-  console.log("Darwin native smoke: 5 passed");
+  console.log("Darwin native smoke: 6 passed");
 });
 
 function testTextCallbacks(): void {
@@ -289,6 +292,59 @@ function testModifierTransitions(): void {
         for (let i = owned.length - 1; i >= 0; i--) {
           sendVoid(owned[i], sel(runtime, "release"));
         }
+      }
+    } finally {
+      closeAll(handles);
+    }
+  });
+}
+
+function testBlitStorageLifetime(): void {
+  withNativeWindow(2, 1, (_library, window) => {
+    const handles: Closeable[] = [];
+    try {
+      const runtime = Deno.dlopen(LIBOBJC, runtimeSymbols);
+      handles.push(runtime);
+      const sendId = openMessage(handles, ["pointer", "pointer"], "pointer");
+      const cg = Deno.dlopen(
+        CORE_GRAPHICS,
+        {
+          CGImageGetDataProvider: { parameters: ["pointer"], result: "pointer" },
+          CGDataProviderCopyData: { parameters: ["pointer"], result: "pointer" },
+        } as const,
+      );
+      handles.push(cg);
+      const cf = Deno.dlopen(
+        CORE_FOUNDATION,
+        {
+          CFDataGetLength: { parameters: ["pointer"], result: "i64" },
+          CFDataGetBytePtr: { parameters: ["pointer"], result: "pointer" },
+          CFRelease: { parameters: ["pointer"], result: "void" },
+        } as const,
+      );
+      handles.push(cf);
+
+      const pixels = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+      window.blit(pixels, 2, 1);
+      pixels.fill(0);
+
+      const layer = sendId(window.contentView, sel(runtime, "layer"));
+      assert(layer !== null, "content view has no layer after blit");
+      const image = sendId(layer, sel(runtime, "contents"));
+      assert(image !== null, "content layer has no image after blit");
+      const provider = cg.symbols.CGImageGetDataProvider(image);
+      assert(provider !== null, "installed image has no data provider");
+      const data = cg.symbols.CGDataProviderCopyData(provider);
+      assert(data !== null, "could not copy installed provider bytes");
+      try {
+        const length = cf.symbols.CFDataGetLength(data);
+        assertEquals(length, 8n);
+        const pointer = cf.symbols.CFDataGetBytePtr(data);
+        assert(pointer !== null, "installed provider returned null bytes");
+        const actual = new Uint8Array(new Deno.UnsafePointerView(pointer).getArrayBuffer(8));
+        assertEquals([...actual], [1, 2, 3, 4, 5, 6, 7, 8]);
+      } finally {
+        cf.symbols.CFRelease(data);
       }
     } finally {
       closeAll(handles);

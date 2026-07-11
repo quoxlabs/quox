@@ -288,8 +288,8 @@ export function openNSRectMsgSend(libraries: Closeable[]): NSRectMsgSend {
 // CoreGraphics / CoreFoundation plain C functions (not Objective-C messages).
 export const cgSymbols = {
   CGColorSpaceCreateDeviceRGB: { parameters: [], result: "pointer" },
-  CGDataProviderCreateWithData: {
-    parameters: ["pointer", "buffer", "usize", "pointer"],
+  CGDataProviderCreateWithCFData: {
+    parameters: ["pointer"],
     result: "pointer",
   },
   CGImageCreate: {
@@ -311,6 +311,7 @@ export const cgSymbols = {
 } as const satisfies Deno.ForeignLibraryInterface;
 
 export const cfSymbols = {
+  CFDataCreate: { parameters: ["pointer", "buffer", "i64"], result: "pointer" },
   CFRelease: { parameters: ["pointer"], result: "void" },
   CFStringGetLength: { parameters: ["pointer"], result: "i64" },
   CFStringGetMaximumSizeForEncoding: { parameters: ["i64", "u32"], result: "i64" },

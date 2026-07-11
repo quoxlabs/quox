@@ -270,12 +270,6 @@ class DarwinWindow implements Window, DarwinNativeResponder {
   #producedPreedit = false;
   readonly #pressedKeys = new PressedLogicalKeyCache<number>();
   #closed = false;
-  // Kept alive for one extra frame: CGImage/CGDataProvider wrap this memory
-  // without copying it, and CALayer's `contents` assignment is composited
-  // asynchronously, so the previous frame's buffer must outlive the call that
-  // replaces it.
-  #imageBuf: Uint8Array | undefined;
-  #prevImageBuf: Uint8Array | undefined;
 
   constructor(readonly lib: DarwinLibrary, x = 0, y = 0, w = 800, h = 600) {
     lib.assertMainThread();
@@ -759,13 +753,14 @@ class DarwinWindow implements Window, DarwinNativeResponder {
   blit(rgba: Uint8Array, width: number, height: number): void {
     this.lib.assertMainThread();
     const { cf, cg, sel, send } = this.lib.ffi;
-    this.#prevImageBuf = this.#imageBuf;
-    // Own a stable copy: the caller's buffer isn't guaranteed to outlive this call.
-    const buf = new Uint8Array(rgba);
-    this.#imageBuf = buf;
-
-    const provider = cg.symbols.CGDataProviderCreateWithData(null, buf, BigInt(buf.byteLength), null);
-    if (provider === null) throw new Error("winding(darwin): CGDataProviderCreateWithData failed");
+    // CFDataCreate copies the bytes into immutable native-owned storage. The
+    // provider retains that storage until the last CGImage/CALayer reference
+    // is gone, so no JavaScript buffer needs an approximate lifetime root.
+    const data = cf.symbols.CFDataCreate(null, rgba, BigInt(rgba.byteLength));
+    if (data === null) throw new Error("winding(darwin): CFDataCreate failed");
+    const provider = cg.symbols.CGDataProviderCreateWithCFData(data);
+    cf.symbols.CFRelease(data);
+    if (provider === null) throw new Error("winding(darwin): CGDataProviderCreateWithCFData failed");
     const image = cg.symbols.CGImageCreate(
       BigInt(width),
       BigInt(height),
