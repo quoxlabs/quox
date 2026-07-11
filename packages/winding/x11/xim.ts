@@ -260,6 +260,7 @@ export class XimManager implements Disposable {
   }
 
   processDeferred(): void {
+    for (const context of this.#contexts) context.processDeferred();
     if (!this.#rebuildPending || this.#closed) return;
     this.#rebuildPending = false;
 
@@ -627,6 +628,7 @@ export class XimContext implements Disposable {
   #cursorVisible = true;
   #cursorArea: ImeCursorArea | undefined;
   #stagedEvents: XimEvent[] | null = null;
+  #resetPending = false;
   #closed = false;
 
   constructor(manager: XimManager, window: bigint) {
@@ -709,7 +711,6 @@ export class XimContext implements Disposable {
           this.#preedit = [];
           this.#cursor = 0;
           this.#cursorVisible = true;
-          this.#emitPreedit();
           return -1;
         },
         (_ic, _clientData, _callData) => {
@@ -736,10 +737,10 @@ export class XimContext implements Disposable {
           const length = view.getInt32(8);
           const textPointer = pointerFromAddress(view.getBigUint64(16));
           const replacement = textPointer === null ? [] : readXimText(textPointer);
-          if (
-            replacement !== undefined &&
-            !applyPreeditChange(this.#preedit, first, length, replacement)
-          ) return;
+          if (replacement === undefined || !applyPreeditChange(this.#preedit, first, length, replacement)) {
+            this.#scheduleNativeReset();
+            return;
+          }
           if (Number.isInteger(caret) && caret >= 0 && caret <= this.#preedit.length) {
             this.#cursor = caret;
           }
@@ -775,6 +776,12 @@ export class XimContext implements Disposable {
     if (this.#closed) return;
     if (this.#stagedEvents !== null) throw new Error("winding(x11): nested XIM lookup");
     this.#stagedEvents = [];
+  }
+
+  processDeferred(): void {
+    if (!this.#resetPending || this.#closed) return;
+    this.#resetPending = false;
+    if (this.#ic !== null && !this.#serverInvalidated) this.manager.resetIc(this.#ic);
   }
 
   /** Publish the completed lookup batch after its causative keydown has been queued. */
@@ -878,9 +885,15 @@ export class XimContext implements Disposable {
   }
 
   #resetAfterCallbackFailure(): void {
+    this.#resetPending = true;
     this.#composition.reset();
     this.#preedit = [];
     this.#cursor = 0;
     this.#cursorVisible = false;
+  }
+
+  #scheduleNativeReset(): void {
+    this.#resetPending = true;
+    this.#clearPreedit(true);
   }
 }
