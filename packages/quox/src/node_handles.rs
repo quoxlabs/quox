@@ -70,6 +70,11 @@ impl NodeHandles {
             .filter_map(|node_id| self.invalidate_node(node_id))
             .collect()
     }
+
+    #[cfg(test)]
+    pub(super) fn exhaust_for_test(&mut self) {
+        self.next_handle = None;
+    }
 }
 
 #[cfg(test)]

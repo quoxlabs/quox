@@ -34,6 +34,19 @@ fn invalid_internal_node(node_id: usize) -> JsValue {
     JsValue::from_str(&format!("Invalid internal DOM node id: {node_id}"))
 }
 
+/// Layout-only anonymous nodes are not DOM nodes and can be rebuilt by Blitz without going
+/// through a Quox mutation. Map them back to their nearest real DOM ancestor before exposing
+/// stable identities at the JavaScript boundary.
+pub(super) fn public_dom_node_id(document: &BaseDocument, mut node_id: usize) -> Option<usize> {
+    loop {
+        let node = document.get_node(node_id)?;
+        if !matches!(&node.data, NodeData::AnonymousBlock(_)) {
+            return Some(node_id);
+        }
+        node_id = node.parent.or_else(|| node.layout_parent.get())?;
+    }
+}
+
 /// Return exactly the node ids Blitz's `remove_and_drop_all_children` will destroy.
 fn dropped_descendant_ids(document: &BaseDocument, parent_id: usize) -> Vec<usize> {
     let Some(parent) = document.get_node(parent_id) else {
@@ -104,24 +117,11 @@ impl QuoxRendererState {
             .map_err(|error| JsValue::from_str(&error.to_string()))
     }
 
-    /// Layout-only anonymous nodes are not DOM nodes and can be rebuilt by Blitz without going
-    /// through a Quox mutation. Map hits on them back to their nearest real DOM ancestor so an
-    /// ephemeral layout slab entry never receives a public handle.
-    fn public_dom_node_id(&self, mut node_id: usize) -> Option<usize> {
-        loop {
-            let node = self.document.get_node(node_id)?;
-            if !matches!(&node.data, NodeData::AnonymousBlock(_)) {
-                return Some(node_id);
-            }
-            node_id = node.parent.or_else(|| node.layout_parent.get())?;
-        }
-    }
-
     pub(super) fn expose_public_dom_node(
         &mut self,
         node_id: usize,
     ) -> Result<Option<u32>, JsValue> {
-        let Some(node_id) = self.public_dom_node_id(node_id) else {
+        let Some(node_id) = public_dom_node_id(&self.document, node_id) else {
             return Ok(None);
         };
         self.expose_node(node_id).map(Some)

@@ -16,6 +16,8 @@ use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use wasm_bindgen::prelude::*;
 
+pub(super) mod staged_dispatch;
+
 /// Convert logical viewport coordinates (the space `mousemove` events report) into Blitz's
 /// page-space coordinates (viewport coordinates plus the current scroll offset), or
 /// `None` if the point is non-finite or outside the viewport bounds.
