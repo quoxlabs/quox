@@ -11,6 +11,7 @@ import type {
   WheelEvent as WindingWheelEvent,
 } from "@quoxlabs/winding";
 import { KeyEventFlag, KeyModifierMask, PointerModifierMask } from "../lib/quox.js";
+import { wheelPixelsForBlitz } from "./wheel.ts";
 
 export { applyImeRequestSnapshot, IME_REQUEST_FLAG } from "./ime_requests.ts";
 
@@ -57,8 +58,6 @@ export interface QuoxInputRoutePort {
   visibility(event: QuoxVisibilityEvent): void;
 }
 
-const WHEEL_LINE_PIXELS = 40;
-
 /** Deterministic, native-independent routing from canonical Quox events to the document port. */
 export class QuoxInputRouter {
   #viewportWidth: number;
@@ -93,13 +92,18 @@ export class QuoxInputRouter {
         );
         return undefined;
       case "wheel": {
-        const scaleX = event.deltaMode === 0 ? 1 : event.deltaMode === 1 ? WHEEL_LINE_PIXELS : this.#viewportWidth;
-        const scaleY = event.deltaMode === 0 ? 1 : event.deltaMode === 1 ? WHEEL_LINE_PIXELS : this.#viewportHeight;
+        const [deltaX, deltaY] = wheelPixelsForBlitz(
+          event.deltaX,
+          event.deltaY,
+          event.deltaMode,
+          this.#viewportWidth,
+          this.#viewportHeight,
+        );
         this.port.wheel(
           event.x,
           event.y,
-          event.deltaX * scaleX,
-          event.deltaY * scaleY,
+          deltaX,
+          deltaY,
           event.buttons,
           encodePointerModifiers(event),
         );

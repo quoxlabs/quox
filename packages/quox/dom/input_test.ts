@@ -36,7 +36,7 @@ const pointer = {
   metaKey: true,
 };
 
-Deno.test("wheel adapter preserves browser units and converts them only for Blitz", () => {
+Deno.test("wheel adapter preserves browser units and translates Blitz scroll direction", () => {
   const calls: number[][] = [];
   const router = new QuoxInputRouter(
     {
@@ -75,9 +75,9 @@ Deno.test("wheel adapter preserves browser units and converts them only for Blit
   router.route({ type: "wheel", deltaX: 0.5, deltaY: -1, deltaMode: 2, ...pointer });
 
   assertEquals(calls, [
-    [7, 9, 2.25, -3.5, 5, 9],
-    [7, 9, 40, -80, 5, 9],
-    [7, 9, 400, -600, 5, 9],
+    [7, 9, -2.25, 3.5, 5, 9],
+    [7, 9, -40, 80, 5, 9],
+    [7, 9, -400, 600, 5, 9],
   ]);
 });
 
