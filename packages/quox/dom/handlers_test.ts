@@ -1,0 +1,101 @@
+import { assertEquals, assertStrictEquals } from "@std/assert";
+import type { QuoxDocument } from "./document.ts";
+import { QuoxEvent } from "./event.ts";
+import { setElementFunctionProp } from "./handlers.ts";
+import { QuoxElement } from "./node.ts";
+import { DOM_DISPATCH_EVENT_TYPES, type DomDispatchEventType } from "./renderer_port.ts";
+
+const EVENT_TYPE_TO_PROP = {
+  pointermove: "onPointerMove",
+  pointerdown: "onPointerDown",
+  pointerup: "onPointerUp",
+  pointerenter: "onPointerEnter",
+  pointerleave: "onPointerLeave",
+  pointerover: "onPointerOver",
+  pointerout: "onPointerOut",
+  mousemove: "onMouseMove",
+  mousedown: "onMouseDown",
+  mouseup: "onMouseUp",
+  mouseenter: "onMouseEnter",
+  mouseleave: "onMouseLeave",
+  mouseover: "onMouseOver",
+  mouseout: "onMouseOut",
+  scroll: "onScroll",
+  wheel: "onWheel",
+  click: "onClick",
+  contextmenu: "onContextMenu",
+  dblclick: "onDoubleClick",
+  keypress: "onKeyPress",
+  keydown: "onKeyDown",
+  keyup: "onKeyUp",
+  input: "onInput",
+  focus: "onFocus",
+  blur: "onBlur",
+  focusin: "onFocusIn",
+  focusout: "onFocusOut",
+} as const satisfies Record<DomDispatchEventType, string>;
+
+let nextNodeId = 1;
+
+function createElement(): QuoxElement {
+  return new QuoxElement({} as QuoxDocument, nextNodeId++);
+}
+
+Deno.test("every staged DOM event has live JSX bubble and capture props", () => {
+  assertEquals(
+    Object.keys(EVENT_TYPE_TO_PROP).sort(),
+    Array.from(DOM_DISPATCH_EVENT_TYPES).sort(),
+  );
+
+  for (const [type, baseProp] of Object.entries(EVENT_TYPE_TO_PROP)) {
+    for (const prop of [baseProp, `${baseProp}Capture`]) {
+      const element = createElement();
+      const event = new QuoxEvent(type, { cancelable: true });
+      let handlerThis: unknown;
+      let handlerArgs: unknown[] = [];
+
+      setElementFunctionProp(element, prop, function (this: QuoxElement, ...args) {
+        handlerThis = this;
+        handlerArgs = args;
+        return false;
+      });
+
+      // JSX listener return values, including false, have no inline-attribute semantics.
+      assertEquals(element.dispatchEvent(event), true, prop);
+      assertStrictEquals(handlerThis, element, prop);
+      assertEquals(handlerArgs, [event], prop);
+    }
+  }
+});
+
+Deno.test("capture JSX props run in the capture listener group", () => {
+  const element = createElement();
+  const calls: string[] = [];
+
+  setElementFunctionProp(element, "onClick", () => calls.push("bubble"));
+  setElementFunctionProp(element, "onClickCapture", () => calls.push("capture"));
+
+  element.dispatchEvent(new QuoxEvent("click"));
+  assertEquals(calls, ["capture", "bubble"]);
+});
+
+Deno.test("React and Preact double-click spellings share stable slots", () => {
+  const element = createElement();
+  const calls: string[] = [];
+
+  element.addEventListener("dblclick", () => calls.push("before"));
+  setElementFunctionProp(element, "onDoubleClick", () => calls.push("old bubble"));
+  element.addEventListener("dblclick", () => calls.push("after"));
+  setElementFunctionProp(element, "onDblClick", () => calls.push("Preact bubble"));
+  setElementFunctionProp(element, "onDoubleClickCapture", () => calls.push("old capture"));
+  setElementFunctionProp(element, "onDblClickCapture", () => calls.push("Preact capture"));
+
+  element.dispatchEvent(new QuoxEvent("dblclick"));
+  assertEquals(calls, ["Preact capture", "before", "Preact bubble", "after"]);
+
+  calls.length = 0;
+  setElementFunctionProp(element, "onDoubleClick", () => calls.push("React bubble"));
+  setElementFunctionProp(element, "onDoubleClickCapture", () => calls.push("React capture"));
+  element.dispatchEvent(new QuoxEvent("dblclick"));
+  assertEquals(calls, ["React capture", "before", "React bubble", "after"]);
+});

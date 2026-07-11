@@ -2,6 +2,7 @@ import { createVNode, Fragment, type QuoxRenderable, type QuoxVNodeType } from "
 import { assert, assertEquals, assertRejects, assertStrictEquals } from "@std/assert";
 import type { QuoxRenderer as WasmRenderer } from "../lib/quox.js";
 import { QuoxDocument } from "./document.ts";
+import { QuoxEvent } from "./event.ts";
 import { getElementFunctionProps } from "./handlers.ts";
 import { mount } from "./mount.ts";
 import { QuoxElement, QuoxNode } from "./node.ts";
@@ -260,6 +261,47 @@ Deno.test("mount lowers props and stores function-valued DOM props", async () =>
   assert(getElementFunctionProps(node as QuoxElement)?.get("onClick") === onClick, "onClick was not stored");
 });
 
+Deno.test("mount connects JSX capture props and preserves non-event function props", async () => {
+  const { root } = createTestDocument();
+  const calls: string[] = [];
+  const ref = () => undefined;
+  const [node] = await mount(
+    root,
+    createVNode("button", {
+      onClick: () => calls.push("bubble"),
+      onClickCapture: () => calls.push("capture"),
+      ref,
+    }),
+  );
+  const element = node as QuoxElement;
+
+  element.dispatchEvent(new QuoxEvent("click"));
+
+  assertEquals(calls, ["capture", "bubble"]);
+  assertStrictEquals(getElementFunctionProps(element)?.get("ref"), ref);
+});
+
+Deno.test("mount rejects function-valued event props Quox cannot dispatch", async () => {
+  const { root } = createTestDocument();
+
+  for (
+    const prop of [
+      "onAuxClick",
+      "onBeforeInput",
+      "onChange",
+      "onCompositionStart",
+      "onCompositionUpdate",
+      "onCompositionEndCapture",
+    ]
+  ) {
+    await assertRejects(
+      () => mount(root, createVNode("input", { [prop]: () => undefined })),
+      TypeError,
+      `quox: JSX event prop "${prop}" is not supported`,
+    );
+  }
+});
+
 Deno.test("mount kebab-cases vendor-prefixed style properties", async () => {
   const { renderer, root } = createTestDocument();
 
@@ -377,6 +419,22 @@ Deno.test("mount recognizes duck-typed Preact-shaped vnodes", async () => {
     { type: "append_child", parentId: 1, childId: 2 },
     { type: "append_child", parentId: 0, childId: 1 },
   ]);
+});
+
+Deno.test("mount connects Preact double-click JSX spellings", async () => {
+  const { root } = createTestDocument();
+  const calls: string[] = [];
+  const [node] = await mount(
+    root,
+    createPreactLikeVNode("button", {
+      onDblClick: () => calls.push("bubble"),
+      onDblClickCapture: () => calls.push("capture"),
+    }),
+  );
+
+  node.dispatchEvent(new QuoxEvent("dblclick"));
+
+  assertEquals(calls, ["capture", "bubble"]);
 });
 
 Deno.test("mount resolves Preact-shaped fragments and function components without special-casing", async () => {
