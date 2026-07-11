@@ -11,7 +11,7 @@ import {
   normalizeCommittedText,
   PressedLogicalKeyCache,
 } from "../input/mod.ts";
-import { domCodeFromX11 } from "../linux/mod.ts";
+import { domCodeFromXkbName } from "../linux/mod.ts";
 import { utf8Bytes, utf8CString as cString } from "../text_encoding.ts";
 import { libcFunctions, NotifyNormal, x11functions, XEventMask, XEventType } from "./ffi.ts";
 import {
@@ -66,6 +66,9 @@ const XK_SUPER_R = 0xffecn;
 const XK_MODE_SWITCH = 0xff7en;
 const XK_ISO_LEVEL3_SHIFT = 0xfe03n;
 const XK_ISO_LEVEL5_SHIFT = 0xfe11n;
+const XKB_USE_CORE_KBD = 0x0100;
+const XKB_KEY_NAMES_MASK = 1 << 9;
+const XKB_ALL_COMPONENTS_MASK = 0x7f;
 
 class X11Window implements Window {
   readonly id: bigint;
@@ -307,6 +310,7 @@ class X11Library implements Library {
     maskByKeycode: new Map(),
     toggleKeycodes: new Set(),
   };
+  #domCodes = new Map<number, string>();
   #closed = false;
   constructor() {
     this.X11 = openX11Library();
@@ -338,6 +342,7 @@ class X11Library implements Library {
     this.netWmName = BigInt(this.X11.symbols.XInternAtom(display, cString("_NET_WM_NAME"), 0));
     this.utf8String = BigInt(this.X11.symbols.XInternAtom(display, cString("UTF8_STRING"), 0));
     this.#refreshModifierMapping();
+    this.#refreshDomCodes();
     try {
       this.input = new XimManager(
         this.X11,
@@ -430,13 +435,14 @@ class X11Library implements Library {
       if (type === XEventType.MappingNotify) {
         this.X11.symbols.XRefreshKeyboardMapping(eventPointer);
         this.#refreshModifierMapping();
+        this.#refreshDomCodes();
         continue;
       }
 
       if ((type === XEventType.KeyPress || type === XEventType.KeyRelease) && window !== undefined) {
         const state = view.getUint32(80, true);
         const keycode = view.getUint32(84, true);
-        const code = domCodeFromX11(keycode);
+        const code = this.#domCodes.get(keycode) ?? "Unidentified";
         const modifiers = x11ModifierSnapshot(
           state,
           keycode,
@@ -680,6 +686,42 @@ class X11Library implements Library {
       };
     } finally {
       this.X11.symbols.XFreeModifiermap(native);
+    }
+  }
+
+  #refreshDomCodes(): void {
+    this.#domCodes = new Map();
+    const opcode = new Int32Array(1);
+    const event = new Int32Array(1);
+    const error = new Int32Array(1);
+    const major = new Int32Array([1]);
+    const minor = new Int32Array([0]);
+    if (this.X11.symbols.XkbQueryExtension(this.display, opcode, event, error, major, minor) === 0) return;
+
+    const keyboard = this.X11.symbols.XkbGetMap(this.display, 0, XKB_USE_CORE_KBD);
+    if (keyboard === null) return;
+    try {
+      if (this.X11.symbols.XkbGetNames(this.display, XKB_KEY_NAMES_MASK, keyboard) === 0) return;
+      const keyboardView = new Deno.UnsafePointerView(keyboard);
+      const minimum = keyboardView.getUint8(12);
+      const maximum = keyboardView.getUint8(13);
+      const namesAddress = keyboardView.getBigUint64(48);
+      if (namesAddress === 0n) return;
+      const names = new Deno.UnsafePointerView(Deno.UnsafePointer.create(namesAddress));
+      const keysAddress = names.getBigUint64(456);
+      if (keysAddress === 0n) return;
+      const keys = new Deno.UnsafePointerView(Deno.UnsafePointer.create(keysAddress));
+      const decoder = new TextDecoder("ascii");
+      for (let keycode = minimum; keycode <= maximum; keycode++) {
+        const bytes = new Uint8Array(4);
+        for (let index = 0; index < bytes.length; index++) {
+          bytes[index] = keys.getUint8(keycode * bytes.length + index);
+        }
+        const code = domCodeFromXkbName(decoder.decode(bytes));
+        if (code !== "Unidentified") this.#domCodes.set(keycode, code);
+      }
+    } finally {
+      this.X11.symbols.XkbFreeKeyboard(keyboard, XKB_ALL_COMPONENTS_MASK, 1);
     }
   }
 

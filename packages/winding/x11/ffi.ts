@@ -383,6 +383,13 @@ export const x11functions = {
   XKeysymToKeycode: { parameters: ["pointer", "usize"], result: "u32" },
   XKeysymToString: { parameters: ["usize"], result: "pointer" },
   XkbKeysymToModifiers: { parameters: ["pointer", "usize"], result: "u32" },
+  XkbQueryExtension: {
+    parameters: ["pointer", "buffer", "buffer", "buffer", "buffer", "buffer"],
+    result: "i32",
+  },
+  XkbGetMap: { parameters: ["pointer", "u32", "u32"], result: "pointer" },
+  XkbGetNames: { parameters: ["pointer", "u32", "pointer"], result: "i32" },
+  XkbFreeKeyboard: { parameters: ["pointer", "u32", "i32"], result: "void" },
   XKillClient: { parameters: ["pointer", "usize"], result: "i32" },
   XListDepths: { parameters: ["pointer", "i32", "pointer"], result: "pointer" },
   XListExtensions: { parameters: ["pointer", "pointer"], result: "pointer" },
