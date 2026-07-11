@@ -17,6 +17,10 @@ const testUser32Functions = {
     parameters: ["pointer", "u32", "usize", "isize"],
     result: "i32",
   },
+  DestroyWindow: {
+    parameters: ["pointer"],
+    result: "i32",
+  },
 } as const satisfies Deno.ForeignLibraryInterface;
 
 interface NativeWin32Window extends Window {
@@ -34,14 +38,14 @@ Deno.test({
     try {
       // A second pass verifies that close destroys the HWND and unregisters
       // the class before its callback and DLL handles are released.
-      for (let iteration = 0; iteration < 2; iteration++) runLifecycle(user32);
+      for (let iteration = 0; iteration < 2; iteration++) runLifecycle(user32, iteration === 1);
     } finally {
       user32.close();
     }
   },
 });
 
-function runLifecycle(user32: Deno.DynamicLibrary<typeof testUser32Functions>): void {
+function runLifecycle(user32: Deno.DynamicLibrary<typeof testUser32Functions>, destroyExternally: boolean): void {
   const library = load();
   try {
     const window = library.openWindow(0, 0, 64, 48) as NativeWin32Window;
@@ -70,6 +74,11 @@ function runLifecycle(user32: Deno.DynamicLibrary<typeof testUser32Functions>): 
         throw new Error("Expected a Win32 commit containing A");
       }
     } finally {
+      if (destroyExternally && user32.symbols.DestroyWindow(window.hwnd) === 0) {
+        throw new Error("DestroyWindow rejected the externally driven lifetime test");
+      }
+      // An external destroy reaches WM_NCDESTROY first; close must then be a
+      // harmless no-op, and library teardown must still unregister the class.
       window.close();
     }
   } finally {

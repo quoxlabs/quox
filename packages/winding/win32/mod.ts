@@ -18,6 +18,7 @@ import { Win32InputController } from "./input_controller.ts";
 const BITMAPINFOHEADER_SIZE = 40;
 const BI_RGB = 0;
 const DIB_RGB_COLORS = 0;
+const ERROR_CLASS_DOES_NOT_EXIST = 1411;
 
 // TRACKMOUSEEVENT: cbSize(4) + dwFlags(4) + hwndTrack(8, 8-byte aligned) +
 // dwHoverTime(4) + 4 bytes trailing padding to the struct's 8-byte alignment = 24 bytes.
@@ -66,7 +67,8 @@ class Win32Window implements Window {
   #bmi = new ArrayBuffer(BITMAPINFOHEADER_SIZE);
   /** Tracks minimized state so `WM_SIZE` transitions map to a single `visibilitychange` event instead of firing on every resize message. */
   minimized = false;
-  #closed = false;
+  #closing = false;
+  #destroyed = false;
 
   constructor(readonly lib: Win32Library, classNameBuf: ArrayBuffer) {
     const window = lib.user32.symbols.CreateWindowExW(
@@ -90,11 +92,11 @@ class Win32Window implements Window {
     try {
       lib.input.attach(this);
     } catch (error) {
-      lib.purgeWindowEvents(this);
-      lib.windows.delete(this.id);
       const errors = [error];
       try {
-        if (lib.user32.symbols.DestroyWindow(window) === 0) errors.push(new Error(lib.getLastError()));
+        if (lib.user32.symbols.DestroyWindow(window) === 0 && !this.#destroyed) {
+          errors.push(new Error(lib.getLastError()));
+        }
       } catch (cleanupError) {
         errors.push(cleanupError);
       }
@@ -112,12 +114,12 @@ class Win32Window implements Window {
   }
 
   setImeEnabled(enabled: boolean): void {
-    if (this.#closed) return;
+    if (this.#destroyed) return;
     this.lib.input.setImeEnabled(this, enabled);
   }
 
   setImeCursorArea(x: number, y: number, width: number, height: number): void {
-    if (this.#closed) return;
+    if (this.#destroyed) return;
     this.lib.input.setImeCursorArea(this, x, y, width, height);
   }
 
@@ -177,22 +179,38 @@ class Win32Window implements Window {
     this.close();
   }
   close(): void {
-    if (this.#closed) return;
-    this.#closed = true;
+    if (this.#destroyed || this.#closing) return;
+    this.#closing = true;
+    try {
+      if (this.lib.user32.symbols.DestroyWindow(this.#hwnd) === 0 && !this.#destroyed) {
+        this.#closing = false;
+        throw new Error(this.lib.getLastError());
+      }
+    } catch (error) {
+      if (!this.#destroyed) this.#closing = false;
+      throw error;
+    }
+    if (!this.#destroyed) {
+      this.#closing = false;
+      throw new Error("winding(win32): DestroyWindow returned before WM_NCDESTROY");
+    }
+  }
+
+  /** Complete JavaScript teardown only at Win32's definitive HWND lifetime boundary. */
+  nativeDestroyed(): void {
+    if (this.#destroyed) return;
+    this.#destroyed = true;
+    this.#closing = false;
     const errors: unknown[] = [];
     try {
       this.lib.input.detach(this);
     } catch (error) {
       errors.push(error);
+    } finally {
+      this.lib.purgeWindowEvents(this);
+      this.lib.windows.delete(this.id);
     }
-    this.lib.purgeWindowEvents(this);
-    this.lib.windows.delete(this.id);
-    try {
-      if (this.lib.user32.symbols.DestroyWindow(this.#hwnd) === 0) errors.push(new Error(this.lib.getLastError()));
-    } catch (error) {
-      errors.push(error);
-    }
-    throwCollected(errors, "Failed to close Win32 window");
+    throwCollected(errors, "Failed to release destroyed Win32 window state");
   }
 }
 
@@ -218,6 +236,8 @@ class Win32Library implements Library {
   // released once the last button of a (possibly multi-button) drag is
   // released rather than on every individual button-up.
   #captureCount = 0;
+  #classRegistered = false;
+  #closing = false;
   #closed = false;
   constructor() {
     this.kernel32 = Deno.dlopen("kernel32", kernel32functions);
@@ -272,6 +292,9 @@ class Win32Library implements Library {
             // Return without calling DefWindowProcW to prevent immediate window
             // destruction; let the application decide when to tear down.
             return 0n;
+          case WM.NCDESTROY:
+            if (win !== undefined) win.nativeDestroyed();
+            break;
           case WM.MOUSEMOVE: {
             if (win === undefined) break;
             // Re-arm on every move: `WM_MOUSELEAVE` tracking is consumed by the leave
@@ -402,6 +425,7 @@ class Win32Library implements Library {
 
     const wndClass = this.user32.symbols.RegisterClassExW(this.#wndClass);
     if (wndClass == 0) throw new Error(this.getLastError());
+    this.#classRegistered = true;
   }
 
   purgeWindowEvents(window: Win32Window): void {
@@ -410,7 +434,7 @@ class Win32Library implements Library {
 
   readonly windows = new Map<bigint, Win32Window>();
   openWindow(_x = 0, _y = 0, _w = 800, _h = 600): Win32Window {
-    if (this.#closed) throw new Error("winding(win32): library is closed");
+    if (this.#closed || this.#closing) throw new Error("winding(win32): library is closed");
     const window = new Win32Window(this, this.#classNameBuffer);
     try {
       this.#callbackErrors.throwIfPending();
@@ -427,7 +451,7 @@ class Win32Library implements Library {
   }
   #msg = new ArrayBuffer(48);
   event(): UIEvent | undefined {
-    if (this.#closed) return undefined;
+    if (this.#closed || this.#closing) return undefined;
     this.#callbackErrors.throwIfPending();
     const queued = this.#events.shift();
     if (queued !== undefined) return queued;
@@ -446,8 +470,7 @@ class Win32Library implements Library {
     return this.#events.shift();
   }
   #lastErrorBuffer = new ArrayBuffer(4096);
-  getLastError() {
-    const code = this.kernel32.symbols.GetLastError();
+  getLastError(code = this.kernel32.symbols.GetLastError()) {
     const bufU16 = new Uint16Array(this.#lastErrorBuffer);
     const bytesWritten = this.kernel32.symbols.FormatMessageW(
       0x1000,
@@ -473,10 +496,9 @@ class Win32Library implements Library {
     this.close();
   }
   close(): void {
-    if (this.#closed) return;
-    this.#closed = true;
+    if (this.#closed || this.#closing) return;
+    this.#closing = true;
     const errors: unknown[] = [];
-    this.#events.close();
     for (const window of [...this.windows.values()]) {
       try {
         window.close();
@@ -484,18 +506,41 @@ class Win32Library implements Library {
         errors.push(error);
       }
     }
-    captureError(errors, () => this.input.close());
-    captureError(errors, () => {
-      if (this.user32.symbols.UnregisterClassW(this.#classNameBuffer, this.#instance) === 0) {
-        throw new Error(this.getLastError());
+
+    if (this.windows.size > 0) {
+      this.#closing = false;
+      throw collectedError(errors, "Failed to destroy every Win32 window");
+    }
+
+    if (this.#classRegistered) {
+      try {
+        if (this.user32.symbols.UnregisterClassW(this.#classNameBuffer, this.#instance) !== 0) {
+          this.#classRegistered = false;
+        } else {
+          const code = this.kernel32.symbols.GetLastError();
+          if (code === ERROR_CLASS_DOES_NOT_EXIST) this.#classRegistered = false;
+          else errors.push(new Error(this.getLastError(code)));
+        }
+      } catch (error) {
+        errors.push(error);
       }
-    });
+    }
+
+    if (this.#classRegistered) {
+      this.#closing = false;
+      throw collectedError(errors, "Failed to unregister the Win32 window class");
+    }
+
+    this.#events.close();
+    captureError(errors, () => this.input.close());
     captureError(errors, () => this.#callbackErrors.throwIfPending());
     captureError(errors, () => this.#wndProc.close());
     captureError(errors, () => this.imm32.close());
     captureError(errors, () => this.gdi32.close());
     captureError(errors, () => this.user32.close());
     captureError(errors, () => this.kernel32.close());
+    this.#closed = true;
+    this.#closing = false;
     throwCollected(errors, "Failed to close Win32 library");
   }
 }
