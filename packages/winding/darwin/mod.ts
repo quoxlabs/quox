@@ -19,7 +19,13 @@ import {
   PressedLogicalKeyCache,
 } from "../input/mod.ts";
 import { getDomCode } from "./dom_code.ts";
-import { appKitWindowFrame, browserWheelDelta, type ScreenFrame } from "./geometry.ts";
+import {
+  appKitWindowFrame,
+  browserWheelDelta,
+  type ScreenFrame,
+  type SurfaceMetrics,
+  surfaceMetrics,
+} from "./geometry.ts";
 import { DarwinInputState } from "./input_state.ts";
 import {
   addMethod as runtimeAddMethod,
@@ -148,6 +154,7 @@ function openMsgSendSymbols(libraries: Closeable[]) {
     bool: openMsgSend(libraries, ["pointer", "pointer"], "bool"),
     bool_id: openMsgSend(libraries, ["pointer", "pointer", "pointer"], "bool"),
     void_bool: openMsgSend(libraries, ["pointer", "pointer", "bool"], "void"),
+    void_f64: openMsgSend(libraries, ["pointer", "pointer", "f64"], "void"),
     bool_i64: openMsgSend(libraries, ["pointer", "pointer", "i64"], "bool"),
     point: openMsgSend(libraries, ["pointer", "pointer"], NSPOINT),
     point_pointId: openMsgSend(
@@ -330,7 +337,7 @@ function validatedBlitGeometry(
   }
   if (width !== expectedWidth || height !== expectedHeight) {
     throw new RangeError(
-      `winding(darwin): blit dimensions ${width}x${height} do not match client size ${expectedWidth}x${expectedHeight}`,
+      `winding(darwin): blit dimensions ${width}x${height} do not match framebuffer size ${expectedWidth}x${expectedHeight}`,
     );
   }
   const rowBytes = width * 4;
@@ -356,6 +363,9 @@ class DarwinWindow implements Window, DarwinNativeResponder {
   #viewImage: Deno.PointerValue = null;
   #width: number;
   #height: number;
+  #framebufferWidth: number;
+  #framebufferHeight: number;
+  #devicePixelRatio = 1;
   #discardingMarkedText = false;
   #keyDispatchActive = false;
   #producedText: string | undefined;
@@ -392,6 +402,8 @@ class DarwinWindow implements Window, DarwinNativeResponder {
     this.id = pointerId(win);
     this.#width = Math.round(contentWidth);
     this.#height = Math.round(contentHeight);
+    this.#framebufferWidth = this.#width;
+    this.#framebufferHeight = this.#height;
     this.inputState = new DarwinInputState(this);
     let delegate: Deno.PointerValue = null;
     let contentView: Deno.PointerValue = null;
@@ -459,6 +471,7 @@ class DarwinWindow implements Window, DarwinNativeResponder {
       lib.nativeClasses.throwIfCallbackFailed();
       lib.registerWindow(this);
       this.#ready = true;
+      this.handleResize();
       if (send.bool(win, sel("isKeyWindow"))) this.handleFocusGained();
     } catch (error) {
       const errors = [error];
@@ -485,11 +498,6 @@ class DarwinWindow implements Window, DarwinNativeResponder {
     }
   }
 
-  setSize(width: number, height: number): void {
-    this.#width = width;
-    this.#height = height;
-  }
-
   get height(): number {
     return this.#height;
   }
@@ -498,6 +506,7 @@ class DarwinWindow implements Window, DarwinNativeResponder {
     kind:
       | "close"
       | "resize"
+      | "backingchange"
       | "geometrychange"
       | "mouseenter"
       | "mouseleave"
@@ -514,6 +523,9 @@ class DarwinWindow implements Window, DarwinNativeResponder {
         return;
       case "resize":
         this.handleResize();
+        return;
+      case "backingchange":
+        this.handleResize(false);
         return;
       case "geometrychange":
         this.invalidateCharacterCoordinates();
@@ -656,15 +668,60 @@ class DarwinWindow implements Window, DarwinNativeResponder {
     };
   }
 
-  handleResize(): void {
+  #readSurfaceMetrics(): SurfaceMetrics {
+    const { nsrect, sel, send } = this.lib.ffi;
+    const bounds = nsrect.noArgs(this.contentView, sel("bounds"));
+    const backingBounds = nsrect.rectArg(
+      this.contentView,
+      sel("convertRectToBacking:"),
+      bounds,
+    );
+    return surfaceMetrics(
+      readStructF64(bounds, 16),
+      readStructF64(bounds, 24),
+      readStructF64(backingBounds, 16),
+      readStructF64(backingBounds, 24),
+      send.f64(this.nsWindow, sel("backingScaleFactor")),
+    );
+  }
+
+  #updateSurfaceMetrics(): boolean {
+    const metrics = this.#readSurfaceMetrics();
+    const changed = metrics.width !== this.#width ||
+      metrics.height !== this.#height ||
+      metrics.framebufferWidth !== this.#framebufferWidth ||
+      metrics.framebufferHeight !== this.#framebufferHeight ||
+      metrics.devicePixelRatio !== this.#devicePixelRatio;
+    this.#width = metrics.width;
+    this.#height = metrics.height;
+    this.#framebufferWidth = metrics.framebufferWidth;
+    this.#framebufferHeight = metrics.framebufferHeight;
+    this.#devicePixelRatio = metrics.devicePixelRatio;
+    this.lib.ffi.send.void_f64(
+      this.#layer,
+      this.lib.ffi.sel("setContentsScale:"),
+      metrics.devicePixelRatio,
+    );
+    return changed;
+  }
+
+  #pushResizeEvent(): void {
+    this.lib.pushEvent({
+      type: "resize",
+      width: this.#width,
+      height: this.#height,
+      framebufferWidth: this.#framebufferWidth,
+      framebufferHeight: this.#framebufferHeight,
+      devicePixelRatio: this.#devicePixelRatio,
+      window: this,
+    });
+  }
+
+  handleResize(alwaysEmit = true): void {
     if (this.#closed) return;
-    const { nsrect, sel } = this.lib.ffi;
-    const frame = nsrect.noArgs(this.contentView, sel("frame"));
-    const width = Math.round(readStructF64(frame, 16));
-    const height = Math.round(readStructF64(frame, 24));
-    this.setSize(width, height);
+    const changed = this.#updateSurfaceMetrics();
     this.invalidateCharacterCoordinates();
-    this.lib.pushEvent({ type: "resize", width, height, window: this });
+    if (alwaysEmit || changed) this.#pushResizeEvent();
   }
 
   handleFocusGained(): void {
@@ -1013,7 +1070,13 @@ class DarwinWindow implements Window, DarwinNativeResponder {
 
   #blit(rgba: Uint8Array, width: number, height: number): void {
     const { cf, cg, sel, send } = this.lib.ffi;
-    const { rowBytes } = validatedBlitGeometry(rgba, width, height, this.#width, this.#height);
+    const { rowBytes } = validatedBlitGeometry(
+      rgba,
+      width,
+      height,
+      this.#framebufferWidth,
+      this.#framebufferHeight,
+    );
     // CFDataCreate copies the bytes into immutable native-owned storage. The
     // provider retains that storage until the last CGImage/CALayer reference
     // is gone, so no JavaScript buffer needs an approximate lifetime root.

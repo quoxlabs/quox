@@ -214,6 +214,9 @@ export class WaylandWindow implements Window {
           type: "resize",
           width: completed.configuration.width,
           height: completed.configuration.height,
+          framebufferWidth: completed.configuration.width,
+          framebufferHeight: completed.configuration.height,
+          devicePixelRatio: 1,
           frameToken: completed.configuration.frameToken,
           window: this,
         });

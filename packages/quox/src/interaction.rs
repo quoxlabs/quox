@@ -12,7 +12,7 @@ use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use wasm_bindgen::prelude::*;
 
-/// Convert viewport-pixel coordinates (the space `mousemove` events report) into Blitz's
+/// Convert logical viewport coordinates (the space `mousemove` events report) into Blitz's
 /// page-space coordinates (viewport coordinates plus the current scroll offset), or
 /// `None` if the point is non-finite or outside the viewport bounds.
 #[allow(
@@ -226,7 +226,7 @@ fn pointer_coords(x: f32, y: f32, page_x: f32, page_y: f32) -> PointerCoords {
     }
 }
 
-/// Build a `BlitzPointerEvent` for a mouse pointer at viewport-pixel `(x, y)`, or `None` if
+/// Build a `BlitzPointerEvent` for a mouse pointer at logical viewport `(x, y)`, or `None` if
 /// the coordinates are non-finite or outside the viewport (mirrors `node_from_point`'s
 /// guard).
 fn pointer_event(
@@ -454,8 +454,8 @@ fn apply_ime_delete_surrounding(
 
 #[wasm_bindgen]
 impl QuoxRenderer {
-    /// Return the id of the topmost DOM node at the given viewport-pixel coordinates
-    /// (top-left origin, unscaled — the same space `mousemove` events report), or `None`
+    /// Return the id of the topmost DOM node at the given logical viewport coordinates
+    /// (top-left origin — the same space `mousemove` events report), or `None`
     /// if nothing is hit (e.g. the point is outside the viewport, or nothing is there).
     /// Forces a layout resolve first, then delegates to Blitz's own hit-testing — which
     /// still has a known TODO for z-index disambiguation among plain overlapping siblings

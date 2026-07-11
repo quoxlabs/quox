@@ -767,7 +767,15 @@ class X11Library implements Library {
         const width = view.getInt32(56, true);
         const height = view.getInt32(60, true);
         if (!window.updateSize(width, height)) continue;
-        return { type: "resize", width, height, window };
+        return {
+          type: "resize",
+          width,
+          height,
+          framebufferWidth: width,
+          framebufferHeight: height,
+          devicePixelRatio: 1,
+          window,
+        };
       }
       if (type === XEventType.DestroyNotify && window !== undefined) {
         if (!window.handleNativeDestroy()) continue;

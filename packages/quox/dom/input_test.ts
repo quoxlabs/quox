@@ -81,6 +81,30 @@ Deno.test("wheel adapter preserves browser units and converts them only for Blit
   ]);
 });
 
+Deno.test("resize adapter preserves logical and framebuffer dimensions", () => {
+  assertEquals(
+    mapWindingEvent({
+      type: "resize",
+      width: 800,
+      height: 600,
+      framebufferWidth: 1600,
+      framebufferHeight: 1200,
+      devicePixelRatio: 2,
+      frameToken: 7,
+      window,
+    }),
+    {
+      type: "resize",
+      width: 800,
+      height: 600,
+      framebufferWidth: 1600,
+      framebufferHeight: 1200,
+      devicePixelRatio: 2,
+      frameToken: 7,
+    },
+  );
+});
+
 Deno.test("canonical key adapter preserves public fields and encodes editor policy", () => {
   const mapped = mapWindingEvent({
     type: "keydown",

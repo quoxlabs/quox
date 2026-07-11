@@ -10,14 +10,15 @@ use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
 impl QuoxRenderer {
-    /// Render the current HTML and return a flat `width × height × 4`
+    /// Render the current HTML and return a flat framebuffer-width × framebuffer-height × 4
     /// RGBA byte buffer (`TextureFormat::Rgba8Unorm`).
     pub async fn render(&self) -> Result<Vec<u8>, JsValue> {
         let (_texture, gpu_buffer, row_bytes, padded_row_bytes, w, h) = {
             let mut state = self.state.borrow_mut();
             state.sync_layout();
-            let w = state.width;
-            let h = state.height;
+            let w = state.framebuffer_width;
+            let h = state.framebuffer_height;
+            let scale = f64::from(state.device_pixel_ratio);
 
             let device_handle = state.context.device_pool[state.dev_id].clone();
 
@@ -41,7 +42,7 @@ impl QuoxRenderer {
 
             let mut scene = Scene::new();
             let mut painter = VelloScenePainter::new(&mut scene);
-            paint_scene(&mut painter, &mut state.document, 1.0, w, h, 0, 0);
+            paint_scene(&mut painter, &mut state.document, scale, w, h, 0, 0);
 
             state
                 .renderer

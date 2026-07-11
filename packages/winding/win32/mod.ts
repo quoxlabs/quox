@@ -390,7 +390,15 @@ class Win32Library implements Library {
               win.minimized = minimized;
               this.#events.push({ type: "visibilitychange", visible: !minimized, window: win });
             } else if (w > 0 && h > 0 && win.observeClientSize(w, h)) {
-              this.#events.push({ type: "resize", width: w, height: h, window: win });
+              this.#events.push({
+                type: "resize",
+                width: w,
+                height: h,
+                framebufferWidth: w,
+                framebufferHeight: h,
+                devicePixelRatio: 1,
+                window: win,
+              });
             }
             break;
           }
@@ -720,7 +728,15 @@ class Win32Library implements Library {
     const width = Math.max(0, rect.getInt32(8, true) - rect.getInt32(0, true));
     const height = Math.max(0, rect.getInt32(12, true) - rect.getInt32(4, true));
     if (window.observeClientSize(width, height)) {
-      this.#events.push({ type: "resize", width, height, window });
+      this.#events.push({
+        type: "resize",
+        width,
+        height,
+        framebufferWidth: width,
+        framebufferHeight: height,
+        devicePixelRatio: 1,
+        window,
+      });
     }
 
     const focus = this.user32.symbols.GetFocus();

@@ -12,6 +12,7 @@ import {
 } from "./input.ts";
 import { isVNode, mount, type QuoxRenderable } from "./mount.ts";
 import type { QuoxElement, QuoxInnerHTML } from "./node.ts";
+import { fitRgbaToFramebuffer } from "./framebuffer.ts";
 
 export type {
   QuoxAppleStandardKeybindingEvent,
@@ -31,9 +32,9 @@ export type {
 export type QuoxWindowContent = QuoxInnerHTML | QuoxRenderable;
 
 export interface WindowOptions {
-  /** Width of the window in pixels (default 800). */
+  /** Logical width of the window (default 800). */
   width?: number;
-  /** Height of the window in pixels (default 600). */
+  /** Logical height of the window (default 600). */
   height?: number;
   /** Native window title. Overrides any initial `<title>` in `head`. */
   title?: string;
@@ -66,6 +67,9 @@ export class QuoxWindow implements Disposable {
   readonly #win: WindingWindow;
   #width: number;
   #height: number;
+  #framebufferWidth: number;
+  #framebufferHeight: number;
+  #devicePixelRatio = 1;
   #frameToken: number | undefined;
   readonly #renderer: WasmRenderer;
   #intervalId: ReturnType<typeof setInterval> | null = null;
@@ -91,6 +95,8 @@ export class QuoxWindow implements Disposable {
     this.#win = win;
     this.#width = width;
     this.#height = height;
+    this.#framebufferWidth = width;
+    this.#framebufferHeight = height;
     this.#renderer = renderer;
     this.document = new QuoxDocument(
       renderer,
@@ -115,8 +121,25 @@ export class QuoxWindow implements Disposable {
         resize: (event) => {
           this.#width = event.width;
           this.#height = event.height;
+          this.#framebufferWidth = event.framebufferWidth;
+          this.#framebufferHeight = event.framebufferHeight;
+          this.#devicePixelRatio = event.devicePixelRatio;
           this.#frameToken = event.frameToken;
-          this.#renderer.resize(event.width, event.height);
+          (this.#renderer as unknown as {
+            resize(
+              width: number,
+              height: number,
+              framebufferWidth: number,
+              framebufferHeight: number,
+              devicePixelRatio: number,
+            ): void;
+          }).resize(
+            event.width,
+            event.height,
+            event.framebufferWidth,
+            event.framebufferHeight,
+            event.devicePixelRatio,
+          );
           this.#requestRender();
         },
         visibility: (event) => {
@@ -241,16 +264,29 @@ export class QuoxWindow implements Disposable {
     this.#needsRender = false;
     const renderWidth = this.#width;
     const renderHeight = this.#height;
+    const renderFramebufferWidth = this.#framebufferWidth;
+    const renderFramebufferHeight = this.#framebufferHeight;
     const renderFrameToken = this.#frameToken;
     try {
       this.document.syncNativeTitle();
 
       // Render the retained Blitz document via WebGPU in WASM.
-      const rgba = await this.#renderer.render();
+      const rgba = fitRgbaToFramebuffer(
+        await this.#renderer.render(),
+        renderWidth,
+        renderHeight,
+        renderFramebufferWidth,
+        renderFramebufferHeight,
+      );
 
       if (!this.#stopped && !this.#disposed) {
         // Blit RGBA buffer to the window (conversion to native pixel format is handled by winding).
-        this.#win.blit(rgba, renderWidth, renderHeight, renderFrameToken);
+        this.#win.blit(
+          rgba,
+          renderFramebufferWidth,
+          renderFramebufferHeight,
+          renderFrameToken,
+        );
       }
     } catch (err) {
       console.error("Quox render failed:", err);

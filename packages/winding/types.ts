@@ -148,8 +148,16 @@ export interface WheelEvent extends PointerEventBase<"wheel"> {
 }
 export interface ResizeEvent extends WindowEvent<"resize"> {
   type: "resize";
+  /** Logical client width; input and IME coordinates use the same units. */
   width: number;
+  /** Logical client height; input and IME coordinates use the same units. */
   height: number;
+  /** Exact number of horizontal pixels expected by `Window.blit()`. */
+  framebufferWidth: number;
+  /** Exact number of vertical pixels expected by `Window.blit()`. */
+  framebufferHeight: number;
+  /** Backing pixels per logical unit, analogous to the browser's `devicePixelRatio`. */
+  devicePixelRatio: number;
   /**
    * Binds an asynchronous frame to the native configure generation that requested it.
    * Backends without configure generations omit this value and ignore it on blit.
@@ -179,10 +187,10 @@ export interface Window {
   /** Set the native window title. */
   setTitle(title: string): void;
   /**
-   * Blit tightly packed, row-major sRGB RGBA8 pixels whose dimensions match
-   * the window. The first pixel is the top-left pixel and alpha is straight
-   * (unpremultiplied). Pass a resize event's frame token when rendering
-   * asynchronously so stale frames can be dropped.
+   * Blit tightly packed, row-major sRGB RGBA8 pixels whose dimensions match a
+   * resize event's framebuffer dimensions. The first pixel is the top-left
+   * pixel and alpha is straight (unpremultiplied). Pass the event's frame token
+   * when rendering asynchronously so stale frames can be dropped.
    */
   blit(rgba: Uint8Array, width: number, height: number, frameToken?: number): void;
   /** Set whether native composition is desired for this window. */

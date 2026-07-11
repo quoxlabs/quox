@@ -1,4 +1,4 @@
-import { appKitWindowFrame, browserWheelDelta, type ScreenFrame } from "./geometry.ts";
+import { appKitWindowFrame, browserWheelDelta, type ScreenFrame, surfaceMetrics } from "./geometry.ts";
 
 const primary: ScreenFrame = { x: 0, y: 0, width: 1920, height: 1080 };
 
@@ -38,6 +38,16 @@ Deno.test("Darwin wheel deltas preserve AppKit precision in browser units", () =
     deltaX: 1,
     deltaY: -3,
     deltaMode: 1,
+  });
+});
+
+Deno.test("Darwin keeps logical bounds independent from exact backing pixels", () => {
+  assertEquals(surfaceMetrics(799.5, 599.5, 1599, 1199, 2), {
+    width: 800,
+    height: 600,
+    framebufferWidth: 1599,
+    framebufferHeight: 1199,
+    devicePixelRatio: 2,
   });
 });
 

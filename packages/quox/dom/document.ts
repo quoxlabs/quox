@@ -96,7 +96,7 @@ export class QuoxDocument {
   }
 
   /**
-   * Return the DOM node at the given viewport-pixel coordinates (the same coordinate
+   * Return the DOM node at the given logical viewport coordinates (the same coordinate
    * space `mousemove` events use), or `null` if nothing is there. Does not distinguish
    * element vs. text hits.
    */

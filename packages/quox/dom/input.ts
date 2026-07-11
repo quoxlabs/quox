@@ -6,6 +6,7 @@ import type {
   KeyEvent as WindingKeyEvent,
   MoveEvent as WindingMoveEvent,
   PointerModifiers as WindingPointerModifiers,
+  ResizeEvent as WindingResizeEvent,
   UIEvent as WindingUIEvent,
   WheelEvent as WindingWheelEvent,
   Window as WindingWindow,
@@ -23,7 +24,7 @@ export type QuoxMouseButtonEvent = Omit<WithoutWindow<WindingButtonEvent>, "butt
   button: number;
 };
 export type QuoxMouseWheelEvent = WithoutWindow<WindingWheelEvent>;
-export type QuoxResizeEvent = { type: "resize"; width: number; height: number; frameToken?: number };
+export type QuoxResizeEvent = WithoutWindow<WindingResizeEvent>;
 export type QuoxCloseEvent = { type: "close" };
 export type QuoxMouseEnterLeaveEvent = WithoutWindow<WindingEnterLeaveEvent>;
 export type QuoxFocusChangeEvent = { type: "focus" | "blur" };
@@ -275,7 +276,15 @@ export function mapWindingEvent(event: WindingUIEvent): QuoxInputEvent {
     case "apple-standard-keybinding":
       return { type: "apple-standard-keybinding", command: event.command };
     case "resize":
-      return { type: "resize", width: event.width, height: event.height, frameToken: event.frameToken };
+      return {
+        type: "resize",
+        width: event.width,
+        height: event.height,
+        framebufferWidth: event.framebufferWidth,
+        framebufferHeight: event.framebufferHeight,
+        devicePixelRatio: event.devicePixelRatio,
+        frameToken: event.frameToken,
+      };
     case "close":
       return { type: "close" };
     case "mouseenter":

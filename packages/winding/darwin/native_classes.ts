@@ -32,6 +32,7 @@ export interface DarwinNativeResponder {
     kind:
       | "close"
       | "resize"
+      | "backingchange"
       | "geometrychange"
       | "mouseenter"
       | "mouseleave"
@@ -158,6 +159,15 @@ export class DarwinNativeClasses {
         ),
       );
       this.#callbacks.push(didResize);
+      const backingChanged = new Deno.UnsafeCallback(
+        { parameters: ["pointer", "pointer", "pointer"], result: "void" },
+        guardNativeCallback(
+          this.#errors,
+          (self: Deno.PointerValue) => this.#delegate(self)?.handleNativeWindowEvent("backingchange"),
+          () => undefined,
+        ),
+      );
+      this.#callbacks.push(backingChanged);
       const geometryChanged = new Deno.UnsafeCallback(
         { parameters: ["pointer", "pointer", "pointer"], result: "void" },
         guardNativeCallback(
@@ -229,6 +239,9 @@ export class DarwinNativeClasses {
       addProtocol(delegate, getProtocol("NSWindowDelegate"));
       addMethod(delegate, sel("windowShouldClose:"), shouldClose.pointer, `${OBJC_BOOL_ENCODING}@:@`);
       addMethod(delegate, sel("windowDidResize:"), didResize.pointer, "v@:@");
+      for (const selector of WINDOW_FRAMEBUFFER_SELECTORS) {
+        addMethod(delegate, sel(selector), backingChanged.pointer, "v@:@");
+      }
       for (const selector of WINDOW_GEOMETRY_SELECTORS) {
         addMethod(delegate, sel(selector), geometryChanged.pointer, "v@:@");
       }
@@ -605,6 +618,10 @@ export const POINTER_INPUT_SELECTORS = [
 export const WINDOW_GEOMETRY_SELECTORS = [
   "windowDidMove:",
   "windowDidChangeScreen:",
+] as const;
+
+/** Notifications that can change backing pixels without changing logical bounds. */
+export const WINDOW_FRAMEBUFFER_SELECTORS = [
   "windowDidChangeBackingProperties:",
 ] as const;
 

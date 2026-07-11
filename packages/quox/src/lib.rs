@@ -39,8 +39,13 @@ pub struct QuoxRenderer {
 
 struct QuoxRendererState {
     document: BaseDocument,
+    /// Browser-style logical viewport dimensions used for input bounds.
     width: u32,
     height: u32,
+    /// Exact physical target dimensions supplied by the window backend.
+    framebuffer_width: u32,
+    framebuffer_height: u32,
+    device_pixel_ratio: f32,
     context: WGPUContext,
     dev_id: usize,
     renderer: Renderer,
@@ -150,7 +155,7 @@ impl ShellProvider for QuoxShellProvider {
     }
 }
 
-/// Compute the focused text editor's current composition/caret area in viewport pixels.
+/// Compute the focused text editor's current composition/caret area in logical viewport units.
 #[allow(
     clippy::cast_possible_truncation,
     reason = "Blitz's shell API uses f32 window coordinates while Parley geometry uses f64"
@@ -176,10 +181,10 @@ fn focused_ime_cursor_area(document: &mut BaseDocument) -> Option<[f32; 4]> {
         + node.final_layout.border.top
         + node.final_layout.padding.top
         + node.text_input_v_centering_offset(scale) as f32;
-    let x = ((f64::from(content_x) - scroll.x) * scale + ime_area.x0) as f32;
-    let y = ((f64::from(content_y) - scroll.y) * scale + ime_area.y0) as f32;
-    let width = ime_area.width() as f32;
-    let height = ime_area.height() as f32;
+    let x = (((f64::from(content_x) - scroll.x) * scale + ime_area.x0) / scale) as f32;
+    let y = (((f64::from(content_y) - scroll.y) * scale + ime_area.y0) / scale) as f32;
+    let width = (ime_area.width() / scale) as f32;
+    let height = (ime_area.height() / scale) as f32;
 
     Some([x, y, width, height])
 }
@@ -193,16 +198,16 @@ impl QuoxRendererState {
     /// mirror of it, which would otherwise clobber Blitz's own wheel-driven scroll updates.
     fn sync_layout(&mut self) {
         self.document.set_viewport(Viewport::new(
-            self.width,
-            self.height,
-            1.0,
+            self.framebuffer_width,
+            self.framebuffer_height,
+            self.device_pixel_ratio,
             ColorScheme::Light,
         ));
         self.document.resolve(0.0);
         self.refresh_ime_cursor_area();
     }
 
-    /// Publish the focused Parley editor's current composition/caret area in viewport pixels.
+    /// Publish the focused Parley editor's composition/caret area in logical viewport units.
     /// Blitz currently publishes the entire input content box only when focus changes; querying
     /// Parley here keeps candidate-window placement current as the caret, preedit, scroll, or
     /// layout changes.
@@ -271,6 +276,9 @@ impl QuoxRenderer {
                 document,
                 width: width.max(1),
                 height: height.max(1),
+                framebuffer_width: width.max(1),
+                framebuffer_height: height.max(1),
+                device_pixel_ratio: 1.0,
                 context,
                 dev_id,
                 renderer,
@@ -281,11 +289,25 @@ impl QuoxRenderer {
         })
     }
 
-    /// Resize the rendering viewport.
-    pub fn resize(&self, width: u32, height: u32) {
+    /// Resize the logical viewport and its physical rendering target independently.
+    pub fn resize(
+        &self,
+        width: u32,
+        height: u32,
+        framebuffer_width: u32,
+        framebuffer_height: u32,
+        device_pixel_ratio: f32,
+    ) {
         let mut state = self.state.borrow_mut();
         state.width = width.max(1);
         state.height = height.max(1);
+        state.framebuffer_width = framebuffer_width.max(1);
+        state.framebuffer_height = framebuffer_height.max(1);
+        state.device_pixel_ratio = if device_pixel_ratio.is_finite() && device_pixel_ratio > 0.0 {
+            device_pixel_ratio
+        } else {
+            1.0
+        };
     }
 
     /// Atomically drain changed native IME requests as
@@ -379,6 +401,14 @@ mod tests {
             .absolute_position(0.0, 0.0);
         let area_before =
             focused_ime_cursor_area(&mut document).expect("input should have an area");
+
+        document.set_viewport(Viewport::new(1600, 1200, 2.0, ColorScheme::Light));
+        document.resolve(0.0);
+        let hidpi_area =
+            focused_ime_cursor_area(&mut document).expect("input should have a HiDPI area");
+        for (logical, hidpi) in area_before.into_iter().zip(hidpi_area) {
+            assert!((logical - hidpi).abs() < 0.001);
+        }
 
         document.set_viewport_scroll(Point { x: 0.0, y: 37.0 });
 

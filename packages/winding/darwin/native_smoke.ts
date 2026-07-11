@@ -1,5 +1,5 @@
 import { load } from "./mod.ts";
-import type { ImeEvent, Library, Window } from "../types.ts";
+import type { ImeEvent, Library, ResizeEvent, Window } from "../types.ts";
 import {
   APPKIT,
   cfSymbols,
@@ -22,7 +22,7 @@ import {
   sel,
 } from "./ffi.ts";
 import { REQUIRED_TEXT_INPUT_SELECTORS } from "./text_input.ts";
-import { POINTER_INPUT_SELECTORS, WINDOW_GEOMETRY_SELECTORS } from "./native_classes.ts";
+import { POINTER_INPUT_SELECTORS, WINDOW_FRAMEBUFFER_SELECTORS, WINDOW_GEOMETRY_SELECTORS } from "./native_classes.ts";
 import { DarwinInputState } from "./input_state.ts";
 
 // AppKit requires all window work on the process main thread. Deno.test runs
@@ -55,7 +55,7 @@ runCase(
   testKeydownOrdering,
 );
 runCase("modifier transitions never query key-only character properties", testModifierTransitions);
-runCase("blit copies pixels into storage retained by Core Graphics", testBlitStorageLifetime);
+runCase("blit uses exact backing pixels retained by Core Graphics", testBlitStorageLifetime);
 runCase("windows opt into ordinary mouse-move delivery", testMouseMoveDeliveryEnabled);
 runCase("closed windows and libraries reject every native operation", testClosedMethodGuards);
 runCase("only one library owns the process-wide AppKit queue", testSingleLibraryOwnership);
@@ -444,19 +444,22 @@ function testModifierTransitions(): void {
 }
 
 function testBlitStorageLifetime(): void {
-  withNativeWindow(64, 64, (_library, window) => {
+  withNativeWindow(64, 64, (library, window) => {
     const handles: Closeable[] = [];
     try {
       const runtime = Deno.dlopen(LIBOBJC, runtimeSymbols);
       handles.push(runtime);
       const rectSend = openNSRectMsgSend(handles);
       const sendId = openMessage(handles, ["pointer", "pointer"], "pointer");
+      const sendF64 = openMessage(handles, ["pointer", "pointer"], "f64");
       const sendVoid = openMessage(handles, ["pointer", "pointer"], "void");
       const cg = Deno.dlopen(
         CORE_GRAPHICS,
         {
           CGImageGetColorSpace: { parameters: ["pointer"], result: "pointer" },
           CGImageGetDataProvider: { parameters: ["pointer"], result: "pointer" },
+          CGImageGetWidth: { parameters: ["pointer"], result: "usize" },
+          CGImageGetHeight: { parameters: ["pointer"], result: "usize" },
           CGColorSpaceCopyName: { parameters: ["pointer"], result: "pointer" },
           CGDataProviderCopyData: { parameters: ["pointer"], result: "pointer" },
         } as const,
@@ -472,9 +475,23 @@ function testBlitStorageLifetime(): void {
       );
       handles.push(cf);
 
-      const contentFrame = rectSend.noArgs(window.contentView, sel(runtime, "frame"));
-      const width = Math.round(readStructF64(contentFrame, 16));
-      const height = Math.round(readStructF64(contentFrame, 24));
+      const resize = takeResizeEvent(library, window);
+      const contentBounds = rectSend.noArgs(window.contentView, sel(runtime, "bounds"));
+      const backingBounds = rectSend.rectArg(
+        window.contentView,
+        sel(runtime, "convertRectToBacking:"),
+        contentBounds,
+      );
+      assertEquals(resize.width, Math.round(readStructF64(contentBounds, 16)));
+      assertEquals(resize.height, Math.round(readStructF64(contentBounds, 24)));
+      assertEquals(resize.framebufferWidth, Math.round(readStructF64(backingBounds, 16)));
+      assertEquals(resize.framebufferHeight, Math.round(readStructF64(backingBounds, 24)));
+      assertClose(
+        resize.devicePixelRatio,
+        sendF64(window.nsWindow, sel(runtime, "backingScaleFactor")),
+      );
+      const width = resize.framebufferWidth;
+      const height = resize.framebufferHeight;
       const byteLength = width * height * 4;
       assert(width > 0 && height > 0, "test window has no drawable client area");
       const pixels = Uint8Array.from(
@@ -498,8 +515,11 @@ function testBlitStorageLifetime(): void {
       sendVoid(window.contentView, sel(runtime, "displayIfNeeded"));
       const layer = sendId(window.contentView, sel(runtime, "layer"));
       assert(layer !== null, "content view has no layer after blit");
+      assertClose(sendF64(layer, sel(runtime, "contentsScale")), resize.devicePixelRatio);
       const image = sendId(layer, sel(runtime, "contents"));
       assert(image !== null, "content layer has no image after blit");
+      assertEquals(cg.symbols.CGImageGetWidth(image), BigInt(width));
+      assertEquals(cg.symbols.CGImageGetHeight(image), BigInt(height));
       const imageColorSpace = cg.symbols.CGImageGetColorSpace(image);
       assert(imageColorSpace !== null, "installed image has no color space");
       const colorSpaceName = cg.symbols.CGColorSpaceCopyName(imageColorSpace);
@@ -687,6 +707,16 @@ function testProtocolAndStructAbis(): void {
         "WindingWindowDelegate does not conform to NSWindowDelegate",
       );
       for (const selector of WINDOW_GEOMETRY_SELECTORS) {
+        assert(
+          respondsToSelector(
+            delegateClass,
+            sel(runtime, "instancesRespondToSelector:"),
+            sel(runtime, selector),
+          ),
+          `WindingWindowDelegate does not respond to ${selector}`,
+        );
+      }
+      for (const selector of WINDOW_FRAMEBUFFER_SELECTORS) {
         assert(
           respondsToSelector(
             delegateClass,
@@ -1028,4 +1058,14 @@ function drainEvents(library: Library): void {
   while (library.event() !== undefined) {
     // Drain activation, focus, and resize notifications queued at window creation.
   }
+}
+
+function takeResizeEvent(library: Library, window: Window): ResizeEvent {
+  let resize: ResizeEvent | undefined;
+  let event;
+  while ((event = library.event()) !== undefined) {
+    if (event.type === "resize" && event.window === window) resize = event;
+  }
+  assert(resize !== undefined, "window creation did not publish framebuffer dimensions");
+  return resize;
 }
