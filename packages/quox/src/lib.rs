@@ -9,7 +9,7 @@ use blitz_html::{HtmlDocument, HtmlProvider};
 use blitz_traits::net::DummyNetProvider;
 use blitz_traits::shell::{ColorScheme, ShellProvider, Viewport};
 use ffi_numbers::{NumericArgumentError, positive_f32, uint32};
-use interaction::{RecordedEvents, staged_dispatch::DispatchStack};
+use interaction::staged_dispatch::DispatchStack;
 use linebender_resource_handle::Blob;
 use node_handles::NodeHandles;
 use std::cell::RefCell;
@@ -55,7 +55,6 @@ struct QuoxRendererState {
     renderer: Renderer,
     redraw_requested: Arc<AtomicBool>,
     ime_requests: Arc<ImeRequestMailbox>,
-    recorded_events: RecordedEvents,
     /// Resumable DOM dispatches paused while JavaScript invokes event listeners.
     dispatch_stack: DispatchStack,
     /// Stable public handles for Blitz's internally reusable slab node ids.
@@ -440,7 +439,6 @@ impl QuoxRenderer {
                 renderer,
                 redraw_requested,
                 ime_requests,
-                recorded_events: RecordedEvents::default(),
                 dispatch_stack: DispatchStack::default(),
                 node_handles: NodeHandles::default(),
             }),
