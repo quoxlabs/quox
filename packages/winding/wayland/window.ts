@@ -213,6 +213,7 @@ export class WaylandWindow implements Window {
     this.#ackPendingConfigure();
     if (!this.#configured) return;
     const buffer = this.#shmBuffer.write(rgba, width, height);
+    if (!buffer) return;
     const symbols = this.lib.wl.symbols;
     const version = symbols.wl_proxy_get_version(this.#surface);
     symbols.wl_proxy_marshal_array_flags(

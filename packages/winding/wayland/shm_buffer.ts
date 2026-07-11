@@ -24,22 +24,69 @@ export interface WaylandShmHost {
   };
 }
 
-/** Owns a wl_buffer and the fd/mapping backing it. */
+const MAX_BUFFERS = 3;
+
+/**
+ * Owns a small release-aware set of wl_shm buffers.
+ *
+ * A committed buffer remains busy until the compositor sends `release`.  When
+ * all slots are busy, `write` deliberately drops the new frame instead of
+ * changing storage that the compositor may still be reading.
+ */
 export class WaylandShmBuffer {
+  readonly #slots: WaylandShmBufferSlot[] = [];
+
+  constructor(readonly host: WaylandShmHost) {}
+
+  write(rgba: Uint8Array, width: number, height: number): Deno.PointerObject | null {
+    const size = checkedImageSize(width, height);
+    if (rgba.byteLength < size) {
+      throw new RangeError(`winding Wayland blit needs ${size} RGBA bytes, received ${rgba.byteLength}`);
+    }
+
+    let slot = this.#slots.find((candidate) => !candidate.busy && candidate.matches(width, height));
+    slot ??= this.#slots.find((candidate) => !candidate.busy);
+    if (!slot && this.#slots.length < MAX_BUFFERS) {
+      slot = new WaylandShmBufferSlot(this.host);
+      this.#slots.push(slot);
+    }
+    if (!slot) return null;
+    return slot.write(rgba, width, height, size);
+  }
+
+  close(): void {
+    const errors: unknown[] = [];
+    for (const slot of this.#slots.splice(0)) {
+      collectCleanupError(errors, () => slot.close());
+    }
+    throwCleanupErrors("winding failed to close Wayland SHM buffers", errors);
+  }
+}
+
+/** Owns one wl_buffer and the fd/mapping backing it. */
+class WaylandShmBufferSlot {
   #fd = -1;
   #mapping: Deno.PointerObject | null = null;
   #size = 0;
   #buffer: Deno.PointerObject | null = null;
   #width = 0;
   #height = 0;
+  #busy = false;
+  #release: Deno.UnsafeCallback | null = null;
+  #vtable: BigUint64Array<ArrayBuffer> | null = null;
 
   constructor(readonly host: WaylandShmHost) {}
 
-  write(rgba: Uint8Array, width: number, height: number): Deno.PointerObject {
-    const size = checkedImageSize(width, height);
-    if (rgba.byteLength < size) {
-      throw new RangeError(`winding Wayland blit needs ${size} RGBA bytes, received ${rgba.byteLength}`);
-    }
+  get busy(): boolean {
+    return this.#busy;
+  }
+
+  matches(width: number, height: number): boolean {
+    return this.#buffer !== null && this.#width === width && this.#height === height;
+  }
+
+  write(rgba: Uint8Array, width: number, height: number, size: number): Deno.PointerObject {
+    if (this.#busy) throw new Error("winding attempted to rewrite a busy Wayland SHM buffer");
     if (!this.#buffer || width !== this.#width || height !== this.#height) {
       this.#replace(width, height, size);
     }
@@ -53,6 +100,7 @@ export class WaylandShmBuffer {
       destination[index + 2] = rgba[index];
       destination[index + 3] = rgba[index + 3];
     }
+    this.#busy = true;
     return this.#buffer!;
   }
 
@@ -102,6 +150,20 @@ export class WaylandShmBuffer {
         args(0n, 0n, BigInt(width), BigInt(height), BigInt(width * 4), BigInt(WlShmFormat.ARGB8888)),
       );
       if (!buffer) throw new Error("winding wl_shm_pool_create_buffer failed");
+
+      const release = new Deno.UnsafeCallback(
+        { parameters: ["pointer", "pointer"], result: "void" },
+        () => {
+          this.#busy = false;
+        },
+      );
+      const vtable = new BigUint64Array([Deno.UnsafePointer.value(release.pointer)]);
+      if (symbols.wl_proxy_add_listener(buffer, Deno.UnsafePointer.of(vtable), null) !== 0) {
+        release.close();
+        throw new Error("winding failed to listen for Wayland SHM buffer release");
+      }
+      this.#release = release;
+      this.#vtable = vtable;
     } catch (error) {
       errors.push(error);
     } finally {
@@ -156,6 +218,7 @@ export class WaylandShmBuffer {
     this.#buffer = buffer;
     this.#width = width;
     this.#height = height;
+    this.#busy = false;
   }
 
   close(): void {
@@ -169,6 +232,10 @@ export class WaylandShmBuffer {
     this.#fd = -1;
     this.#width = 0;
     this.#height = 0;
+    this.#busy = false;
+    const release = this.#release;
+    this.#release = null;
+    this.#vtable = null;
 
     const errors: unknown[] = [];
     if (buffer) {
@@ -197,6 +264,7 @@ export class WaylandShmBuffer {
         }
       });
     }
+    if (release) collectCleanupError(errors, () => release.close());
     throwCleanupErrors("winding failed to close Wayland SHM buffer", errors);
   }
 }

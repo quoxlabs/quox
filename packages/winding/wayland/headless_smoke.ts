@@ -16,7 +16,12 @@ Deno.test("Wayland opens, blits, and survives repeated lifecycles", () => {
         window.setTitle(`winding Wayland smoke test ${iteration + 1}`);
         window.setImeCursorArea(4.25, 8.5, 12.75, 16.5);
         window.setImeEnabled(true);
-        window.blit(pixels, WIDTH, HEIGHT);
+        // Submit faster than the compositor can release buffers. The bounded
+        // pool must drop excess frames without rewriting committed storage.
+        for (let frame = 0; frame < 5; frame++) {
+          pixels[0] = frame;
+          window.blit(pixels, WIDTH, HEIGHT);
+        }
         drainEvents(library);
         window.setImeEnabled(false);
       } finally {
