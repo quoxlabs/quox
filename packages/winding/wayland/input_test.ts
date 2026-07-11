@@ -20,18 +20,14 @@ import {
   DEFAULT_CURSOR_HOTSPOT_Y,
   DEFAULT_CURSOR_WIDTH,
   hasFatalPollEvent,
+  pointerCapabilityAction,
   POLLERR,
   POLLHUP,
   POLLIN,
   POLLNVAL,
-  pointerCapabilityAction,
   waylandConnectionError,
 } from "./protocol.ts";
-import {
-  damageOpcodeForSurfaceVersion,
-  frameMatchesConfiguration,
-  WaylandConfigureState,
-} from "./window.ts";
+import { damageOpcodeForSurfaceVersion, frameMatchesConfiguration, WaylandConfigureState } from "./window.ts";
 
 Deno.test("Wayland core cursor fallback has a visible in-bounds hotspot", () => {
   const pixels = createDefaultCursorPixels();
