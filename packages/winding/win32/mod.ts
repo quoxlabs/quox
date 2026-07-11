@@ -13,6 +13,7 @@ import {
 } from "./ffi.ts";
 import {
   decodeMouseLParam,
+  TranslateMessageReentrancyGuard,
   validateWin32Geometry,
   type Win32MouseButton,
   Win32MouseCaptureState,
@@ -291,6 +292,7 @@ class Win32Library implements Library {
   }>;
   readonly #events = new EventQueue<UIEvent>();
   readonly #callbackErrors = new DeferredNativeError();
+  readonly #translateMessageGuard = new TranslateMessageReentrancyGuard();
   readonly input: Win32InputController;
   readonly instance: Deno.PointerObject;
   readonly #instance: bigint;
@@ -322,7 +324,22 @@ class Win32Library implements Library {
       },
       guardNativeCallback(this.#callbackErrors, (hWnd, uMsg, wParam, lParam) => {
         const win = this.windows.get(BigInt(Deno.UnsafePointer.value(hWnd)));
-        const inputResult = this.input.handleMessage(win, uMsg, wParam, lParam);
+        let inputResult: bigint | undefined;
+        const inSendMessageFlags = this.#translateMessageGuard.translating
+          ? this.user32.symbols.InSendMessageEx(null)
+          : 0;
+        if (this.#translateMessageGuard.shouldDefer(inSendMessageFlags)) {
+          const deferred = this.input.deferImeMessage(
+            win,
+            uMsg,
+            wParam,
+            lParam,
+            (operation) => this.#translateMessageGuard.defer(operation),
+          );
+          inputResult = deferred === undefined ? this.input.handleMessage(win, uMsg, wParam, lParam) : deferred.result;
+        } else {
+          inputResult = this.input.handleMessage(win, uMsg, wParam, lParam);
+        }
         if (inputResult !== undefined) return inputResult;
         switch (uMsg) {
           case WM.PAINT: {
@@ -649,7 +666,12 @@ class Win32Library implements Library {
     while (this.#events.length === 0 && this.user32.symbols.PeekMessageW(ptr, null, 0, 0, PM_REMOVE) !== 0) {
       this.input.prepareKeyMessage(this.#msg);
       try {
-        this.user32.symbols.TranslateMessage(ptr);
+        this.#translateMessageGuard.begin();
+        try {
+          this.user32.symbols.TranslateMessage(ptr);
+        } finally {
+          this.#translateMessageGuard.end();
+        }
         this.user32.symbols.DispatchMessageW(ptr);
       } finally {
         this.input.clearPreparedKey();
@@ -721,6 +743,7 @@ class Win32Library implements Library {
     }
 
     this.#events.close();
+    this.#translateMessageGuard.clear();
     captureError(errors, () => this.input.close());
     captureError(errors, () => this.#callbackErrors.throwIfPending());
     captureError(errors, () => this.#wndProc.close());

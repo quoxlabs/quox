@@ -7,11 +7,13 @@ import {
   keyboardModifiers,
   keyboardStateForTranslation,
   logicalKeyFromVirtualKey,
+  matchesWin32KeyMessage,
   repeatedWmCharText,
   ResultEchoSuppressor,
   shouldExposeAltGraph,
   TO_UNICODE_NO_STATE_CHANGE,
   translateLogicalKey,
+  TranslateMessageReentrancyGuard,
   validateWin32Geometry,
   VK,
   win32KeyEditDisposition,
@@ -58,6 +60,32 @@ Deno.test("Win32 key lParam decoding preserves repeat, scan, extended, context, 
     isRepeat: true,
   });
   assertEquals(decodeKeyLParam(makeKeyLParam(0x1e)).isRepeat, false);
+});
+
+Deno.test("TranslateMessage guard defers only sent-message reentry and preserves FIFO order", () => {
+  const guard = new TranslateMessageReentrancyGuard();
+  const order: string[] = [];
+  assertEquals(guard.shouldDefer(1), false);
+  guard.defer(() => order.push("outside"));
+  guard.begin();
+  assertEquals(guard.shouldDefer(0), false);
+  assertEquals(guard.shouldDefer(1), true);
+  guard.defer(() => order.push("focus"));
+  guard.begin();
+  guard.defer(() => order.push("ime"));
+  guard.end();
+  assertEquals(order, ["outside"]);
+  guard.end();
+  assertEquals(order, ["outside", "focus", "ime"]);
+  assertThrows(() => guard.end());
+});
+
+Deno.test("prepared Win32 keys match the complete native message identity", () => {
+  const prepared = { windowId: 1n, message: 0x0104, virtualKey: 0x51, lParam: 0x2010001n };
+  assertEquals(matchesWin32KeyMessage(prepared, { ...prepared }), true);
+  assertEquals(matchesWin32KeyMessage(prepared, { ...prepared, windowId: 2n }), false);
+  assertEquals(matchesWin32KeyMessage(prepared, { ...prepared, message: 0x0100 }), false);
+  assertEquals(matchesWin32KeyMessage(prepared, { ...prepared, lParam: prepared.lParam | (1n << 30n) }), false);
 });
 
 Deno.test("Win32 validates signed outer-window geometry before native creation", () => {

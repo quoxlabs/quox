@@ -40,6 +40,7 @@ export const user32functions = {
   GetKeyState: { parameters: ["i32"], result: "i16" },
   GetKeyboardState: { parameters: ["buffer"], result: "i32" },
   GetKeyboardLayout: { parameters: ["u32"], result: "pointer" },
+  InSendMessageEx: { parameters: ["pointer"], result: "u32" },
   ToUnicodeEx: {
     parameters: ["u32", "u32", "buffer", "buffer", "i32", "u32", "pointer"],
     result: "i32",

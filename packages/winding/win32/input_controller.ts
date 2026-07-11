@@ -48,6 +48,7 @@ import {
   isCommitText,
   keyboardModifiers,
   logicalKeyFromVirtualKey,
+  matchesWin32KeyMessage,
   repeatedWmCharText,
   ResultEchoSuppressor,
   shouldExposeAltGraph,
@@ -95,9 +96,13 @@ interface WindowInputState {
   readonly resultEcho: ResultEchoSuppressor;
 }
 
-interface PreparedKeyEvent {
+interface KeyEventResult {
   event: KeyEvent;
   suppress: boolean;
+}
+
+interface PreparedKeyEvent extends KeyEventResult {
+  native: NativeKeyMessage;
 }
 
 interface NativeKeyMessage {
@@ -239,12 +244,50 @@ export class Win32InputController {
     this.#enqueue({ type: "blur", window });
   }
 
+  /** Queue IME-owning sent-message work while TranslateMessage has the IME on its stack. */
+  deferImeMessage(
+    window: Win32InputWindow | undefined,
+    message: number,
+    wParam: number | bigint,
+    lParam: number | bigint,
+    schedule: (operation: () => void) => void,
+  ): { result: bigint | undefined } | undefined {
+    if (window === undefined) return undefined;
+    const state = this.#states.get(window);
+    if (state === undefined) return undefined;
+
+    let result: bigint | undefined;
+    switch (message) {
+      case WM.SETFOCUS:
+      case WM.KILLFOCUS:
+        result = undefined;
+        break;
+      case WM.IME_STARTCOMPOSITION:
+      case WM.IME_COMPOSITION:
+      case WM.IME_ENDCOMPOSITION:
+        if (!state.activation.desired) return undefined;
+        result = 0n;
+        break;
+      case WM.IME_SETCONTEXT:
+        result = this.#forwardImeSetContext(window, state, message, wParam, lParam);
+        break;
+      default:
+        return undefined;
+    }
+
+    schedule(() => {
+      if (this.#states.get(window) === state) this.handleMessage(window, message, wParam, lParam, true);
+    });
+    return { result };
+  }
+
   /** Process input-owned WndProc messages; undefined means continue with DefWindowProcW. */
   handleMessage(
     window: Win32InputWindow | undefined,
     message: number,
     wParam: number | bigint,
     lParam: number | bigint,
+    replayed = false,
   ): bigint | undefined {
     const state = window === undefined ? undefined : this.#states.get(window);
     switch (message) {
@@ -352,10 +395,7 @@ export class Win32InputController {
             this.#cancelComposition(window, state);
             this.#setImeActive(window, state, false);
           }
-          const forwardedLParam = state.activation.desired
-            ? BigInt.asUintN(64, BigInt(lParam)) & ~BigInt(ISC_SHOWUICOMPOSITIONWINDOW)
-            : BigInt(lParam);
-          return this.#user32.symbols.DefWindowProcW(window.hwnd, message, BigInt(wParam), forwardedLParam);
+          return replayed ? 0n : this.#forwardImeSetContext(window, state, message, wParam, lParam);
         }
         return undefined;
       case WM.IME_REQUEST:
@@ -435,6 +475,7 @@ export class Win32InputController {
       timestamp: nextMessage.timestamp,
     };
     this.#preparedKey = {
+      native: message,
       suppress: layoutHasAltGraph && state.altGraphControlFilter.shouldSuppress(current, next),
       event: createWin32KeyEvent(
         type,
@@ -474,6 +515,19 @@ export class Win32InputController {
     const state = this.#states.get(window);
     if (state === undefined) throw new Error("winding(win32): window input is not attached");
     return state;
+  }
+
+  #forwardImeSetContext(
+    window: Win32InputWindow,
+    state: WindowInputState,
+    message: number,
+    wParam: number | bigint,
+    lParam: number | bigint,
+  ): bigint {
+    const forwardedLParam = state.activation.desired
+      ? BigInt.asUintN(64, BigInt(lParam)) & ~BigInt(ISC_SHOWUICOMPOSITIONWINDOW)
+      : BigInt(lParam);
+    return this.#user32.symbols.DefWindowProcW(window.hwnd, message, BigInt(wParam), forwardedLParam);
   }
 
   #snapshotKeyboardState(): Uint8Array<ArrayBuffer> {
@@ -585,13 +639,23 @@ export class Win32InputController {
     wParam: number | bigint,
     lParam: number | bigint,
     systemMessage: boolean,
-  ): PreparedKeyEvent | undefined {
+  ): KeyEventResult | undefined {
     const prepared = this.#preparedKey;
-    this.#preparedKey = undefined;
+    const expectedMessage = type === "keydown"
+      ? (systemMessage ? WM.SYSKEYDOWN : WM.KEYDOWN)
+      : (systemMessage ? WM.SYSKEYUP : WM.KEYUP);
     if (
-      prepared !== undefined && prepared.event.type === type && prepared.event.keycode === Number(wParam) &&
-      prepared.event.code === getDomCode(lParam)
-    ) return prepared;
+      prepared !== undefined && window !== undefined &&
+      matchesWin32KeyMessage(prepared.native, {
+        windowId: window.id,
+        message: expectedMessage,
+        virtualKey: Number(wParam),
+        lParam: BigInt.asUintN(64, BigInt(lParam)),
+      })
+    ) {
+      this.#preparedKey = undefined;
+      return prepared;
+    }
     if (window === undefined) return undefined;
     const state = this.#states.get(window);
     if (state === undefined) return undefined;

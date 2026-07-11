@@ -113,6 +113,73 @@ export class Win32MouseCaptureState {
   }
 }
 
+/** Defers unsafe native work until the outer TranslateMessage call has returned. */
+export class TranslateMessageReentrancyGuard {
+  #depth = 0;
+  #deferred: Array<() => void> = [];
+
+  get translating(): boolean {
+    return this.#depth > 0;
+  }
+
+  begin(): void {
+    this.#depth++;
+  }
+
+  shouldDefer(inSendMessageFlags: number): boolean {
+    return this.#depth > 0 && inSendMessageFlags !== 0;
+  }
+
+  defer(operation: () => void): void {
+    if (this.#depth === 0) {
+      operation();
+      return;
+    }
+    this.#deferred.push(operation);
+  }
+
+  end(): void {
+    if (this.#depth === 0) throw new Error("winding(win32): unbalanced TranslateMessage guard");
+    this.#depth--;
+    if (this.#depth !== 0) return;
+
+    const deferred = this.#deferred;
+    this.#deferred = [];
+    const errors: unknown[] = [];
+    for (const operation of deferred) {
+      try {
+        operation();
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) throw new AggregateError(errors, "Failed to replay deferred Win32 IME messages");
+  }
+
+  clear(): void {
+    this.#depth = 0;
+    this.#deferred = [];
+  }
+}
+
+export interface Win32KeyMessageIdentity {
+  windowId: bigint;
+  message: number;
+  virtualKey: number;
+  lParam: bigint;
+}
+
+/** Require the complete WndProc-visible identity before consuming a prepared key. */
+export function matchesWin32KeyMessage(
+  prepared: Win32KeyMessageIdentity,
+  current: Win32KeyMessageIdentity,
+): boolean {
+  return prepared.windowId === current.windowId && prepared.message === current.message &&
+    prepared.virtualKey === current.virtualKey &&
+    BigInt.asUintN(64, prepared.lParam) === BigInt.asUintN(64, current.lParam);
+}
+
 /** Virtual-key values used by the Win32 input implementation. */
 export const VK = {
   BACK: 0x08,
