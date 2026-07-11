@@ -114,8 +114,6 @@ class X11Window implements Window {
       lib.X11.symbols.XSetWMProtocols(lib.display, window, protocolsBuf, 1);
     }
 
-    lib.X11.symbols.XMapWindow(lib.display, window);
-    lib.X11.symbols.XFlush(lib.display);
     this.id = BigInt(window);
     this.#width = w;
     this.#height = h;
@@ -123,6 +121,7 @@ class X11Window implements Window {
     const gc = BigInt(lib.X11.symbols.XCreateGC(lib.display, window, 0n, null));
     if (gc === 0n) {
       lib.X11.symbols.XDestroyWindow(lib.display, window);
+      lib.X11.symbols.XFlush(lib.display);
       throw new Error("winding(x11): failed to create graphics context");
     }
     this.#gc = gc;
@@ -141,16 +140,23 @@ class X11Window implements Window {
       );
 
       lib.windows.set(this.id, this);
+      let input: XimContext | undefined;
       try {
-        this.input = lib.input.createContext(this.id);
+        input = lib.input.createContext(this.id);
+        this.input = input;
+        // Publish only after every fallible local and XIM resource exists.
+        lib.X11.symbols.XMapWindow(lib.display, window);
+        lib.X11.symbols.XFlush(lib.display);
       } catch (error) {
         lib.windows.delete(this.id);
+        input?.close();
         this.#image.close();
         throw error;
       }
     } catch (error) {
       lib.X11.symbols.XFreeGC(lib.display, gc);
       lib.X11.symbols.XDestroyWindow(lib.display, window);
+      lib.X11.symbols.XFlush(lib.display);
       throw error;
     }
   }
@@ -262,6 +268,7 @@ class X11Window implements Window {
     });
     cleanup(() => {
       this.lib.X11.symbols.XDestroyWindow(this.lib.display, this.id);
+      this.lib.X11.symbols.XFlush(this.lib.display);
     });
     if (errors.length === 1) throw errors[0];
     if (errors.length > 1) {
