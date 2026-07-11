@@ -69,6 +69,7 @@ import {
 import {
   encodeCandidateForm,
   encodeCompositionForm,
+  IME_CANDIDATE_LIST_INDICES,
   type ImeCompositionUpdate,
   type ImmCompositionAdapter,
   immCompositionRangeToUtf8,
@@ -1107,12 +1108,18 @@ export class Win32InputController {
     if (rectangle === undefined) return;
     const applied = this.#withImeContext(window, (context) => {
       const errors: unknown[] = [];
-      if (this.#imm32.symbols.ImmSetCandidateWindow(context, encodeCandidateForm(rectangle)) === 0) {
-        errors.push(new Error("winding(win32): ImmSetCandidateWindow failed"));
+      for (const index of IME_CANDIDATE_LIST_INDICES) {
+        captureError(errors, () => {
+          if (this.#imm32.symbols.ImmSetCandidateWindow(context, encodeCandidateForm(rectangle, index)) === 0) {
+            throw new Error(`winding(win32): ImmSetCandidateWindow failed for candidate-list index ${index}`);
+          }
+        });
       }
-      if (this.#imm32.symbols.ImmSetCompositionWindow(context, encodeCompositionForm(rectangle)) === 0) {
-        errors.push(new Error("winding(win32): ImmSetCompositionWindow failed"));
-      }
+      captureError(errors, () => {
+        if (this.#imm32.symbols.ImmSetCompositionWindow(context, encodeCompositionForm(rectangle)) === 0) {
+          throw new Error("winding(win32): ImmSetCompositionWindow failed");
+        }
+      });
       throwCollected(errors, "Failed to position Win32 IME windows");
       return true;
     });

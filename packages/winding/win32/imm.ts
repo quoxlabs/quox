@@ -12,6 +12,8 @@ const UINT32_MAX = 0xffffffff;
 export const CFS_EXCLUDE = 0x0080;
 /** Composition window uses the supplied point. */
 export const CFS_POINT = 0x0002;
+/** IMM32 exposes four independently positionable candidate lists. */
+export const IME_CANDIDATE_LIST_INDICES = [0, 1, 2, 3] as const;
 
 export type PreeditCursorRange = readonly [start: number, end: number];
 
@@ -108,9 +110,12 @@ function rectBottom(rect: ImeCursorArea): number {
 
 /** Encode the 32-byte, pointer-free CANDIDATEFORM structure. */
 export function encodeCandidateForm(rect: ImeCursorArea, index = 0): ArrayBuffer {
+  if (!Number.isSafeInteger(index) || index < 0 || index >= IME_CANDIDATE_LIST_INDICES.length) {
+    throw new RangeError("winding(win32): candidate-list index must be an integer from 0 through 3");
+  }
   const buffer = new ArrayBuffer(32);
   const view = new DataView(buffer);
-  view.setUint32(0, clampUint32(index), true);
+  view.setUint32(0, index, true);
   view.setUint32(4, CFS_EXCLUDE, true);
   view.setInt32(8, rect.x, true);
   view.setInt32(12, rectBottom(rect), true);

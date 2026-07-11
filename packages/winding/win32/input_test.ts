@@ -36,6 +36,7 @@ import {
   encodeCandidateForm,
   encodeCompositionForm,
   encodeImeCharPosition,
+  IME_CANDIDATE_LIST_INDICES,
   immCompositionRangeToUtf8,
   insertCompositionCharacter,
   readImmBytes,
@@ -567,13 +568,22 @@ Deno.test("Win32 input rejects failed initial disassociation", () => {
   assertEquals(harness.calls.associationFlags, [0]);
 });
 
-Deno.test("Win32 input reports both failed IME placement operations", () => {
-  const harness = createInputControllerHarness({ candidateResult: 0, compositionResult: 0 });
+Deno.test("Win32 attempts every candidate list and composition placement before reporting failures", () => {
+  const harness = createInputControllerHarness({
+    candidateResults: new Map([[1, 0], [3, 0]]),
+    compositionResult: 0,
+  });
   harness.controller.attach(harness.window);
   harness.controller.observeNativeFocus(harness.window, true);
   harness.controller.setImeCursorArea(harness.window, 1, 2, 3, 4);
-  assertThrows(() => harness.controller.setImeEnabled(harness.window, true), AggregateError);
-  assertEquals(harness.calls.candidatePlacements, 1);
+  const error = assertThrows(() => harness.controller.setImeEnabled(harness.window, true), AggregateError);
+  assertEquals(error.errors.map((item) => String(item)), [
+    "Error: winding(win32): ImmSetCandidateWindow failed for candidate-list index 1",
+    "Error: winding(win32): ImmSetCandidateWindow failed for candidate-list index 3",
+    "Error: winding(win32): ImmSetCompositionWindow failed",
+  ]);
+  assertEquals(harness.calls.candidatePlacements, 4);
+  assertEquals(harness.calls.candidateForms.map((form) => new DataView(form).getUint32(0, true)), [0, 1, 2, 3]);
   assertEquals(harness.calls.compositionPlacements, 1);
   assertEquals(harness.calls.releases, 1);
 });
@@ -585,17 +595,32 @@ Deno.test("Win32 caches logical IME geometry and reapplies scaled native forms a
   harness.controller.observeNativeFocus(harness.window, true);
   harness.controller.setImeCursorArea(harness.window, 10, 20, 2, 10);
   harness.controller.setImeEnabled(harness.window, true);
+  harness.controller.setImeCursorArea(harness.window, 11, 21, 3, 11);
 
   behavior.devicePixelRatio = 2;
   harness.controller.dpiChanged(harness.window);
 
   assertEquals(harness.calls.candidateForms.map((form) => readCandidateForm(form)), [
-    { point: [15, 45], rect: [15, 30, 18, 45] },
-    { point: [20, 60], rect: [20, 40, 24, 60] },
+    ...IME_CANDIDATE_LIST_INDICES.map((index) => ({
+      index,
+      point: [15, 45] as [number, number],
+      rect: [15, 30, 18, 45] as [number, number, number, number],
+    })),
+    ...IME_CANDIDATE_LIST_INDICES.map((index) => ({
+      index,
+      point: [16, 48] as [number, number],
+      rect: [16, 31, 21, 48] as [number, number, number, number],
+    })),
+    ...IME_CANDIDATE_LIST_INDICES.map((index) => ({
+      index,
+      point: [22, 64] as [number, number],
+      rect: [22, 42, 28, 64] as [number, number, number, number],
+    })),
   ]);
   assertEquals(harness.calls.compositionForms.map((form) => readCompositionForm(form)), [
     { point: [15, 45], rect: [15, 30, 18, 45] },
-    { point: [20, 60], rect: [20, 40, 24, 60] },
+    { point: [16, 48], rect: [16, 31, 21, 48] },
+    { point: [22, 64], rect: [22, 42, 28, 64] },
   ]);
 });
 
@@ -1355,12 +1380,15 @@ Deno.test("cursor rectangles round outward, reject invalid values, and clamp to 
 
 Deno.test("native IME structure encoders use the documented little-endian layouts", () => {
   const caret = { x: 10, y: 20, width: 4, height: 5 };
-  const candidate = new DataView(encodeCandidateForm(caret, 3));
-  assertEquals(candidate.byteLength, 32);
-  assertEquals(candidate.getUint32(0, true), 3);
-  assertEquals(candidate.getUint32(4, true), CFS_EXCLUDE);
-  assertEquals(readPoint(candidate, 8), [10, 25]);
-  assertEquals(readRect(candidate, 16), [10, 20, 14, 25]);
+  for (const index of IME_CANDIDATE_LIST_INDICES) {
+    const candidate = new DataView(encodeCandidateForm(caret, index));
+    assertEquals(candidate.byteLength, 32);
+    assertEquals(candidate.getUint32(0, true), index);
+    assertEquals(candidate.getUint32(4, true), CFS_EXCLUDE);
+    assertEquals(readPoint(candidate, 8), [10, 25]);
+    assertEquals(readRect(candidate, 16), [10, 20, 14, 25]);
+  }
+  for (const invalid of [-1, 0.5, 4]) assertThrows(() => encodeCandidateForm(caret, invalid), RangeError);
 
   const composition = new DataView(encodeCompositionForm(caret));
   assertEquals(composition.byteLength, 28);
@@ -1529,7 +1557,7 @@ function readRect(view: DataView, offset: number): [number, number, number, numb
 
 function readCandidateForm(buffer: ArrayBuffer) {
   const view = new DataView(buffer);
-  return { point: readPoint(view, 8), rect: readRect(view, 16) };
+  return { index: view.getUint32(0, true), point: readPoint(view, 8), rect: readRect(view, 16) };
 }
 
 function readCompositionForm(buffer: ArrayBuffer) {
@@ -1563,7 +1591,7 @@ function uint32Le(values: readonly number[]): Uint8Array {
 
 interface FakeImmBehavior {
   associateResults?: number[];
-  candidateResult?: number;
+  candidateResults?: ReadonlyMap<number, number>;
   compositionResult?: number;
   notifyResult?: number;
   releaseResult?: number;
@@ -1635,7 +1663,7 @@ function createInputControllerHarness(behavior: FakeImmBehavior = {}) {
       ImmSetCandidateWindow(_context: unknown, form: ArrayBuffer) {
         calls.candidatePlacements++;
         calls.candidateForms.push(form.slice(0));
-        return behavior.candidateResult ?? 1;
+        return behavior.candidateResults?.get(new DataView(form).getUint32(0, true)) ?? 1;
       },
       ImmSetCompositionWindow(_context: unknown, form: ArrayBuffer) {
         calls.compositionPlacements++;
