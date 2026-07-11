@@ -200,6 +200,12 @@ export interface VisibilityEvent extends WindowEvent<"visibilitychange"> {
   visible: boolean;
 }
 
+/**
+ * A native window with an explicit lifetime boundary.
+ *
+ * `close()` and `[Symbol.dispose]()` are idempotent. Once close begins, every
+ * other public mutation method throws a backend-specific closed-window error.
+ */
 export interface Window {
   [Symbol.dispose](): void;
   close(): void;

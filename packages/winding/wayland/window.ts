@@ -46,6 +46,7 @@ import {
   type WaylandFractionalScaleManagerPair,
   WaylandFractionalSurfaceOwnership,
 } from "./fractional_scale.ts";
+import { WaylandWindowLifecycleGate } from "./window_lifecycle.ts";
 
 export const DEFAULT_WAYLAND_APP_ID = "winding";
 
@@ -348,7 +349,7 @@ export class WaylandWindow implements Window {
   #configuration: WaylandConfiguration | undefined;
   readonly #configureAcks = new WaylandConfigureAckState();
   #registered = false;
-  #closed = false;
+  readonly #lifecycle = new WaylandWindowLifecycleGate();
   readonly imeActivation = new ImeActivationState();
   readonly composition = new CompositionState();
   #imeCursorArea: ImeCursorArea | undefined;
@@ -434,8 +435,7 @@ export class WaylandWindow implements Window {
     } catch (error) {
       errors.push(error);
     }
-    this.#closed = true;
-    this.#cleanup(errors);
+    this.#lifecycle.close(() => this.#cleanup(errors));
     throwCleanupErrors("winding failed to create Wayland window", errors);
   }
 
@@ -452,7 +452,7 @@ export class WaylandWindow implements Window {
   }
 
   tryCreateDecoration(preferredMode: WaylandDecorationMode = WaylandDecorationMode.serverSide): void {
-    if (this.#closed || !this.#xdgToplevel || this.#decoration) return;
+    if (this.#lifecycle.closed || !this.#xdgToplevel || this.#decoration) return;
     const binding = this.lib.decorationManager;
     if (binding === undefined) return;
     const generation = this.#decorationLifecycle.begin(binding.generation, binding.version);
@@ -476,7 +476,7 @@ export class WaylandWindow implements Window {
         { parameters: ["pointer", "pointer", "u32"], result: "void" },
         this.lib.guardCallback((_data, _decoration, mode) => {
           dispatchWaylandWindowCallbackIfOpen(
-            this.#closed,
+            this.#lifecycle.closed,
             () => this.#decorationLifecycle.configure(generation, mode),
           );
         }),
@@ -505,7 +505,7 @@ export class WaylandWindow implements Window {
   }
 
   tryCreateFractionalScale(): void {
-    if (this.#closed || !this.#surface) return;
+    if (this.#lifecycle.closed || !this.#surface) return;
     const managers = this.lib.fractionalScaleManagers;
     if (managers === undefined) return;
     const generation = this.#fractionalScaleLifecycle.begin(managers);
@@ -528,7 +528,7 @@ export class WaylandWindow implements Window {
       const preferred = new Deno.UnsafeCallback(
         { parameters: ["pointer", "pointer", "u32"], result: "void" },
         this.lib.guardCallback((_data, _fractionalScale, numerator) => {
-          if (this.#closed || !this.#fractionalScaleLifecycle.prefer(generation, numerator)) return;
+          if (this.#lifecycle.closed || !this.#fractionalScaleLifecycle.prefer(generation, numerator)) return;
           this.#reconcileOutputScale();
         }),
       );
@@ -564,13 +564,13 @@ export class WaylandWindow implements Window {
   }
 
   updateOutputScale(generation: WaylandOutputGeneration, scale: number): void {
-    if (this.#closed) return;
+    if (this.#lifecycle.closed) return;
     if (!this.#surfaceOutputScale?.update(generation, scale)) return;
     this.#reconcileOutputScale();
   }
 
   removeOutput(generation: WaylandOutputGeneration): void {
-    if (this.#closed) return;
+    if (this.#lifecycle.closed) return;
     if (!this.#surfaceOutputScale?.leave(generation)) return;
     this.#reconcileOutputScale();
   }
@@ -615,7 +615,7 @@ export class WaylandWindow implements Window {
     this.#surfaceEnter = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer", "pointer"], result: "void" },
       this.lib.guardCallback((_data, _surface, output) => {
-        if (this.#closed) return;
+        if (this.#lifecycle.closed) return;
         const snapshot = this.lib.outputScale(output);
         if (snapshot === undefined || !this.#surfaceOutputScale?.enter(snapshot.generation, snapshot.scale)) return;
         this.#reconcileOutputScale();
@@ -624,7 +624,7 @@ export class WaylandWindow implements Window {
     this.#surfaceLeave = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer", "pointer"], result: "void" },
       this.lib.guardCallback((_data, _surface, output) => {
-        if (this.#closed) return;
+        if (this.#lifecycle.closed) return;
         const snapshot = this.lib.outputScale(output);
         if (snapshot === undefined || !this.#surfaceOutputScale?.leave(snapshot.generation)) return;
         this.#reconcileOutputScale();
@@ -633,7 +633,7 @@ export class WaylandWindow implements Window {
     this.#surfacePreferredScale = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer", "i32"], result: "void" },
       this.lib.guardCallback((_data, _surface, factor) => {
-        if (this.#closed) return;
+        if (this.#lifecycle.closed) return;
         if (!this.#surfaceOutputScale?.prefer(factor)) return;
         this.#reconcileOutputScale();
       }),
@@ -654,7 +654,7 @@ export class WaylandWindow implements Window {
     this.#xdgSurfaceConfigure = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer", "u32"], result: "void" },
       this.lib.guardCallback((_data, _surface, serial) => {
-        dispatchWaylandWindowCallbackIfOpen(this.#closed, () => {
+        dispatchWaylandWindowCallbackIfOpen(this.#lifecycle.closed, () => {
           const completed = this.#configureState.complete(serial);
           const configuration = this.#configurationWithCurrentScale(completed.configuration, false);
           this.#configuration = configuration;
@@ -685,7 +685,7 @@ export class WaylandWindow implements Window {
     this.#toplevelConfigure = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer", "i32", "i32", "pointer"], result: "void" },
       this.lib.guardCallback((_data, _toplevel, width, height, states) => {
-        dispatchWaylandWindowCallbackIfOpen(this.#closed, () => {
+        dispatchWaylandWindowCallbackIfOpen(this.#lifecycle.closed, () => {
           const suspended = hasXdgToplevelState(states, SUSPENDED_TOPLEVEL_STATE);
           this.#configureState.stageToplevel(width, height, suspended);
         });
@@ -695,7 +695,7 @@ export class WaylandWindow implements Window {
       { parameters: ["pointer", "pointer"], result: "void" },
       this.lib.guardCallback(() => {
         dispatchWaylandWindowCallbackIfOpen(
-          this.#closed,
+          this.#lifecycle.closed,
           () => this.lib.pushEvent({ type: "close", window: this }),
         );
       }),
@@ -743,54 +743,62 @@ export class WaylandWindow implements Window {
   }
 
   setTitle(title: string): void {
-    this.lib.throwIfConnectionFailed();
-    if (!this.#xdgToplevel || this.#closed) return;
-    const symbols = this.lib.wl.symbols;
-    const titleBuffer = cStr(title);
-    symbols.wl_proxy_marshal_array_flags(
-      this.#xdgToplevel,
-      WlOp.XDG_TOPLEVEL_SET_TITLE,
-      null,
-      symbols.wl_proxy_get_version(this.#xdgToplevel),
-      0,
-      args(Deno.UnsafePointer.value(Deno.UnsafePointer.of(titleBuffer))),
-    );
-    this.lib.flushDisplay("setting a window title");
+    this.#lifecycle.mutate("setTitle", () => {
+      this.lib.throwIfConnectionFailed();
+      if (!this.#xdgToplevel) return;
+      const symbols = this.lib.wl.symbols;
+      const titleBuffer = cStr(title);
+      symbols.wl_proxy_marshal_array_flags(
+        this.#xdgToplevel,
+        WlOp.XDG_TOPLEVEL_SET_TITLE,
+        null,
+        symbols.wl_proxy_get_version(this.#xdgToplevel),
+        0,
+        args(Deno.UnsafePointer.value(Deno.UnsafePointer.of(titleBuffer))),
+      );
+      this.lib.flushDisplay("setting a window title");
+    });
   }
 
   setImeEnabled(enabled: boolean): void {
-    this.lib.throwIfConnectionFailed();
-    if (this.#closed || this.imeActivation.desired === enabled) return;
-    this.imeActivation.setDesired(enabled);
-    this.lib.updateWindowImeState(this);
+    this.#lifecycle.mutate("setImeEnabled", () => {
+      this.lib.throwIfConnectionFailed();
+      if (this.imeActivation.desired === enabled) return;
+      this.imeActivation.setDesired(enabled);
+      this.lib.updateWindowImeState(this);
+    });
   }
 
   setImeCursorArea(x: number, y: number, width: number, height: number): void {
-    this.lib.throwIfConnectionFailed();
-    if (this.#closed) return;
-    const area = normalizeImeCursorArea(x, y, width, height);
-    if (area === undefined) return;
-    this.#imeCursorArea = area;
-    this.lib.updateWindowImeCursorArea(this);
+    this.#lifecycle.mutate("setImeCursorArea", () => {
+      this.lib.throwIfConnectionFailed();
+      const area = normalizeImeCursorArea(x, y, width, height);
+      if (area === undefined) return;
+      this.#imeCursorArea = area;
+      this.lib.updateWindowImeCursorArea(this);
+    });
   }
 
   setImeSurroundingText(text: string, selectionStartBytes: number, selectionEndBytes: number): void {
-    this.lib.throwIfConnectionFailed();
-    if (this.#closed) return;
-    this.#imeSurroundingText = createWaylandSurroundingTextState(
-      text,
-      selectionStartBytes,
-      selectionEndBytes,
-    );
-    this.lib.updateWindowImeSurroundingText(this);
+    this.#lifecycle.mutate("setImeSurroundingText", () => {
+      this.lib.throwIfConnectionFailed();
+      this.#imeSurroundingText = createWaylandSurroundingTextState(
+        text,
+        selectionStartBytes,
+        selectionEndBytes,
+      );
+      this.lib.updateWindowImeSurroundingText(this);
+    });
   }
 
   blit(rgba: Uint8Array, width: number, height: number, frameToken?: number): void {
-    this.lib.throwIfConnectionFailed();
-    if (this.#closed || !this.#surface) return;
-    const configuration = this.#configuration;
-    if (!configuration || !frameMatchesConfiguration(configuration, width, height, frameToken)) return;
-    this.#present(rgba, width, height, configuration);
+    this.#lifecycle.mutate("blit", () => {
+      this.lib.throwIfConnectionFailed();
+      if (!this.#surface) return;
+      const configuration = this.#configuration;
+      if (!configuration || !frameMatchesConfiguration(configuration, width, height, frameToken)) return;
+      this.#present(rgba, width, height, configuration);
+    });
   }
 
   #present(rgba: Uint8Array, width: number, height: number, configuration: WaylandConfiguration): void {
@@ -883,11 +891,11 @@ export class WaylandWindow implements Window {
   }
 
   close(): void {
-    if (this.#closed) return;
-    this.#closed = true;
-    const errors: unknown[] = [];
-    this.#cleanup(errors);
-    throwCleanupErrors("winding failed to close Wayland window", errors);
+    this.#lifecycle.close(() => {
+      const errors: unknown[] = [];
+      this.#cleanup(errors);
+      throwCleanupErrors("winding failed to close Wayland window", errors);
+    });
   }
 
   #abandonUnconfiguredInitialDecoration(): void {

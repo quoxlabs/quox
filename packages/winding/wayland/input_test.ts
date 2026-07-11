@@ -88,6 +88,12 @@ import {
   WaylandSurfaceOutputScaleState,
 } from "./output.ts";
 import type { KeyModifiers } from "../types.ts";
+import {
+  WAYLAND_WINDOW_CLOSED_MESSAGE,
+  WAYLAND_WINDOW_MUTATION_NAMES,
+  WaylandWindowLifecycleGate,
+  type WaylandWindowMutationName,
+} from "./window_lifecycle.ts";
 
 Deno.test("required Wayland dependency failures identify the support boundary", () => {
   const nativeError = new Error("native loader failed");
@@ -920,6 +926,88 @@ Deno.test("failed Wayland surface destruction retains proxy listener ownership i
     true,
   );
   assertEquals(successActions, ["destroy"]);
+});
+
+Deno.test("Wayland window mutations share one authoritative post-close boundary", () => {
+  const lifecycle = new WaylandWindowLifecycleGate();
+  const constructorOperations: WaylandWindowMutationName[] = [];
+  lifecycle.mutate("setTitle", () => constructorOperations.push("setTitle"));
+  lifecycle.mutate("blit", () => constructorOperations.push("blit"));
+  assertEquals(constructorOperations, ["setTitle", "blit"]);
+
+  const calls: WaylandWindowMutationName[] = [];
+  const invalidInput = new Error("invalid input must not win after close");
+  const operations = {
+    setTitle: () => {
+      calls.push("setTitle");
+      throw invalidInput;
+    },
+    blit: () => {
+      calls.push("blit");
+      throw invalidInput;
+    },
+    setImeEnabled: () => {
+      calls.push("setImeEnabled");
+      throw invalidInput;
+    },
+    setImeSurroundingText: () => {
+      calls.push("setImeSurroundingText");
+      throw invalidInput;
+    },
+    setImeCursorArea: () => {
+      calls.push("setImeCursorArea");
+      throw invalidInput;
+    },
+  } satisfies Record<WaylandWindowMutationName, () => never>;
+
+  assertEquals(lifecycle.close(() => {}), true);
+  for (const name of WAYLAND_WINDOW_MUTATION_NAMES) {
+    try {
+      lifecycle.mutate(name, operations[name]);
+    } catch (error) {
+      assert(error instanceof Error);
+      assertEquals(error.message, WAYLAND_WINDOW_CLOSED_MESSAGE);
+      continue;
+    }
+    throw new Error(`${name} accepted a closed Wayland window`);
+  }
+  assertEquals(calls, []);
+});
+
+Deno.test("Wayland close stays terminal and idempotent across cleanup failure", () => {
+  const lifecycle = new WaylandWindowLifecycleGate();
+  const cleanupError = new Error("cleanup failed");
+  let cleanupCalls = 0;
+  let guardedCalls = 0;
+
+  try {
+    lifecycle.close(() => {
+      cleanupCalls++;
+      assertThrowsMessage(
+        () =>
+          lifecycle.mutate("setTitle", () => {
+            guardedCalls++;
+          }),
+        WAYLAND_WINDOW_CLOSED_MESSAGE,
+      );
+      throw cleanupError;
+    });
+  } catch (error) {
+    assert(error === cleanupError);
+  }
+
+  // The library closes windows through the same idempotent close path. A
+  // second owner must neither retry failed cleanup nor reopen the mutation gate.
+  assertEquals(lifecycle.close(() => cleanupCalls++), false);
+  assertThrowsMessage(
+    () =>
+      lifecycle.mutate("blit", () => {
+        guardedCalls++;
+      }),
+    WAYLAND_WINDOW_CLOSED_MESSAGE,
+  );
+  assertEquals(cleanupCalls, 1);
+  assertEquals(guardedCalls, 0);
 });
 
 Deno.test("Wayland initial window frames are opaque black", () => {
