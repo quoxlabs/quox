@@ -323,13 +323,17 @@ export class XimManager implements Disposable {
   }
 
   createIc(context: XimContext): Deno.PointerObject | null {
+    // A disabled context must not register XIM filters for the client window.
+    // Plain key events still pass through the display-wide XFilterEvent call,
+    // then use XLookupString when there is no active XIC.
+    if (!context.enabled) return null;
     if (this.#im === null || this.#styles === undefined) return null;
-    const style = context.enabled ? this.#styles.preedit : this.#styles.none;
+    const style = this.#styles.preedit;
     if (style === undefined) return null;
     const conversionRecord = context.createStringConversionCallback();
     let ic: Deno.PointerObject | null;
 
-    if (context.enabled && this.#styles.callbacks) {
+    if (this.#styles.callbacks) {
       const callbackAttributes = context.createCallbackAttributes();
       if (callbackAttributes === null) return null;
       try {
@@ -362,7 +366,7 @@ export class XimManager implements Disposable {
       } finally {
         this.#x11.XFree(callbackAttributes);
       }
-    } else if (context.enabled && this.#styles.positioned) {
+    } else if (this.#styles.positioned) {
       const positionAttributes = this.#createPositionAttributes(context.cursorArea);
       if (positionAttributes === null) return null;
       try {
