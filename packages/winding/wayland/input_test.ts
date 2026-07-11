@@ -1847,7 +1847,7 @@ Deno.test("keyboard enter batches intervening transitions until modifiers arrive
   assertEquals(batch.complete(), undefined);
 });
 
-Deno.test("held enter keys retain their logical identity without synthetic presses", () => {
+Deno.test("held enter keys use the current layout without synthetic presses", () => {
   const state = new WaylandKeyTransitionState();
   let layoutKey = "a";
   state.confirmModifiers(keyModifiers());
@@ -1855,8 +1855,8 @@ Deno.test("held enter keys retain their logical identity without synthetic press
 
   assertEquals(state.pressedKeyCount, 1);
   layoutKey = "q";
-  assertEquals(state.resolve(30, "repeat", layoutKey).key, "a");
-  assertEquals(state.resolve(30, "release", layoutKey).key, "a");
+  assertEquals(state.resolve(30, "repeat", layoutKey).key, "q");
+  assertEquals(state.resolve(30, "release", layoutKey).key, "q");
   assertEquals(state.pressedKeyCount, 0);
 });
 
@@ -1889,10 +1889,10 @@ Deno.test("left and right modifier transitions use post-transition group state",
     assertEquals(state.resolve(11, "press", key).modifiers[field], true);
 
     const firstRelease = state.resolve(10, "release", "layout changed");
-    assertEquals(firstRelease.key, key);
+    assertEquals(firstRelease.key, "layout changed");
     assertEquals(firstRelease.modifiers[field], true);
     const finalRelease = state.resolve(11, "release", "layout changed");
-    assertEquals(finalRelease.key, key);
+    assertEquals(finalRelease.key, "layout changed");
     assertEquals(finalRelease.modifiers[field], false);
   }
 });

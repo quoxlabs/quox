@@ -827,9 +827,10 @@ class DarwinWindow implements Window, DarwinNativeResponder {
     if (this.#closed || event === null) return;
     this.lib.markNativeEventHandled(event);
     const native = this.#nativeKeyData(event);
-    const matchedPress = this.#pressedKeys.has(native.base.keycode);
-    const retainedKey = this.#pressedKeys.release(native.base.keycode, native.base.key);
-    const currentKey = matchedPress && retainedKey !== "Dead" ? native.base.key : retainedKey;
+    // AppKit does not reliably reproduce a dead-key identity on key-up. Preserve that one
+    // backend fallback, but otherwise use this occurrence's current modifier/layout result.
+    const currentKey = this.#pressedKeys.get(native.base.keycode) === "Dead" ? "Dead" : native.base.key;
+    this.#pressedKeys.release(native.base.keycode, currentKey);
     const key: KeyUpEvent = createKeyUpEvent({
       ...native.base,
       key: currentKey,

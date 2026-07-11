@@ -54,7 +54,6 @@ import {
   InsertOnTypeFallbackState,
   isCommitText,
   keyboardModifiers,
-  logicalKeyFromVirtualKey,
   matchesWin32KeyMessage,
   probeWin32AltGraphLayout,
   repeatedWmCharText,
@@ -517,19 +516,20 @@ export class Win32InputController {
 
     const code = getDomCode(message.lParam);
     const identity = win32KeyIdentity(message.virtualKey, message.lParam);
-    let key = logicalKeyFromVirtualKey(message.virtualKey, undefined, languageId);
+    // VK_PACKET carries its Unicode scalar through WM_CHAR rather than ToUnicodeEx. Its
+    // key-up therefore has no current layout lookup and deliberately uses the pressed fallback.
+    const translated = type === "keyup" && message.virtualKey === VK.PACKET ? undefined : translateLogicalKey(
+      message.virtualKey,
+      message.lParam,
+      keyboardState,
+      this.#toUnicodeAdapter(layout),
+      layoutHasAltGraph && modifiers.ctrlKey && modifiers.altKey,
+      languageId,
+    );
+    let key = translated?.key ?? "Unidentified";
     let translatedText: string | undefined;
     if (type === "keydown") {
-      const translated = translateLogicalKey(
-        message.virtualKey,
-        message.lParam,
-        keyboardState,
-        this.#toUnicodeAdapter(layout),
-        layoutHasAltGraph && modifiers.ctrlKey && modifiers.altKey,
-        languageId,
-      );
-      key = translated.key;
-      translatedText = translated.text;
+      translatedText = translated?.text;
       if (modifiers.ctrlKey && modifiers.altKey && translatedText !== undefined) {
         state.altGraphTextKeys.add(identity);
       } else if (!decodeKeyLParam(message.lParam).isRepeat) {
@@ -546,7 +546,7 @@ export class Win32InputController {
       key = state.logicalKeys.press(identity, key);
       state.resultEcho.clear();
     } else {
-      key = state.logicalKeys.release(identity, key);
+      key = state.logicalKeys.release(identity, key === "Unidentified" ? undefined : key);
     }
 
     const current = {
@@ -757,19 +757,19 @@ export class Win32InputController {
     modifiers.altGraphKey = shouldExposeAltGraph(modifiers, layoutHasAltGraph, false);
     const code = getDomCode(lParam);
     const identity = win32KeyIdentity(Number(wParam), lParam);
-    let key = logicalKeyFromVirtualKey(Number(wParam), undefined, languageId);
+    const virtualKey = Number(wParam);
+    const translated = type === "keyup" && virtualKey === VK.PACKET ? undefined : translateLogicalKey(
+      virtualKey,
+      lParam,
+      keyboardState,
+      this.#toUnicodeAdapter(layout),
+      layoutHasAltGraph && modifiers.ctrlKey && modifiers.altKey,
+      languageId,
+    );
+    let key = translated?.key ?? "Unidentified";
     let translatedText: string | undefined;
     if (type === "keydown") {
-      const translated = translateLogicalKey(
-        Number(wParam),
-        lParam,
-        keyboardState,
-        this.#toUnicodeAdapter(layout),
-        layoutHasAltGraph && modifiers.ctrlKey && modifiers.altKey,
-        languageId,
-      );
-      key = translated.key;
-      translatedText = translated.text;
+      translatedText = translated?.text;
       if (modifiers.ctrlKey && modifiers.altKey && translatedText !== undefined) {
         state.altGraphTextKeys.add(identity);
       } else if (!decodeKeyLParam(lParam).isRepeat) {
@@ -781,7 +781,9 @@ export class Win32InputController {
     modifiers.altGraphKey = shouldExposeAltGraph(modifiers, layoutHasAltGraph, translatedText !== undefined);
     modifiers.accelKey = modifiers.ctrlKey && !modifiers.altGraphKey;
     if (code === "AltRight") key = modifiers.altGraphKey ? "AltGraph" : "Alt";
-    key = type === "keydown" ? state.logicalKeys.press(identity, key) : state.logicalKeys.release(identity, key);
+    key = type === "keydown"
+      ? state.logicalKeys.press(identity, key)
+      : state.logicalKeys.release(identity, key === "Unidentified" ? undefined : key);
     return {
       suppress: false,
       event: createWin32KeyEvent(

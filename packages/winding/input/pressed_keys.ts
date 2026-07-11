@@ -1,8 +1,8 @@
 import { normalizeLogicalKey } from "./keyboard.ts";
 
 /**
- * Retains the logical key resolved on initial press so repeat and release events
- * stay stable across modifier or keyboard-layout changes.
+ * Tracks physical pressed identities for repeat detection. The last resolved key is retained
+ * only as a best-effort release fallback for backends which cannot resolve key-up independently.
  */
 export class PressedLogicalKeyCache<Identity = number> {
   readonly #keys = new Map<Identity, string>();
@@ -15,20 +15,23 @@ export class PressedLogicalKeyCache<Identity = number> {
     return this.#keys.has(identity);
   }
 
-  /** Remember an initial key, or return the key already retained for a repeat. */
+  /** Return the most recent logical key, for a backend-specific fallback such as dead keys. */
+  get(identity: Identity): string | undefined {
+    return this.#keys.get(identity);
+  }
+
+  /** Mark a physical key pressed and use the logical value resolved for this occurrence. */
   press(identity: Identity, key: string | undefined): string {
-    const retained = this.#keys.get(identity);
-    if (retained !== undefined) return retained;
     const resolved = normalizeLogicalKey(key);
     this.#keys.set(identity, resolved);
     return resolved;
   }
 
-  /** Release and return the retained key, falling back to the current lookup. */
-  release(identity: Identity, fallback?: string): string {
+  /** Release a physical key, preferring a current lookup over the retained fallback. */
+  release(identity: Identity, current?: string): string {
     const retained = this.#keys.get(identity);
     this.#keys.delete(identity);
-    return retained ?? normalizeLogicalKey(fallback);
+    return current === undefined ? retained ?? "Unidentified" : normalizeLogicalKey(current);
   }
 
   clear(): void {

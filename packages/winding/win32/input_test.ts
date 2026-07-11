@@ -1237,7 +1237,7 @@ Deno.test("Win32 translation keeps alias language through zero and failed ToUnic
   );
 });
 
-Deno.test("Win32 layout aliases retain keydown identity through repeats, release, and layout change", () => {
+Deno.test("Win32 layout aliases follow the active layout on repeat and release", () => {
   const behavior: FakeImmBehavior = { keyboardLayout: 0x0411n };
   const harness = createInputControllerHarness(behavior);
   harness.controller.attach(harness.window);
@@ -1263,8 +1263,8 @@ Deno.test("Win32 layout aliases retain keydown identity through repeats, release
     })),
     [
       { type: "keydown", key: "KanaMode", code: "KanaMode", location: 0, repeat: false },
-      { type: "keydown", key: "KanaMode", code: "KanaMode", location: 0, repeat: true },
-      { type: "keyup", key: "KanaMode", code: "KanaMode", location: 0, repeat: undefined },
+      { type: "keydown", key: "HangulMode", code: "KanaMode", location: 0, repeat: true },
+      { type: "keyup", key: "HangulMode", code: "KanaMode", location: 0, repeat: undefined },
       { type: "keydown", key: "HangulMode", code: "KanaMode", location: 0, repeat: false },
       { type: "keyup", key: "HanjaMode", code: "Lang2", location: 0, repeat: undefined },
       { type: "keydown", key: "KanjiMode", code: "Lang2", location: 0, repeat: false },
@@ -1272,7 +1272,7 @@ Deno.test("Win32 layout aliases retain keydown identity through repeats, release
   );
 });
 
-Deno.test("Win32 retains the normalized logical key through repeat and release", () => {
+Deno.test("Win32 recomputes the normalized logical key for repeat and release", () => {
   let candidate = "e\u0301";
   const harness = createInputControllerHarness({ translateKey: () => candidate });
   harness.controller.attach(harness.window);
@@ -1292,8 +1292,8 @@ Deno.test("Win32 retains the normalized logical key through repeat and release",
     })),
     [
       { type: "keydown", key: "é", repeat: false },
-      { type: "keydown", key: "é", repeat: true },
-      { type: "keyup", key: "é", repeat: false },
+      { type: "keydown", key: "x", repeat: true },
+      { type: "keyup", key: "x", repeat: false },
     ],
   );
 });
@@ -2069,15 +2069,15 @@ Deno.test("AltGr filter reset boundaries discard every partial synthetic sequenc
   assertEquals(filter.shouldSuppress(messages.controlDown, messages.rightAltDown), true);
 });
 
-Deno.test("logical key cache resolves keyup using the keydown identity", () => {
+Deno.test("logical key cache tracks identity without freezing the logical value", () => {
   const cache = new PressedLogicalKeyCache<string>();
   const down = makeKeyLParam(0x15);
   const repeat = makeKeyLParam(0x15, { previous: true, repeatCount: 5 });
   const up = makeKeyLParam(0x15, { previous: true, transition: true });
 
   assertEquals(cache.press(win32KeyIdentity(0x59, down), "z"), "z");
-  assertEquals(cache.press(win32KeyIdentity(0x59, repeat), "y"), "z");
-  assertEquals(cache.release(win32KeyIdentity(0x59, up)), "z");
+  assertEquals(cache.press(win32KeyIdentity(0x59, repeat), "y"), "y");
+  assertEquals(cache.release(win32KeyIdentity(0x59, up), "x"), "x");
   assertEquals(cache.size, 0);
 });
 

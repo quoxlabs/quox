@@ -686,7 +686,7 @@ class X11Library implements Library {
 
           if (type === XEventType.KeyRelease) {
             if (this.#isAutoRepeatRelease(view)) continue;
-            const key = window.pressedKeys.release(keycode);
+            const key = window.pressedKeys.release(keycode, this.input.lookupLogicalKey(eventPointer));
             const event: KeyUpEvent = createKeyUpEvent({
               keycode,
               code,

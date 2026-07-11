@@ -322,6 +322,17 @@ export class XimManager implements Disposable {
     };
   }
 
+  /** Resolve a key release against the occurrence's current X modifier/layout state. */
+  lookupLogicalKey(event: Deno.PointerObject): string {
+    const buffer = new Uint8Array(64) as Uint8Array<ArrayBuffer>;
+    const keysymBuffer = new BigUint64Array(1) as BigUint64Array<ArrayBuffer>;
+    const written = this.#x11.XLookupString(event, buffer, buffer.length, keysymBuffer, null);
+    const keysym = keysymBuffer[0] === 0n ? BigInt(this.#x11.XLookupKeysym(event, 0)) : keysymBuffer[0];
+    const bytes = written > 0 && written <= buffer.length ? buffer.subarray(0, written) : buffer.subarray(0, 0);
+    const text = fallbackLookupText(bytes, unicodeTextFromKeysym(keysym));
+    return logicalKeyFromKeysym(keysym, text ?? "");
+  }
+
   createIc(context: XimContext): Deno.PointerObject | null {
     // A disabled context must not register XIM filters for the client window.
     // Plain key events still pass through the display-wide XFilterEvent call,
