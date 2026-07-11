@@ -66,6 +66,7 @@ const KEYCODE_TO_DOM_CODE: Record<number, string> = {
   0x003c: "ShiftRight",
   0x003d: "AltRight",
   0x003e: "ControlRight",
+  0x003f: "Fn",
   0x0040: "F17",
   0x0041: "NumpadDecimal",
   0x0043: "NumpadMultiply",
@@ -125,6 +126,14 @@ const KEYCODE_TO_DOM_CODE: Record<number, string> = {
   0x007e: "ArrowUp",
 };
 
-export function getDomCode(keycode: number): string {
-  return KEYCODE_TO_DOM_CODE[keycode] ?? "Unidentified";
+export function getDomCode(keycode: number, isoKeyboard = false): string {
+  // AppKit swaps the ANSI grave and ISO section positions on ISO hardware.
+  const physicalKeycode = isoKeyboard
+    ? keycode === 0x000a
+      ? 0x0032
+      : keycode === 0x0032
+      ? 0x000a
+      : keycode
+    : keycode;
+  return KEYCODE_TO_DOM_CODE[physicalKeycode] ?? "Unidentified";
 }

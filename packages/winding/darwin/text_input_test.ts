@@ -1,7 +1,9 @@
 import { makeNSRange, NS_NOT_FOUND, OBJC_BOOL_ENCODING, readNSRange } from "./ffi.ts";
 import { nativeMouseButton } from "./mod.ts";
+import { getDomCode } from "./dom_code.ts";
 import {
   cocoaRectFromClient,
+  domKeyText,
   logicalKeyForEvent,
   REQUIRED_TEXT_INPUT_SELECTORS,
   uninterpretedCommitText,
@@ -101,6 +103,16 @@ Deno.test("logical key resolution covers interpreted text, dead keys, and named 
   );
   assertEquals(
     logicalKeyForEvent({
+      code: "KeyE",
+      characters: "´",
+      charactersIgnoringModifiers: "´",
+      producedPreedit: true,
+      deadKey: true,
+    }),
+    "Dead",
+  );
+  assertEquals(
+    logicalKeyForEvent({
       code: "KeyK",
       characters: "k",
       charactersIgnoringModifiers: "k",
@@ -133,6 +145,39 @@ Deno.test("logical key resolution covers interpreted text, dead keys, and named 
     }),
     "ArrowLeft",
   );
+});
+
+Deno.test("Darwin resolves JIS and macOS special keys before misleading characters", () => {
+  for (const [keycode, code, key] of [
+    [0x66, "Lang2", "Eisu"],
+    [0x68, "Lang1", "KanjiMode"],
+    [0x3f, "Fn", "Fn"],
+    [0x47, "NumLock", "Clear"],
+    [0x72, "Insert", "Help"],
+  ] as const) {
+    assertEquals(logicalKeyForEvent({
+      keycode,
+      code,
+      characters: " ",
+      charactersIgnoringModifiers: " ",
+    }), key);
+  }
+});
+
+Deno.test("Darwin DOM key strings are NFC-normalized single grapheme clusters", () => {
+  assertEquals(domKeyText("e\u0301"), "é");
+  assertEquals(domKeyText("invalid"), "d");
+  assertEquals(domKeyText("👨‍👩‍👧‍👦"), "👨‍👩‍👧‍👦");
+  assertEquals(domKeyText("\uf702"), undefined);
+  assertEquals(domKeyText("\u0003"), undefined);
+});
+
+Deno.test("Darwin swaps grave and ISO section physical positions only on ISO hardware", () => {
+  assertEquals(getDomCode(0x0a, false), "IntlBackslash");
+  assertEquals(getDomCode(0x32, false), "Backquote");
+  assertEquals(getDomCode(0x0a, true), "Backquote");
+  assertEquals(getDomCode(0x32, true), "IntlBackslash");
+  assertEquals(getDomCode(0x3f, true), "Fn");
 });
 
 Deno.test("inactive AppKit input commits ordinary text but not shortcuts or function scalars", () => {

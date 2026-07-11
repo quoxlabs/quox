@@ -40,9 +40,10 @@ const NAMED_KEYS_BY_CODE: Readonly<Record<string, string>> = {
   Escape: "Escape",
   Home: "Home",
   Insert: "Insert",
+  Fn: "Fn",
   MetaLeft: "Meta",
   MetaRight: "Meta",
-  NumLock: "NumLock",
+  NumLock: "Clear",
   NumpadEnter: "Enter",
   PageDown: "PageDown",
   PageUp: "PageUp",
@@ -51,16 +52,29 @@ const NAMED_KEYS_BY_CODE: Readonly<Record<string, string>> = {
   Tab: "Tab",
 };
 
+const NAMED_KEYS_BY_KEYCODE: Readonly<Record<number, string>> = {
+  0x3f: "Fn",
+  0x47: "Clear",
+  0x66: "Eisu",
+  0x68: "KanjiMode",
+  0x72: "Help",
+};
+const DOM_KEY_SEGMENTER = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
 export interface NativeLogicalKeyInput {
+  /** AppKit hardware keyCode, used for macOS-specific named keys. */
+  keycode?: number;
   code: string;
   /** `NSEvent.characters`, decoded as a complete NSString. */
   characters: string;
-  /** `NSEvent.charactersIgnoringModifiers`, decoded as a complete NSString. */
+  /** `charactersByApplyingModifiers:` with only Shift/CapsLock/Option glyph modifiers. */
   charactersIgnoringModifiers: string;
   /** Text delivered synchronously through insertText:, when available. */
   producedText?: string;
   /** Whether interpretKeyEvents: produced marked text for this key. */
   producedPreedit?: boolean;
+  /** Native layout evidence that this transition started a dead-key sequence. */
+  deadKey?: boolean;
 }
 
 /**
@@ -69,14 +83,17 @@ export interface NativeLogicalKeyInput {
  * `characters` represents them with private-use Unicode scalars.
  */
 export function logicalKeyForEvent(input: NativeLogicalKeyInput): string {
+  const keycodeNamed = input.keycode === undefined ? undefined : NAMED_KEYS_BY_KEYCODE[input.keycode];
+  if (keycodeNamed !== undefined) return keycodeNamed;
   const named = NAMED_KEYS_BY_CODE[input.code];
   if (named !== undefined) return named;
   if (/^F(?:[1-9]|1[0-9]|2[0-4])$/.test(input.code)) return input.code;
+  if (input.deadKey) return "Dead";
 
-  const produced = printableText(input.producedText ?? "");
+  const produced = domKeyText(input.producedText ?? "");
   if (produced !== undefined) return produced;
 
-  const modified = printableText(input.characters);
+  const modified = domKeyText(input.characters);
   if (modified !== undefined) return modified;
 
   // A dead key commonly has no `characters`, while
@@ -85,7 +102,7 @@ export function logicalKeyForEvent(input: NativeLogicalKeyInput): string {
   // preedit keystrokes still keep their layout-aware `characters` above.
   if (input.producedPreedit) return "Dead";
 
-  const unmodified = printableText(input.charactersIgnoringModifiers);
+  const unmodified = domKeyText(input.charactersIgnoringModifiers);
   if (input.characters.length === 0 && unmodified !== undefined && isPotentiallyPrintableCode(input.code)) {
     return "Dead";
   }
@@ -93,6 +110,23 @@ export function logicalKeyForEvent(input: NativeLogicalKeyInput): string {
 
   if (isPotentiallyPrintableCode(input.code)) return "Dead";
   return "Unidentified";
+}
+
+/** Normalize an NSEvent key string to the final valid DOM key cluster. */
+export function domKeyText(value: string): string | undefined {
+  const normalized = value.normalize("NFC");
+  if (normalized.length === 0) return undefined;
+  for (const character of normalized) {
+    const scalar = character.codePointAt(0)!;
+    if (scalar < 0x20 || (scalar >= 0x7f && scalar <= 0x9f) || (scalar >= 0xf700 && scalar <= 0xf8ff)) {
+      return undefined;
+    }
+  }
+
+  // Invalid dead-key recovery can contain multiple base characters. UI Events
+  // uses the final generated key value, including any following combining marks.
+  const clusters = [...DOM_KEY_SEGMENTER.segment(normalized)];
+  return clusters.at(-1)?.segment;
 }
 
 /** Return printable text only; control and AppKit private-use key values are not text. */

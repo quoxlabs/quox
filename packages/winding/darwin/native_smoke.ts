@@ -209,6 +209,12 @@ function testKeydownOrdering(): void {
           sendIdBuffer(stringAlloc, sel(runtime, "initWithUTF8String:"), cStr("a")),
           "key event characters",
         );
+        const shiftedStringAlloc = sendId(getClass(runtime, "NSString"), sel(runtime, "alloc"));
+        const shiftedString = own(
+          owned,
+          sendIdBuffer(shiftedStringAlloc, sel(runtime, "initWithUTF8String:"), cStr("A")),
+          "shifted key event characters",
+        );
         const event = makeKeyEvent(
           getClass(runtime, "NSEvent"),
           sel(
@@ -240,6 +246,54 @@ function testKeydownOrdering(): void {
         assertEquals(key.editDisposition, "text-input");
         const commit = assertIme(library.event(), "commit");
         assertEquals(commit.text, "a");
+
+        const repeatEvent = makeKeyEvent(
+          getClass(runtime, "NSEvent"),
+          sel(
+            runtime,
+            "keyEventWithType:location:modifierFlags:timestamp:windowNumber:context:characters:charactersIgnoringModifiers:isARepeat:keyCode:",
+          ),
+          10n,
+          new Float64Array([0, 0]),
+          1n << 17n,
+          0,
+          sendI64(window.nsWindow, sel(runtime, "windowNumber")),
+          null,
+          shiftedString,
+          shiftedString,
+          true,
+          0,
+        );
+        assert(repeatEvent !== null, "failed to create synthetic repeat event");
+        sendVoidId(window.contentView, sel(runtime, "keyDown:"), repeatEvent);
+        const repeat = library.event();
+        assert(repeat?.type === "keydown", "expected repeated keydown");
+        assertEquals(repeat.repeat, true);
+        assertEquals(repeat.key, "A");
+        assertEquals(assertIme(library.event(), "commit").text, "A");
+
+        const keyUpEvent = makeKeyEvent(
+          getClass(runtime, "NSEvent"),
+          sel(
+            runtime,
+            "keyEventWithType:location:modifierFlags:timestamp:windowNumber:context:characters:charactersIgnoringModifiers:isARepeat:keyCode:",
+          ),
+          11n,
+          new Float64Array([0, 0]),
+          1n << 17n,
+          0,
+          sendI64(window.nsWindow, sel(runtime, "windowNumber")),
+          null,
+          shiftedString,
+          shiftedString,
+          false,
+          0,
+        );
+        assert(keyUpEvent !== null, "failed to create synthetic key-up event");
+        sendVoidId(window.contentView, sel(runtime, "keyUp:"), keyUpEvent);
+        const keyUp = library.event();
+        assert(keyUp?.type === "keyup", "expected keyup");
+        assertEquals(keyUp.key, "A");
       } finally {
         for (let i = owned.length - 1; i >= 0; i--) {
           sendVoid(owned[i], sel(runtime, "release"));

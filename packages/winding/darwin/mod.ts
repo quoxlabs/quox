@@ -30,6 +30,8 @@ import {
   cStr,
   getClass as runtimeGetClass,
   getProtocol as runtimeGetProtocol,
+  HITOOLBOX,
+  hitoolboxSymbols,
   LIBOBJC,
   LIBSYSTEM,
   NS_NOT_FOUND,
@@ -63,6 +65,7 @@ const NS_EVENT_MODIFIER_FLAG_SHIFT = 1n << 17n;
 const NS_EVENT_MODIFIER_FLAG_CONTROL = 1n << 18n;
 const NS_EVENT_MODIFIER_FLAG_OPTION = 1n << 19n;
 const NS_EVENT_MODIFIER_FLAG_COMMAND = 1n << 20n;
+const NS_EVENT_MODIFIER_FLAG_FUNCTION = 1n << 23n;
 // NSTrackingAreaOptions: MouseEnteredAndExited | ActiveInKeyWindow | InVisibleRect. The rect
 // passed to `initWithRect:` is ignored when InVisibleRect is set — AppKit tracks the owning
 // view's visible rect automatically, so the area stays correct across resizes for free.
@@ -84,6 +87,8 @@ function modifierFlagForCode(code: string): bigint | undefined {
     case "MetaLeft":
     case "MetaRight":
       return NS_EVENT_MODIFIER_FLAG_COMMAND;
+    case "Fn":
+      return NS_EVENT_MODIFIER_FLAG_FUNCTION;
     default:
       return undefined;
   }
@@ -112,6 +117,7 @@ function openMsgSendSymbols(libraries: Closeable[]) {
     id: openMsgSend(libraries, ["pointer", "pointer"], "pointer"),
     id_cstr: openMsgSend(libraries, ["pointer", "pointer", "buffer"], "pointer"),
     id_id: openMsgSend(libraries, ["pointer", "pointer", "pointer"], "pointer"),
+    id_u64: openMsgSend(libraries, ["pointer", "pointer", "u64"], "pointer"),
     id_rect: openMsgSend(libraries, ["pointer", "pointer", NSRECT], "pointer"),
     id_rectU64U64Bool: openMsgSend(
       libraries,
@@ -156,6 +162,9 @@ function openDarwinFfi() {
     const appKit = Deno.dlopen(APPKIT, {});
     opened.push(appKit);
 
+    const hitoolbox = Deno.dlopen(HITOOLBOX, hitoolboxSymbols);
+    opened.push(hitoolbox);
+
     const runtime: ObjcRuntime = Deno.dlopen(LIBOBJC, runtimeSymbols);
     opened.push(runtime);
 
@@ -170,6 +179,7 @@ function openDarwinFfi() {
 
     return {
       appKit,
+      hitoolbox,
       runtime,
       send,
       nsrect,
@@ -177,6 +187,7 @@ function openDarwinFfi() {
       cf,
       system,
       assertMainThread: () => assertMainThread(system),
+      isIsoKeyboard: () => hitoolbox.symbols.KBGetLayoutType(hitoolbox.symbols.LMGetKbdType()) === 0x49534f20,
       getClass: (name: string) => runtimeGetClass(runtime, name),
       sel: (name: string) => runtimeSel(runtime, name),
       allocateClassPair: (superclass: Deno.PointerObject, name: string) =>
@@ -627,13 +638,18 @@ class DarwinWindow implements Window, DarwinNativeResponder {
       const completedKey = batch[0];
       if (completedKey?.type === "keydown") {
         const resolvedKey = logicalKeyForEvent({
+          keycode: completedKey.keycode,
           code: completedKey.code,
           characters: native.characters,
           charactersIgnoringModifiers: native.charactersIgnoringModifiers,
           producedText: this.#producedText,
           producedPreedit: this.#producedPreedit || completedKey.isComposing,
+          deadKey: this.#producedPreedit && completedKey.altKey,
         });
-        completedKey.key = this.#pressedKeys.press(completedKey.keycode, resolvedKey);
+        this.#pressedKeys.press(completedKey.keycode, resolvedKey);
+        // UI Events resolves `key` for every native repeat using the current
+        // modifier/layout state rather than freezing the initial press value.
+        completedKey.key = resolvedKey;
       }
       this.#keyDispatchActive = false;
       this.#producedText = undefined;
@@ -646,9 +662,12 @@ class DarwinWindow implements Window, DarwinNativeResponder {
     if (this.#closed || event === null) return;
     this.lib.markNativeEventHandled(event);
     const native = this.#nativeKeyData(event);
+    const matchedPress = this.#pressedKeys.has(native.base.keycode);
+    const retainedKey = this.#pressedKeys.release(native.base.keycode);
+    const currentKey = matchedPress && retainedKey !== "Dead" ? native.base.key : retainedKey;
     const key: KeyUpEvent = createKeyUpEvent({
       ...native.base,
-      key: this.#pressedKeys.release(native.base.keycode),
+      key: currentKey,
     });
     this.lib.pushEvent(key);
   }
@@ -662,7 +681,7 @@ class DarwinWindow implements Window, DarwinNativeResponder {
       repeat: this.lib.ffi.send.bool(event, this.lib.ffi.sel("isARepeat")),
       editDisposition: "platform",
     });
-    key.key = this.#pressedKeys.press(key.keycode, key.key);
+    this.#pressedKeys.press(key.keycode, key.key);
     this.lib.pushEvent(key);
   }
 
@@ -838,7 +857,17 @@ class DarwinWindow implements Window, DarwinNativeResponder {
   } {
     const { sel, send } = this.lib.ffi;
     const charactersPointer = send.id(event, sel("characters"));
-    const charactersIgnoringModifiersPointer = send.id(event, sel("charactersIgnoringModifiers"));
+    const eventFlags = send.u64(event, sel("modifierFlags"));
+    const glyphModifiers = eventFlags & (
+      NS_EVENT_MODIFIER_FLAG_CAPS_LOCK |
+      NS_EVENT_MODIFIER_FLAG_SHIFT |
+      NS_EVENT_MODIFIER_FLAG_OPTION
+    );
+    const charactersIgnoringModifiersPointer = send.id_u64(
+      event,
+      sel("charactersByApplyingModifiers:"),
+      glyphModifiers,
+    );
     const characters = charactersPointer === null ? "" : readCFString(this.lib.ffi.cf, charactersPointer);
     const charactersIgnoringModifiers = charactersIgnoringModifiersPointer === null
       ? ""
@@ -846,7 +875,11 @@ class DarwinWindow implements Window, DarwinNativeResponder {
     const base = this.#nativeKeyBase(
       event,
       logicalKeyForEvent({
-        code: getDomCode(send.u16(event, sel("keyCode"))),
+        keycode: send.u16(event, sel("keyCode")),
+        code: getDomCode(
+          send.u16(event, sel("keyCode")),
+          this.lib.ffi.isIsoKeyboard(),
+        ),
         characters,
         charactersIgnoringModifiers,
       }),
@@ -861,16 +894,17 @@ class DarwinWindow implements Window, DarwinNativeResponder {
   ): Omit<KeyEventBase, "type"> {
     const { sel, send } = this.lib.ffi;
     const keycode = send.u16(event, sel("keyCode"));
-    const code = getDomCode(keycode);
+    const code = getDomCode(keycode, this.lib.ffi.isIsoKeyboard());
     return {
       keycode,
       code,
       key: logicalKey ?? logicalKeyForEvent({
+        keycode,
         code,
         characters: "",
         charactersIgnoringModifiers: "",
       }),
-      location: keyLocationForCode(code),
+      location: keycode === 0x47 ? 3 : keyLocationForCode(code),
       isComposing: this.inputState.composing,
       ...getModifiers(event, this.lib.ffi),
       window: this,

@@ -14,9 +14,15 @@ export const APPKIT = "/System/Library/Frameworks/AppKit.framework/AppKit";
 export const CORE_GRAPHICS = "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics";
 export const CORE_FOUNDATION = "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation";
 export const LIBSYSTEM = "/usr/lib/libSystem.B.dylib";
+export const HITOOLBOX = "/System/Library/Frameworks/Carbon.framework/Frameworks/HIToolbox.framework/HIToolbox";
 
 export const systemSymbols = {
   pthread_main_np: { parameters: [], result: "i32" },
+} as const satisfies Deno.ForeignLibraryInterface;
+
+export const hitoolboxSymbols = {
+  LMGetKbdType: { parameters: [], result: "u8" },
+  KBGetLayoutType: { parameters: ["i16"], result: "u32" },
 } as const satisfies Deno.ForeignLibraryInterface;
 
 export type DarwinSystem = Deno.DynamicLibrary<typeof systemSymbols>;
