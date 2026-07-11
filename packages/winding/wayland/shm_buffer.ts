@@ -27,6 +27,27 @@ export interface WaylandShmHost {
 
 const MAX_BUFFERS = 3;
 
+/** Convert the public straight-alpha RGBA bytes to Wayland's premultiplied BGRA layout. */
+export function copyStraightRgbaToPremultipliedBgra(
+  source: Uint8Array,
+  destination: Uint8Array,
+): void {
+  if (destination.byteLength % 4 !== 0 || source.byteLength < destination.byteLength) {
+    throw new RangeError("winding Wayland pixel conversion needs complete RGBA pixels");
+  }
+  for (let index = 0; index < destination.byteLength; index += 4) {
+    const alpha = source[index + 3];
+    destination[index] = premultiply(source[index + 2], alpha);
+    destination[index + 1] = premultiply(source[index + 1], alpha);
+    destination[index + 2] = premultiply(source[index], alpha);
+    destination[index + 3] = alpha;
+  }
+}
+
+function premultiply(channel: number, alpha: number): number {
+  return Math.floor((channel * alpha + 127) / 255);
+}
+
 /**
  * Owns a small release-aware set of wl_shm buffers.
  *
@@ -95,12 +116,7 @@ class WaylandShmBufferSlot {
     const destination = new Uint8Array(
       new Deno.UnsafePointerView(this.#mapping!).getArrayBuffer(size),
     );
-    for (let index = 0; index < size; index += 4) {
-      destination[index] = rgba[index + 2];
-      destination[index + 1] = rgba[index + 1];
-      destination[index + 2] = rgba[index];
-      destination[index + 3] = rgba[index + 3];
-    }
+    copyStraightRgbaToPremultipliedBgra(rgba, destination);
     this.#busy = true;
     return this.#buffer!;
   }
