@@ -1,6 +1,6 @@
 /** Pure Win32 keyboard, AltGr, and WM_CHAR helpers. This module performs no FFI. */
 
-import type { KeyEditDisposition } from "../types.ts";
+import type { KeyEditDisposition, KeyEvent } from "../types.ts";
 import { normalizeCommittedText } from "../input/keyboard.ts";
 import { WM } from "./ffi.ts";
 
@@ -417,6 +417,19 @@ export function decodeKeyLParam(lParam: number | bigint): DecodedKeyLParam {
     transitionState: ((raw >> 31n) & 1n) !== 0n,
     isRepeat: previousKeyState,
   };
+}
+
+/** Expand one packed native keydown into browser-style per-transition events. */
+export function expandWin32KeyRepeats(event: KeyEvent, lParam: number | bigint): KeyEvent[] {
+  if (event.type !== "keydown") return [event];
+  const decoded = decodeKeyLParam(lParam);
+  // A real key message always represents at least one transition. Preserve
+  // that transition for malformed/synthetic messages whose low word is zero.
+  const count = Math.max(1, decoded.repeatCount);
+  return Array.from({ length: count }, (_, index) => ({
+    ...event,
+    repeat: decoded.previousKeyState || index > 0,
+  }));
 }
 
 function keyIsDown(state: Uint8Array, virtualKey: number): boolean {

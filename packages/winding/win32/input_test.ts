@@ -1,4 +1,5 @@
 import { assert, assertEquals, assertThrows } from "jsr:@std/assert@^1.0.19";
+import type { KeyDownEvent, UIEvent } from "../types.ts";
 import {
   AltGraphControlFilter,
   decodeKeyLParam,
@@ -69,6 +70,86 @@ Deno.test("Win32 key lParam decoding preserves repeat, scan, extended, context, 
     isRepeat: true,
   });
   assertEquals(decodeKeyLParam(makeKeyLParam(0x1e)).isRepeat, false);
+});
+
+Deno.test({
+  name: "packed printable key repeats emit per-transition keydowns and one exactly-sized commit",
+  fn() {
+    const harness = createInputControllerHarness({ keyText: new Map([[0x41, "a"]]) });
+    harness.controller.attach(harness.window);
+    const lParam = makeKeyLParam(0x1e, { repeatCount: 3 });
+    dispatchKeyDown(harness, 0x41, lParam);
+    harness.controller.handleMessage(harness.window, WM.CHAR, "a".charCodeAt(0), lParam);
+
+    const keydowns = harness.events.filter((event): event is KeyDownEvent => event.type === "keydown");
+    assertEquals(keydowns.map((event) => event.repeat), [false, true, true]);
+    assertEquals(keydowns.map((event) => [event.key, event.editDisposition]), [
+      ["a", "text-input"],
+      ["a", "text-input"],
+      ["a", "text-input"],
+    ]);
+    assertEquals(
+      harness.events.filter((event) => event.type === "ime"),
+      [{ type: "ime", kind: "commit", text: "aaa", window: harness.window }],
+    );
+  },
+});
+
+Deno.test({
+  name: "packed non-text repeats preserve Backspace, Delete, arrow, and shortcut edit multiplicity",
+  fn() {
+    const cases: ReadonlyArray<{
+      name: string;
+      virtualKey: number;
+      scanCode: number;
+      character?: number;
+      extended?: boolean;
+      shortcut?: boolean;
+    }> = [
+      { name: "Backspace", virtualKey: VK.BACK, scanCode: 0x0e, character: 0x08 },
+      { name: "Delete", virtualKey: VK.DELETE, scanCode: 0x53, character: 0x7f, extended: true },
+      { name: "ArrowLeft", virtualKey: VK.LEFT, scanCode: 0x4b, extended: true },
+      { name: "z", virtualKey: 0x5a, scanCode: 0x2c, character: 0x1a, shortcut: true },
+    ];
+
+    for (const testCase of cases) {
+      const harness = createInputControllerHarness({
+        ...(testCase.shortcut
+          ? {
+            keyText: new Map([[testCase.virtualKey, "z"]]),
+            keyboardState: [[VK.CONTROL, 0x80], [VK.LCONTROL, 0x80]],
+          }
+          : {}),
+      });
+      harness.controller.attach(harness.window);
+      const lParam = makeKeyLParam(testCase.scanCode, {
+        repeatCount: 4,
+        previous: true,
+        extended: testCase.extended ?? false,
+      });
+      dispatchKeyDown(harness, testCase.virtualKey, lParam);
+      if (testCase.character !== undefined) {
+        harness.controller.handleMessage(harness.window, WM.CHAR, testCase.character, lParam);
+      }
+
+      const keydowns = harness.events.filter((event): event is KeyDownEvent => event.type === "keydown");
+      assertEquals(keydowns.length, 4, `${testCase.name} keydown count`);
+      assertEquals(keydowns.map((event) => event.repeat), [true, true, true, true]);
+      assertEquals(keydowns.map((event) => event.key), [
+        testCase.name,
+        testCase.name,
+        testCase.name,
+        testCase.name,
+      ]);
+      assertEquals(keydowns.map((event) => event.editDisposition), [
+        "key-default",
+        "key-default",
+        "key-default",
+        "key-default",
+      ]);
+      assertEquals(harness.events.filter((event) => event.type === "ime"), []);
+    }
+  },
 });
 
 Deno.test("TranslateMessage guard defers only sent-message reentry and preserves FIFO order", () => {
@@ -817,6 +898,8 @@ interface FakeImmBehavior {
   compositionResult?: number;
   notifyResult?: number;
   releaseResult?: number;
+  keyText?: ReadonlyMap<number, string>;
+  keyboardState?: ReadonlyArray<readonly [virtualKey: number, state: number]>;
 }
 
 function createInputControllerHarness(behavior: FakeImmBehavior = {}) {
@@ -829,9 +912,29 @@ function createInputControllerHarness(behavior: FakeImmBehavior = {}) {
     notifications: 0,
     releases: 0,
   };
+  const events: UIEvent[] = [];
   const user32 = {
     symbols: {
       DefWindowProcW: () => 0n,
+      GetKeyboardState(target: Uint8Array) {
+        target.fill(0);
+        for (const [virtualKey, state] of behavior.keyboardState ?? []) target[virtualKey] = state;
+        return 1;
+      },
+      GetKeyboardLayout: () => null,
+      GetKeyState: () => 0,
+      PeekMessageW: () => 0,
+      ToUnicodeEx(
+        virtualKey: number,
+        _scanCode: number,
+        _keyboardState: Uint8Array,
+        output: Uint16Array,
+      ) {
+        const text = behavior.keyText?.get(virtualKey);
+        if (text === undefined) return 0;
+        for (let index = 0; index < text.length; index++) output[index] = text.charCodeAt(index);
+        return text.length;
+      },
     },
   } as unknown as Deno.DynamicLibrary<typeof user32functions>;
   const imm32 = {
@@ -871,6 +974,19 @@ function createInputControllerHarness(behavior: FakeImmBehavior = {}) {
     setImeCursorArea() {},
     [Symbol.dispose]() {},
   };
-  const controller = new Win32InputController(user32, imm32, () => {}, (id) => id === window.id ? window : undefined);
-  return { calls, controller, window };
+  const controller = new Win32InputController(
+    user32,
+    imm32,
+    (event) => events.push(event),
+    (id) => id === window.id ? window : undefined,
+  );
+  return { calls, controller, events, window };
+}
+
+function dispatchKeyDown(
+  harness: ReturnType<typeof createInputControllerHarness>,
+  virtualKey: number,
+  lParam: bigint,
+): void {
+  harness.controller.handleMessage(harness.window, WM.KEYDOWN, virtualKey, lParam);
 }

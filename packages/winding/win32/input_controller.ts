@@ -45,6 +45,7 @@ import {
 import {
   AltGraphControlFilter,
   decodeKeyLParam,
+  expandWin32KeyRepeats,
   isCommitText,
   keyboardModifiers,
   logicalKeyFromVirtualKey,
@@ -325,7 +326,9 @@ export class Win32InputController {
           lParam,
           message === WM.SYSKEYDOWN,
         );
-        if (prepared !== undefined && !prepared.suppress) this.#enqueue(prepared.event);
+        if (prepared !== undefined && !prepared.suppress) {
+          for (const event of expandWin32KeyRepeats(prepared.event, lParam)) this.#enqueue(event);
+        }
         return undefined;
       }
       case WM.KEYUP:
