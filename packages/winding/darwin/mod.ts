@@ -16,6 +16,7 @@ import {
   PressedLogicalKeyCache,
 } from "../input/mod.ts";
 import { getDomCode } from "./dom_code.ts";
+import { appKitWindowFrame, type ScreenFrame } from "./geometry.ts";
 import { DarwinInputState } from "./input_state.ts";
 import {
   addMethod as runtimeAddMethod,
@@ -271,6 +272,20 @@ function pointerId(p: Deno.PointerValue): bigint {
   return BigInt(Deno.UnsafePointer.value(p));
 }
 
+function primaryScreenFrame(ffi: DarwinFfi): ScreenFrame {
+  const { getClass, nsrect, sel, send } = ffi;
+  const screens = send.id(getClass("NSScreen"), sel("screens"));
+  const primary = screens === null ? null : send.id(screens, sel("firstObject"));
+  if (primary === null) throw new Error("winding(darwin): AppKit reported no screens");
+  const frame = nsrect.noArgs(primary, sel("frame"));
+  return {
+    x: readStructF64(frame, 0),
+    y: readStructF64(frame, 8),
+    width: readStructF64(frame, 16),
+    height: readStructF64(frame, 24),
+  };
+}
+
 function getModifiers(event: Deno.PointerValue, ffi: DarwinFfi): KeyModifiers {
   const { sel, send } = ffi;
   const flags = send.u64(event, sel("modifierFlags"));
@@ -343,22 +358,32 @@ class DarwinWindow implements Window, DarwinNativeResponder {
 
   constructor(readonly lib: DarwinLibrary, x = 0, y = 0, w = 800, h = 600) {
     lib.assertMainThread();
-    const { getClass, sel, send } = lib.ffi;
-    const alloc = send.id(getClass("NSWindow"), sel("alloc"));
-    const rect = new Float64Array([x, y, w, h]);
+    const { getClass, nsrect, sel, send } = lib.ffi;
+    const windowClass = getClass("NSWindow");
+    const styleMask = BigInt(NS_WINDOW_STYLE_MASK);
+    const frame = appKitWindowFrame(x, y, w, h, primaryScreenFrame(lib.ffi));
+    const contentRect = nsrect.rectU64Arg(
+      windowClass,
+      sel("contentRectForFrameRect:styleMask:"),
+      frame,
+      styleMask,
+    );
+    const contentWidth = readStructF64(contentRect, 16);
+    const contentHeight = readStructF64(contentRect, 24);
+    const alloc = send.id(windowClass, sel("alloc"));
     const win = send.id_rectU64U64Bool(
       alloc,
       sel("initWithContentRect:styleMask:backing:defer:"),
-      rect,
-      BigInt(NS_WINDOW_STYLE_MASK),
+      contentRect,
+      styleMask,
       NS_BACKING_STORE_BUFFERED,
       false,
     );
     if (win === null) throw new Error("winding(darwin): failed to create NSWindow");
     this.nsWindow = win;
     this.id = pointerId(win);
-    this.#width = w;
-    this.#height = h;
+    this.#width = Math.round(contentWidth);
+    this.#height = Math.round(contentHeight);
     this.inputState = new DarwinInputState(this);
     let delegate: Deno.PointerValue = null;
     let contentView: Deno.PointerValue = null;
@@ -377,7 +402,7 @@ class DarwinWindow implements Window, DarwinNativeResponder {
       contentView = send.id_rect(
         viewAlloc,
         sel("initWithFrame:"),
-        new Float64Array([0, 0, w, h]),
+        new Float64Array([0, 0, contentWidth, contentHeight]),
       );
       if (contentView === null) throw new Error("winding(darwin): failed to create content view");
       this.contentView = contentView;

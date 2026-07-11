@@ -183,6 +183,12 @@ export interface NSRectMsgSend {
     selector: Deno.PointerValue,
     rect: NSRectBuffer,
   ): Uint8Array;
+  rectU64Arg(
+    receiver: Deno.PointerValue,
+    selector: Deno.PointerValue,
+    rect: NSRectBuffer,
+    value: bigint,
+  ): Uint8Array;
   rectPointerArg(
     receiver: Deno.PointerValue,
     selector: Deno.PointerValue,
@@ -227,6 +233,15 @@ export function openNSRectMsgSend(libraries: Closeable[]): NSRectMsgSend {
         },
       } as const,
     );
+    const rectU64ArgLib = Deno.dlopen(
+      LIBOBJC,
+      {
+        objc_msgSend_stret: {
+          parameters: ["buffer", "pointer", "pointer", NSRECT, "u64"],
+          result: "void",
+        },
+      } as const,
+    );
     const rangePointerArgsLib = Deno.dlopen(
       LIBOBJC,
       {
@@ -245,7 +260,13 @@ export function openNSRectMsgSend(libraries: Closeable[]): NSRectMsgSend {
         },
       } as const,
     );
-    libraries.push(noArgsLib, rectArgLib, rectPointerArgLib, rangePointerArgsLib);
+    libraries.push(
+      noArgsLib,
+      rectArgLib,
+      rectU64ArgLib,
+      rectPointerArgLib,
+      rangePointerArgsLib,
+    );
     return {
       noArgs(receiver, selector) {
         const result = new Float64Array(4);
@@ -255,6 +276,11 @@ export function openNSRectMsgSend(libraries: Closeable[]): NSRectMsgSend {
       rectArg(receiver, selector, rect) {
         const result = new Float64Array(4);
         rectArgLib.symbols.objc_msgSend_stret(result, receiver, selector, rect);
+        return new Uint8Array(result.buffer);
+      },
+      rectU64Arg(receiver, selector, rect, value) {
+        const result = new Float64Array(4);
+        rectU64ArgLib.symbols.objc_msgSend_stret(result, receiver, selector, rect, value);
         return new Uint8Array(result.buffer);
       },
       rectPointerArg(receiver, selector, rect, pointer) {
@@ -294,6 +320,15 @@ export function openNSRectMsgSend(libraries: Closeable[]): NSRectMsgSend {
       },
     } as const,
   );
+  const rectU64ArgLib = Deno.dlopen(
+    LIBOBJC,
+    {
+      objc_msgSend: {
+        parameters: ["pointer", "pointer", NSRECT, "u64"],
+        result: NSRECT,
+      },
+    } as const,
+  );
   const rangePointerArgsLib = Deno.dlopen(
     LIBOBJC,
     {
@@ -312,10 +347,18 @@ export function openNSRectMsgSend(libraries: Closeable[]): NSRectMsgSend {
       },
     } as const,
   );
-  libraries.push(noArgsLib, rectArgLib, rectPointerArgLib, rangePointerArgsLib);
+  libraries.push(
+    noArgsLib,
+    rectArgLib,
+    rectU64ArgLib,
+    rectPointerArgLib,
+    rangePointerArgsLib,
+  );
   return {
     noArgs: (receiver, selector) => noArgsLib.symbols.objc_msgSend(receiver, selector) as Uint8Array,
     rectArg: (receiver, selector, rect) => rectArgLib.symbols.objc_msgSend(receiver, selector, rect) as Uint8Array,
+    rectU64Arg: (receiver, selector, rect, value) =>
+      rectU64ArgLib.symbols.objc_msgSend(receiver, selector, rect, value) as Uint8Array,
     rectPointerArg: (receiver, selector, rect, pointer) =>
       rectPointerArgLib.symbols.objc_msgSend(receiver, selector, rect, pointer) as Uint8Array,
     rangePointerArgs: (receiver, selector, range, actualRange) =>

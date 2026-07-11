@@ -416,11 +416,12 @@ function testModifierTransitions(): void {
 }
 
 function testBlitStorageLifetime(): void {
-  withNativeWindow(2, 1, (_library, window) => {
+  withNativeWindow(64, 64, (_library, window) => {
     const handles: Closeable[] = [];
     try {
       const runtime = Deno.dlopen(LIBOBJC, runtimeSymbols);
       handles.push(runtime);
+      const rectSend = openNSRectMsgSend(handles);
       const sendId = openMessage(handles, ["pointer", "pointer"], "pointer");
       const sendVoid = openMessage(handles, ["pointer", "pointer"], "void");
       const cg = Deno.dlopen(
@@ -441,12 +442,27 @@ function testBlitStorageLifetime(): void {
       );
       handles.push(cf);
 
-      const pixels = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
-      assertThrowsMessage(() => window.blit(pixels, 0, 1), "positive safe integers");
-      assertThrowsMessage(() => window.blit(pixels, 1.5, 1), "positive safe integers");
-      assertThrowsMessage(() => window.blit(pixels, 1, 2), "do not match client size");
-      assertThrowsMessage(() => window.blit(pixels.subarray(0, 7), 2, 1), "expected 8");
-      window.blit(pixels, 2, 1);
+      const contentFrame = rectSend.noArgs(window.contentView, sel(runtime, "frame"));
+      const width = Math.round(readStructF64(contentFrame, 16));
+      const height = Math.round(readStructF64(contentFrame, 24));
+      const byteLength = width * height * 4;
+      assert(width > 0 && height > 0, "test window has no drawable client area");
+      const pixels = Uint8Array.from(
+        { length: byteLength },
+        (_value, index) => (index % 251) + 1,
+      );
+      const expectedPixels = pixels.slice();
+      assertThrowsMessage(() => window.blit(pixels, 0, height), "positive safe integers");
+      assertThrowsMessage(() => window.blit(pixels, 1.5, height), "positive safe integers");
+      assertThrowsMessage(
+        () => window.blit(pixels, width + 1, height),
+        "do not match client size",
+      );
+      assertThrowsMessage(
+        () => window.blit(pixels.subarray(0, byteLength - 1), width, height),
+        `expected ${byteLength}`,
+      );
+      window.blit(pixels, width, height);
       pixels.fill(0);
 
       sendVoid(window.contentView, sel(runtime, "displayIfNeeded"));
@@ -460,11 +476,13 @@ function testBlitStorageLifetime(): void {
       assert(data !== null, "could not copy installed provider bytes");
       try {
         const length = cf.symbols.CFDataGetLength(data);
-        assertEquals(length, 8n);
+        assertEquals(length, BigInt(byteLength));
         const pointer = cf.symbols.CFDataGetBytePtr(data);
         assert(pointer !== null, "installed provider returned null bytes");
-        const actual = new Uint8Array(new Deno.UnsafePointerView(pointer).getArrayBuffer(8));
-        assertEquals([...actual], [1, 2, 3, 4, 5, 6, 7, 8]);
+        const actual = new Uint8Array(
+          new Deno.UnsafePointerView(pointer).getArrayBuffer(byteLength),
+        );
+        assertEquals([...actual], [...expectedPixels]);
       } finally {
         cf.symbols.CFRelease(data);
       }
@@ -502,7 +520,9 @@ function testMouseMoveDeliveryEnabled(): void {
 
 function testClosedMethodGuards(): void {
   const library = load();
-  const window = library.openWindow(0, 0, 2, 1) as NativeWindow & { cancelComposition(): void };
+  const window = library.openWindow(0, 0, 64, 64) as NativeWindow & {
+    cancelComposition(): void;
+  };
   window.close();
 
   const closedWindowOperations = [
@@ -575,7 +595,7 @@ function testActivationCallShapes(): void {
 }
 
 function testProtocolAndStructAbis(): void {
-  withNativeWindow(64, 48, (_library, window) => {
+  withNativeWindow(128, 96, (_library, window) => {
     const handles: Closeable[] = [];
     try {
       const runtime = Deno.dlopen(LIBOBJC, runtimeSymbols);
@@ -719,8 +739,22 @@ function testProtocolAndStructAbis(): void {
 
       const rectSend = openNSRectMsgSend(handles);
       const frame = rectSend.noArgs(window.contentView, sel(runtime, "frame"));
-      assertEquals(readStructF64(frame, 16), 64);
-      assertEquals(readStructF64(frame, 24), 48);
+      const contentWidth = readStructF64(frame, 16);
+      const contentHeight = readStructF64(frame, 24);
+      assert(contentWidth > 0 && contentHeight > 0, "window has no client area");
+
+      const windowFrame = rectSend.noArgs(window.nsWindow, sel(runtime, "frame"));
+      const screens = sendId(getClass(runtime, "NSScreen"), sel(runtime, "screens"));
+      const primary = screens === null ? null : sendId(screens, sel(runtime, "firstObject"));
+      assert(primary !== null, "AppKit reported no primary screen");
+      const primaryFrame = rectSend.noArgs(primary, sel(runtime, "frame"));
+      assertClose(readStructF64(windowFrame, 0), readStructF64(primaryFrame, 0));
+      assertClose(
+        readStructF64(windowFrame, 8),
+        readStructF64(primaryFrame, 8) + readStructF64(primaryFrame, 24) - 96,
+      );
+      assertClose(readStructF64(windowFrame, 16), 128);
+      assertClose(readStructF64(windowFrame, 24), 96);
 
       window.setImeCursorArea(4, 6, 2, 14);
       const actualRange = makeNSRange(0, 0);
@@ -736,7 +770,7 @@ function testProtocolAndStructAbis(): void {
         rectSend.rectPointerArg(
           window.contentView,
           sel(runtime, "convertRect:toView:"),
-          new Float64Array([4, 28, 2, 14]),
+          new Float64Array([4, contentHeight - 20, 2, 14]),
           null,
         ),
       );
