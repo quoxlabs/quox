@@ -308,14 +308,29 @@ class X11Window implements Window {
 }
 
 function openX11Library(): Deno.DynamicLibrary<typeof x11functions> {
+  let library: Deno.DynamicLibrary<typeof x11functions>;
   try {
-    return Deno.dlopen("libX11.so.6", x11functions);
+    library = Deno.dlopen("libX11.so.6", x11functions);
   } catch (versionedError) {
     try {
-      return Deno.dlopen("libX11.so", x11functions);
+      library = Deno.dlopen("libX11.so", x11functions);
     } catch {
       throw versionedError;
     }
+  }
+  if (library.symbols.XInitThreads() === 0) {
+    library.close();
+    throw new Error("winding(x11): Xlib could not initialize thread safety");
+  }
+  return library;
+}
+
+let libraryActive = false;
+
+function assertMainIsolate(): void {
+  const constructorName = (globalThis as { constructor?: { name?: string } }).constructor?.name ?? "";
+  if (constructorName.includes("Worker")) {
+    throw new Error("winding(x11): the library must be created on the main thread, not a Worker");
   }
 }
 
@@ -673,6 +688,7 @@ class X11Library implements Library {
     });
     cleanup(() => this.X11.close());
     cleanup(() => this.libc.close());
+    libraryActive = false;
     if (errors.length === 1) throw errors[0];
     if (errors.length > 1) {
       throw new AggregateError(errors, "winding(x11): errors while closing library");
@@ -868,7 +884,17 @@ function importEvent(
   }
 }
 
-export const load: LoadLibrary = () => new X11Library();
+export const load: LoadLibrary = () => {
+  assertMainIsolate();
+  if (libraryActive) throw new Error("winding(x11): only one library instance may be active");
+  libraryActive = true;
+  try {
+    return new X11Library();
+  } catch (error) {
+    libraryActive = false;
+    throw error;
+  }
+};
 
 function assertNever(_value: never): never {
   throw new TypeError("Unsupported XIM event");

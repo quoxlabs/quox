@@ -147,6 +147,7 @@ export class XimManager implements Disposable {
   #rebuildPending = false;
   #serverDestroyed = false;
   #closed = false;
+  readonly #previousLocale: string | undefined;
   readonly localeIsUtf8: boolean;
 
   constructor(
@@ -162,6 +163,7 @@ export class XimManager implements Disposable {
     this.#selectInput = selectInput;
     this.#libc = libc;
 
+    this.#previousLocale = pointerString(this.#libc.symbols.setlocale(LC_CTYPE, null));
     const locale = this.#libc.symbols.setlocale(LC_CTYPE, cString(""));
     this.localeIsUtf8 = isUtf8Locale(pointerString(locale));
 
@@ -468,6 +470,12 @@ export class XimManager implements Disposable {
     }
     cleanup(() => this.#destroyCallback.close());
     cleanup(() => this.#instantiateCallback.close());
+    const previousLocale = this.#previousLocale;
+    if (previousLocale !== undefined) {
+      cleanup(() => {
+        this.#libc.symbols.setlocale(LC_CTYPE, cString(previousLocale));
+      });
+    }
     if (errors.length === 1) throw errors[0];
     if (errors.length > 1) {
       throw new AggregateError(errors, "winding(x11): errors while closing XIM");
