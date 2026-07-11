@@ -5,6 +5,10 @@ import { QuoxElement, QuoxInputElement, QuoxTextAreaElement } from "./node.ts";
 
 class FakeActiveElementRenderer {
   active: number | undefined = 2;
+  readonly #values = new Map<number, string>([
+    [3, ""],
+    [4, ""],
+  ]);
   readonly #interfaces = new Map<number, number>([
     [1, 0],
     [2, 0],
@@ -43,6 +47,26 @@ class FakeActiveElementRenderer {
     const elementInterface = this.#interfaces.get(nodeHandle);
     if (elementInterface === undefined) throw new TypeError(`unknown fake handle: ${nodeHandle}`);
     return elementInterface;
+  }
+
+  remove_node(nodeHandle: number): void {
+    if (this.active === nodeHandle) this.active = 2;
+  }
+
+  append_child(_parentHandle: number, _childHandle: number): void {
+    // Reattaching an old wrapper must not restore the focus cleared by removal.
+  }
+
+  form_control_value(nodeHandle: number): string {
+    const value = this.#values.get(nodeHandle);
+    if (value === undefined) throw new TypeError(`unknown fake form control: ${nodeHandle}`);
+    return value;
+  }
+
+  set_form_control_value(nodeHandle: number, value: string): boolean {
+    const previous = this.form_control_value(nodeHandle);
+    this.#values.set(nodeHandle, value);
+    return previous !== value;
   }
 }
 
@@ -95,4 +119,25 @@ Deno.test("activeElement observes document liveness before crossing the boundary
 
   active = false;
   assertThrows(() => document.activeElement, Error, "stopped");
+});
+
+Deno.test("detaching the active control is silent and reattachment does not restore focus", () => {
+  const renderer = new FakeActiveElementRenderer();
+  const document = createDocument(renderer);
+  const input = document.createElement("input");
+  let focusEvents = 0;
+  input.addEventListener("blur", () => focusEvents += 1);
+  input.addEventListener("focusout", () => focusEvents += 1);
+  input.value = "edited";
+  renderer.active = input.nodeId;
+
+  input.remove();
+  assertStrictEquals(document.activeElement, document.body);
+  assertEquals(input.value, "edited");
+  assertEquals(focusEvents, 0);
+
+  document.body.appendChild(input);
+  assertStrictEquals(document.activeElement, document.body);
+  assertEquals(input.value, "edited");
+  assertEquals(focusEvents, 0);
 });

@@ -70,11 +70,70 @@ pub(super) fn public_dom_node_id(document: &BaseDocument, mut node_id: usize) ->
 /// Return the connected element which actually owns DOM focus. Blitz reports the document
 /// element when no node is focused, so the focus bit is part of the distinction.
 pub(super) fn actual_focus_node_id(document: &BaseDocument) -> Option<usize> {
-    document.get_focussed_node_id().filter(|target| {
-        document.get_node(*target).is_some_and(|node| {
-            node.element_data().is_some() && node.is_focussed() && node.flags.is_in_document()
-        })
+    retained_focus_node_id(document).filter(|target| {
+        document
+            .get_node(*target)
+            .is_some_and(|node| node.flags.is_in_document())
     })
+}
+
+/// Return Blitz's retained focus owner even if a previous tree mutation disconnected it. The
+/// focus bit distinguishes a real owner from Blitz's document-element keyboard-target fallback.
+fn retained_focus_node_id(document: &BaseDocument) -> Option<usize> {
+    document.get_focussed_node_id().filter(|target| {
+        document
+            .get_node(*target)
+            .is_some_and(|node| node.element_data().is_some() && node.is_focussed())
+    })
+}
+
+fn subtree_contains_node(document: &BaseDocument, root_id: usize, mut node_id: usize) -> bool {
+    loop {
+        if node_id == root_id {
+            return true;
+        }
+        let Some(parent_id) = document.get_node(node_id).and_then(|node| node.parent) else {
+            return false;
+        };
+        node_id = parent_id;
+    }
+}
+
+/// Synchronize the live editor and clear Blitz's retained focus before a subtree leaves its
+/// current position. `BaseDocument::clear_focus` updates internal focus/IME state but does not
+/// synthesize DOM blur or focusout events, matching browser removal behavior.
+fn clear_retained_focus_in_subtree(
+    document: &mut BaseDocument,
+    text_controls: &mut crate::form_controls::TextControlStates,
+    root_id: usize,
+) -> bool {
+    let Some(focus_id) = retained_focus_node_id(document) else {
+        return false;
+    };
+    if !subtree_contains_node(document, root_id, focus_id) {
+        return false;
+    }
+
+    text_controls.sync_editor_value(document, focus_id);
+    document.clear_focus();
+    true
+}
+
+fn clear_retained_focus_in_descendants(
+    document: &mut BaseDocument,
+    text_controls: &mut crate::form_controls::TextControlStates,
+    parent_id: usize,
+) -> bool {
+    let Some(focus_id) = retained_focus_node_id(document) else {
+        return false;
+    };
+    if focus_id == parent_id || !subtree_contains_node(document, parent_id, focus_id) {
+        return false;
+    }
+
+    text_controls.sync_editor_value(document, focus_id);
+    document.clear_focus();
+    true
 }
 
 /// Resolve `Document.activeElement`, including the HTML fallback used when no element owns
@@ -264,9 +323,33 @@ impl QuoxRendererState {
     fn invalidate_dropped_descendants(&mut self, parent_id: usize) -> Vec<u32> {
         // Collect and invalidate before mutation so the HTML parser cannot reuse a freed slab
         // index while its old public mapping still exists.
+        self.clear_focus_in_descendants(parent_id);
         let dropped = dropped_descendant_ids(&self.document, parent_id);
         self.text_controls.invalidate_nodes(dropped.iter().copied());
         self.node_handles.invalidate_nodes(dropped)
+    }
+
+    fn clear_focus_in_subtree(&mut self, root_id: usize) {
+        let ime_before = self.focused_editor_snapshot();
+        let cleared =
+            clear_retained_focus_in_subtree(&mut self.document, &mut self.text_controls, root_id);
+        if cleared {
+            // Blitz's shell callback already publishes this edge for ordinary text controls. The
+            // snapshot reconciliation also covers retained editor states which Blitz cannot see.
+            self.reconcile_native_ime_after_editor_mutation(ime_before);
+        }
+    }
+
+    fn clear_focus_in_descendants(&mut self, parent_id: usize) {
+        let ime_before = self.focused_editor_snapshot();
+        let cleared = clear_retained_focus_in_descendants(
+            &mut self.document,
+            &mut self.text_controls,
+            parent_id,
+        );
+        if cleared {
+            self.reconcile_native_ime_after_editor_mutation(ime_before);
+        }
     }
 
     fn reconcile_text_controls(&mut self) {
@@ -329,6 +412,7 @@ impl QuoxRenderer {
             uint32(node_handle, "nodeHandle").map_err(NumericArgumentError::into_js)?;
         let mut state = self.state.borrow_mut();
         let node_id = state.resolve_node(node_handle)?;
+        state.clear_focus_in_subtree(node_id);
         state.mutate_document(|mutator| {
             mutator.remove_node(node_id);
             Ok(())
@@ -346,6 +430,10 @@ impl QuoxRenderer {
         let mut state = self.state.borrow_mut();
         let parent_id = state.resolve_node(parent_handle)?;
         let child_id = state.resolve_node(child_handle)?;
+        // appendChild reparents through a removal, even when both parents are connected. Like a
+        // browser's ordinary appendChild (as opposed to state-preserving moveBefore), that loses
+        // focus before the node is inserted at its new position.
+        state.clear_focus_in_subtree(child_id);
         state.mutate_document(|mutator| {
             mutator.append_children(parent_id, &[child_id]);
             Ok(())
@@ -673,12 +761,16 @@ impl QuoxRenderer {
 mod tests {
     use super::{
         active_element_node_id, actual_focus_node_id, attr_name, attribute_value,
-        dropped_descendant_ids, synthetic_event_node_path,
+        clear_retained_focus_in_descendants, clear_retained_focus_in_subtree,
+        dropped_descendant_ids, retained_focus_node_id, synthetic_event_node_path,
     };
+    use crate::form_controls::TextControlStates;
     use crate::node_handles::NodeHandles;
+    use crate::{IME_REQUEST_ENABLED, ImeRequestMailbox, QuoxShellProvider};
     use blitz_dom::{DocumentConfig, NodeData};
     use blitz_html::{HtmlDocument, HtmlProvider};
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
     fn element_by_tag(document: &blitz_dom::BaseDocument, tag_name: &str) -> usize {
         document
@@ -690,6 +782,53 @@ mod tests {
                     .then_some(node_id)
             })
             .unwrap_or_else(|| panic!("test document should contain <{tag_name}>"))
+    }
+
+    fn element_by_id(document: &blitz_dom::BaseDocument, id: &str) -> usize {
+        document
+            .tree()
+            .iter()
+            .find_map(|(node_id, node)| {
+                node.element_data()
+                    .is_some_and(|element| {
+                        element.attr(blitz_dom::LocalName::from("id")) == Some(id)
+                    })
+                    .then_some(node_id)
+            })
+            .unwrap_or_else(|| panic!("test document should contain #{id}"))
+    }
+
+    fn ime_document(body: &str) -> (blitz_dom::BaseDocument, Arc<ImeRequestMailbox>) {
+        let ime_requests = Arc::new(ImeRequestMailbox::default());
+        let document = HtmlDocument::from_html(
+            &format!("<!doctype html><html><body>{body}</body></html>"),
+            DocumentConfig {
+                shell_provider: Some(Arc::new(QuoxShellProvider {
+                    redraw_requested: Arc::new(AtomicBool::new(false)),
+                    ime_requests: Arc::clone(&ime_requests),
+                })),
+                html_parser_provider: Some(Arc::new(HtmlProvider)),
+                ..DocumentConfig::default()
+            },
+        )
+        .into_inner();
+        (document, ime_requests)
+    }
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "IME wire revisions are exactly represented u32 values"
+    )]
+    fn acknowledge_ime_request(ime_requests: &ImeRequestMailbox) -> [f64; 7] {
+        let snapshot = ime_requests
+            .peek_snapshot()
+            .expect("IME request peek should succeed")
+            .expect("an IME request should be pending");
+        ime_requests
+            .acknowledge_snapshot(snapshot[0] as u32)
+            .expect("IME request acknowledgment should succeed");
+        snapshot
     }
 
     #[test]
@@ -817,6 +956,127 @@ mod tests {
             active_element_node_id(&frameset_document),
             Some(frameset_id)
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::float_cmp,
+        reason = "IME wire flags and booleans are exactly represented integer values"
+    )]
+    fn subtree_detach_saves_the_live_value_clears_focus_and_disables_ime_silently() {
+        let (mut document, ime_requests) = ime_document(
+            "<main><section id='moving'><input id='field' value='seed'></section><aside></aside></main>",
+        );
+        let body_id = element_by_tag(&document, "body");
+        let aside_id = element_by_tag(&document, "aside");
+        let moving_id = element_by_id(&document, "moving");
+        let input_id = element_by_id(&document, "field");
+        let mut text_controls = TextControlStates::default();
+        text_controls.reconcile_document(&mut document);
+
+        assert!(document.set_focus_to(input_id));
+        let enabled = acknowledge_ime_request(&ime_requests);
+        assert_ne!(enabled[1] as u8 & IME_REQUEST_ENABLED, 0);
+        assert_eq!(enabled[6], 1.0);
+        document.with_text_input(input_id, |mut driver| {
+            driver.move_to_text_end();
+            driver.set_compose("候補", None);
+        });
+
+        assert!(clear_retained_focus_in_subtree(
+            &mut document,
+            &mut text_controls,
+            moving_id,
+        ));
+        assert_eq!(retained_focus_node_id(&document), None);
+        assert!(!document.get_node(input_id).unwrap().is_focussed());
+        let disabled = acknowledge_ime_request(&ime_requests);
+        assert_ne!(disabled[1] as u8 & IME_REQUEST_ENABLED, 0);
+        assert_eq!(disabled[6], 0.0);
+
+        document.mutate().remove_node(moving_id);
+        text_controls.reconcile_document(&mut document);
+        assert_eq!(
+            text_controls.value(&mut document, input_id).as_deref(),
+            Some("seed候補")
+        );
+
+        document.mutate().append_children(body_id, &[moving_id]);
+        text_controls.reconcile_document(&mut document);
+        assert_eq!(retained_focus_node_id(&document), None);
+        assert_eq!(
+            text_controls.value(&mut document, input_id).as_deref(),
+            Some("seed候補")
+        );
+
+        // An ordinary connected reparent is also a removal/insertion operation and must not carry
+        // focus to the new parent. There is deliberately no DOM event callback in this path.
+        assert!(document.set_focus_to(input_id));
+        acknowledge_ime_request(&ime_requests);
+        assert!(clear_retained_focus_in_subtree(
+            &mut document,
+            &mut text_controls,
+            moving_id,
+        ));
+        document.mutate().append_children(aside_id, &[moving_id]);
+        assert_eq!(retained_focus_node_id(&document), None);
+        assert_eq!(
+            text_controls.value(&mut document, input_id).as_deref(),
+            Some("seed候補")
+        );
+    }
+
+    #[test]
+    fn child_replacement_clears_only_focus_that_will_be_destroyed() {
+        let mut document = HtmlDocument::from_html(
+            "<!doctype html><html><body><section id='host'><input id='field' value='old'></section></body></html>",
+            DocumentConfig {
+                html_parser_provider: Some(Arc::new(HtmlProvider)),
+                ..DocumentConfig::default()
+            },
+        )
+        .into_inner();
+        let host_id = element_by_id(&document, "host");
+        let input_id = element_by_id(&document, "field");
+        let mut text_controls = TextControlStates::default();
+        text_controls.reconcile_document(&mut document);
+
+        assert!(document.set_focus_to(host_id));
+        assert!(!clear_retained_focus_in_descendants(
+            &mut document,
+            &mut text_controls,
+            host_id,
+        ));
+        assert_eq!(retained_focus_node_id(&document), Some(host_id));
+
+        assert!(document.set_focus_to(input_id));
+        document.with_text_input(input_id, |mut driver| {
+            driver.move_to_text_end();
+            driver.insert_or_replace_selection("-edited");
+        });
+        assert!(clear_retained_focus_in_descendants(
+            &mut document,
+            &mut text_controls,
+            host_id,
+        ));
+        assert_eq!(
+            text_controls.value(&mut document, input_id).as_deref(),
+            Some("old-edited")
+        );
+
+        let dropped = dropped_descendant_ids(&document, host_id);
+        text_controls.invalidate_nodes(dropped);
+        document
+            .mutate()
+            .set_inner_html(host_id, "<span>replacement</span>");
+        assert!(document.tree().iter().all(|(_, node)| {
+            node.element_data().is_none_or(|element| {
+                element.attr(blitz_dom::LocalName::from("id")) != Some("field")
+            })
+        }));
+        assert_eq!(retained_focus_node_id(&document), None);
     }
 
     #[test]
