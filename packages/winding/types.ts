@@ -179,8 +179,10 @@ export interface Window {
   /** Set the native window title. */
   setTitle(title: string): void;
   /**
-   * Blit an RGBA pixel buffer whose dimensions match the window. Pass a resize
-   * event's frame token when rendering asynchronously so stale frames can be dropped.
+   * Blit tightly packed, row-major sRGB RGBA8 pixels whose dimensions match
+   * the window. The first pixel is the top-left pixel and alpha is straight
+   * (unpremultiplied). Pass a resize event's frame token when rendering
+   * asynchronously so stale frames can be dropped.
    */
   blit(rgba: Uint8Array, width: number, height: number, frameToken?: number): void;
   /** Set whether native composition is desired for this window. */

@@ -455,7 +455,9 @@ function testBlitStorageLifetime(): void {
       const cg = Deno.dlopen(
         CORE_GRAPHICS,
         {
+          CGImageGetColorSpace: { parameters: ["pointer"], result: "pointer" },
           CGImageGetDataProvider: { parameters: ["pointer"], result: "pointer" },
+          CGColorSpaceCopyName: { parameters: ["pointer"], result: "pointer" },
           CGDataProviderCopyData: { parameters: ["pointer"], result: "pointer" },
         } as const,
       );
@@ -463,9 +465,9 @@ function testBlitStorageLifetime(): void {
       const cf = Deno.dlopen(
         CORE_FOUNDATION,
         {
+          ...cfSymbols,
           CFDataGetLength: { parameters: ["pointer"], result: "i64" },
           CFDataGetBytePtr: { parameters: ["pointer"], result: "pointer" },
-          CFRelease: { parameters: ["pointer"], result: "void" },
         } as const,
       );
       handles.push(cf);
@@ -498,6 +500,15 @@ function testBlitStorageLifetime(): void {
       assert(layer !== null, "content view has no layer after blit");
       const image = sendId(layer, sel(runtime, "contents"));
       assert(image !== null, "content layer has no image after blit");
+      const imageColorSpace = cg.symbols.CGImageGetColorSpace(image);
+      assert(imageColorSpace !== null, "installed image has no color space");
+      const colorSpaceName = cg.symbols.CGColorSpaceCopyName(imageColorSpace);
+      assert(colorSpaceName !== null, "installed image color space has no name");
+      try {
+        assertEquals(readCFString(cf, colorSpaceName), "kCGColorSpaceSRGB");
+      } finally {
+        cf.symbols.CFRelease(colorSpaceName);
+      }
       const provider = cg.symbols.CGImageGetDataProvider(image);
       assert(provider !== null, "installed image has no data provider");
       const data = cg.symbols.CGDataProviderCopyData(provider);

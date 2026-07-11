@@ -1174,8 +1174,12 @@ class DarwinLibrary implements Library {
         distantPast = send.id(send.id(getClass("NSDate"), sel("distantPast")), sel("retain"));
         if (distantPast === null) throw new Error("winding(darwin): failed to retain NSDate.distantPast");
         runLoopMode = makeNSString(this.ffi, "kCFRunLoopDefaultMode");
-        colorSpace = cg.symbols.CGColorSpaceCreateDeviceRGB();
-        if (colorSpace === null) throw new Error("winding(darwin): CGColorSpaceCreateDeviceRGB failed");
+        const srgbName = cg.symbols.kCGColorSpaceSRGB;
+        if (srgbName === null) throw new Error("winding(darwin): kCGColorSpaceSRGB is unavailable");
+        colorSpace = cg.symbols.CGColorSpaceCreateWithName(srgbName);
+        if (colorSpace === null) {
+          throw new Error("winding(darwin): failed to create the named sRGB color space");
+        }
         return { nativeClasses, nsApp, distantPast, runLoopMode, colorSpace };
       });
     } catch (error) {

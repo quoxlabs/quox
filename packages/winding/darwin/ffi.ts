@@ -368,7 +368,8 @@ export function openNSRectMsgSend(libraries: Closeable[]): NSRectMsgSend {
 
 // CoreGraphics / CoreFoundation plain C functions (not Objective-C messages).
 export const cgSymbols = {
-  CGColorSpaceCreateDeviceRGB: { parameters: [], result: "pointer" },
+  kCGColorSpaceSRGB: { type: "pointer" },
+  CGColorSpaceCreateWithName: { parameters: ["pointer"], result: "pointer" },
   CGDataProviderCreateWithCFData: {
     parameters: ["pointer"],
     result: "pointer",
@@ -445,7 +446,8 @@ export function readCFString(cf: CoreFoundation, string: Deno.PointerValue): str
 }
 
 // kCGImageAlphaLast | kCGBitmapByteOrderDefault: straight (non-premultiplied)
-// alpha, RGBA byte order — matches the RGBA buffer winding's callers hand us.
+// alpha, RGBA byte order. The image's named sRGB color space supplies the
+// public buffer contract's color interpretation.
 export const RGBA_BITMAP_INFO = 3;
 
 export function readStructF64(view: Uint8Array, offset: number): number {
