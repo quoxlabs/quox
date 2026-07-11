@@ -1,4 +1,8 @@
 use super::{QuoxRenderer, QuoxRendererState};
+use crate::ffi_numbers::{
+    NumericArgumentError, NumericResult, finite_f32, finite_f64, integer_range, known_mask,
+    wasm_usize,
+};
 use blitz_dom::{BaseDocument, Document, EventDriver, EventHandler};
 use blitz_traits::events::{
     BlitzImeEvent, BlitzInputEvent, BlitzKeyEvent, BlitzPointerEvent, BlitzPointerId,
@@ -126,11 +130,6 @@ fn build_editor_modifiers(bits: u32) -> Modifiers {
 }
 
 fn build_pointer_modifiers(bits: u32) -> Modifiers {
-    assert_eq!(
-        bits & !POINTER_MOD_KNOWN,
-        0,
-        "unknown pointer modifier bits"
-    );
     let mut mods = Modifiers::empty();
     if bits & POINTER_MOD_SHIFT != 0 {
         mods |= Modifiers::SHIFT;
@@ -147,21 +146,23 @@ fn build_pointer_modifiers(bits: u32) -> Modifiers {
     mods
 }
 
-fn validate_key_abi(modifier_bits: u32, location: u32, event_flags: u32) {
-    assert_eq!(
-        modifier_bits & !KEY_MOD_KNOWN,
-        0,
-        "unknown key modifier bits"
-    );
-    assert_eq!(event_flags & !KEY_EVENT_KNOWN, 0, "unknown key event bits");
-    assert!(location <= 3, "invalid DOM key location");
-    if event_flags & KEY_EVENT_PRESSED == 0 {
-        assert_eq!(
-            event_flags & (KEY_EVENT_REPEAT | KEY_EVENT_PREVENT_DEFAULT),
-            0,
-            "key releases cannot repeat or suppress a keydown default"
-        );
+fn validate_key_abi(
+    modifier_bits: f64,
+    location: f64,
+    event_flags: f64,
+) -> NumericResult<(u32, u32, u32)> {
+    let modifier_bits = known_mask(modifier_bits, KEY_MOD_KNOWN, "modifierBits")?;
+    let location = integer_range(location, 0, 3, "location")?;
+    let event_flags = known_mask(event_flags, KEY_EVENT_KNOWN, "eventFlags")?;
+    if event_flags & KEY_EVENT_PRESSED == 0
+        && event_flags & (KEY_EVENT_REPEAT | KEY_EVENT_PREVENT_DEFAULT) != 0
+    {
+        return Err(NumericArgumentError::new(
+            "eventFlags",
+            "not repeat or suppress a keydown default on key release",
+        ));
     }
+    Ok((modifier_bits, location, event_flags))
 }
 
 fn logical_key(key: &str) -> Key {
@@ -187,28 +188,52 @@ fn key_location(location: u32) -> Location {
 
 fn preedit_cursor(
     text: &str,
-    cursor_start: Option<usize>,
-    cursor_end: Option<usize>,
-) -> Option<(usize, usize)> {
-    cursor_start.zip(cursor_end).filter(|(start, end)| {
-        start <= end
-            && *end <= text.len()
-            && text.is_char_boundary(*start)
-            && text.is_char_boundary(*end)
-    })
+    cursor_start: Option<f64>,
+    cursor_end: Option<f64>,
+) -> NumericResult<Option<(usize, usize)>> {
+    let (Some(cursor_start), Some(cursor_end)) = (cursor_start, cursor_end) else {
+        if cursor_start.is_none() && cursor_end.is_none() {
+            return Ok(None);
+        }
+        return Err(NumericArgumentError::new(
+            "cursorRange",
+            "provide both UTF-8 byte offsets or neither",
+        ));
+    };
+    let cursor_start = wasm_usize(cursor_start, "cursorStart")?;
+    let cursor_end = wasm_usize(cursor_end, "cursorEnd")?;
+    if cursor_start > cursor_end
+        || cursor_end > text.len()
+        || !text.is_char_boundary(cursor_start)
+        || !text.is_char_boundary(cursor_end)
+    {
+        return Err(NumericArgumentError::new(
+            "cursorRange",
+            "contain ordered UTF-8 boundaries within the preedit text",
+        ));
+    }
+    Ok(Some((cursor_start, cursor_end)))
 }
 
 /// Map a `winding` button index (`left:0, middle:1, right:2`, matching the ordinals
 /// `MouseEventButton` itself already uses for `Main`/`Auxiliary`/`Secondary`) to the
 /// corresponding `MouseEventButton`.
-fn mouse_button(button: u8) -> MouseEventButton {
-    match button {
+fn mouse_button(button: f64) -> NumericResult<MouseEventButton> {
+    Ok(match integer_range(button, 0, 4, "button")? {
+        0 => MouseEventButton::Main,
         1 => MouseEventButton::Auxiliary,
         2 => MouseEventButton::Secondary,
         3 => MouseEventButton::Fourth,
         4 => MouseEventButton::Fifth,
-        _ => MouseEventButton::Main,
-    }
+        _ => unreachable!("integer_range returned a value outside its bounds"),
+    })
+}
+
+fn pointer_buttons(buttons: f64) -> NumericResult<MouseEventButtons> {
+    let buttons = known_mask(buttons, 0x1f, "buttons")?;
+    let buttons = u8::try_from(buttons).expect("the known pointer-button mask fits u8");
+    Ok(MouseEventButtons::from_bits(buttons)
+        .expect("the validated mask contains only Blitz pointer-button bits"))
 }
 
 fn pointer_coords(x: f32, y: f32, page_x: f32, page_y: f32) -> PointerCoords {
@@ -231,7 +256,7 @@ fn pointer_event(
     x: f32,
     y: f32,
     button: MouseEventButton,
-    buttons: u8,
+    buttons: MouseEventButtons,
     modifier_bits: u32,
 ) -> Option<BlitzPointerEvent> {
     let scroll = state.document.viewport_scroll();
@@ -243,7 +268,7 @@ fn pointer_event(
         is_primary: true,
         coords: pointer_coords(x, y, page_x, page_y),
         button,
-        buttons: MouseEventButtons::from_bits_truncate(buttons),
+        buttons,
         mods: build_pointer_modifiers(modifier_bits),
         details: PointerDetails::default(),
         // Overwritten internally by Blitz (relative to the hit target's bounding rect)
@@ -457,7 +482,9 @@ impl QuoxRenderer {
     /// Forces a layout resolve first, then delegates to Blitz's own hit-testing — which
     /// still has a known TODO for z-index disambiguation among plain overlapping siblings
     /// (see Blitz's `Node::hit`), so overlapping-sibling ordering isn't fully guaranteed.
-    pub fn node_from_point(&self, x: f32, y: f32) -> Result<Option<u32>, JsValue> {
+    pub fn node_from_point(&self, x: f64, y: f64) -> Result<Option<u32>, JsValue> {
+        let x = finite_f32(x, "x").map_err(NumericArgumentError::into_js)?;
+        let y = finite_f32(y, "y").map_err(NumericArgumentError::into_js)?;
         let mut state = self.state.borrow_mut();
         state.sync_layout();
 
@@ -480,14 +507,25 @@ impl QuoxRenderer {
     /// cadence) would be a real perf regression; staleness is bounded to about one frame.
     /// `buttons` is a `MouseEventButtons` bitmask (`Primary=1, Secondary=2, Auxiliary=4`).
     /// Returns whether a redraw was requested.
-    pub fn dispatch_pointer_move(&self, x: f32, y: f32, buttons: u8, modifier_bits: u32) -> bool {
+    pub fn dispatch_pointer_move(
+        &self,
+        x: f64,
+        y: f64,
+        buttons: f64,
+        modifier_bits: f64,
+    ) -> Result<bool, JsValue> {
+        let x = finite_f32(x, "x").map_err(NumericArgumentError::into_js)?;
+        let y = finite_f32(y, "y").map_err(NumericArgumentError::into_js)?;
+        let buttons = pointer_buttons(buttons).map_err(NumericArgumentError::into_js)?;
+        let modifier_bits = known_mask(modifier_bits, POINTER_MOD_KNOWN, "modifierBits")
+            .map_err(NumericArgumentError::into_js)?;
         let mut state = self.state.borrow_mut();
         let Some(event) =
             pointer_event(&state, x, y, MouseEventButton::Main, buttons, modifier_bits)
         else {
-            return false;
+            return Ok(false);
         };
-        state.dispatch(UiEvent::PointerMove(event))
+        Ok(state.dispatch(UiEvent::PointerMove(event)))
     }
 
     /// Feed a pointer-down event into Blitz (drives `:active`, click/double-click timing,
@@ -497,18 +535,23 @@ impl QuoxRenderer {
     /// requested.
     pub fn dispatch_pointer_down(
         &self,
-        x: f32,
-        y: f32,
-        button: u8,
-        buttons: u8,
-        modifier_bits: u32,
-    ) -> bool {
+        x: f64,
+        y: f64,
+        button: f64,
+        buttons: f64,
+        modifier_bits: f64,
+    ) -> Result<bool, JsValue> {
+        let x = finite_f32(x, "x").map_err(NumericArgumentError::into_js)?;
+        let y = finite_f32(y, "y").map_err(NumericArgumentError::into_js)?;
+        let button = mouse_button(button).map_err(NumericArgumentError::into_js)?;
+        let buttons = pointer_buttons(buttons).map_err(NumericArgumentError::into_js)?;
+        let modifier_bits = known_mask(modifier_bits, POINTER_MOD_KNOWN, "modifierBits")
+            .map_err(NumericArgumentError::into_js)?;
         let mut state = self.state.borrow_mut();
-        let Some(event) = pointer_event(&state, x, y, mouse_button(button), buttons, modifier_bits)
-        else {
-            return false;
+        let Some(event) = pointer_event(&state, x, y, button, buttons, modifier_bits) else {
+            return Ok(false);
         };
-        state.dispatch(UiEvent::PointerDown(event))
+        Ok(state.dispatch(UiEvent::PointerDown(event)))
     }
 
     /// Feed a pointer-up event into Blitz (clears `:active`, ends drag/selection, and is
@@ -516,18 +559,23 @@ impl QuoxRenderer {
     /// Returns whether a redraw was requested.
     pub fn dispatch_pointer_up(
         &self,
-        x: f32,
-        y: f32,
-        button: u8,
-        buttons: u8,
-        modifier_bits: u32,
-    ) -> bool {
+        x: f64,
+        y: f64,
+        button: f64,
+        buttons: f64,
+        modifier_bits: f64,
+    ) -> Result<bool, JsValue> {
+        let x = finite_f32(x, "x").map_err(NumericArgumentError::into_js)?;
+        let y = finite_f32(y, "y").map_err(NumericArgumentError::into_js)?;
+        let button = mouse_button(button).map_err(NumericArgumentError::into_js)?;
+        let buttons = pointer_buttons(buttons).map_err(NumericArgumentError::into_js)?;
+        let modifier_bits = known_mask(modifier_bits, POINTER_MOD_KNOWN, "modifierBits")
+            .map_err(NumericArgumentError::into_js)?;
         let mut state = self.state.borrow_mut();
-        let Some(event) = pointer_event(&state, x, y, mouse_button(button), buttons, modifier_bits)
-        else {
-            return false;
+        let Some(event) = pointer_event(&state, x, y, button, buttons, modifier_bits) else {
+            return Ok(false);
         };
-        state.dispatch(UiEvent::PointerUp(event))
+        Ok(state.dispatch(UiEvent::PointerUp(event)))
     }
 
     /// Feed a wheel event into Blitz, which scrolls whatever's currently hovered (bubbling
@@ -538,28 +586,35 @@ impl QuoxRenderer {
     /// requested.
     pub fn dispatch_wheel(
         &self,
-        x: f32,
-        y: f32,
+        x: f64,
+        y: f64,
         delta_x: f64,
         delta_y: f64,
-        buttons: u8,
-        modifier_bits: u32,
-    ) -> bool {
+        buttons: f64,
+        modifier_bits: f64,
+    ) -> Result<bool, JsValue> {
+        let x = finite_f32(x, "x").map_err(NumericArgumentError::into_js)?;
+        let y = finite_f32(y, "y").map_err(NumericArgumentError::into_js)?;
+        let delta_x = finite_f64(delta_x, "deltaX").map_err(NumericArgumentError::into_js)?;
+        let delta_y = finite_f64(delta_y, "deltaY").map_err(NumericArgumentError::into_js)?;
+        let buttons = pointer_buttons(buttons).map_err(NumericArgumentError::into_js)?;
+        let modifier_bits = known_mask(modifier_bits, POINTER_MOD_KNOWN, "modifierBits")
+            .map_err(NumericArgumentError::into_js)?;
         let mut state = self.state.borrow_mut();
         let scroll = state.document.viewport_scroll();
         let Some((page_x, page_y)) =
             viewport_point_to_page(x, y, state.width, state.height, scroll.x, scroll.y)
         else {
-            return false;
+            return Ok(false);
         };
 
         let event = BlitzWheelEvent {
             delta: BlitzWheelDelta::Pixels(delta_x, delta_y),
             coords: pointer_coords(x, y, page_x, page_y),
-            buttons: MouseEventButtons::from_bits_truncate(buttons),
+            buttons,
             mods: build_pointer_modifiers(modifier_bits),
         };
-        state.dispatch(UiEvent::Wheel(event))
+        Ok(state.dispatch(UiEvent::Wheel(event)))
     }
 
     /// Feed a canonical native key event into Blitz. `modifier_bits` carries the editor-facing
@@ -570,18 +625,20 @@ impl QuoxRenderer {
         &self,
         code: &str,
         key: &str,
-        modifier_bits: u32,
-        location: u32,
-        event_flags: u32,
-    ) -> bool {
-        validate_key_abi(modifier_bits, location, event_flags);
+        modifier_bits: f64,
+        location: f64,
+        event_flags: f64,
+    ) -> Result<bool, JsValue> {
+        let (modifier_bits, location, event_flags) =
+            validate_key_abi(modifier_bits, location, event_flags)
+                .map_err(NumericArgumentError::into_js)?;
         let mut state = self.state.borrow_mut();
         let event = key_event(code, key, modifier_bits, location, event_flags);
         let cancel_keydown_default = event_flags & KEY_EVENT_PREVENT_DEFAULT != 0;
         if event.state.is_pressed() {
-            state.dispatch_with_policy(UiEvent::KeyDown(event), cancel_keydown_default)
+            Ok(state.dispatch_with_policy(UiEvent::KeyDown(event), cancel_keydown_default))
         } else {
-            state.dispatch(UiEvent::KeyUp(event))
+            Ok(state.dispatch(UiEvent::KeyUp(event)))
         }
     }
 
@@ -605,16 +662,18 @@ impl QuoxRenderer {
     pub fn dispatch_ime_preedit(
         &self,
         text: &str,
-        cursor_start: Option<usize>,
-        cursor_end: Option<usize>,
-    ) -> bool {
-        let cursor = preedit_cursor(text, cursor_start, cursor_end);
-        self.state
+        cursor_start: Option<f64>,
+        cursor_end: Option<f64>,
+    ) -> Result<bool, JsValue> {
+        let cursor = preedit_cursor(text, cursor_start, cursor_end)
+            .map_err(NumericArgumentError::into_js)?;
+        Ok(self
+            .state
             .borrow_mut()
             .dispatch(UiEvent::Ime(BlitzImeEvent::Preedit(
                 text.to_owned(),
                 cursor,
-            )))
+            ))))
     }
 
     /// Commit native IME text to the focused Blitz text editor.
@@ -634,20 +693,26 @@ impl QuoxRenderer {
     }
 
     /// Apply byte-counted surrounding-text deletion to the focused Blitz editor.
-    pub fn dispatch_ime_delete_surrounding(&self, before_bytes: u32, after_bytes: u32) -> bool {
+    pub fn dispatch_ime_delete_surrounding(
+        &self,
+        before_bytes: f64,
+        after_bytes: f64,
+    ) -> Result<bool, JsValue> {
+        let before_bytes =
+            wasm_usize(before_bytes, "beforeBytes").map_err(NumericArgumentError::into_js)?;
+        let after_bytes =
+            wasm_usize(after_bytes, "afterBytes").map_err(NumericArgumentError::into_js)?;
         let mut state = self.state.borrow_mut();
-        let Some(event) = apply_ime_delete_surrounding(
-            &mut state.document,
-            before_bytes as usize,
-            after_bytes as usize,
-        ) else {
-            return false;
+        let Some(event) =
+            apply_ime_delete_surrounding(&mut state.document, before_bytes, after_bytes)
+        else {
+            return Ok(false);
         };
 
         // The pinned Blitz event handler leaves delete-surrounding as a TODO, so this direct
         // editor operation must request the paint that Blitz normally requests for IME edits.
         state.redraw_requested.store(true, Ordering::Relaxed);
-        state.with_event_driver(false, |driver| driver.handle_dom_event(event))
+        Ok(state.with_event_driver(false, |driver| driver.handle_dom_event(event)))
     }
 
     /// Clear Blitz's hover state (and reset the cursor), e.g. when the pointer leaves the
@@ -729,12 +794,14 @@ mod tests {
         KEY_EVENT_COMPOSING, KEY_EVENT_PRESSED, KEY_EVENT_REPEAT, KEY_MOD_ACCEL, KEY_MOD_ALT,
         KEY_MOD_ALT_GRAPH, KEY_MOD_META, KEY_MOD_SHIFT, RecordedEvents, RecordingEventHandler,
         apply_ime_delete_surrounding, build_editor_modifiers, build_pointer_modifiers,
-        drive_ime_commit, is_insertable_text, key_event, preedit_cursor, validate_key_abi,
-        viewport_point_to_page,
+        drive_ime_commit, is_insertable_text, key_event, mouse_button, preedit_cursor,
+        validate_key_abi, viewport_point_to_page,
     };
     use blitz_dom::{BaseDocument, DocumentConfig, EventDriver};
     use blitz_html::HtmlDocument;
-    use blitz_traits::events::{BlitzImeEvent, BlitzInputEvent, DomEvent, DomEventData, UiEvent};
+    use blitz_traits::events::{
+        BlitzImeEvent, BlitzInputEvent, DomEvent, DomEventData, MouseEventButton, UiEvent,
+    };
     use blitz_traits::shell::{ColorScheme, Viewport};
     use keyboard_types::{Key, Location, Modifiers};
 
@@ -937,30 +1004,37 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "key releases cannot repeat")]
     fn key_abi_rejects_release_only_flag_violations() {
-        validate_key_abi(0, 0, KEY_EVENT_REPEAT);
+        assert!(validate_key_abi(0.0, 0.0, f64::from(KEY_EVENT_REPEAT)).is_err());
     }
 
     #[test]
-    #[should_panic(expected = "unknown key modifier bits")]
     fn key_abi_rejects_values_that_would_have_wrapped_a_narrow_mask() {
-        validate_key_abi(1 << 16, 0, KEY_EVENT_PRESSED);
+        assert!(validate_key_abi(65_536.0, 0.0, f64::from(KEY_EVENT_PRESSED)).is_err());
+        assert!(validate_key_abi(4_294_967_296.0, 0.0, f64::from(KEY_EVENT_PRESSED)).is_err());
     }
 
     #[test]
-    #[should_panic(expected = "invalid DOM key location")]
     fn key_abi_rejects_values_that_would_have_wrapped_a_narrow_location() {
-        validate_key_abi(0, 256, KEY_EVENT_PRESSED);
+        assert!(validate_key_abi(0.0, 256.0, f64::from(KEY_EVENT_PRESSED)).is_err());
     }
 
     #[test]
     fn preedit_cursor_accepts_only_valid_utf8_byte_ranges() {
-        assert_eq!(preedit_cursor("éx", Some(2), Some(3)), Some((2, 3)));
-        assert_eq!(preedit_cursor("éx", Some(1), Some(3)), None);
-        assert_eq!(preedit_cursor("éx", Some(3), Some(2)), None);
-        assert_eq!(preedit_cursor("éx", Some(0), Some(4)), None);
-        assert_eq!(preedit_cursor("éx", Some(0), None), None);
+        assert_eq!(preedit_cursor("éx", Some(2.0), Some(3.0)), Ok(Some((2, 3))));
+        assert!(preedit_cursor("éx", Some(1.0), Some(3.0)).is_err());
+        assert!(preedit_cursor("éx", Some(3.0), Some(2.0)).is_err());
+        assert!(preedit_cursor("éx", Some(0.0), Some(4.0)).is_err());
+        assert!(preedit_cursor("éx", Some(0.0), None).is_err());
+        assert_eq!(preedit_cursor("éx", None, None), Ok(None));
+    }
+
+    #[test]
+    fn invalid_pointer_buttons_never_default_to_primary() {
+        assert_eq!(mouse_button(0.0), Ok(MouseEventButton::Main));
+        assert_eq!(mouse_button(4.0), Ok(MouseEventButton::Fifth));
+        assert!(mouse_button(5.0).is_err());
+        assert!(mouse_button(256.0).is_err());
     }
 
     #[test]

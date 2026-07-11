@@ -6,6 +6,14 @@ import {
   type QuoxImeEvent,
   type QuoxKeyboardEvent,
 } from "./input.ts";
+import {
+  assertFiniteNumber,
+  assertFloat32,
+  assertIntegerRange,
+  assertKnownMask,
+  assertUint32,
+  assertUtf8ByteRange,
+} from "./ffi_numbers.ts";
 import { type AssertActive, attachDocumentInternals, type RequestRender } from "./internals.ts";
 import { ELEMENT_NODE, QuoxNodeCache, TEXT_NODE } from "./node_cache.ts";
 import type { QuoxElement, QuoxNode, QuoxText } from "./node.ts";
@@ -29,6 +37,14 @@ const EVENT_KIND_TO_PROP = {
   blur: "onBlur",
   scroll: "onScroll",
 } as const;
+
+const POINTER_BUTTONS_MASK = 0x1f;
+const POINTER_MODIFIER_MASK = 0x0f;
+const KEY_MODIFIER_MASK = 0x3f;
+const KEY_EVENT_PRESSED = 0x01;
+const KEY_EVENT_REPEAT = 0x02;
+const KEY_EVENT_PREVENT_DEFAULT = 0x08;
+const KEY_EVENT_MASK = 0x0f;
 
 export class QuoxDocument {
   readonly #renderer: WasmRenderer;
@@ -113,33 +129,69 @@ export class QuoxDocument {
    */
   nodeFromPoint(x: number, y: number): QuoxNode | null {
     this.#assertActive();
+    x = assertFloat32(x, "x");
+    y = assertFloat32(y, "y");
     const nodeHandle = this.#renderer.node_from_point(x, y);
     return nodeHandle === undefined ? null : this.#nodeForHandle(nodeHandle);
   }
 
   /** Feed a pointer-move event into Blitz. Drives hover/`:hover` and cursor resolution. */
   dispatchPointerMove(x: number, y: number, buttons: number, modifierBits: number): void {
+    this.#assertActive();
+    x = assertFloat32(x, "x");
+    y = assertFloat32(y, "y");
+    buttons = assertKnownMask(buttons, POINTER_BUTTONS_MASK, "buttons");
+    modifierBits = assertKnownMask(modifierBits, POINTER_MODIFIER_MASK, "modifierBits");
     this.#dispatchInputEvent(() => this.#renderer.dispatch_pointer_move(x, y, buttons, modifierBits));
   }
 
   /** Feed a pointer-down event into Blitz. Drives `:active`, click timing, and focus. */
   dispatchPointerDown(x: number, y: number, button: number, buttons: number, modifierBits: number): void {
+    this.#assertActive();
+    x = assertFloat32(x, "x");
+    y = assertFloat32(y, "y");
+    button = assertIntegerRange(button, 0, 4, "button");
+    buttons = assertKnownMask(buttons, POINTER_BUTTONS_MASK, "buttons");
+    modifierBits = assertKnownMask(modifierBits, POINTER_MODIFIER_MASK, "modifierBits");
     this.#dispatchInputEvent(() => this.#renderer.dispatch_pointer_down(x, y, button, buttons, modifierBits));
   }
 
   /** Feed a pointer-up event into Blitz. Synthesizes `click`/`dblclick`/`contextmenu`. */
   dispatchPointerUp(x: number, y: number, button: number, buttons: number, modifierBits: number): void {
+    this.#assertActive();
+    x = assertFloat32(x, "x");
+    y = assertFloat32(y, "y");
+    button = assertIntegerRange(button, 0, 4, "button");
+    buttons = assertKnownMask(buttons, POINTER_BUTTONS_MASK, "buttons");
+    modifierBits = assertKnownMask(modifierBits, POINTER_MODIFIER_MASK, "modifierBits");
     this.#dispatchInputEvent(() => this.#renderer.dispatch_pointer_up(x, y, button, buttons, modifierBits));
   }
 
   /** Feed a wheel event into Blitz, scrolling whatever's hovered (not just the viewport). */
   dispatchWheel(x: number, y: number, deltaX: number, deltaY: number, buttons: number, modifierBits: number): void {
+    this.#assertActive();
+    x = assertFloat32(x, "x");
+    y = assertFloat32(y, "y");
+    deltaX = assertFiniteNumber(deltaX, "deltaX");
+    deltaY = assertFiniteNumber(deltaY, "deltaY");
+    buttons = assertKnownMask(buttons, POINTER_BUTTONS_MASK, "buttons");
+    modifierBits = assertKnownMask(modifierBits, POINTER_MODIFIER_MASK, "modifierBits");
     this.#dispatchInputEvent(() => this.#renderer.dispatch_wheel(x, y, deltaX, deltaY, buttons, modifierBits));
   }
 
   /** Feed a canonical native key event into Blitz. Character insertion remains a later Commit. */
   dispatchKey(event: QuoxKeyboardEvent): void {
+    this.#assertActive();
     const encoded = encodeKeyEvent(event);
+    encoded.modifierBits = assertKnownMask(encoded.modifierBits, KEY_MODIFIER_MASK, "modifierBits");
+    encoded.location = assertIntegerRange(encoded.location, 0, 3, "location");
+    encoded.eventFlags = assertKnownMask(encoded.eventFlags, KEY_EVENT_MASK, "eventFlags");
+    if (
+      (encoded.eventFlags & KEY_EVENT_PRESSED) === 0 &&
+      (encoded.eventFlags & (KEY_EVENT_REPEAT | KEY_EVENT_PREVENT_DEFAULT)) !== 0
+    ) {
+      throw new RangeError("quox: key release flags cannot repeat or suppress a keydown default");
+    }
     this.#dispatchInputEvent(() =>
       this.#renderer.dispatch_key_event(
         encoded.code,
@@ -166,19 +218,23 @@ export class QuoxDocument {
         this.#dispatchInputEvent(() => this.#renderer.dispatch_ime_disabled());
         break;
       case "preedit": {
-        const start = event.cursorRange?.[0] ?? undefined;
-        const end = event.cursorRange?.[1] ?? undefined;
+        this.#assertActive();
+        const range = assertUtf8ByteRange(event.text, event.cursorRange);
+        const start = range?.[0] ?? undefined;
+        const end = range?.[1] ?? undefined;
         this.#dispatchInputEvent(() => this.#renderer.dispatch_ime_preedit(event.text, start, end));
         break;
       }
       case "commit":
         this.#dispatchInputEvent(() => this.#renderer.dispatch_ime_commit(event.text));
         break;
-      case "deleteSurrounding":
-        this.#dispatchInputEvent(() =>
-          this.#renderer.dispatch_ime_delete_surrounding(event.beforeBytes, event.afterBytes)
-        );
+      case "deleteSurrounding": {
+        this.#assertActive();
+        const beforeBytes = assertUint32(event.beforeBytes, "beforeBytes");
+        const afterBytes = assertUint32(event.afterBytes, "afterBytes");
+        this.#dispatchInputEvent(() => this.#renderer.dispatch_ime_delete_surrounding(beforeBytes, afterBytes));
         break;
+      }
       case "replace":
         throw new Error("quox: atomic IME replacement is not connected to Blitz yet");
       default:
@@ -223,6 +279,7 @@ export class QuoxDocument {
   }
 
   #nodeForHandle(nodeHandle: number): QuoxNode {
+    nodeHandle = assertUint32(nodeHandle, "nodeHandle");
     const nodeKind = (this.#renderer as NodeKindRenderer).node_kind(nodeHandle);
     return this.#nodes.get(nodeHandle, nodeKind);
   }

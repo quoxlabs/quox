@@ -1,4 +1,5 @@
 import type { QuoxDocument } from "./document.ts";
+import { assertUint32 } from "./ffi_numbers.ts";
 import { documentInternals } from "./internals.ts";
 
 export type QuoxInnerHTML = string;
@@ -9,11 +10,18 @@ type InvalidatingNodeRenderer = {
 };
 
 export class QuoxNode {
+  readonly ownerDocument: QuoxDocument;
+  readonly #nodeId: number;
+
   /** Opaque document-local handle. Its numeric value has no relationship to Blitz's slab id. */
-  constructor(
-    readonly ownerDocument: QuoxDocument,
-    readonly nodeId: number,
-  ) {}
+  constructor(ownerDocument: QuoxDocument, nodeId: number) {
+    this.ownerDocument = ownerDocument;
+    this.#nodeId = assertUint32(nodeId, "nodeHandle");
+  }
+
+  get nodeId(): number {
+    return this.#nodeId;
+  }
 
   get textContent(): string {
     return documentInternals(this.ownerDocument).renderer.text_content(this.nodeId);

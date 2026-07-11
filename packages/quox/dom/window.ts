@@ -13,6 +13,7 @@ import {
 import { isVNode, mount, type QuoxRenderable } from "./mount.ts";
 import type { QuoxElement, QuoxInnerHTML } from "./node.ts";
 import { fitRgbaToFramebuffer, FramebufferState } from "./framebuffer.ts";
+import { assertPositiveFloat32, assertPositiveUint32, assertUint32 } from "./ffi_numbers.ts";
 import {
   BufferedEventSource,
   collectInitializationCleanupErrors,
@@ -127,10 +128,15 @@ export class QuoxWindow implements Disposable {
         appleCommand: (event) => this.document.dispatchAppleStandardKeybinding(event),
         clearHover: () => this.document.clearHover(),
         resize: (event) => {
-          this.#width = event.width;
-          this.#height = event.height;
-          this.#framebuffer.update(event.framebufferWidth, event.framebufferHeight);
-          this.#devicePixelRatio = event.devicePixelRatio;
+          const width = assertUint32(event.width, "width");
+          const height = assertUint32(event.height, "height");
+          const framebufferWidth = assertUint32(event.framebufferWidth, "framebufferWidth");
+          const framebufferHeight = assertUint32(event.framebufferHeight, "framebufferHeight");
+          const devicePixelRatio = assertPositiveFloat32(event.devicePixelRatio, "devicePixelRatio");
+          this.#width = width;
+          this.#height = height;
+          this.#framebuffer.update(framebufferWidth, framebufferHeight);
+          this.#devicePixelRatio = devicePixelRatio;
           this.#frameToken = event.frameToken;
           (this.#renderer as unknown as {
             resize(
@@ -141,11 +147,11 @@ export class QuoxWindow implements Disposable {
               devicePixelRatio: number,
             ): void;
           }).resize(
-            event.width,
-            event.height,
-            event.framebufferWidth,
-            event.framebufferHeight,
-            event.devicePixelRatio,
+            width,
+            height,
+            framebufferWidth,
+            framebufferHeight,
+            devicePixelRatio,
           );
           this.#requestRender();
         },
@@ -161,8 +167,8 @@ export class QuoxWindow implements Disposable {
 
   /** Open a window and create a WASM renderer with a live document. */
   static async create(options: WindowOptions = {}): Promise<QuoxWindow> {
-    const width = options.width ?? 800;
-    const height = options.height ?? 600;
+    const width = assertPositiveUint32(options.width ?? 800, "width");
+    const height = assertPositiveUint32(options.height ?? 600, "height");
     const head = contentToString(options.head);
     const body = contentToString(options.body);
 

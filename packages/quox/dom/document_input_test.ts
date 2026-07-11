@@ -215,3 +215,30 @@ Deno.test("native IME requests are synchronized even when renderer dispatch thro
   assertThrows(() => document.dispatchPointerMove(10, 20, 0, 0), Error, "pointer dispatch failed");
   assertEquals(syncs.count, 1);
 });
+
+Deno.test("invalid numeric input is rejected before renderer or IME synchronization side effects", () => {
+  const { document, renderer, renders, syncs } = createDocument();
+
+  assertThrows(() => document.dispatchPointerMove(NaN, 20, 0, 0), RangeError);
+  assertThrows(() => document.dispatchPointerDown(10, 20, 256, 1, 0), RangeError);
+  assertThrows(() => document.dispatchPointerUp(10, 20, 0, 0x20, 0), RangeError);
+  assertThrows(() => document.dispatchWheel(10, 20, Infinity, 0, 0, 0), RangeError);
+  assertThrows(
+    () => document.dispatchIme({ type: "ime", kind: "preedit", text: "éx", cursorRange: [1, 3] }),
+    RangeError,
+  );
+  assertThrows(
+    () =>
+      document.dispatchIme({
+        type: "ime",
+        kind: "deleteSurrounding",
+        beforeBytes: 0x1_0000_0000,
+        afterBytes: 0,
+      }),
+    RangeError,
+  );
+
+  assertEquals(renderer.calls, []);
+  assertEquals(renders.count, 0);
+  assertEquals(syncs.count, 0);
+});

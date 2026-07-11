@@ -1,4 +1,11 @@
-import { assert, assertEquals, assertInstanceOf, assertNotStrictEquals, assertStrictEquals } from "@std/assert";
+import {
+  assert,
+  assertEquals,
+  assertInstanceOf,
+  assertNotStrictEquals,
+  assertStrictEquals,
+  assertThrows,
+} from "@std/assert";
 import type { QuoxDocument } from "./document.ts";
 import { getElementFunctionProps, setElementFunctionProp } from "./handlers.ts";
 import { ELEMENT_NODE, QuoxNodeCache, TEXT_NODE } from "./node_cache.ts";
@@ -58,4 +65,10 @@ Deno.test("the wrapper cache preserves element and text identity", () => {
   assertStrictEquals(cache.get(1, ELEMENT_NODE), element);
   assertStrictEquals(cache.get(2, TEXT_NODE), text);
   assert(element !== text);
+});
+
+Deno.test("node handles cannot alias after unsigned WASM narrowing", () => {
+  const cache = new QuoxNodeCache({} as QuoxDocument);
+
+  assertThrows(() => cache.get(0x1_0000_0001, ELEMENT_NODE), RangeError);
 });

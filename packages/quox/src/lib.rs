@@ -1,4 +1,5 @@
 mod dom;
+mod ffi_numbers;
 mod interaction;
 mod node_handles;
 mod render;
@@ -7,6 +8,7 @@ use blitz_dom::{BaseDocument, DEFAULT_CSS, DocumentConfig, FontContext};
 use blitz_html::{HtmlDocument, HtmlProvider};
 use blitz_traits::net::DummyNetProvider;
 use blitz_traits::shell::{ColorScheme, ShellProvider, Viewport};
+use ffi_numbers::{NumericArgumentError, positive_f32, uint32};
 use interaction::RecordedEvents;
 use linebender_resource_handle::Blob;
 use node_handles::NodeHandles;
@@ -250,11 +252,13 @@ impl QuoxRenderer {
     ///
     /// Acquires a WebGPU device; must be `await`ed.
     pub async fn create(
-        width: u32,
-        height: u32,
+        width: f64,
+        height: f64,
         head: &str,
         body: &str,
     ) -> Result<QuoxRenderer, JsValue> {
+        let width = uint32(width, "width").map_err(NumericArgumentError::into_js)?;
+        let height = uint32(height, "height").map_err(NumericArgumentError::into_js)?;
         let mut context = WGPUContext::new();
         let dev_id = context
             .find_or_create_device(None)
@@ -319,22 +323,27 @@ impl QuoxRenderer {
     /// Resize the logical viewport and its physical rendering target independently.
     pub fn resize(
         &self,
-        width: u32,
-        height: u32,
-        framebuffer_width: u32,
-        framebuffer_height: u32,
-        device_pixel_ratio: f32,
-    ) {
+        width: f64,
+        height: f64,
+        framebuffer_width: f64,
+        framebuffer_height: f64,
+        device_pixel_ratio: f64,
+    ) -> Result<(), JsValue> {
+        let width = uint32(width, "width").map_err(NumericArgumentError::into_js)?;
+        let height = uint32(height, "height").map_err(NumericArgumentError::into_js)?;
+        let framebuffer_width =
+            uint32(framebuffer_width, "framebufferWidth").map_err(NumericArgumentError::into_js)?;
+        let framebuffer_height = uint32(framebuffer_height, "framebufferHeight")
+            .map_err(NumericArgumentError::into_js)?;
+        let device_pixel_ratio = positive_f32(device_pixel_ratio, "devicePixelRatio")
+            .map_err(NumericArgumentError::into_js)?;
         let mut state = self.state.borrow_mut();
         state.width = width.max(1);
         state.height = height.max(1);
         state.framebuffer_width = framebuffer_width.max(1);
         state.framebuffer_height = framebuffer_height.max(1);
-        state.device_pixel_ratio = if device_pixel_ratio.is_finite() && device_pixel_ratio > 0.0 {
-            device_pixel_ratio
-        } else {
-            1.0
-        };
+        state.device_pixel_ratio = device_pixel_ratio;
+        Ok(())
     }
 
     /// Atomically drain changed native IME requests as

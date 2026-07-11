@@ -1,4 +1,5 @@
 use super::{QuoxRenderer, QuoxRendererState};
+use crate::ffi_numbers::{NumericArgumentError, uint32};
 use blitz_dom::{BaseDocument, DocumentMutator, LocalName, NodeData, QualName, ns};
 use wasm_bindgen::prelude::*;
 
@@ -197,7 +198,9 @@ impl QuoxRendererState {
 impl QuoxRenderer {
     /// Detach a node from the retained document without destroying it or changing its public
     /// handle. This preserves browser-style identity if the caller later reattaches it.
-    pub fn remove_node(&self, node_handle: u32) -> Result<(), JsValue> {
+    pub fn remove_node(&self, node_handle: f64) -> Result<(), JsValue> {
+        let node_handle =
+            uint32(node_handle, "nodeHandle").map_err(NumericArgumentError::into_js)?;
         let mut state = self.state.borrow_mut();
         let node_id = state.resolve_node(node_handle)?;
         state.mutate_document(|mutator| {
@@ -207,7 +210,11 @@ impl QuoxRenderer {
     }
 
     // Append `child_handle` to `parent_handle`.
-    pub fn append_child(&self, parent_handle: u32, child_handle: u32) -> Result<(), JsValue> {
+    pub fn append_child(&self, parent_handle: f64, child_handle: f64) -> Result<(), JsValue> {
+        let parent_handle =
+            uint32(parent_handle, "parentHandle").map_err(NumericArgumentError::into_js)?;
+        let child_handle =
+            uint32(child_handle, "childHandle").map_err(NumericArgumentError::into_js)?;
         let mut state = self.state.borrow_mut();
         let parent_id = state.resolve_node(parent_handle)?;
         let child_id = state.resolve_node(child_handle)?;
@@ -218,7 +225,9 @@ impl QuoxRenderer {
     }
 
     /// Return a node's text content.
-    pub fn text_content(&self, node_handle: u32) -> Result<String, JsValue> {
+    pub fn text_content(&self, node_handle: f64) -> Result<String, JsValue> {
+        let node_handle =
+            uint32(node_handle, "nodeHandle").map_err(NumericArgumentError::into_js)?;
         let mut state = self.state.borrow_mut();
         let node_id = state.resolve_node(node_handle)?;
         state
@@ -242,7 +251,9 @@ impl QuoxRenderer {
     }
 
     /// Set an element attribute.
-    pub fn set_attribute(&self, node_handle: u32, name: &str, value: &str) -> Result<(), JsValue> {
+    pub fn set_attribute(&self, node_handle: f64, name: &str, value: &str) -> Result<(), JsValue> {
+        let node_handle =
+            uint32(node_handle, "nodeHandle").map_err(NumericArgumentError::into_js)?;
         let mut state = self.state.borrow_mut();
         let node_id = state.resolve_element(node_handle)?;
         state.mutate_document(|mutator| {
@@ -261,7 +272,9 @@ impl QuoxRenderer {
     }
 
     /// Replace an element's children by parsing an HTML fragment through Blitz's mutator.
-    pub fn set_inner_html(&self, node_handle: u32, html: &str) -> Result<Box<[u32]>, JsValue> {
+    pub fn set_inner_html(&self, node_handle: f64, html: &str) -> Result<Box<[u32]>, JsValue> {
+        let node_handle =
+            uint32(node_handle, "nodeHandle").map_err(NumericArgumentError::into_js)?;
         let mut state = self.state.borrow_mut();
         let node_id = state.resolve_element(node_handle)?;
         let invalidated_handles = state.invalidate_dropped_descendants(node_id);
@@ -287,7 +300,9 @@ impl QuoxRenderer {
     }
 
     /// Remove an element attribute.
-    pub fn remove_attribute(&self, node_handle: u32, name: &str) -> Result<(), JsValue> {
+    pub fn remove_attribute(&self, node_handle: f64, name: &str) -> Result<(), JsValue> {
+        let node_handle =
+            uint32(node_handle, "nodeHandle").map_err(NumericArgumentError::into_js)?;
         let mut state = self.state.borrow_mut();
         let node_id = state.resolve_element(node_handle)?;
         state.mutate_document(|mutator| {
@@ -297,7 +312,9 @@ impl QuoxRenderer {
     }
 
     /// Replace a node's text content.
-    pub fn set_text_content(&self, node_handle: u32, value: &str) -> Result<Box<[u32]>, JsValue> {
+    pub fn set_text_content(&self, node_handle: f64, value: &str) -> Result<Box<[u32]>, JsValue> {
+        let node_handle =
+            uint32(node_handle, "nodeHandle").map_err(NumericArgumentError::into_js)?;
         let mut state = self.state.borrow_mut();
         let node_id = state.resolve_node(node_handle)?;
         let is_text_node = {
@@ -380,7 +397,9 @@ impl QuoxRenderer {
 
     /// Return the browser `nodeType` value for a public handle. The TypeScript facade uses this
     /// to select the correct cached wrapper class for hit-test and event targets.
-    pub fn node_kind(&self, node_handle: u32) -> Result<u8, JsValue> {
+    pub fn node_kind(&self, node_handle: f64) -> Result<u8, JsValue> {
+        let node_handle =
+            uint32(node_handle, "nodeHandle").map_err(NumericArgumentError::into_js)?;
         let mut state = self.state.borrow_mut();
         let node_id = state.resolve_node(node_handle)?;
         Ok(state.node_kind(node_id))

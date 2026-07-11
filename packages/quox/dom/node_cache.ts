@@ -1,4 +1,5 @@
 import type { QuoxDocument } from "./document.ts";
+import { assertUint32 } from "./ffi_numbers.ts";
 import { QuoxElement, QuoxNode, QuoxText } from "./node.ts";
 
 // Match the browser `Node.nodeType` constants returned by the Rust boundary.
@@ -23,6 +24,7 @@ export class QuoxNodeCache {
   get(nodeHandle: number, nodeKind: typeof TEXT_NODE): QuoxText;
   get(nodeHandle: number, nodeKind: number): QuoxNode;
   get(nodeHandle: number, nodeKind: number): QuoxNode {
+    nodeHandle = assertUint32(nodeHandle, "nodeHandle");
     const cached = this.#nodes.get(nodeHandle);
     if (cached !== undefined) {
       assertWrapperKind(cached, nodeKind);
