@@ -11,7 +11,13 @@ import {
   WHEEL_DELTA,
   WM,
 } from "./ffi.ts";
-import { decodeMouseLParam, validateWin32Geometry, Win32MouseTrackingState } from "./input.ts";
+import {
+  decodeMouseLParam,
+  validateWin32Geometry,
+  type Win32MouseButton,
+  Win32MouseCaptureState,
+  Win32MouseTrackingState,
+} from "./input.ts";
 import { Win32InputController } from "./input_controller.ts";
 
 // BITMAPINFOHEADER is 40 bytes; for 32bpp BI_RGB no color table follows, so
@@ -32,12 +38,12 @@ let win32LibraryActive = false;
 const TRACKMOUSEEVENT_SIZE = 24;
 const TME_LEAVE = 0x00000002;
 
-const DOWN_BUTTON: Partial<Record<WM, "left" | "middle" | "right">> = {
+const DOWN_BUTTON: Partial<Record<WM, Win32MouseButton>> = {
   [WM.LBUTTONDOWN]: "left",
   [WM.MBUTTONDOWN]: "middle",
   [WM.RBUTTONDOWN]: "right",
 };
-const UP_BUTTON: Partial<Record<WM, "left" | "middle" | "right">> = {
+const UP_BUTTON: Partial<Record<WM, Win32MouseButton>> = {
   [WM.LBUTTONUP]: "left",
   [WM.MBUTTONUP]: "middle",
   [WM.RBUTTONUP]: "right",
@@ -288,10 +294,7 @@ class Win32Library implements Library {
   readonly input: Win32InputController;
   readonly instance: Deno.PointerObject;
   readonly #instance: bigint;
-  // Tracks how many mouse buttons are currently held, so capture is only
-  // released once the last button of a (possibly multi-button) drag is
-  // released rather than on every individual button-up.
-  #captureCount = 0;
+  readonly #mouseCapture = new Win32MouseCaptureState();
   #classRegistered = false;
   #closing = false;
   #closed = false;
@@ -363,7 +366,16 @@ class Win32Library implements Library {
             // destruction; let the application decide when to tear down.
             return 0n;
           case WM.NCDESTROY:
-            if (win !== undefined) win.nativeDestroyed();
+            if (win !== undefined) {
+              this.#mouseCapture.resetOwner(win.id);
+              win.nativeDestroyed();
+            }
+            break;
+          case WM.CAPTURECHANGED:
+            if (win !== undefined) this.#mouseCapture.resetOwner(win.id);
+            break;
+          case WM.CANCELMODE:
+            if (win !== undefined) this.#cancelMouseCapture(win);
             break;
           case WM.MOUSEMOVE: {
             if (win === undefined) break;
@@ -397,18 +409,18 @@ class Win32Library implements Library {
             // Capture the mouse so drags that leave the client area (e.g.
             // dragging a scrollbar thumb) still deliver the eventual button-up,
             // matching X11's implicit passive grab on button press.
-            if (this.#captureCount++ === 0) this.user32.symbols.SetCapture(hWnd);
-            this.#events.push({ type: "mousedown", button: DOWN_BUTTON[uMsg as WM]!, window: win });
+            const button = DOWN_BUTTON[uMsg as WM]!;
+            this.#captureMouseButton(win, button);
+            this.#events.push({ type: "mousedown", button, window: win });
             break;
           }
           case WM.LBUTTONUP:
           case WM.MBUTTONUP:
           case WM.RBUTTONUP: {
             if (win === undefined) break;
-            if (this.#captureCount > 0 && --this.#captureCount === 0) {
-              this.user32.symbols.ReleaseCapture();
-            }
-            this.#events.push({ type: "mouseup", button: UP_BUTTON[uMsg as WM]!, window: win });
+            const button = UP_BUTTON[uMsg as WM]!;
+            this.#releaseMouseButton(win, button);
+            this.#events.push({ type: "mouseup", button, window: win });
             break;
           }
           case WM.MOUSEWHEEL:
@@ -540,6 +552,55 @@ class Win32Library implements Library {
 
   purgeWindowEvents(window: Win32Window): void {
     this.#events.purgeWindow(window);
+  }
+
+  #nativeCaptureOwner(): bigint | undefined {
+    const capture = this.user32.symbols.GetCapture();
+    return capture === null ? undefined : BigInt(Deno.UnsafePointer.value(capture));
+  }
+
+  #captureMouseButton(window: Win32Window, button: Win32MouseButton): void {
+    if (this.#mouseCapture.owns(window.id) && this.#nativeCaptureOwner() !== window.id) {
+      this.#mouseCapture.resetOwner(window.id);
+    }
+    if (!this.#mouseCapture.owns(window.id)) {
+      // A null SetCapture result only means there was no previous owner. Query
+      // the actual owner instead of interpreting the return as success/failure.
+      this.user32.symbols.SetCapture(window.hwnd);
+      if (this.#nativeCaptureOwner() !== window.id) {
+        throw new Error("winding(win32): SetCapture did not assign mouse capture");
+      }
+    }
+    this.#mouseCapture.recordDown(window.id, button);
+  }
+
+  #releaseMouseButton(window: Win32Window, button: Win32MouseButton): void {
+    if (!this.#mouseCapture.owns(window.id) || !this.#mouseCapture.hasButton(button)) return;
+    if (!this.#mouseCapture.releaseWouldEnd(window.id, button)) {
+      this.#mouseCapture.recordUp(window.id, button);
+      return;
+    }
+
+    const released = this.user32.symbols.ReleaseCapture();
+    const nativeOwner = this.#nativeCaptureOwner();
+    if (nativeOwner !== window.id) this.#mouseCapture.resetOwner(window.id);
+    if (released === 0) {
+      throw new Error("winding(win32): ReleaseCapture failed");
+    }
+    this.#mouseCapture.resetOwner(window.id);
+  }
+
+  #cancelMouseCapture(window: Win32Window): void {
+    if (!this.#mouseCapture.owns(window.id)) return;
+    if (this.#nativeCaptureOwner() !== window.id) {
+      this.#mouseCapture.resetOwner(window.id);
+      return;
+    }
+    const released = this.user32.symbols.ReleaseCapture();
+    const nativeOwner = this.#nativeCaptureOwner();
+    if (nativeOwner !== window.id) this.#mouseCapture.resetOwner(window.id);
+    if (released === 0) throw new Error("winding(win32): failed to cancel mouse capture");
+    this.#mouseCapture.resetOwner(window.id);
   }
 
   publishInitialWindowState(window: Win32Window): void {

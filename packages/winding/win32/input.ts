@@ -62,6 +62,57 @@ export class Win32MouseTrackingState {
   }
 }
 
+export type Win32MouseButton = "left" | "middle" | "right";
+
+/** Tracks the one thread-global Win32 capture owner and its pressed-button chord. */
+export class Win32MouseCaptureState {
+  #owner: bigint | undefined;
+  readonly #buttons = new Set<Win32MouseButton>();
+
+  get owner(): bigint | undefined {
+    return this.#owner;
+  }
+
+  get buttonCount(): number {
+    return this.#buttons.size;
+  }
+
+  owns(owner: bigint): boolean {
+    return this.#owner === owner;
+  }
+
+  hasButton(button: Win32MouseButton): boolean {
+    return this.#buttons.has(button);
+  }
+
+  recordDown(owner: bigint, button: Win32MouseButton): void {
+    if (this.#owner !== owner) this.reset();
+    this.#owner = owner;
+    this.#buttons.add(button);
+  }
+
+  releaseWouldEnd(owner: bigint, button: Win32MouseButton): boolean {
+    return this.#owner === owner && this.#buttons.has(button) && this.#buttons.size === 1;
+  }
+
+  recordUp(owner: bigint, button: Win32MouseButton): void {
+    if (this.#owner !== owner) return;
+    this.#buttons.delete(button);
+    if (this.#buttons.size === 0) this.#owner = undefined;
+  }
+
+  resetOwner(owner: bigint): boolean {
+    if (this.#owner !== owner) return false;
+    this.reset();
+    return true;
+  }
+
+  reset(): void {
+    this.#owner = undefined;
+    this.#buttons.clear();
+  }
+}
+
 /** Virtual-key values used by the Win32 input implementation. */
 export const VK = {
   BACK: 0x08,

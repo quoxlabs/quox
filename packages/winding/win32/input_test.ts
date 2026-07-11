@@ -13,6 +13,7 @@ import {
   translateLogicalKey,
   validateWin32Geometry,
   VK,
+  Win32MouseCaptureState,
   Win32MouseTrackingState,
   win32KeyEditDisposition,
   win32KeyIdentity,
@@ -85,6 +86,27 @@ Deno.test("Win32 mouse coordinates sign-extend and leave tracking follows real c
   assertEquals(tracking.observeLeave(), false);
   assertEquals(tracking.needsLeaveTracking(false), false);
   assertEquals(tracking.needsLeaveTracking(true), true);
+});
+
+Deno.test("Win32 mouse capture state follows one owner and complete button chords", () => {
+  const capture = new Win32MouseCaptureState();
+  capture.recordDown(1n, "left");
+  capture.recordDown(1n, "left");
+  capture.recordDown(1n, "middle");
+  assertEquals(capture.owner, 1n);
+  assertEquals(capture.buttonCount, 2);
+  assertEquals(capture.releaseWouldEnd(1n, "left"), false);
+  capture.recordUp(1n, "left");
+  assertEquals(capture.releaseWouldEnd(1n, "middle"), true);
+  assertEquals(capture.resetOwner(2n), false);
+  assertEquals(capture.resetOwner(1n), true);
+  assertEquals(capture.buttonCount, 0);
+
+  capture.recordDown(1n, "right");
+  capture.recordDown(2n, "left");
+  assertEquals(capture.owner, 2n);
+  assertEquals(capture.buttonCount, 1);
+  assertEquals(capture.hasButton("right"), false);
 });
 
 Deno.test("physical codes determine DOM key locations", () => {
