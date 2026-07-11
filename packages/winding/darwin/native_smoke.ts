@@ -20,6 +20,7 @@ import {
   sel,
 } from "./ffi.ts";
 import { REQUIRED_TEXT_INPUT_SELECTORS } from "./text_input.ts";
+import { POINTER_INPUT_SELECTORS } from "./native_classes.ts";
 
 // AppKit requires all window work on the process main thread. Deno.test runs
 // test bodies on worker threads, so this file must be invoked with `deno run`.
@@ -387,6 +388,16 @@ function testProtocolAndStructAbis(): void {
         "bool",
       );
       for (const selector of REQUIRED_TEXT_INPUT_SELECTORS) {
+        assert(
+          respondsToSelector(
+            viewClass,
+            sel(runtime, "instancesRespondToSelector:"),
+            sel(runtime, selector),
+          ),
+          `WindingContentView does not respond to ${selector}`,
+        );
+      }
+      for (const selector of POINTER_INPUT_SELECTORS) {
         assert(
           respondsToSelector(
             viewClass,

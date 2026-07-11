@@ -438,6 +438,12 @@ class DarwinWindow implements Window, DarwinNativeResponder {
     }
   }
 
+  handleNativePointerEvent(event: Deno.PointerValue): void {
+    if (this.#closed || event === null) return;
+    const translated = importPointerEvent(event, this);
+    if (translated !== undefined) this.lib.pushEvent(translated);
+  }
+
   handleNativeInsertText(text: Deno.PointerValue): void {
     this.handleInsertText(text);
   }
@@ -916,12 +922,6 @@ class DarwinLibrary implements Library {
           this.nativeClasses.throwIfCallbackFailed();
         }
 
-        const translated = importEvent(event, this);
-        this.nativeClasses.throwIfCallbackFailed();
-        // sendEvent: may synchronously enqueue focus, resize, or text events.
-        // Classify the already-dequeued event before returning any of those
-        // callbacks, otherwise the causative native event is gone forever.
-        if (translated !== undefined) this.#queue.prepend(translated);
         if (this.#queue.length) return this.#queue.shift();
       } finally {
         if (pool !== null) send.void(pool, sel("drain"));
@@ -990,12 +990,9 @@ class DarwinLibrary implements Library {
   }
 }
 
-function importEvent(event: Deno.PointerValue, lib: DarwinLibrary): UIEvent | undefined {
-  const { sel, send } = lib.ffi;
+function importPointerEvent(event: Deno.PointerValue, window: DarwinWindow): UIEvent | undefined {
+  const { sel, send } = window.lib.ffi;
   const type = send.u64(event, sel("type"));
-  const windowPtr = send.id(event, sel("window"));
-  const window = windowPtr !== null ? lib.windows.get(pointerId(windowPtr)) : undefined;
-  if (window === undefined) return undefined;
 
   switch (type) {
     case NSEventType.LeftMouseDown:

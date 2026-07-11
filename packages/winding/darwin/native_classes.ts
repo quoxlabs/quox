@@ -42,6 +42,7 @@ export interface DarwinNativeResponder {
     kind: "keydown" | "keyup" | "flagschanged",
     event: Deno.PointerValue,
   ): void;
+  handleNativePointerEvent(event: Deno.PointerValue): void;
   handleNativeInsertText(text: Deno.PointerValue): void;
   handleNativeSetMarkedText(
     text: Deno.PointerValue,
@@ -225,6 +226,15 @@ export class DarwinNativeClasses {
         () => undefined,
       ),
     );
+    const pointerEvent = new Deno.UnsafeCallback(
+      { parameters: ["pointer", "pointer", "pointer"], result: "void" },
+      guardNativeCallback(
+        this.#errors,
+        (self: Deno.PointerValue, _cmd: Deno.PointerValue, event: Deno.PointerValue) =>
+          this.#view(self)?.handleNativePointerEvent(event),
+        () => undefined,
+      ),
+    );
     const insertText = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer", "pointer", NSRANGE], result: "void" },
       guardNativeCallback(
@@ -356,6 +366,7 @@ export class DarwinNativeClasses {
       keyDown,
       keyUp,
       flagsChanged,
+      pointerEvent,
       insertText,
       setMarkedText,
       unmarkText,
@@ -380,6 +391,9 @@ export class DarwinNativeClasses {
     addMethod(contentView, sel("keyDown:"), keyDown.pointer, "v@:@");
     addMethod(contentView, sel("keyUp:"), keyUp.pointer, "v@:@");
     addMethod(contentView, sel("flagsChanged:"), flagsChanged.pointer, "v@:@");
+    for (const selector of POINTER_INPUT_SELECTORS) {
+      addMethod(contentView, sel(selector), pointerEvent.pointer, "v@:@");
+    }
     addMethod(
       contentView,
       sel("insertText:replacementRange:"),
@@ -448,6 +462,21 @@ export class DarwinNativeClasses {
     return pointer === null ? undefined : this.#views.get(pointerId(pointer));
   }
 }
+
+/** Pointer responders implemented by WindingContentView for AppKit hit-testing. */
+export const POINTER_INPUT_SELECTORS = [
+  "mouseDown:",
+  "mouseUp:",
+  "rightMouseDown:",
+  "rightMouseUp:",
+  "otherMouseDown:",
+  "otherMouseUp:",
+  "mouseMoved:",
+  "mouseDragged:",
+  "rightMouseDragged:",
+  "otherMouseDragged:",
+  "scrollWheel:",
+] as const;
 
 let nativeClasses: DarwinNativeClasses | undefined;
 
