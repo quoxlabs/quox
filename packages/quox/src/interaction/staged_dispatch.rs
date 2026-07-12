@@ -32,6 +32,7 @@ const KEY_MOD_META: u32 = super::KEY_MOD_META;
 const KEY_MOD_SHIFT: u32 = super::KEY_MOD_SHIFT;
 const POINTER_MOD_KNOWN: u32 = super::POINTER_MOD_KNOWN;
 const WHEEL_TRANSACTION_TIMEOUT_MS: f64 = 1_500.0;
+const UI_EVENT_DETAIL_MAX: u32 = 2_147_483_647;
 
 /// One paused host dispatch. Frames form a stack because an event listener may synchronously
 /// start another trusted event before it resumes the event which invoked it.
@@ -42,6 +43,7 @@ pub(crate) struct DispatchStack {
     wheel_transaction: Option<WheelTransaction>,
     prevent_compatibility_mouse: bool,
     mouse_button_presses: [Option<MouseButtonPress>; 5],
+    click_sequence: Option<ClickSequence>,
 }
 
 #[derive(Clone, Copy)]
@@ -60,14 +62,25 @@ struct MouseButtonPress {
 }
 
 #[derive(Clone, Copy)]
+struct ClickSequence {
+    button: i16,
+    target: GuardedNode,
+    native_detail: u32,
+    detail: u32,
+}
+
+#[derive(Clone, Copy)]
 struct PointerStreamState {
     suppress_compatibility_mouse: bool,
     release_press: Option<MouseButtonPress>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum PointerReleaseClick {
-    Matched(GuardedNode),
+    Matched {
+        down_target: GuardedNode,
+        up_target: GuardedNode,
+    },
     Unmatched,
 }
 
@@ -146,6 +159,7 @@ struct EventMetadata {
     wheel: Option<NativeWheelMetadata>,
     key: Option<NativeKeyMetadata>,
     related_target: Option<GuardedNode>,
+    click_detail: Option<u32>,
     event_type_override: Option<&'static str>,
     suppress_default: bool,
     defer_click_target: bool,
@@ -161,6 +175,7 @@ impl EventMetadata {
             wheel: None,
             key: None,
             related_target: None,
+            click_detail: None,
             event_type_override: None,
             suppress_default: false,
             defer_click_target: false,
@@ -176,6 +191,7 @@ impl EventMetadata {
             wheel: None,
             key: None,
             related_target: None,
+            click_detail: None,
             event_type_override: None,
             suppress_default: false,
             defer_click_target: false,
@@ -202,6 +218,7 @@ impl EventMetadata {
             }),
             key: None,
             related_target: None,
+            click_detail: None,
             event_type_override: None,
             suppress_default: false,
             defer_click_target: false,
@@ -217,6 +234,7 @@ impl EventMetadata {
             wheel: None,
             key: Some(key),
             related_target: None,
+            click_detail: None,
             event_type_override: None,
             suppress_default: false,
             defer_click_target: false,
@@ -235,6 +253,11 @@ impl EventMetadata {
 
     fn with_pointer_release_click(mut self, release: Option<PointerReleaseClick>) -> Self {
         self.pointer_release_click = release;
+        self
+    }
+
+    fn with_click_detail(mut self, detail: u32) -> Self {
+        self.click_detail = Some(detail);
         self
     }
 
@@ -320,7 +343,14 @@ enum PlannedWork {
         data: DomEventData,
         metadata: EventMetadata,
     },
+    DoubleClick(PendingDoubleClick),
     Action(DispatchAction),
+}
+
+struct PendingDoubleClick {
+    target: GuardedNode,
+    event: BlitzPointerEvent,
+    metadata: EventMetadata,
 }
 
 enum DispatchAction {
@@ -360,6 +390,7 @@ enum PointerFlavor {
 enum ResumeAction {
     Normal {
         suppress_default: bool,
+        double_click: Option<Box<PendingDoubleClick>>,
     },
     PointerLead {
         pointer_default: Box<GuardedDomEvent>,
@@ -683,6 +714,7 @@ impl Default for DispatchStack {
             wheel_transaction: None,
             prevent_compatibility_mouse: false,
             mouse_button_presses: [None; 5],
+            click_sequence: None,
         }
     }
 }
@@ -796,7 +828,10 @@ impl DispatchStack {
 
         let cancelled = default_prevented && pending.guarded.event.cancelable;
         match pending.resume {
-            ResumeAction::Normal { suppress_default } => {
+            ResumeAction::Normal {
+                suppress_default,
+                double_click,
+            } => {
                 if !cancelled && !suppress_default {
                     self.run_default(
                         document,
@@ -805,6 +840,13 @@ impl DispatchStack {
                         handles,
                         pending.guarded,
                     )?;
+                }
+                if let Some(double_click) = double_click {
+                    self.frames
+                        .last_mut()
+                        .expect("double-click follow-up belongs to the active frame")
+                        .planned
+                        .push_front(PlannedWork::DoubleClick(*double_click));
                 }
             }
             ResumeAction::PointerLead {
@@ -1084,9 +1126,17 @@ impl DispatchStack {
                     // focus owner after that nested transition completes.
                     continue;
                 }
-                if let Some(event) = freeze_event_path(document, handles, event)? {
+                if let Some(mut event) = freeze_event_path(document, handles, event)? {
                     let suppress_default = event.metadata.suppress_default;
-                    return self.stage(redraw, event, ResumeAction::Normal { suppress_default });
+                    let double_click = self.observe_completed_click(&mut event);
+                    return self.stage(
+                        redraw,
+                        event,
+                        ResumeAction::Normal {
+                            suppress_default,
+                            double_click,
+                        },
+                    );
                 }
                 continue;
             }
@@ -1116,7 +1166,10 @@ impl DispatchStack {
                         return self.stage(
                             redraw,
                             event,
-                            ResumeAction::Normal { suppress_default },
+                            ResumeAction::Normal {
+                                suppress_default,
+                                double_click: None,
+                            },
                         );
                     }
                 }
@@ -1242,6 +1295,7 @@ impl DispatchStack {
                         event,
                         ResumeAction::Normal {
                             suppress_default: false,
+                            double_click: None,
                         },
                     );
                 }
@@ -1261,6 +1315,33 @@ impl DispatchStack {
                             event,
                         )?;
                     }
+                }
+                PlannedWork::DoubleClick(pending) => {
+                    if !node_is_live(pending.target, document, handles)
+                        || !document
+                            .get_node(pending.target.raw)
+                            .is_some_and(|node| node.flags.is_in_document())
+                    {
+                        continue;
+                    }
+                    let Some(event) = guard_event_with_target(
+                        document,
+                        handles,
+                        pending.target,
+                        DomEventData::DoubleClick(pending.event),
+                        pending.metadata,
+                    )?
+                    else {
+                        continue;
+                    };
+                    return self.stage(
+                        redraw,
+                        event,
+                        ResumeAction::Normal {
+                            suppress_default: false,
+                            double_click: None,
+                        },
+                    );
                 }
                 PlannedWork::Action(action) => {
                     self.run_action(document, text_controls, handles, action)?;
@@ -1303,6 +1384,57 @@ impl DispatchStack {
         });
         self.capture_redraw(redraw);
         Ok(DispatchStep::Event(step))
+    }
+
+    fn observe_completed_click(
+        &mut self,
+        event: &mut GuardedDomEvent,
+    ) -> Option<Box<PendingDoubleClick>> {
+        let DomEventData::Click(pointer) = &event.event.data else {
+            return None;
+        };
+        let Some(PointerReleaseClick::Matched { .. }) = event.metadata.pointer_release_click else {
+            return None;
+        };
+        let native_detail = event.metadata.pointer?.detail;
+        let button = mouse_button_number(pointer.button);
+        let previous = self.click_sequence;
+        let consecutive = previous.is_some_and(|previous| {
+            previous.button == button
+                && previous.target == event.target
+                && native_detail > 1
+                && previous.native_detail.checked_add(1) == Some(native_detail)
+        });
+        let detail = if consecutive {
+            previous
+                .expect("a consecutive click has a previous occurrence")
+                .detail
+                .saturating_add(1)
+                .min(UI_EVENT_DETAIL_MAX)
+        } else {
+            1
+        };
+        self.click_sequence = Some(ClickSequence {
+            button,
+            target: event.target,
+            native_detail,
+            detail,
+        });
+        event.metadata.click_detail = Some(detail);
+
+        if button != 0 || detail != 2 {
+            return None;
+        }
+        let mut metadata = event.metadata.clone().with_click_detail(2);
+        metadata.pointer_release_click = None;
+        metadata.event_type_override = None;
+        metadata.suppress_default = false;
+        metadata.defer_click_target = false;
+        Some(Box::new(PendingDoubleClick {
+            target: event.target,
+            event: pointer.clone(),
+            metadata,
+        }))
     }
 
     fn queue_generated_pointer_release(
@@ -1432,7 +1564,7 @@ impl DispatchStack {
             (None, None)
         };
         let mut guarded_generated = VecDeque::with_capacity(generated.len());
-        for event in generated {
+        for event in generated.into_iter().filter(not_blitz_double_click) {
             let metadata =
                 generated_event_metadata(&source_metadata, &event.data, old_focus, new_focus);
             if let Some(event) = guard_queued_event(document, handles, event, metadata)? {
@@ -1756,6 +1888,11 @@ fn generated_event_metadata(
     source.clone().with_related_target(related_target)
 }
 
+/// Blitz's `DoubleClick` uses one document-global counter which ignores button and target.
+fn not_blitz_double_click(event: &DomEvent) -> bool {
+    !matches!(&event.data, DomEventData::DoubleClick(_))
+}
+
 fn is_focus_event(data: &DomEventData) -> bool {
     matches!(
         data,
@@ -1799,11 +1936,17 @@ fn plan_pointer(
         (GuardedRawNode::from_public(root), root)
     };
     let release_click = (event.is_mouse() && matches!(flavor, PointerFlavor::Up)).then(|| {
-        stream
-            .release_press
-            .filter(|press| !press.dragged)
-            .and_then(|press| press.author_target)
-            .map_or(PointerReleaseClick::Unmatched, PointerReleaseClick::Matched)
+        let Some(press) = stream.release_press.filter(|press| !press.dragged) else {
+            return PointerReleaseClick::Unmatched;
+        };
+        press
+            .author_target
+            .map_or(PointerReleaseClick::Unmatched, |down_target| {
+                PointerReleaseClick::Matched {
+                    down_target,
+                    up_target: author_target,
+                }
+            })
     });
     let metadata = metadata.with_pointer_release_click(release_click);
     planned.push_back(PlannedWork::Pointer {
@@ -2279,10 +2422,15 @@ fn retarget_pointer_click(
     let Some(release) = metadata.pointer_release_click else {
         return Ok(true);
     };
-    let PointerReleaseClick::Matched(down_target) = release else {
+    let PointerReleaseClick::Matched {
+        down_target,
+        up_target,
+        ..
+    } = release
+    else {
         return Ok(false);
     };
-    let Some(target) = common_pointer_click_target(document, handles, down_target, *author_target)?
+    let Some(target) = common_pointer_click_target(document, handles, down_target, up_target)?
     else {
         return Ok(false);
     };
@@ -2715,7 +2863,10 @@ fn mouse_payload(
 }
 
 fn pointer_detail(metadata: &EventMetadata) -> u32 {
-    metadata.pointer.map_or(0, |native| native.detail)
+    metadata
+        .click_detail
+        .or_else(|| metadata.pointer.map(|native| native.detail))
+        .unwrap_or(0)
 }
 
 fn wheel_mouse_payload(event: &BlitzWheelEvent, metadata: &EventMetadata) -> MousePayload {
@@ -3851,6 +4002,46 @@ mod tests {
         }
     }
 
+    fn drain_steps(context: &mut TestContext, mut step: DispatchStep) -> Vec<DispatchEventStep> {
+        let mut events = Vec::new();
+        while let DispatchStep::Event(current) = step {
+            events.push(current.clone());
+            step = context.resume(&current, false);
+        }
+        events
+    }
+
+    fn dispatch_click_at(
+        context: &mut TestContext,
+        x: f32,
+        y: f32,
+        button: MouseEventButton,
+        mask: MouseEventButtons,
+        down_time_stamp: f64,
+        native_detail: u32,
+    ) -> Vec<DispatchEventStep> {
+        let down = context.begin(pointer_request_at(
+            x,
+            y,
+            button,
+            mask,
+            PointerFlavor::Down,
+            down_time_stamp,
+            native_detail,
+        ));
+        let _ = drain(context, down);
+        let up = context.begin(pointer_request_at(
+            x,
+            y,
+            button,
+            MouseEventButtons::None,
+            PointerFlavor::Up,
+            down_time_stamp + 1.0,
+            native_detail,
+        ));
+        drain_steps(context, up)
+    }
+
     fn drain_pointer_mouse_records(
         context: &mut TestContext,
         mut step: DispatchStep,
@@ -3924,6 +4115,26 @@ mod tests {
             mods: Modifiers::empty(),
             details: PointerDetails::default(),
             element: blitz_traits::events::Point::default(),
+        }
+    }
+
+    fn pointer_request_at(
+        x: f32,
+        y: f32,
+        button: MouseEventButton,
+        buttons: MouseEventButtons,
+        flavor: PointerFlavor,
+        time_stamp: f64,
+        detail: u32,
+    ) -> DispatchRequest {
+        DispatchRequest::Pointer {
+            event: pointer(x, y, button, buttons),
+            flavor,
+            metadata: EventMetadata::pointer(
+                time_stamp,
+                native_pointer_coordinates(f64::from(x), f64::from(y), 0.0, 0.0),
+                detail,
+            ),
         }
     }
 
@@ -4601,6 +4812,619 @@ mod tests {
             step = context.resume(&current, false);
         }
         assert_eq!(click_target, Some(parent));
+    }
+
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "the trusted second release retains its exact integral timestamp"
+    )]
+    fn double_click_uses_final_target_sequence_and_follows_click_defaults() {
+        let mut context =
+            TestContext::new("<input id='box' type='checkbox' style='width:24px;height:24px'>");
+        let checkbox = context.element("box");
+        let (x, y) = context.center(checkbox);
+        assert!(context.document.set_hover_to(x, y));
+
+        let first = dispatch_click_at(
+            &mut context,
+            x,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            100.0,
+            1,
+        );
+        let second = dispatch_click_at(
+            &mut context,
+            x + 2.0,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            599.0,
+            2,
+        );
+        let click_details = first
+            .iter()
+            .chain(&second)
+            .filter(|event| event.event_type == "click")
+            .map(|event| {
+                let Some(DispatchEventPayload::Pointer(payload)) = event.payload.as_deref() else {
+                    panic!("click should carry a pointer payload");
+                };
+                payload.mouse.detail
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(click_details, [1, 2]);
+
+        let second_types = second
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>();
+        let click_index = second_types
+            .iter()
+            .position(|kind| *kind == "click")
+            .unwrap();
+        let input_index = second_types
+            .iter()
+            .position(|kind| *kind == "input")
+            .unwrap();
+        let double_index = second_types
+            .iter()
+            .position(|kind| *kind == "dblclick")
+            .unwrap();
+        assert!(click_index < input_index && input_index < double_index);
+        assert_eq!(
+            second_types
+                .iter()
+                .filter(|kind| **kind == "dblclick")
+                .count(),
+            1,
+            "the poisoned Blitz double-click must be replaced rather than duplicated",
+        );
+        let double_click = &second[double_index];
+        assert_eq!(context.handles.resolve(double_click.target), Some(checkbox));
+        assert_eq!(double_click.time_stamp, 600.0);
+        let Some(DispatchEventPayload::Mouse(payload)) = double_click.payload.as_deref() else {
+            panic!("dblclick should carry a mouse payload");
+        };
+        assert_eq!(payload.button, 0);
+        assert_eq!(payload.detail, 2);
+        assert!(
+            !context
+                .checked_controls
+                .checked(&mut context.document, checkbox)
+                .expect("checkbox should expose checkedness")
+        );
+
+        let third = dispatch_click_at(
+            &mut context,
+            x,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            700.0,
+            3,
+        );
+        assert!(!third.iter().any(|event| event.event_type == "dblclick"));
+        let third_click = third
+            .iter()
+            .find(|event| event.event_type == "click")
+            .unwrap();
+        let Some(DispatchEventPayload::Pointer(payload)) = third_click.payload.as_deref() else {
+            panic!("click should carry a pointer payload");
+        };
+        assert_eq!(payload.mouse.detail, 3);
+    }
+
+    #[test]
+    fn intervening_auxclick_breaks_the_primary_double_click_sequence() {
+        let mut context = TestContext::new(
+            "<div id='target' style='display:block;width:100px;height:40px'></div>",
+        );
+        let target = context.element("target");
+        let (x, y) = context.center(target);
+        assert!(context.document.set_hover_to(x, y));
+
+        let first = dispatch_click_at(
+            &mut context,
+            x,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            100.0,
+            1,
+        );
+        let auxiliary = dispatch_click_at(
+            &mut context,
+            x,
+            y,
+            MouseEventButton::Auxiliary,
+            MouseEventButtons::Auxiliary,
+            200.0,
+            1,
+        );
+        let second_primary = dispatch_click_at(
+            &mut context,
+            x,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            300.0,
+            1,
+        );
+        for events in [&first, &auxiliary, &second_primary] {
+            let click = events
+                .iter()
+                .find(|event| matches!(event.event_type.as_str(), "click" | "auxclick"))
+                .unwrap();
+            let Some(DispatchEventPayload::Pointer(payload)) = click.payload.as_deref() else {
+                panic!("click-family event should carry a pointer payload");
+            };
+            assert_eq!(payload.mouse.detail, 1);
+        }
+        assert!(
+            !second_primary
+                .iter()
+                .any(|event| event.event_type == "dblclick")
+        );
+
+        let restarted_second = dispatch_click_at(
+            &mut context,
+            x,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            400.0,
+            2,
+        );
+        assert!(
+            restarted_second
+                .iter()
+                .any(|event| event.event_type == "dblclick")
+        );
+    }
+
+    #[test]
+    fn an_intervening_drag_breaks_the_completed_click_sequence() {
+        let mut context = TestContext::new(
+            "<div id='target' style='display:block;width:100px;height:40px'></div>",
+        );
+        let target = context.element("target");
+        let (x, y) = context.center(target);
+        assert!(context.document.set_hover_to(x, y));
+        let _ = dispatch_click_at(
+            &mut context,
+            x,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            100.0,
+            1,
+        );
+        let down = context.begin(pointer_request_at(
+            x,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            PointerFlavor::Down,
+            200.0,
+            2,
+        ));
+        let _ = drain(&mut context, down);
+        let moved = context.begin(pointer_request_at(
+            x + 3.0,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            PointerFlavor::Move,
+            201.0,
+            0,
+        ));
+        let _ = drain(&mut context, moved);
+        let up = context.begin(pointer_request_at(
+            x + 3.0,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::None,
+            PointerFlavor::Up,
+            202.0,
+            2,
+        ));
+        let (drag_types, _, _) = drain(&mut context, up);
+        assert!(!drag_types.iter().any(|kind| kind == "click"));
+
+        let after_drag = dispatch_click_at(
+            &mut context,
+            x,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            300.0,
+            3,
+        );
+        let click = after_drag
+            .iter()
+            .find(|event| event.event_type == "click")
+            .unwrap();
+        let Some(DispatchEventPayload::Pointer(payload)) = click.payload.as_deref() else {
+            panic!("click should carry a pointer payload");
+        };
+        assert_eq!(payload.mouse.detail, 1);
+        assert!(
+            !after_drag
+                .iter()
+                .any(|event| event.event_type == "dblclick")
+        );
+    }
+
+    #[test]
+    fn double_click_uses_native_sequence_and_final_target() {
+        for (second_time, offset, native_detail, expected_detail, expected_double) in [
+            (599.0, 2.0, 2, 2, true),
+            (600.0, 0.0, 1, 1, false),
+            (599.0, 2.25, 3, 1, false),
+        ] {
+            let mut context = TestContext::new(
+                "<div id='target' style='display:block;width:100px;height:40px'></div>",
+            );
+            let target = context.element("target");
+            let (x, y) = context.center(target);
+            assert!(context.document.set_hover_to(x, y));
+            let _ = dispatch_click_at(
+                &mut context,
+                x,
+                y,
+                MouseEventButton::Main,
+                MouseEventButtons::Primary,
+                100.0,
+                1,
+            );
+            let second = dispatch_click_at(
+                &mut context,
+                x + offset,
+                y,
+                MouseEventButton::Main,
+                MouseEventButtons::Primary,
+                second_time,
+                native_detail,
+            );
+            let click = second
+                .iter()
+                .find(|event| event.event_type == "click")
+                .unwrap();
+            let Some(DispatchEventPayload::Pointer(payload)) = click.payload.as_deref() else {
+                panic!("click should carry a pointer payload");
+            };
+            assert_eq!(payload.mouse.detail, expected_detail);
+            assert_eq!(
+                second.iter().any(|event| event.event_type == "dblclick"),
+                expected_double,
+            );
+        }
+
+        let mut context = TestContext::new(
+            "<div id='a' style='display:block;width:100px;height:40px'></div>\
+             <div id='b' style='display:block;width:100px;height:40px'></div>",
+        );
+        let a = context.element("a");
+        let b = context.element("b");
+        let (ax, ay) = context.center(a);
+        let (bx, by) = context.center(b);
+        let _ = dispatch_click_at(
+            &mut context,
+            ax,
+            ay,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            100.0,
+            1,
+        );
+        let _ = dispatch_click_at(
+            &mut context,
+            bx,
+            by,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            200.0,
+            2,
+        );
+        let next_a = dispatch_click_at(
+            &mut context,
+            ax,
+            ay,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            300.0,
+            3,
+        );
+        let click = next_a
+            .iter()
+            .find(|event| event.event_type == "click")
+            .unwrap();
+        let Some(DispatchEventPayload::Pointer(payload)) = click.payload.as_deref() else {
+            panic!("click should carry a pointer payload");
+        };
+        assert_eq!(payload.mouse.detail, 1);
+        assert!(!next_a.iter().any(|event| event.event_type == "dblclick"));
+    }
+
+    #[test]
+    fn crossed_clicks_can_qualify_their_common_parent_for_double_click() {
+        let mut context = TestContext::new(
+            "<div id='parent' style='display:flex;width:240px;height:80px'>\
+               <div id='a' style='width:100px;height:40px'></div>\
+               <div id='b' style='width:100px;height:40px'></div>\
+             </div>",
+        );
+        let parent = context.element("parent");
+        let a = context.element("a");
+        let b = context.element("b");
+        let (ax, ay) = context.center(a);
+        let (bx, by) = context.center(b);
+        assert!(context.document.set_hover_to(ax, ay));
+        let down = context.begin(pointer_request_at(
+            ax,
+            ay,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            PointerFlavor::Down,
+            100.0,
+            1,
+        ));
+        let _ = drain(&mut context, down);
+        let crossed = context.begin(pointer_request_at(
+            bx,
+            by,
+            MouseEventButton::Main,
+            MouseEventButtons::None,
+            PointerFlavor::Up,
+            101.0,
+            1,
+        ));
+        let crossed = drain_steps(&mut context, crossed);
+        let crossed_click = crossed
+            .iter()
+            .find(|event| event.event_type == "click")
+            .unwrap();
+        assert_eq!(context.handles.resolve(crossed_click.target), Some(parent));
+
+        {
+            let mut mutator = context.document.mutate();
+            mutator.remove_node(a);
+            mutator.remove_node(b);
+        }
+        context.document.resolve(0.0);
+        assert_eq!(
+            context
+                .document
+                .hit(ax, ay)
+                .and_then(|hit| pointer_author_target_id(&context.document, hit.node_id)),
+            Some(parent),
+        );
+
+        let parent_click = dispatch_click_at(
+            &mut context,
+            ax,
+            ay,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            200.0,
+            2,
+        );
+        let click = parent_click
+            .iter()
+            .find(|event| event.event_type == "click")
+            .unwrap();
+        let Some(DispatchEventPayload::Pointer(payload)) = click.payload.as_deref() else {
+            panic!("click should carry a pointer payload");
+        };
+        assert_eq!(payload.mouse.detail, 2);
+        let double_click = parent_click
+            .iter()
+            .find(|event| event.event_type == "dblclick")
+            .expect("matching completed click targets should qualify dblclick");
+        assert_eq!(context.handles.resolve(double_click.target), Some(parent));
+    }
+
+    #[test]
+    fn cancelling_the_second_click_still_dispatches_double_click() {
+        let mut context =
+            TestContext::new("<input id='box' type='checkbox' style='width:24px;height:24px'>");
+        let checkbox = context.element("box");
+        let (x, y) = context.center(checkbox);
+        assert!(context.document.set_hover_to(x, y));
+        let _ = dispatch_click_at(
+            &mut context,
+            x,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            100.0,
+            1,
+        );
+        assert!(
+            context
+                .checked_controls
+                .checked(&mut context.document, checkbox)
+                .unwrap()
+        );
+
+        let down = context.begin(pointer_request_at(
+            x,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            PointerFlavor::Down,
+            200.0,
+            2,
+        ));
+        let _ = drain(&mut context, down);
+        let mut step = context.begin(pointer_request_at(
+            x,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::None,
+            PointerFlavor::Up,
+            201.0,
+            2,
+        ));
+        let mut types = Vec::new();
+        while let DispatchStep::Event(current) = step {
+            types.push(current.event_type.clone());
+            step = context.resume(&current, current.event_type == "click");
+        }
+        assert!(types.iter().any(|kind| kind == "dblclick"));
+        assert!(!types.iter().any(|kind| kind == "input"));
+        assert!(
+            context
+                .checked_controls
+                .checked(&mut context.document, checkbox)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn cancelling_the_second_mouseup_still_dispatches_click_and_double_click() {
+        let mut context = TestContext::new(
+            "<div id='target' style='display:block;width:100px;height:40px'></div>",
+        );
+        let target = context.element("target");
+        let (x, y) = context.center(target);
+        assert!(context.document.set_hover_to(x, y));
+        let _ = dispatch_click_at(
+            &mut context,
+            x,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            100.0,
+            1,
+        );
+        let down = context.begin(pointer_request_at(
+            x,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            PointerFlavor::Down,
+            200.0,
+            2,
+        ));
+        let _ = drain(&mut context, down);
+        let mut step = context.begin(pointer_request_at(
+            x,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::None,
+            PointerFlavor::Up,
+            201.0,
+            2,
+        ));
+        let mut types = Vec::new();
+        while let DispatchStep::Event(current) = step {
+            types.push(current.event_type.clone());
+            step = context.resume(&current, current.event_type == "mouseup");
+        }
+        assert!(types.iter().any(|kind| kind == "click"));
+        assert!(types.iter().any(|kind| kind == "dblclick"));
+    }
+
+    #[test]
+    fn double_click_keeps_its_target_but_uses_listener_mutated_ancestry() {
+        let mut context = TestContext::new(
+            "<div id='old'><button id='target' style='width:80px;height:30px'>go</button></div>\
+             <div id='new'></div>",
+        );
+        let target = context.element("target");
+        let new_parent = context.element("new");
+        let new_parent_handle = context.handles.expose(new_parent).unwrap();
+        let (x, y) = context.center(target);
+        assert!(context.document.set_hover_to(x, y));
+        let _ = dispatch_click_at(
+            &mut context,
+            x,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            100.0,
+            1,
+        );
+
+        let down = context.begin(pointer_request_at(
+            x,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            PointerFlavor::Down,
+            200.0,
+            2,
+        ));
+        let _ = drain(&mut context, down);
+        let up = context.begin(pointer_request_at(
+            x,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::None,
+            PointerFlavor::Up,
+            201.0,
+            2,
+        ));
+        let click = next_event_of_type(&mut context, up, "click");
+        {
+            let mut mutator = context.document.mutate();
+            mutator.remove_node(target);
+            mutator.append_children(new_parent, &[target]);
+        }
+        let after_click = context.resume(&click, false);
+        let events = drain_steps(&mut context, after_click);
+        let double_click = events
+            .iter()
+            .find(|event| event.event_type == "dblclick")
+            .expect("moving the live target should retain dblclick");
+        assert_eq!(context.handles.resolve(double_click.target), Some(target));
+        assert!(double_click.path.contains(&new_parent_handle));
+    }
+
+    #[test]
+    fn detaching_the_second_click_target_suppresses_pending_double_click() {
+        let mut context =
+            TestContext::new("<button id='target' style='width:80px;height:30px'>go</button>");
+        let target = context.element("target");
+        let (x, y) = context.center(target);
+        assert!(context.document.set_hover_to(x, y));
+        let _ = dispatch_click_at(
+            &mut context,
+            x,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            100.0,
+            1,
+        );
+        let down = context.begin(pointer_request_at(
+            x,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            PointerFlavor::Down,
+            200.0,
+            2,
+        ));
+        let _ = drain(&mut context, down);
+        let up = context.begin(pointer_request_at(
+            x,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::None,
+            PointerFlavor::Up,
+            201.0,
+            2,
+        ));
+        let click = next_event_of_type(&mut context, up, "click");
+        context.document.mutate().remove_node(target);
+        let after_click = context.resume(&click, false);
+        let (types, _, _) = drain(&mut context, after_click);
+        assert!(!types.iter().any(|kind| kind == "dblclick"));
     }
 
     #[test]
@@ -7050,7 +7874,7 @@ mod tests {
                     else {
                         panic!("click should carry the causal pointer payload");
                     };
-                    assert_eq!(payload.mouse.detail, 2);
+                    assert_eq!(payload.mouse.detail, 1);
                 }
                 "input" => {
                     saw_input = true;
