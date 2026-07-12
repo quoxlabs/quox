@@ -30,6 +30,8 @@ type LiveTextControlRenderer = {
 type LiveCheckedControlRenderer = {
   form_control_checked(nodeHandle: number): boolean;
   set_form_control_checked(nodeHandle: number, checked: boolean): boolean;
+  form_control_indeterminate(nodeHandle: number): boolean;
+  set_form_control_indeterminate(nodeHandle: number, indeterminate: boolean): boolean;
 };
 
 type TextControlSelectionRenderer = {
@@ -359,6 +361,22 @@ export class QuoxInputElement extends QuoxElement {
   set checked(value: boolean) {
     const { renderer, requestRender } = documentInternals(this.ownerDocument);
     const changed = (renderer as unknown as LiveCheckedControlRenderer).set_form_control_checked(
+      this.nodeId,
+      Boolean(value),
+    );
+    if (changed) requestRender();
+  }
+
+  get indeterminate(): boolean {
+    const { renderer } = documentInternals(this.ownerDocument);
+    return (renderer as unknown as LiveCheckedControlRenderer).form_control_indeterminate(
+      this.nodeId,
+    );
+  }
+
+  set indeterminate(value: boolean) {
+    const { renderer, requestRender } = documentInternals(this.ownerDocument);
+    const changed = (renderer as unknown as LiveCheckedControlRenderer).set_form_control_indeterminate(
       this.nodeId,
       Boolean(value),
     );

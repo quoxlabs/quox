@@ -62,10 +62,15 @@ struct RadioGroupKey {
     form_owner: Option<usize>,
 }
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "these are independent HTML input checkedness and indeterminateness flags"
+)]
 struct CheckedControlState {
     checked: bool,
     default_checked: bool,
     dirty_checkedness: bool,
+    indeterminate: bool,
     descriptor: CheckedInputDescriptor,
 }
 
@@ -97,6 +102,7 @@ impl CheckedControlStates {
                         checked: default_checked,
                         default_checked,
                         dirty_checkedness: false,
+                        indeterminate: false,
                         descriptor,
                     });
                     if default_checked {
@@ -158,6 +164,36 @@ impl CheckedControlStates {
         Some(rendered_changed)
     }
 
+    /// Return the script-owned indeterminate flag. It exists on every HTML input, remains
+    /// independent of checkedness and content attributes, and survives type transitions.
+    pub(crate) fn indeterminate(
+        &mut self,
+        document: &mut BaseDocument,
+        node_id: usize,
+    ) -> Option<bool> {
+        self.reconcile_document(document);
+        self.controls.get(&node_id).map(|state| state.indeterminate)
+    }
+
+    /// Set the script-owned flag without dispatching events. Only checkbox state can affect
+    /// rendering, but every input retains the value for a later type transition.
+    pub(crate) fn set_indeterminate(
+        &mut self,
+        document: &mut BaseDocument,
+        node_id: usize,
+        indeterminate: bool,
+    ) -> Option<bool> {
+        let mut rendered_changed = self.reconcile_document(document);
+        let state = self.controls.get_mut(&node_id)?;
+        let state_changed = state.indeterminate != indeterminate;
+        state.indeterminate = indeterminate;
+        if state_changed && state.descriptor.kind == CheckedInputKind::Checkbox {
+            mark_checkedness_restyle(document, node_id);
+            rendered_changed = true;
+        }
+        Some(rendered_changed)
+    }
+
     /// Import a checkedness mutation made inside pinned Blitz's click default before the generated
     /// `input` record is exposed to JavaScript. Quox then reprojects every state, repairing Blitz's
     /// name-only radio grouping (which can otherwise uncheck unrelated radios and checkboxes).
@@ -196,6 +232,7 @@ impl CheckedControlStates {
                 checked: default_checked,
                 default_checked,
                 dirty_checkedness: false,
+                indeterminate: false,
                 descriptor: descriptor.clone(),
             });
         state.default_checked = default_checked;
@@ -2906,6 +2943,51 @@ mod tests {
         assert!(!controls.checked(&mut document, field).unwrap());
         assert_eq!(rendered_checked(&document, field), Some(false));
         assert!(controls.state(field).unwrap().dirty_checkedness);
+    }
+
+    #[test]
+    fn indeterminateness_is_attribute_independent_and_survives_type_changes() {
+        let mut document = document("<input id='field'>");
+        let field = element(&document, "field");
+        let mut controls = CheckedControlStates::default();
+        controls.reconcile_document(&mut document);
+
+        assert!(!controls.indeterminate(&mut document, field).unwrap());
+        assert_eq!(
+            controls.set_indeterminate(&mut document, field, true),
+            Some(false),
+            "a text input retains the flag without a visual change",
+        );
+        assert!(controls.indeterminate(&mut document, field).unwrap());
+        assert!(!controls.checked(&mut document, field).unwrap());
+
+        set_input_type(&mut document, field, "checkbox");
+        controls.reconcile_document(&mut document);
+        assert!(controls.indeterminate(&mut document, field).unwrap());
+        assert_eq!(
+            controls.set_indeterminate(&mut document, field, false),
+            Some(true)
+        );
+        assert!(!controls.indeterminate(&mut document, field).unwrap());
+        assert!(!controls.checked(&mut document, field).unwrap());
+
+        document.mutate().set_attribute(
+            field,
+            QualName {
+                prefix: None,
+                ns: ns!(),
+                local: LocalName::from("indeterminate"),
+            },
+            "true",
+        );
+        assert!(!controls.indeterminate(&mut document, field).unwrap());
+        set_input_type(&mut document, field, "radio");
+        controls.reconcile_document(&mut document);
+        assert_eq!(
+            controls.set_indeterminate(&mut document, field, true),
+            Some(false)
+        );
+        assert!(controls.indeterminate(&mut document, field).unwrap());
     }
 
     #[test]

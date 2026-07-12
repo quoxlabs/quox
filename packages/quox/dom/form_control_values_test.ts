@@ -11,6 +11,7 @@ interface ControlState {
   dirty: boolean;
   checked: boolean;
   dirtyCheckedness: boolean;
+  indeterminate: boolean;
   files: string[];
   selectionStart: number;
   selectionEnd: number;
@@ -487,6 +488,7 @@ class FakeLiveControlRenderer {
       dirty: false,
       checked: false,
       dirtyCheckedness: false,
+      indeterminate: false,
       files: [],
       selectionStart: 0,
       selectionEnd: 0,
@@ -579,6 +581,20 @@ class FakeLiveControlRenderer {
     control.dirtyCheckedness = true;
     const type = (control.attributes.get("type") ?? "").toLowerCase();
     return changed && (type === "checkbox" || type === "radio");
+  }
+
+  form_control_indeterminate(nodeHandle: number): boolean {
+    const control = this.#control(nodeHandle);
+    if (control.tagName !== "input") throw new TypeError("fake node is not an input");
+    return control.indeterminate;
+  }
+
+  set_form_control_indeterminate(nodeHandle: number, indeterminate: boolean): boolean {
+    const control = this.#control(nodeHandle);
+    if (control.tagName !== "input") throw new TypeError("fake node is not an input");
+    const changed = control.indeterminate !== indeterminate;
+    control.indeterminate = indeterminate;
+    return changed && (control.attributes.get("type") ?? "").toLowerCase() === "checkbox";
   }
 
   form_control_selection(nodeHandle: number): Uint32Array | undefined {
@@ -1028,6 +1044,43 @@ Deno.test("checked uses Web IDL boolean conversion and survives non-checkable in
   (clean as unknown as { defaultChecked: unknown }).defaultChecked = 0n;
   assertEquals(clean.defaultChecked, false);
   assertEquals(clean.checked, false);
+});
+
+Deno.test("indeterminate is independent script state across input type changes", () => {
+  const { document, renders } = createDocument();
+  const input = document.createElement("input");
+  let inputs = 0;
+  let changes = 0;
+  input.addEventListener("input", () => inputs++);
+  input.addEventListener("change", () => changes++);
+
+  assertEquals(input.indeterminate, false);
+  assertEquals(input.getAttribute("indeterminate"), null);
+  (input as unknown as { indeterminate: unknown }).indeterminate = {
+    valueOf: () => {
+      throw new Error("Boolean conversion must not invoke object coercion hooks");
+    },
+  };
+  assertEquals(input.indeterminate, true);
+  assertEquals(input.checked, false, "indeterminateness does not alter checkedness");
+  assertEquals(input.getAttribute("indeterminate"), null, "the property does not reflect an attribute");
+  assertEquals(renders.count, 0, "a text input retains the flag without a visual change");
+
+  input.setAttribute("type", "checkbox");
+  assertEquals(input.indeterminate, true, "the flag survives becoming a checkbox");
+  const checkboxRenders = renders.count;
+  input.indeterminate = true;
+  assertEquals(renders.count, checkboxRenders, "identical assignment is inert");
+  input.indeterminate = false;
+  assertEquals(renders.count, checkboxRenders + 1);
+
+  input.setAttribute("type", "radio");
+  const radioRenders = renders.count;
+  (input as unknown as { indeterminate: unknown }).indeterminate = Symbol("truthy");
+  assertEquals(input.indeterminate, true);
+  assertEquals(renders.count, radioRenders, "a radio retains the flag without a visual change");
+  assertEquals(inputs, 0);
+  assertEquals(changes, 0);
 });
 
 Deno.test("input type changes transfer values between value and attribute modes", () => {

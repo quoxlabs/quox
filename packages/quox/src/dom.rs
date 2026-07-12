@@ -1241,6 +1241,44 @@ impl QuoxRenderer {
             .ok_or_else(|| unsupported_input_checkedness(node_handle))
     }
 
+    /// Return the script-owned indeterminate flag for an HTML input. This flag is not reflected
+    /// by a content attribute and remains present while the input has a non-checkbox type.
+    pub fn form_control_indeterminate(&self, node_handle: f64) -> Result<bool, JsValue> {
+        let node_handle =
+            uint32(node_handle, "nodeHandle").map_err(NumericArgumentError::into_js)?;
+        let mut state = self.state.borrow_mut();
+        let node_id = state.resolve_element(node_handle)?;
+        let QuoxRendererState {
+            document,
+            checked_controls,
+            ..
+        } = &mut *state;
+        checked_controls
+            .indeterminate(document, node_id)
+            .ok_or_else(|| unsupported_input_checkedness(node_handle))
+    }
+
+    /// Set script indeterminateness without changing checkedness or dispatching an event. The
+    /// result reports whether rendering may have changed.
+    pub fn set_form_control_indeterminate(
+        &self,
+        node_handle: f64,
+        indeterminate: bool,
+    ) -> Result<bool, JsValue> {
+        let node_handle =
+            uint32(node_handle, "nodeHandle").map_err(NumericArgumentError::into_js)?;
+        let mut state = self.state.borrow_mut();
+        let node_id = state.resolve_element(node_handle)?;
+        let QuoxRendererState {
+            document,
+            checked_controls,
+            ..
+        } = &mut *state;
+        checked_controls
+            .set_indeterminate(document, node_id, indeterminate)
+            .ok_or_else(|| unsupported_input_checkedness(node_handle))
+    }
+
     /// Return `[selectionStart, selectionEnd, direction]` for a selectable text control. Input
     /// states to which HTML's range APIs do not apply return `undefined` at the JS boundary.
     pub fn form_control_selection(&self, node_handle: f64) -> Result<Option<Box<[u32]>>, JsValue> {
