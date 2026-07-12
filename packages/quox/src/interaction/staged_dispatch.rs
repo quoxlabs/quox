@@ -12,8 +12,9 @@ use crate::node_handles::NodeHandles;
 use crate::{QuoxRenderer, QuoxRendererState, sync_document_layout};
 use blitz_dom::{BaseDocument, LocalName, QualName, local_name, ns};
 use blitz_traits::events::{
-    BlitzImeEvent, BlitzPointerEvent, BlitzPointerId, BlitzWheelDelta, BlitzWheelEvent, DomEvent,
-    DomEventData, MouseEventButton, Point as ElementPoint, PointerDetails,
+    BlitzImeEvent, BlitzPointerEvent, BlitzPointerId, BlitzScrollEvent, BlitzWheelDelta,
+    BlitzWheelEvent, DomEvent, DomEventData, MouseEventButton, Point as ElementPoint,
+    PointerDetails,
 };
 use js_sys::{Array, Object, Reflect};
 use std::collections::VecDeque;
@@ -1108,6 +1109,7 @@ impl DispatchStack {
 
         let old_focus = actual_focus_node_id(document);
         let source_metadata = guarded.metadata.clone();
+        let viewport_scroll_before_default = document.viewport_scroll();
         let preserved_file_value = matches!(&guarded.event.data, DomEventData::Click(_))
             .then(|| activated_file_input(document, guarded.default_target.raw))
             .flatten()
@@ -1137,6 +1139,9 @@ impl DispatchStack {
             run_wheel_default(document, guarded.default_target.raw, event, &mut generated);
         } else {
             document.handle_dom_event(&mut guarded.event, |event| generated.push(event));
+        }
+        if document.viewport_scroll() != viewport_scroll_before_default {
+            generated.push(viewport_scroll_event(document));
         }
         if let Some((target, value)) = preserved_file_value {
             restore_file_input_value_attribute(document, target, value.as_deref());
@@ -1331,6 +1336,29 @@ impl DispatchStack {
             }
         }
     }
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "Blitz's scroll record uses integral layout metrics while retaining fractional offsets"
+)]
+fn viewport_scroll_event(document: &BaseDocument) -> DomEvent {
+    let scroll = document.viewport_scroll();
+    let root = document.root_element();
+    let layout = root.final_layout;
+    let viewport = document.viewport();
+    let scale = viewport.scale_f64();
+    DomEvent::new(
+        root.id,
+        DomEventData::Scroll(BlitzScrollEvent {
+            scroll_top: scroll.y,
+            scroll_left: scroll.x,
+            scroll_width: layout.size.width as i32,
+            scroll_height: layout.size.height as i32,
+            client_width: (f64::from(viewport.window_size.0) / scale) as i32,
+            client_height: (f64::from(viewport.window_size.1) / scale) as i32,
+        }),
+    )
 }
 
 fn plan_programmatic_focus(
@@ -3671,6 +3699,83 @@ mod tests {
                 .abs()
                 < f64::EPSILON
         );
+    }
+
+    #[test]
+    fn trusted_wheel_reports_viewport_scroll_and_cancellation_suppresses_it() {
+        let body = "<div id='target' style='height:1200px'>target</div>";
+        let mut cancelled_context = TestContext::new(body);
+        let target = cancelled_context.element("target");
+        let point = cancelled_context
+            .point_hitting(target)
+            .expect("tall document target should be hittable");
+        let wheel = event(cancelled_context.begin_trusted_wheel(point.0, point.1));
+        let completed = cancelled_context.resume(&wheel, true);
+        let (_, redraw_requested) = complete(completed);
+        assert!(!redraw_requested);
+        assert!(cancelled_context.document.viewport_scroll().y.abs() < f64::EPSILON);
+
+        let mut context = TestContext::new(body);
+        let root = context.document.root_element().id;
+        let target = context.element("target");
+        let point = context
+            .point_hitting(target)
+            .expect("tall document target should be hittable");
+        let wheel = event(context.begin_trusted_wheel(point.0, point.1));
+        let scroll = event(context.resume(&wheel, false));
+        assert_eq!(scroll.event_type, "scroll");
+        assert_eq!(context.handles.resolve(scroll.target), Some(root));
+        let (_, redraw_requested) = complete(context.resume(&scroll, false));
+        assert!(redraw_requested);
+        assert!(context.document.viewport_scroll().y > 0.0);
+    }
+
+    #[test]
+    fn viewport_scroll_marker_follows_nested_element_markers() {
+        let mut context = TestContext::new(
+            "<div id='scroller' style='overflow:auto;width:120px;height:60px'>\
+               <div id='target' style='height:300px'>target</div>\
+             </div>\
+             <div style='height:1200px'></div>",
+        );
+        let root = context.document.root_element().id;
+        let scroller = context.element("scroller");
+        let target = context.element("target");
+        let point = context
+            .point_hitting(target)
+            .expect("nested scroll target should be hittable");
+        let scroll_limit = f64::from(
+            context
+                .document
+                .get_node(scroller)
+                .expect("scroller should exist")
+                .final_layout
+                .scroll_height(),
+        );
+        assert!(scroll_limit > 10.0);
+        context
+            .document
+            .get_node_mut(scroller)
+            .expect("scroller should exist")
+            .scroll_offset
+            .y = scroll_limit - 10.0;
+
+        let wheel = event(context.begin_trusted_wheel(point.0, point.1));
+        let element_scroll = event(context.resume(&wheel, false));
+        assert_eq!(element_scroll.event_type, "scroll");
+        assert_eq!(
+            context.handles.resolve(element_scroll.target),
+            Some(scroller)
+        );
+
+        // Scroll is noncancelable. Even incorrect cancellation feedback must not hide the later
+        // viewport marker which belongs to the same default action.
+        let viewport_scroll = event(context.resume(&element_scroll, true));
+        assert_eq!(viewport_scroll.event_type, "scroll");
+        assert_eq!(context.handles.resolve(viewport_scroll.target), Some(root));
+        let (_, redraw_requested) = complete(context.resume(&viewport_scroll, false));
+        assert!(redraw_requested);
+        assert!(context.document.viewport_scroll().y > 0.0);
     }
 
     #[test]
