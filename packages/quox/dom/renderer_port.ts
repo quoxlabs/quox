@@ -26,6 +26,7 @@ export const DOM_DISPATCH_EVENT_TYPES = Object.freeze(
     "scroll",
     "wheel",
     "click",
+    "auxclick",
     "contextmenu",
     "dblclick",
     "keypress",
@@ -608,6 +609,7 @@ function validateEventPayload(
     case "pointerover":
     case "pointerout":
     case "click":
+    case "auxclick":
     case "contextmenu":
       return validatePointerPayload(value);
     case "mousemove":

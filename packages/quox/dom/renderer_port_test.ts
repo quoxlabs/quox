@@ -89,6 +89,7 @@ function payloadForType(type: DomDispatchEventType): Record<string, unknown> | u
     case "pointerover":
     case "pointerout":
     case "click":
+    case "auxclick":
     case "contextmenu":
       return pointerPayload();
     case "mousemove":
@@ -251,6 +252,7 @@ Deno.test("DOM dispatch validator requires the exact payload family and rejects 
   const invalidValues = [
     missingPayload,
     eventStep({ type: "click", payload: mousePayload() }),
+    eventStep({ type: "auxclick", payload: mousePayload() }),
     eventStep({ type: "dblclick", payload: pointerPayload() }),
     eventStep({ type: "wheel", payload: mousePayload() }),
     eventStep({ type: "keydown", payload: { ...keyboardPayload(), data: null } }),

@@ -575,6 +575,7 @@ export class QuoxDocument extends QuoxEventTarget {
       case "pointerover":
       case "pointerout":
       case "click":
+      case "auxclick":
       case "contextmenu": {
         const payload = step.payload as DomDispatchPointerPayload;
         return new QuoxPointerEvent(

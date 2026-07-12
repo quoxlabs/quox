@@ -167,6 +167,7 @@ type QuoxBaseEventProps = {
   onScroll?: QuoxEventProp<QuoxJsxEvent>;
   onWheel?: QuoxEventProp<QuoxJsxWheelEvent>;
   onClick?: QuoxEventProp<QuoxJsxPointerEvent>;
+  onAuxClick?: QuoxEventProp<QuoxJsxPointerEvent>;
   onContextMenu?: QuoxEventProp<QuoxJsxPointerEvent>;
   onDoubleClick?: QuoxEventProp<QuoxJsxMouseEvent>;
   onDblClick?: QuoxEventProp<QuoxJsxMouseEvent>;

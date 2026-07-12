@@ -25,6 +25,7 @@ const EVENT_TYPE_TO_PROP = {
   scroll: "onScroll",
   wheel: "onWheel",
   click: "onClick",
+  auxclick: "onAuxClick",
   contextmenu: "onContextMenu",
   dblclick: "onDoubleClick",
   keypress: "onKeyPress",

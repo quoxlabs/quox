@@ -114,6 +114,7 @@ function payloadForType(type: DomDispatchEventType): Record<string, unknown> | u
     case "pointerover":
     case "pointerout":
     case "click":
+    case "auxclick":
     case "contextmenu":
       return pointerPayload();
     case "mousemove":
@@ -575,6 +576,7 @@ Deno.test("trusted staged payloads create browser-style event subclasses with ex
   const events = new Map<string, QuoxEvent>();
   const eventTypes: DomDispatchEventType[] = [
     "click",
+    "auxclick",
     "contextmenu",
     "dblclick",
     "wheel",
@@ -609,6 +611,12 @@ Deno.test("trusted staged payloads create browser-style event subclasses with ex
         detail: 3,
         pressure: 0.75,
       }),
+    },
+    {
+      type: "auxclick",
+      target: target.nodeId,
+      path: [target.nodeId],
+      payload: pointerPayload({ button: 1, buttons: 0, detail: 1 }),
     },
     {
       type: "contextmenu",
@@ -709,6 +717,9 @@ Deno.test("trusted staged payloads create browser-style event subclasses with ex
   assert(click.shiftKey);
   assert(click.altKey);
   assertStrictEquals(click.relatedTarget, related);
+  const auxClick = events.get("auxclick");
+  assert(auxClick instanceof QuoxPointerEvent);
+  assertEquals([auxClick.button, auxClick.buttons, auxClick.detail], [1, 0, 1]);
   assert(events.get("contextmenu") instanceof QuoxPointerEvent);
   assert(events.get("dblclick") instanceof QuoxMouseEvent);
   assert(!(events.get("dblclick") instanceof QuoxPointerEvent));

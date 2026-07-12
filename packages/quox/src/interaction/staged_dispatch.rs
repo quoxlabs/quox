@@ -146,6 +146,9 @@ struct EventMetadata {
     wheel: Option<NativeWheelMetadata>,
     key: Option<NativeKeyMetadata>,
     related_target: Option<GuardedNode>,
+    event_type_override: Option<&'static str>,
+    suppress_default: bool,
+    defer_click_target: bool,
 }
 
 impl EventMetadata {
@@ -158,6 +161,9 @@ impl EventMetadata {
             wheel: None,
             key: None,
             related_target: None,
+            event_type_override: None,
+            suppress_default: false,
+            defer_click_target: false,
         }
     }
 
@@ -170,6 +176,9 @@ impl EventMetadata {
             wheel: None,
             key: None,
             related_target: None,
+            event_type_override: None,
+            suppress_default: false,
+            defer_click_target: false,
         }
     }
 
@@ -193,6 +202,9 @@ impl EventMetadata {
             }),
             key: None,
             related_target: None,
+            event_type_override: None,
+            suppress_default: false,
+            defer_click_target: false,
         }
     }
 
@@ -205,6 +217,9 @@ impl EventMetadata {
             wheel: None,
             key: Some(key),
             related_target: None,
+            event_type_override: None,
+            suppress_default: false,
+            defer_click_target: false,
         }
     }
 
@@ -220,6 +235,14 @@ impl EventMetadata {
 
     fn with_pointer_release_click(mut self, release: Option<PointerReleaseClick>) -> Self {
         self.pointer_release_click = release;
+        self
+    }
+
+    fn into_auxclick(mut self) -> Self {
+        self.event_type_override = Some("auxclick");
+        // Blitz has no auxclick primitive. Reusing its Click default would run primary-button
+        // control activation and cannot express middle-click navigation in a new context.
+        self.suppress_default = true;
         self
     }
 
@@ -343,6 +366,7 @@ enum ResumeAction {
         pointer_fallback_default: Box<GuardedDomEvent>,
         mouse_data: Option<DomEventData>,
         suppressed_release_activation: Option<Box<DomEventData>>,
+        release_auxclick: Option<Box<DomEventData>>,
         pointer_cancellation_suppresses_default: bool,
         starts_compatibility_mouse: bool,
         suppress_compatibility_mouse: bool,
@@ -350,6 +374,7 @@ enum ResumeAction {
     PointerMouse {
         pointer_default: Box<GuardedDomEvent>,
         pointer_default_prevented: bool,
+        release_auxclick: Option<Box<DomEventData>>,
     },
 }
 
@@ -787,6 +812,7 @@ impl DispatchStack {
                 pointer_fallback_default,
                 mouse_data,
                 suppressed_release_activation,
+                release_auxclick,
                 pointer_cancellation_suppresses_default,
                 starts_compatibility_mouse,
                 suppress_compatibility_mouse,
@@ -826,9 +852,18 @@ impl DispatchStack {
                         ResumeAction::PointerMouse {
                             pointer_default,
                             pointer_default_prevented,
+                            release_auxclick,
                         },
                     );
                 }
+                let release_auxclick = release_auxclick.map(|data| {
+                    (
+                        pointer_default.default_target,
+                        pointer_default.target,
+                        *data,
+                        pointer_default.metadata.clone().into_auxclick(),
+                    )
+                });
                 let (pointer_default, pointer_default_prevented) = if suppress_mouse {
                     let prevented = cancelled
                         && !matches!(
@@ -848,28 +883,22 @@ impl DispatchStack {
                         pointer_default,
                     )?;
                 }
-                if let Some((default_target, author_target, data, metadata)) =
-                    suppressed_release_activation
-                    && let Some(event) = guard_event_with_targets(
-                        document,
-                        handles,
-                        default_target,
-                        author_target,
-                        data,
-                        metadata,
-                    )?
-                {
-                    self.frames
-                        .last_mut()
-                        .expect("pointer defaults run only for an active frame")
-                        .generated
-                        .push_back(event);
-                }
+                self.queue_generated_pointer_release(suppressed_release_activation);
+                self.queue_generated_pointer_release(release_auxclick);
             }
             ResumeAction::PointerMouse {
                 pointer_default,
                 pointer_default_prevented,
+                release_auxclick,
             } => {
+                let release_auxclick = release_auxclick.map(|data| {
+                    (
+                        pointer_default.default_target,
+                        pointer_default.target,
+                        *data,
+                        pointer_default.metadata.clone().into_auxclick(),
+                    )
+                });
                 if !cancelled && !pointer_default_prevented {
                     self.run_default(
                         document,
@@ -879,6 +908,7 @@ impl DispatchStack {
                         *pointer_default,
                     )?;
                 }
+                self.queue_generated_pointer_release(release_auxclick);
             }
         }
 
@@ -1022,7 +1052,24 @@ impl DispatchStack {
             };
             debug_assert!(frame.pending.is_none());
 
-            if let Some(event) = frame.generated.pop_front() {
+            if let Some(mut event) = frame.generated.pop_front() {
+                if event.metadata.defer_click_target {
+                    if !retarget_pointer_click(
+                        document,
+                        handles,
+                        &event.event.data,
+                        &event.metadata,
+                        &mut event.default_target,
+                        &mut event.target,
+                    )? {
+                        continue;
+                    }
+                    event.event.target = event.default_target.raw;
+                    event.metadata.defer_click_target = false;
+                    event.metadata = event
+                        .metadata
+                        .with_target_offset(document, event.target.raw);
+                }
                 if matches!(
                     &event.event.data,
                     DomEventData::Focus(_) | DomEventData::FocusIn(_)
@@ -1034,13 +1081,8 @@ impl DispatchStack {
                     continue;
                 }
                 if let Some(event) = freeze_event_path(document, handles, event)? {
-                    return self.stage(
-                        redraw,
-                        event,
-                        ResumeAction::Normal {
-                            suppress_default: false,
-                        },
-                    );
+                    let suppress_default = event.metadata.suppress_default;
+                    return self.stage(redraw, event, ResumeAction::Normal { suppress_default });
                 }
                 continue;
             }
@@ -1148,6 +1190,11 @@ impl DispatchStack {
                                 && release_press.is_some_and(|press| !press.dragged)
                         })
                         .map(Box::new);
+                    let release_auxclick = (data.is_mouse()
+                        && matches!(physical_flavor, PointerFlavor::Up)
+                        && !matches!(data.button, MouseEventButton::Main)
+                        && release_press.is_some_and(|press| !press.dragged))
+                    .then(|| Box::new(DomEventData::Click(data.clone())));
                     return self.stage(
                         redraw,
                         pointer_event.clone(),
@@ -1156,6 +1203,7 @@ impl DispatchStack {
                             pointer_fallback_default: Box::new(pointer_event),
                             mouse_data,
                             suppressed_release_activation,
+                            release_auxclick,
                             pointer_cancellation_suppresses_default: !chord_transition
                                 && !matches!(physical_flavor, PointerFlavor::Up),
                             starts_compatibility_mouse,
@@ -1231,7 +1279,11 @@ impl DispatchStack {
         let step = DispatchEventStep {
             frame_id: frame.id,
             event_id,
-            event_type: event.event.name().to_owned(),
+            event_type: event
+                .metadata
+                .event_type_override
+                .unwrap_or_else(|| event.event.name())
+                .to_owned(),
             target: event.target.handle,
             path: event.path.iter().map(|node| node.handle).collect(),
             bubbles: event.event.bubbles,
@@ -1247,6 +1299,28 @@ impl DispatchStack {
         });
         self.capture_redraw(redraw);
         Ok(DispatchStep::Event(step))
+    }
+
+    fn queue_generated_pointer_release(
+        &mut self,
+        release: Option<(GuardedRawNode, GuardedNode, DomEventData, EventMetadata)>,
+    ) {
+        let Some((default_target, author_target, data, metadata)) = release else {
+            return;
+        };
+        let mut metadata = metadata;
+        metadata.defer_click_target = true;
+        self.frames
+            .last_mut()
+            .expect("pointer releases run only for an active frame")
+            .generated
+            .push_back(GuardedDomEvent {
+                event: DomEvent::new(default_target.raw, data),
+                default_target,
+                target: author_target,
+                path: Vec::new(),
+                metadata,
+            });
     }
 
     fn run_default(
@@ -4560,6 +4634,236 @@ mod tests {
         });
         let (types, _, _) = drain(&mut context, up);
         assert!(!types.iter().any(|event_type| event_type == "click"));
+    }
+
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "the Pointer Events defaults and fixed mouse pointer id are exact constants"
+    )]
+    fn matched_non_primary_releases_emit_pointer_auxclick() {
+        for (button, mask, number) in [
+            (MouseEventButton::Auxiliary, MouseEventButtons::Auxiliary, 1),
+            (MouseEventButton::Secondary, MouseEventButtons::Secondary, 2),
+            (MouseEventButton::Fourth, MouseEventButtons::Fourth, 3),
+            (MouseEventButton::Fifth, MouseEventButtons::Fifth, 4),
+        ] {
+            let mut context = TestContext::new(
+                "<div id='target' style='display:block;width:100px;height:40px'></div>",
+            );
+            let target = context.element("target");
+            let (x, y) = context.center(target);
+            assert!(context.document.set_hover_to(x, y));
+            let down = context.begin(DispatchRequest::Pointer {
+                event: pointer(x, y, button, mask),
+                flavor: PointerFlavor::Down,
+                metadata: EventMetadata::native(),
+            });
+            let _ = drain(&mut context, down);
+
+            let mut step = context.begin(DispatchRequest::Pointer {
+                event: pointer(x, y, button, MouseEventButtons::None),
+                flavor: PointerFlavor::Up,
+                metadata: EventMetadata::native(),
+            });
+            let mut types = Vec::new();
+            let mut aux_payload = None;
+            while let DispatchStep::Event(current) = step {
+                types.push(current.event_type.clone());
+                if current.event_type == "auxclick" {
+                    let Some(DispatchEventPayload::Pointer(payload)) = current.payload.as_deref()
+                    else {
+                        panic!("auxclick should carry a pointer payload");
+                    };
+                    assert!(!payload.is_primary);
+                    assert_eq!(payload.pressure, 0.0);
+                    assert_eq!(payload.tangential_pressure, 0.0);
+                    assert_eq!(payload.tilt_x, 0);
+                    assert_eq!(payload.tilt_y, 0);
+                    assert_eq!(payload.twist, 0);
+                    assert_eq!(payload.altitude_angle, std::f64::consts::FRAC_PI_2);
+                    assert_eq!(payload.azimuth_angle, 0.0);
+                    assert_eq!(payload.persistent_device_id, 0);
+                    aux_payload = Some((
+                        context.handles.resolve(current.target),
+                        payload.mouse.button,
+                        payload.mouse.buttons,
+                    ));
+                }
+                step = context.resume(&current, false);
+            }
+            assert_eq!(aux_payload, Some((Some(target), number, 0)));
+            assert_eq!(
+                types
+                    .iter()
+                    .filter(|event_type| *event_type == "auxclick")
+                    .count(),
+                1
+            );
+            if matches!(button, MouseEventButton::Secondary) {
+                let context_index = types
+                    .iter()
+                    .position(|event_type| event_type == "contextmenu")
+                    .expect("secondary release should emit contextmenu");
+                let aux_index = types
+                    .iter()
+                    .position(|event_type| event_type == "auxclick")
+                    .expect("secondary release should emit auxclick");
+                assert!(context_index < aux_index);
+            }
+        }
+    }
+
+    #[test]
+    fn auxclick_survives_pointer_cancellation_but_not_a_drag() {
+        let mut context = TestContext::new(
+            "<div id='target' style='display:block;width:100px;height:40px'></div>",
+        );
+        let target = context.element("target");
+        let (x, y) = context.center(target);
+        assert!(context.document.set_hover_to(x, y));
+        let down = event(context.begin(DispatchRequest::Pointer {
+            event: pointer(
+                x,
+                y,
+                MouseEventButton::Auxiliary,
+                MouseEventButtons::Auxiliary,
+            ),
+            flavor: PointerFlavor::Down,
+            metadata: EventMetadata::native(),
+        }));
+        complete(context.resume(&down, true));
+        let up = context.begin(DispatchRequest::Pointer {
+            event: pointer(x, y, MouseEventButton::Auxiliary, MouseEventButtons::None),
+            flavor: PointerFlavor::Up,
+            metadata: EventMetadata::native(),
+        });
+        let (types, _, _) = drain(&mut context, up);
+        assert!(types.iter().any(|event_type| event_type == "auxclick"));
+
+        let down = context.begin(DispatchRequest::Pointer {
+            event: pointer(
+                x,
+                y,
+                MouseEventButton::Auxiliary,
+                MouseEventButtons::Auxiliary,
+            ),
+            flavor: PointerFlavor::Down,
+            metadata: EventMetadata::native(),
+        });
+        let _ = drain(&mut context, down);
+        let moved = context.begin(DispatchRequest::Pointer {
+            event: pointer(
+                x + 3.0,
+                y,
+                MouseEventButton::Auxiliary,
+                MouseEventButtons::Auxiliary,
+            ),
+            flavor: PointerFlavor::Move,
+            metadata: EventMetadata::native(),
+        });
+        let _ = drain(&mut context, moved);
+        let up = context.begin(DispatchRequest::Pointer {
+            event: pointer(
+                x + 3.0,
+                y,
+                MouseEventButton::Auxiliary,
+                MouseEventButtons::None,
+            ),
+            flavor: PointerFlavor::Up,
+            metadata: EventMetadata::native(),
+        });
+        let (types, _, _) = drain(&mut context, up);
+        assert!(!types.iter().any(|event_type| event_type == "auxclick"));
+    }
+
+    #[test]
+    fn auxclick_retargets_after_the_preceding_contextmenu_listener() {
+        let mut context = TestContext::new(
+            "<div id='old' style='display:flex;width:220px;height:60px'>\
+               <div id='down' style='width:100px;height:40px'></div>\
+               <div id='up' style='width:100px;height:40px'></div>\
+             </div>\
+             <div id='new'></div>",
+        );
+        let down_target = context.element("down");
+        let up_target = context.element("up");
+        let new_parent = context.element("new");
+        let (down_x, down_y) = context.center(down_target);
+        let (up_x, up_y) = context.center(up_target);
+        assert!(context.document.set_hover_to(down_x, down_y));
+        let down = context.begin(DispatchRequest::Pointer {
+            event: pointer(
+                down_x,
+                down_y,
+                MouseEventButton::Secondary,
+                MouseEventButtons::Secondary,
+            ),
+            flavor: PointerFlavor::Down,
+            metadata: EventMetadata::native(),
+        });
+        let _ = drain(&mut context, down);
+
+        let up = context.begin(DispatchRequest::Pointer {
+            event: pointer(
+                up_x,
+                up_y,
+                MouseEventButton::Secondary,
+                MouseEventButtons::None,
+            ),
+            flavor: PointerFlavor::Up,
+            metadata: EventMetadata::native(),
+        });
+        let contextmenu = next_event_of_type(&mut context, up, "contextmenu");
+        {
+            let mut mutator = context.document.mutate();
+            mutator.remove_node(down_target);
+            mutator.remove_node(up_target);
+            mutator.append_children(new_parent, &[down_target, up_target]);
+        }
+        let mut step = context.resume(&contextmenu, false);
+        let mut aux_target = None;
+        while let DispatchStep::Event(current) = step {
+            if current.event_type == "auxclick" {
+                aux_target = context.handles.resolve(current.target);
+            }
+            step = context.resume(&current, false);
+        }
+        assert_eq!(aux_target, Some(new_parent));
+    }
+
+    #[test]
+    fn auxclick_does_not_reuse_primary_control_activation() {
+        let mut context =
+            TestContext::new("<input id='box' type='checkbox' style='width:24px;height:24px'>");
+        let checkbox = context.element("box");
+        let (x, y) = context.center(checkbox);
+        assert!(context.document.set_hover_to(x, y));
+        let down = context.begin(DispatchRequest::Pointer {
+            event: pointer(
+                x,
+                y,
+                MouseEventButton::Auxiliary,
+                MouseEventButtons::Auxiliary,
+            ),
+            flavor: PointerFlavor::Down,
+            metadata: EventMetadata::native(),
+        });
+        let _ = drain(&mut context, down);
+        let up = context.begin(DispatchRequest::Pointer {
+            event: pointer(x, y, MouseEventButton::Auxiliary, MouseEventButtons::None),
+            flavor: PointerFlavor::Up,
+            metadata: EventMetadata::native(),
+        });
+        let (types, _, _) = drain(&mut context, up);
+
+        assert!(types.iter().any(|event_type| event_type == "auxclick"));
+        assert!(
+            !context
+                .checked_controls
+                .checked(&mut context.document, checkbox)
+                .expect("checkbox should expose checkedness")
+        );
     }
 
     #[test]

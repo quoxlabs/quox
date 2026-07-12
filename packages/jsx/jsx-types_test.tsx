@@ -43,6 +43,7 @@ type ExpectedBaseEventProp =
   | "onScroll"
   | "onWheel"
   | "onClick"
+  | "onAuxClick"
   | "onContextMenu"
   | "onDoubleClick"
   | "onDblClick"
@@ -84,6 +85,7 @@ const supportedEvents = (
     onPointerMoveCapture={(event) => expectType<QuoxJsxPointerEvent>(event)}
     onMouseUp={(event) => expectType<QuoxJsxMouseEvent>(event)}
     onWheelCapture={(event) => expectType<QuoxJsxWheelEvent>(event)}
+    onAuxClick={(event) => expectType<QuoxJsxPointerEvent>(event)}
     onKeyDown={(event) => expectType<QuoxJsxKeyboardEvent>(event)}
     onInput={(event) => expectType<QuoxJsxInputEvent>(event)}
     onFocusOutCapture={(event) => expectType<QuoxJsxFocusEvent>(event)}
@@ -111,7 +113,6 @@ const broadAttributeSurface = (
     </svg>
   </main>
 );
-const runtimeValidatedAuxClick = <div onAuxClick={() => {}} />;
 const runtimeValidatedBeforeInput = <input onBeforeInput={() => {}} />;
 const runtimeValidatedMadeUpEvent = <div onMadeUp={() => {}} />;
 // @ts-expect-error Supported event props still reject non-handler truthy values.
@@ -141,7 +142,6 @@ Deno.test("JSX event props retain runtime vnodes", () => {
   assertEquals(isQuoxVNode(supportedEvents), true);
   assertEquals(isQuoxVNode(wrongPayload), true);
   assertEquals(isQuoxVNode(broadAttributeSurface), true);
-  assertEquals(isQuoxVNode(runtimeValidatedAuxClick), true);
   assertEquals(isQuoxVNode(runtimeValidatedBeforeInput), true);
   assertEquals(isQuoxVNode(runtimeValidatedMadeUpEvent), true);
   assertEquals(isQuoxVNode(invalidTruthyHandler), true);
