@@ -30,6 +30,7 @@ const KEY_MOD_CONTROL: u32 = super::KEY_MOD_CONTROL;
 const KEY_MOD_META: u32 = super::KEY_MOD_META;
 const KEY_MOD_SHIFT: u32 = super::KEY_MOD_SHIFT;
 const POINTER_MOD_KNOWN: u32 = super::POINTER_MOD_KNOWN;
+const WHEEL_TRANSACTION_TIMEOUT_MS: f64 = 1_500.0;
 
 /// One paused host dispatch. Frames form a stack because an event listener may synchronously
 /// start another trusted event before it resumes the event which invoked it.
@@ -37,6 +38,14 @@ pub(crate) struct DispatchStack {
     frames: Vec<DispatchFrame>,
     next_frame_id: Option<u32>,
     next_event_id: Option<u32>,
+    wheel_transaction: Option<WheelTransaction>,
+}
+
+#[derive(Clone, Copy)]
+struct WheelTransaction {
+    default_target: GuardedRawNode,
+    author_target: GuardedNode,
+    last_time_stamp: f64,
 }
 
 struct DispatchFrame {
@@ -594,11 +603,16 @@ impl Default for DispatchStack {
             frames: Vec::new(),
             next_frame_id: Some(1),
             next_event_id: Some(1),
+            wheel_transaction: None,
         }
     }
 }
 
 impl DispatchStack {
+    pub(crate) fn end_wheel_transaction(&mut self) {
+        self.wheel_transaction = None;
+    }
+
     fn allocate_frame_id(&mut self) -> Result<u32, DispatchError> {
         let id = self
             .next_frame_id
@@ -781,6 +795,7 @@ impl DispatchStack {
         handles: &mut NodeHandles,
         request: DispatchRequest,
     ) -> Result<(), DispatchError> {
+        let wheel_transaction = &mut self.wheel_transaction;
         let planned = &mut self
             .frames
             .last_mut()
@@ -794,6 +809,7 @@ impl DispatchStack {
                 flavor,
                 metadata,
             } => {
+                end_wheel_transaction_for_pointer_down(wheel_transaction, flavor);
                 plan_pointer(document, handles, planned, &event, flavor, metadata)?;
             }
             DispatchRequest::Wheel {
@@ -801,14 +817,15 @@ impl DispatchStack {
                 metadata,
                 occurrence_target,
             } => {
-                let (default_target, author_target) =
-                    guarded_hit_target_or_root(document, handles, occurrence_target)?;
-                planned.push_back(PlannedWork::Wheel {
-                    default_target,
-                    author_target,
-                    data: event,
+                plan_wheel(
+                    document,
+                    handles,
+                    planned,
+                    wheel_transaction,
+                    event,
                     metadata,
-                });
+                    occurrence_target,
+                )?;
             }
             DispatchRequest::Key {
                 event,
@@ -842,26 +859,7 @@ impl DispatchStack {
                     metadata: EventMetadata::native(),
                 });
             }
-            DispatchRequest::ImeCommit(text) => {
-                let time_stamp = event_time_stamp();
-                let metadata = EventMetadata {
-                    time_stamp,
-                    pointer: None,
-                    wheel: None,
-                    key: None,
-                    related_target: None,
-                };
-                planned.push_back(PlannedWork::DefaultOnly {
-                    target: PlannedTarget::Focused,
-                    data: DomEventData::Ime(BlitzImeEvent::Preedit(String::new(), None)),
-                    metadata: metadata.clone(),
-                });
-                planned.push_back(PlannedWork::DefaultOnly {
-                    target: PlannedTarget::Focused,
-                    data: DomEventData::Ime(BlitzImeEvent::Commit(text)),
-                    metadata,
-                });
-            }
+            DispatchRequest::ImeCommit(text) => plan_ime_commit(planned, text),
             DispatchRequest::AppleStandardKeybinding(command) => {
                 let target =
                     guarded_target_or_root(document, handles, document.get_focussed_node_id())?;
@@ -1220,6 +1218,7 @@ impl DispatchStack {
                 document.unactive_node();
             }
             DispatchAction::ClearHover => {
+                self.wheel_transaction = None;
                 document.clear_hover();
             }
             DispatchAction::LoseFocus {
@@ -1368,6 +1367,20 @@ fn plan_programmatic_focus(
         metadata,
     }));
     Ok(())
+}
+
+fn plan_ime_commit(planned: &mut VecDeque<PlannedWork>, text: String) {
+    let metadata = EventMetadata::native();
+    planned.push_back(PlannedWork::DefaultOnly {
+        target: PlannedTarget::Focused,
+        data: DomEventData::Ime(BlitzImeEvent::Preedit(String::new(), None)),
+        metadata: metadata.clone(),
+    });
+    planned.push_back(PlannedWork::DefaultOnly {
+        target: PlannedTarget::Focused,
+        data: DomEventData::Ime(BlitzImeEvent::Commit(text)),
+        metadata,
+    });
 }
 
 fn plan_programmatic_blur(
@@ -1930,6 +1943,76 @@ fn guarded_hit_target_or_root(
 
     let root = guarded_target_or_root(document, handles, None)?;
     Ok((GuardedRawNode::from_public(root), root))
+}
+
+fn plan_wheel(
+    document: &BaseDocument,
+    handles: &mut NodeHandles,
+    planned: &mut VecDeque<PlannedWork>,
+    transaction: &mut Option<WheelTransaction>,
+    event: BlitzWheelEvent,
+    metadata: EventMetadata,
+    occurrence_target: Option<usize>,
+) -> Result<(), DispatchError> {
+    let (default_target, author_target) = wheel_transaction_targets(
+        document,
+        handles,
+        transaction,
+        occurrence_target,
+        metadata.time_stamp,
+    )?;
+    planned.push_back(PlannedWork::Wheel {
+        default_target,
+        author_target,
+        data: event,
+        metadata,
+    });
+    Ok(())
+}
+
+fn end_wheel_transaction_for_pointer_down(
+    transaction: &mut Option<WheelTransaction>,
+    flavor: PointerFlavor,
+) {
+    if matches!(flavor, PointerFlavor::Down) {
+        *transaction = None;
+    }
+}
+
+fn wheel_transaction_targets(
+    document: &BaseDocument,
+    handles: &mut NodeHandles,
+    transaction: &mut Option<WheelTransaction>,
+    occurrence_target: Option<usize>,
+    time_stamp: f64,
+) -> Result<(GuardedRawNode, GuardedNode), DispatchError> {
+    let retained = transaction.and_then(|transaction| {
+        let elapsed = time_stamp - transaction.last_time_stamp;
+        ((0.0..=WHEEL_TRANSACTION_TIMEOUT_MS).contains(&elapsed)
+            && node_is_live(transaction.author_target, document, handles))
+        .then(|| {
+            let default_target = if raw_node_is_live(transaction.default_target, document, handles)
+                && pointer_author_target_id(document, transaction.default_target.raw)
+                    == Some(transaction.author_target.raw)
+            {
+                transaction.default_target
+            } else {
+                GuardedRawNode::from_public(transaction.author_target)
+            };
+            (default_target, transaction.author_target)
+        })
+    });
+    let (default_target, author_target) = if let Some(retained) = retained {
+        retained
+    } else {
+        guarded_hit_target_or_root(document, handles, occurrence_target)?
+    };
+    *transaction = Some(WheelTransaction {
+        default_target,
+        author_target,
+        last_time_stamp: time_stamp,
+    });
+    Ok((default_target, author_target))
 }
 
 fn guard_node(
@@ -3206,6 +3289,10 @@ mod tests {
         }
 
         fn begin_trusted_wheel(&mut self, x: f32, y: f32) -> DispatchStep {
+            self.begin_trusted_wheel_at(x, y, event_time_stamp())
+        }
+
+        fn begin_trusted_wheel_at(&mut self, x: f32, y: f32, time_stamp: f64) -> DispatchStep {
             let request = ResolvedInputLayout::new(
                 &mut self.document,
                 &mut self.text_controls,
@@ -3229,7 +3316,7 @@ mod tests {
                 delta_mode: 1,
                 buttons: MouseEventButtons::None,
                 modifier_bits: 0,
-                time_stamp: event_time_stamp(),
+                time_stamp,
             });
             self.begin(request)
         }
@@ -3711,6 +3798,266 @@ mod tests {
                 < f64::EPSILON
         );
         assert_eq!(context.document.get_hover_node_id(), Some(left_target));
+    }
+
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "native coordinates and integral line-scroll defaults are copied exactly"
+    )]
+    fn wheel_transaction_retains_its_first_target_until_the_idle_timeout() {
+        let mut context = TestContext::new(
+            "<div id='left' style='position:absolute;left:0;top:0;overflow:auto;width:120px;height:60px'>\
+               <div id='left-target' style='height:300px'></div>\
+             </div>\
+             <div id='right' style='position:absolute;left:200px;top:0;overflow:auto;width:120px;height:60px'>\
+               <div id='right-target' style='height:300px'></div>\
+             </div>",
+        );
+        let left = context.element("left");
+        let left_target = context.element("left-target");
+        let right = context.element("right");
+        let right_target = context.element("right-target");
+        let left_point = context
+            .point_hitting(left_target)
+            .expect("left target should be hittable");
+        let right_point = context
+            .point_hitting(right_target)
+            .expect("right target should be hittable");
+
+        let first = event(context.begin_trusted_wheel_at(left_point.0, left_point.1, 100.0));
+        assert_eq!(context.handles.resolve(first.target), Some(left_target));
+        let resumed = context.resume(&first, false);
+        let _ = drain(&mut context, resumed);
+
+        let second = event(context.begin_trusted_wheel_at(right_point.0, right_point.1, 200.0));
+        assert_eq!(context.handles.resolve(second.target), Some(left_target));
+        let Some(DispatchEventPayload::Wheel(payload)) = second.payload.as_deref() else {
+            panic!("wheel should carry its occurrence coordinates");
+        };
+        assert_eq!(payload.mouse.client_x, f64::from(right_point.0));
+        assert_eq!(payload.mouse.client_y, f64::from(right_point.1));
+        let resumed = context.resume(&second, false);
+        let _ = drain(&mut context, resumed);
+
+        assert_eq!(
+            context
+                .document
+                .get_node(left)
+                .expect("left scroller should exist")
+                .scroll_offset
+                .y,
+            40.0
+        );
+        assert_eq!(
+            context
+                .document
+                .get_node(right)
+                .expect("right scroller should exist")
+                .scroll_offset
+                .y,
+            0.0
+        );
+
+        let after_timeout = event(context.begin_trusted_wheel_at(
+            right_point.0,
+            right_point.1,
+            200.0 + WHEEL_TRANSACTION_TIMEOUT_MS + 1.0,
+        ));
+        assert_eq!(
+            context.handles.resolve(after_timeout.target),
+            Some(right_target)
+        );
+        let resumed = context.resume(&after_timeout, false);
+        let _ = drain(&mut context, resumed);
+        assert_eq!(
+            context
+                .document
+                .get_node(right)
+                .expect("right scroller should exist")
+                .scroll_offset
+                .y,
+            20.0
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "integral line-scroll defaults and canceled zero offsets are exact"
+    )]
+    fn cancelled_wheel_keeps_its_transaction_without_running_a_default() {
+        let mut context = TestContext::new(
+            "<div id='left' style='position:absolute;left:0;top:0;overflow:auto;width:120px;height:60px'>\
+               <div id='left-target' style='height:300px'></div>\
+             </div>\
+             <div id='right' style='position:absolute;left:200px;top:0;overflow:auto;width:120px;height:60px'>\
+               <div id='right-target' style='height:300px'></div>\
+             </div>",
+        );
+        let left = context.element("left");
+        let left_target = context.element("left-target");
+        let right = context.element("right");
+        let right_target = context.element("right-target");
+        let left_point = context
+            .point_hitting(left_target)
+            .expect("left target should be hittable");
+        let right_point = context
+            .point_hitting(right_target)
+            .expect("right target should be hittable");
+
+        let cancelled = event(context.begin_trusted_wheel_at(left_point.0, left_point.1, 100.0));
+        let resumed = context.resume(&cancelled, true);
+        let (generated, _, _) = drain(&mut context, resumed);
+        assert!(generated.is_empty());
+        assert_eq!(context.document.viewport_scroll().y, 0.0);
+        assert_eq!(
+            context
+                .document
+                .get_node(left)
+                .expect("left scroller should exist")
+                .scroll_offset
+                .y,
+            0.0
+        );
+
+        let retained = event(context.begin_trusted_wheel_at(right_point.0, right_point.1, 200.0));
+        assert_eq!(context.handles.resolve(retained.target), Some(left_target));
+        let resumed = context.resume(&retained, false);
+        let _ = drain(&mut context, resumed);
+        assert_eq!(
+            context
+                .document
+                .get_node(left)
+                .expect("left scroller should exist")
+                .scroll_offset
+                .y,
+            20.0
+        );
+        assert_eq!(
+            context
+                .document
+                .get_node(right)
+                .expect("right scroller should exist")
+                .scroll_offset
+                .y,
+            0.0
+        );
+
+        let stale_handle = context
+            .handles
+            .invalidate_node(left_target)
+            .expect("the transaction target should have a public handle");
+        context.document.mutate().remove_and_drop_node(left_target);
+        assert_eq!(context.handles.resolve(stale_handle), None);
+        let replacement =
+            event(context.begin_trusted_wheel_at(right_point.0, right_point.1, 300.0));
+        assert_eq!(
+            context.handles.resolve(replacement.target),
+            Some(right_target)
+        );
+        let resumed = context.resume(&replacement, false);
+        let _ = drain(&mut context, resumed);
+        assert_eq!(
+            context
+                .document
+                .get_node(right)
+                .expect("right scroller should exist")
+                .scroll_offset
+                .y,
+            20.0
+        );
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp, reason = "integral line-scroll defaults are exact")]
+    fn wheel_transaction_keeps_its_element_when_the_raw_hit_moves() {
+        let mut context = TestContext::new(
+            "<div id='left' style='position:absolute;left:0;top:0;overflow:auto;width:120px;height:60px'>\
+               <div id='left-target' style='height:300px'>wheel text</div>\
+             </div>\
+             <div id='right' style='position:absolute;left:200px;top:0;overflow:auto;width:120px;height:60px'>\
+               <div id='right-target' style='height:300px'></div>\
+             </div>",
+        );
+        let left = context.element("left");
+        let left_target = context.element("left-target");
+        let right = context.element("right");
+        let right_target = context.element("right-target");
+        let text = context.text_child(left_target);
+        let left_point = context
+            .glyph_points_targeting(left_target)
+            .into_iter()
+            .next()
+            .expect("left text should be hittable");
+        let right_point = context
+            .point_hitting(right_target)
+            .expect("right target should be hittable");
+
+        let first = event(context.begin_trusted_wheel_at(left_point.0, left_point.1, 100.0));
+        assert_eq!(context.handles.resolve(first.target), Some(left_target));
+        let resumed = context.resume(&first, false);
+        let _ = drain(&mut context, resumed);
+
+        {
+            let mut mutator = context.document.mutate();
+            mutator.remove_node(text);
+            mutator.append_children(right_target, &[text]);
+        }
+        let second = event(context.begin_trusted_wheel_at(right_point.0, right_point.1, 200.0));
+        assert_eq!(context.handles.resolve(second.target), Some(left_target));
+        let resumed = context.resume(&second, false);
+        let _ = drain(&mut context, resumed);
+
+        assert_eq!(
+            context
+                .document
+                .get_node(left)
+                .expect("left scroller should exist")
+                .scroll_offset
+                .y,
+            40.0
+        );
+        assert_eq!(
+            context
+                .document
+                .get_node(right)
+                .expect("right scroller should exist")
+                .scroll_offset
+                .y,
+            0.0
+        );
+    }
+
+    #[test]
+    fn pointer_down_ends_the_active_wheel_transaction() {
+        let mut context = TestContext::new(
+            "<div id='left' style='position:absolute;left:0;top:0;width:120px;height:60px'></div>\
+             <div id='right' style='position:absolute;left:200px;top:0;width:120px;height:60px'></div>",
+        );
+        let left = context.element("left");
+        let right = context.element("right");
+        let left_point = context.center(left);
+        let right_point = context.center(right);
+
+        let first = event(context.begin_trusted_wheel_at(left_point.0, left_point.1, 100.0));
+        assert_eq!(context.handles.resolve(first.target), Some(left));
+        let resumed = context.resume(&first, true);
+        let _ = drain(&mut context, resumed);
+
+        let pointer_down = context.begin_trusted_pointer(
+            right_point.0,
+            right_point.1,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            PointerFlavor::Down,
+        );
+        let _ = drain(&mut context, pointer_down);
+
+        let next = event(context.begin_trusted_wheel_at(right_point.0, right_point.1, 120.0));
+        assert_eq!(context.handles.resolve(next.target), Some(right));
+        let resumed = context.resume(&next, true);
+        let _ = drain(&mut context, resumed);
     }
 
     #[test]

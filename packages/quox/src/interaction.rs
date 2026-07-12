@@ -358,6 +358,7 @@ impl QuoxRenderer {
     pub fn clear_hover(&self) -> bool {
         let mut state = self.state.borrow_mut();
         state.document.clear_hover();
+        state.dispatch_stack.end_wheel_transaction();
         state.redraw_requested.swap(false, Ordering::Relaxed)
     }
 }
