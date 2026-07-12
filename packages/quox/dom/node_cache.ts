@@ -62,6 +62,11 @@ export class QuoxNodeCache {
   invalidate(nodeHandles: Iterable<number>): void {
     for (const nodeHandle of nodeHandles) this.#nodes.delete(nodeHandle);
   }
+
+  /** Whether a retained wrapper still has a live Rust node behind its stable handle. */
+  isCurrent(node: QuoxNode): boolean {
+    return this.#nodes.get(node.nodeId) === node;
+  }
 }
 
 function createElementWrapper(

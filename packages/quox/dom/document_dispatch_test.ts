@@ -158,6 +158,7 @@ class FakeDispatchRenderer {
   resumeError: unknown;
   abortError: unknown;
   abortRedrawRequested = false;
+  documentElementHandle = 0;
 
   title(): string {
     return "";
@@ -173,6 +174,10 @@ class FakeDispatchRenderer {
     const id = this.#nextNodeId++;
     this.#nodeKinds.set(id, 3);
     return id;
+  }
+
+  document_element(): number {
+    return this.documentElementHandle;
   }
 
   node_kind(nodeHandle: number): number {
@@ -636,6 +641,8 @@ Deno.test("trusted staged payloads create browser-style event subclasses with ex
   ]);
 
   document.dispatchPointerMove(1, 2, 0, 0);
+  assertEquals(events.get("scroll"), undefined);
+  document.flushPendingScrollEvents();
 
   const click = events.get("click");
   assert(click instanceof QuoxPointerEvent);
@@ -714,6 +721,135 @@ Deno.test("trusted staged payloads create browser-style event subclasses with ex
   assert(scroll instanceof QuoxEvent);
   assert(!(scroll instanceof QuoxFocusEvent));
   assert(!(scroll instanceof QuoxMouseEvent));
+});
+
+Deno.test("scroll events wait for rendering, coalesce targets, and use browser paths", () => {
+  const { document, renderer, window, renders } = createHarness();
+  const root = document.createElement("main");
+  const outer = document.createElement("section");
+  const inner = document.createElement("div");
+  renderer.documentElementHandle = root.nodeId;
+  renderer.syntheticEventPaths.set(inner.nodeId, Uint32Array.of(inner.nodeId, outer.nodeId, root.nodeId, 0));
+  renderer.syntheticEventPaths.set(outer.nodeId, Uint32Array.of(outer.nodeId, root.nodeId, 0));
+
+  const name = (target: unknown): string =>
+    target === inner ? "inner" : target === outer ? "outer" : target === document ? "document" : "unexpected";
+  const calls: string[] = [];
+  const record = (label: string) => (event: QuoxEvent) => {
+    assert(event.isTrusted);
+    assertFalse(event.cancelable);
+    assertFalse(event.composed);
+    calls.push(`${label}:${name(event.target)}`);
+  };
+
+  window.addEventListener("scroll", record("window capture"), true);
+  window.addEventListener("scroll", record("window bubble"));
+  document.addEventListener("scroll", record("document capture"), true);
+  document.addEventListener("scroll", record("document bubble"));
+  root.addEventListener("scroll", record("root capture"), true);
+  root.addEventListener("scroll", record("root bubble"));
+  outer.addEventListener("scroll", record("outer capture"), true);
+  outer.addEventListener("scroll", record("outer bubble"));
+  inner.addEventListener("scroll", record("inner target"));
+
+  renderer.queueFrame([
+    { type: "scroll", target: inner.nodeId, path: [inner.nodeId, outer.nodeId, root.nodeId] },
+    { type: "scroll", target: outer.nodeId, path: [outer.nodeId, root.nodeId] },
+    { type: "scroll", target: inner.nodeId, path: [inner.nodeId, outer.nodeId, root.nodeId] },
+    { type: "scroll", target: root.nodeId, path: [root.nodeId] },
+  ], true);
+  document.dispatchPointerMove(1, 2, 0, 0);
+
+  assertEquals(calls, []);
+  assertEquals(renders, ["render"]);
+  document.flushPendingScrollEvents();
+  assertEquals(calls, [
+    "window capture:inner",
+    "document capture:inner",
+    "root capture:inner",
+    "outer capture:inner",
+    "inner target:inner",
+    "window capture:outer",
+    "document capture:outer",
+    "root capture:outer",
+    "outer capture:outer",
+    "outer bubble:outer",
+    "window capture:document",
+    "document capture:document",
+    "document bubble:document",
+    "window bubble:document",
+  ]);
+
+  calls.length = 0;
+  inner.addEventListener("scroll", () => {
+    renderer.queueFrame([
+      { type: "scroll", target: outer.nodeId, path: [outer.nodeId, root.nodeId] },
+      { type: "scroll", target: inner.nodeId, path: [inner.nodeId, outer.nodeId, root.nodeId] },
+    ]);
+    document.dispatchPointerMove(3, 4, 0, 0);
+  }, { once: true });
+  renderer.queueFrame([
+    { type: "scroll", target: inner.nodeId, path: [inner.nodeId, outer.nodeId, root.nodeId] },
+  ]);
+  document.dispatchPointerMove(1, 2, 0, 0);
+  document.flushPendingScrollEvents();
+  assertEquals(calls, [
+    "window capture:inner",
+    "document capture:inner",
+    "root capture:inner",
+    "outer capture:inner",
+    "inner target:inner",
+    "window capture:outer",
+    "document capture:outer",
+    "root capture:outer",
+    "outer capture:outer",
+    "outer bubble:outer",
+  ]);
+
+  calls.length = 0;
+  document.flushPendingScrollEvents();
+  assertEquals(calls, []);
+});
+
+Deno.test("scroll flushing stops cleanly when a listener deactivates the document", () => {
+  const renderer = new FakeDispatchRenderer();
+  const window = new QuoxEventTarget();
+  let active = true;
+  let idleCount = 0;
+  const document = new QuoxDocument(
+    renderer as unknown as WasmRenderer,
+    () => undefined,
+    () => {
+      if (!active) throw new Error("window is not active");
+    },
+    undefined,
+    undefined,
+    window,
+    () => idleCount++,
+    () => active,
+  );
+  const first = document.createElement("div");
+  const second = document.createElement("div");
+  renderer.syntheticEventPaths.set(first.nodeId, Uint32Array.of(first.nodeId, 0));
+  renderer.syntheticEventPaths.set(second.nodeId, Uint32Array.of(second.nodeId, 0));
+  const calls: string[] = [];
+  first.addEventListener("scroll", () => {
+    calls.push("first");
+    assert(documentHasActiveDispatch(document));
+    active = false;
+  });
+  second.addEventListener("scroll", () => calls.push("second"));
+  renderer.queueFrame([
+    { type: "scroll", target: first.nodeId, path: [first.nodeId] },
+    { type: "scroll", target: second.nodeId, path: [second.nodeId] },
+  ]);
+
+  document.dispatchPointerMove(1, 2, 0, 0);
+  assertEquals(idleCount, 1);
+  document.flushPendingScrollEvents();
+  assertEquals(calls, ["first"]);
+  assertEquals(idleCount, 2);
+  assertFalse(documentHasActiveDispatch(document));
 });
 
 Deno.test("pointer detail stays within the signed DOM UIEvent range", () => {
@@ -984,6 +1120,23 @@ Deno.test("fatal bridge failures resume prevented, abort, and preserve cleanup e
 
   const error = assertThrows(() => document.dispatchPointerMove(1, 2, 0, 0), AggregateError);
   assertEquals(error.errors, [pathError, resumeError, abortError]);
+  assertEquals(
+    renderer.calls.filter(([method]) => method === "resume" || method === "abort").map((call) => call[0]),
+    ["resume", "abort"],
+  );
+  assertEquals(renderer.calls.find(([method]) => method === "resume")?.slice(3), [true]);
+});
+
+Deno.test("scroll target failures resume and abort their staged frame", () => {
+  const { document, renderer } = createHarness();
+  const target = document.createElement("div");
+  const targetError = new Error("scroll target resolution failed");
+  renderer.nodeKindError = targetError;
+  const unknownTarget = target.nodeId + 100;
+  renderer.queueFrame([{ type: "scroll", target: unknownTarget, path: [unknownTarget] }]);
+
+  const error = assertThrows(() => document.dispatchPointerMove(1, 2, 0, 0));
+  assertStrictEquals(error, targetError);
   assertEquals(
     renderer.calls.filter(([method]) => method === "resume" || method === "abort").map((call) => call[0]),
     ["resume", "abort"],

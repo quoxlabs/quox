@@ -18,7 +18,7 @@ import {
 import { runWithImeSynchronization } from "./ime_requests.ts";
 import { type AssertActive, attachDocumentInternals, type RequestRender } from "./internals.ts";
 import { ELEMENT_NODE, GENERIC_ELEMENT_INTERFACE, QuoxNodeCache, TEXT_NODE } from "./node_cache.ts";
-import type { QuoxElement, QuoxInputElement, QuoxNode, QuoxText, QuoxTextAreaElement } from "./node.ts";
+import { QuoxElement, type QuoxInputElement, type QuoxNode, type QuoxText, type QuoxTextAreaElement } from "./node.ts";
 import {
   type DomDispatchEventStep,
   type DomDispatchFocusPayload,
@@ -44,6 +44,7 @@ import {
 
 type SetNativeTitle = (title: string) => void;
 type SyncNativeImeRequests = () => void;
+type IsActive = () => boolean;
 type NodeKindRenderer = WasmRenderer & { node_kind(nodeHandle: number): number };
 type SyntheticEventPathRenderer = WasmRenderer & {
   synthetic_event_path(nodeHandle: number): Uint32Array;
@@ -76,7 +77,10 @@ export class QuoxDocument extends QuoxEventTarget {
   readonly #syncNativeImeRequests: SyncNativeImeRequests;
   readonly #defaultView: QuoxEventTarget | null;
   readonly #onDispatchIdle: () => void;
+  readonly #isActive: IsActive;
   readonly #nodes: QuoxNodeCache;
+  #pendingScrollTargets: QuoxEventTarget[] = [];
+  #pendingScrollTargetSet = new Set<QuoxEventTarget>();
   #lastNativeTitle: string;
   #dispatchDepth = 0;
 
@@ -88,6 +92,7 @@ export class QuoxDocument extends QuoxEventTarget {
     syncNativeImeRequests: SyncNativeImeRequests = () => undefined,
     defaultView: QuoxEventTarget | null = null,
     onDispatchIdle: () => void = () => undefined,
+    isActive?: IsActive,
   ) {
     super();
     this.#renderer = renderer;
@@ -98,6 +103,14 @@ export class QuoxDocument extends QuoxEventTarget {
     this.#syncNativeImeRequests = syncNativeImeRequests;
     this.#defaultView = defaultView;
     this.#onDispatchIdle = onDispatchIdle;
+    this.#isActive = isActive ?? (() => {
+      try {
+        assertActive();
+        return true;
+      } catch {
+        return false;
+      }
+    });
     this.#nodes = new QuoxNodeCache(this);
     this.#lastNativeTitle = renderer.title();
     attachDocumentInternals(this, {
@@ -152,6 +165,51 @@ export class QuoxDocument extends QuoxEventTarget {
       this.#lastNativeTitle = title;
       this.#setNativeTitle(title);
     }
+  }
+
+  /** Dispatch CSSOM View's coalesced scroll list at the next rendering opportunity. */
+  flushPendingScrollEvents(): void {
+    this.#assertActive();
+    if (this.#pendingScrollTargets.length === 0) return;
+    this.#dispatchDepth += 1;
+    let failed = false;
+    let failure: unknown;
+    let idleFailed = false;
+    let idleFailure: unknown;
+    try {
+      for (let index = 0; index < this.#pendingScrollTargets.length; index += 1) {
+        if (!this.#isActive()) break;
+        const target = this.#pendingScrollTargets[index];
+        const event = new QuoxEvent("scroll", { bubbles: target === this });
+        const path = target === this || this.#nodes.isCurrent(target as QuoxNode)
+          ? Array.from(target[eventTargetPath](event))
+          : [target];
+        this.#dispatchTrustedEventOnPath(event, target, path, performance.now());
+      }
+    } catch (error) {
+      failed = true;
+      failure = error;
+    } finally {
+      this.#pendingScrollTargets = [];
+      this.#pendingScrollTargetSet = new Set();
+      this.#dispatchDepth -= 1;
+      if (this.#dispatchDepth === 0) {
+        try {
+          this.#onDispatchIdle();
+        } catch (error) {
+          idleFailed = true;
+          idleFailure = error;
+        }
+      }
+    }
+    if (failed && idleFailed) {
+      throw new AggregateError(
+        [failure, idleFailure],
+        "Quox scroll dispatch and dispatch cleanup both failed",
+      );
+    }
+    if (failed) throw failure;
+    if (idleFailed) throw idleFailure;
   }
 
   get documentElement(): QuoxElement {
@@ -424,10 +482,19 @@ export class QuoxDocument extends QuoxEventTarget {
       }
 
       let defaultPrevented: boolean;
-      try {
-        defaultPrevented = this.#dispatchTrustedEvent(step);
-      } catch (error) {
-        this.#resumePreventedThenAbort(step, error);
+      if (step.type === "scroll") {
+        try {
+          this.#queuePendingScrollTarget(step.target);
+        } catch (error) {
+          this.#resumePreventedThenAbort(step, error);
+        }
+        defaultPrevented = false;
+      } else {
+        try {
+          defaultPrevented = this.#dispatchTrustedEvent(step);
+        } catch (error) {
+          this.#resumePreventedThenAbort(step, error);
+        }
       }
 
       try {
@@ -447,8 +514,17 @@ export class QuoxDocument extends QuoxEventTarget {
 
     const target = path[0];
     const event = this.#createTrustedEvent(step);
+    return this.#dispatchTrustedEventOnPath(event, target, path, step.timeStamp);
+  }
+
+  #dispatchTrustedEventOnPath(
+    event: QuoxEvent,
+    target: QuoxEventTarget,
+    path: readonly QuoxEventTarget[],
+    timeStamp: number,
+  ): boolean {
     const dispatch = event[eventDispatchInternals];
-    dispatch.begin(target, path, true, step.timeStamp);
+    dispatch.begin(target, path, true, timeStamp);
     try {
       for (let index = path.length - 1; index > 0; index -= 1) {
         path[index][invokeEventListeners](event, "capturing", QuoxEvent.CAPTURING_PHASE);
@@ -466,6 +542,17 @@ export class QuoxDocument extends QuoxEventTarget {
     } finally {
       dispatch.end();
     }
+  }
+
+  #queuePendingScrollTarget(nodeHandle: number): void {
+    const element = this.#nodeForHandle(nodeHandle);
+    if (!(element instanceof QuoxElement)) {
+      throw new TypeError("quox: a trusted scroll target must be an element");
+    }
+    const target = nodeHandle === this.#renderer.document_element() ? this : element;
+    if (this.#pendingScrollTargetSet.has(target)) return;
+    this.#pendingScrollTargetSet.add(target);
+    this.#pendingScrollTargets.push(target);
   }
 
   #createTrustedEvent(step: DomDispatchEventStep): QuoxEvent {
