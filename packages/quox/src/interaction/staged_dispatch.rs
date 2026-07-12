@@ -10,7 +10,7 @@ use crate::ffi_numbers::{
 use crate::form_controls::{CheckedControlStates, TextControlStates};
 use crate::node_handles::NodeHandles;
 use crate::{QuoxRenderer, QuoxRendererState, sync_document_layout};
-use blitz_dom::BaseDocument;
+use blitz_dom::{BaseDocument, LocalName, QualName, local_name, ns};
 use blitz_traits::events::{
     BlitzImeEvent, BlitzPointerEvent, BlitzPointerId, BlitzWheelDelta, BlitzWheelEvent, DomEvent,
     DomEventData, MouseEventButton, Point as ElementPoint, PointerDetails,
@@ -374,13 +374,14 @@ impl<'a> ResolvedInputLayout<'a> {
         document: &'a mut BaseDocument,
         text_controls: &mut TextControlStates,
         checked_controls: &mut CheckedControlStates,
+        handles: &mut NodeHandles,
         width: u32,
         height: u32,
         framebuffer_width: u32,
         framebuffer_height: u32,
         device_pixel_ratio: f32,
     ) -> Self {
-        text_controls.reconcile_document(document);
+        text_controls.reconcile_document_with_handles(document, handles);
         checked_controls.reconcile_document(document);
         sync_document_layout(
             document,
@@ -1105,6 +1106,23 @@ impl DispatchStack {
 
         let old_focus = actual_focus_node_id(document);
         let source_metadata = guarded.metadata.clone();
+        let preserved_file_value = matches!(&guarded.event.data, DomEventData::Click(_))
+            .then(|| activated_file_input(document, guarded.default_target.raw))
+            .flatten()
+            .map(|target| {
+                let value = document
+                    .get_node(target)
+                    .and_then(blitz_dom::Node::element_data)
+                    .and_then(|element| {
+                        element.attrs.iter().find(|attribute| {
+                            attribute.name.ns == ns!()
+                                && attribute.name.local == local_name!("value")
+                        })
+                    })
+                    .map(|attribute| attribute.value.as_str())
+                    .map(str::to_owned);
+                (target, value)
+            });
         let mut generated = Vec::new();
         if matches!(&guarded.event.data, DomEventData::Wheel(_))
             && wheel_target_forwards_default(document, guarded.default_target.raw)
@@ -1117,6 +1135,10 @@ impl DispatchStack {
             run_wheel_default(document, guarded.default_target.raw, event, &mut generated);
         } else {
             document.handle_dom_event(&mut guarded.event, |event| generated.push(event));
+        }
+        if let Some((target, value)) = preserved_file_value {
+            restore_file_input_value_attribute(document, target, value.as_deref());
+            text_controls.sanitize_file_input_label(document, target);
         }
         // Blitz mutates checkbox/radio render data before queuing `input`. Import the generated
         // target now, then repair radio peers from Quox's stricter tree/form/name group model so
@@ -1658,6 +1680,77 @@ fn pointer_author_chain(
         chain.push(guard);
     }
     Ok(chain)
+}
+
+fn activated_file_input(document: &BaseDocument, mut node_id: usize) -> Option<usize> {
+    loop {
+        let node = document.get_node(node_id)?;
+        if node.element_data().is_some_and(|element| {
+            element.name.ns == ns!(html)
+                && element.name.local.as_ref() == "input"
+                && element
+                    .attr(local_name!("type"))
+                    .is_some_and(|value| value.eq_ignore_ascii_case("file"))
+        }) {
+            return Some(node_id);
+        }
+        if node.element_data().is_some_and(|element| {
+            element.name.ns == ns!(html) && element.name.local.as_ref() == "label"
+        }) && let Some(input) = document.label_bound_input_element(node_id)
+            && input.element_data().is_some_and(|element| {
+                element.name.ns == ns!(html)
+                    && element.name.local.as_ref() == "input"
+                    && element
+                        .attr(local_name!("type"))
+                        .is_some_and(|value| value.eq_ignore_ascii_case("file"))
+            })
+        {
+            return Some(input.id);
+        }
+        node_id = node.parent?;
+    }
+}
+
+fn restore_file_input_value_attribute(
+    document: &mut BaseDocument,
+    node_id: usize,
+    value: Option<&str>,
+) {
+    let name = QualName {
+        prefix: None,
+        ns: ns!(),
+        local: LocalName::from("value"),
+    };
+    // Pinned Blitz accidentally writes this content attribute in the HTML namespace. Remove that
+    // private mutation explicitly; ordinary DOM attribute helpers address the unnamespaced name.
+    let blitz_name = QualName {
+        prefix: None,
+        ns: ns!(html),
+        local: LocalName::from("value"),
+    };
+    if let Some(element) = document
+        .get_node_mut(node_id)
+        .and_then(blitz_dom::Node::element_data_mut)
+    {
+        element.attrs.remove(&blitz_name);
+    }
+    let current = document
+        .get_node(node_id)
+        .and_then(blitz_dom::Node::element_data)
+        .and_then(|element| {
+            element
+                .attrs
+                .iter()
+                .find(|attribute| attribute.name == name)
+        })
+        .map(|attribute| attribute.value.as_str());
+    if current == value {
+        return;
+    }
+    match value {
+        Some(value) => document.mutate().set_attribute(node_id, name, value),
+        None => document.mutate().clear_attribute(node_id, name),
+    }
 }
 
 fn pointer_dom_data(
@@ -2384,12 +2477,14 @@ fn resolve_input_layout(state: &mut QuoxRendererState) -> ResolvedInputLayout<'_
         document,
         text_controls,
         checked_controls,
+        node_handles,
         ..
     } = state;
     ResolvedInputLayout::new(
         document,
         text_controls,
         checked_controls,
+        node_handles,
         width,
         height,
         framebuffer_width,
@@ -2812,7 +2907,7 @@ mod tests {
         BlitzFocusEvent, BlitzInputEvent, BlitzKeyEvent, KeyState, MouseEventButtons,
         PointerCoords, PointerDetails,
     };
-    use blitz_traits::shell::{ColorScheme, Viewport};
+    use blitz_traits::shell::{ColorScheme, ShellProvider, Viewport};
     use keyboard_types::{Code, Key, Location, Modifiers};
     use std::sync::Arc;
 
@@ -2830,14 +2925,33 @@ mod tests {
         fn new(body: &str) -> Self {
             let redraw = Arc::new(AtomicBool::new(false));
             let ime_requests = Arc::new(ImeRequestMailbox::default());
+            let shell_provider = Arc::new(QuoxShellProvider {
+                redraw_requested: Arc::clone(&redraw),
+                ime_requests: Arc::clone(&ime_requests),
+            });
+            Self::build(body, redraw, ime_requests, shell_provider)
+        }
+
+        fn with_shell(body: &str, shell_provider: Arc<dyn ShellProvider>) -> Self {
+            Self::build(
+                body,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(ImeRequestMailbox::default()),
+                shell_provider,
+            )
+        }
+
+        fn build(
+            body: &str,
+            redraw: Arc<AtomicBool>,
+            ime_requests: Arc<ImeRequestMailbox>,
+            shell_provider: Arc<dyn ShellProvider>,
+        ) -> Self {
             let mut document = HtmlDocument::from_html(
                 &format!("<!doctype html><html><body>{body}</body></html>"),
                 DocumentConfig {
                     viewport: Some(Viewport::new(800, 600, 1.0, ColorScheme::Light)),
-                    shell_provider: Some(Arc::new(QuoxShellProvider {
-                        redraw_requested: Arc::clone(&redraw),
-                        ime_requests: Arc::clone(&ime_requests),
-                    })),
+                    shell_provider: Some(shell_provider),
                     ..Default::default()
                 },
             )
@@ -2913,6 +3027,22 @@ mod tests {
                         .is_some_and(|child| matches!(&child.data, NodeData::Text(_)))
                 })
                 .expect("test parent should have a text child")
+        }
+
+        /// Mirror the public attribute path's filename-mode bookkeeping without constructing a
+        /// GPU-backed `QuoxRenderer` in this pure dispatch harness.
+        fn set_input_type(&mut self, node_id: usize, value: &str) {
+            self.document.mutate().set_attribute(
+                node_id,
+                QualName {
+                    prefix: None,
+                    ns: ns!(),
+                    local: LocalName::from("type"),
+                },
+                value,
+            );
+            self.text_controls
+                .reconcile_document_with_handles(&mut self.document, &mut self.handles);
         }
 
         #[allow(
@@ -3049,6 +3179,7 @@ mod tests {
                 &mut self.document,
                 &mut self.text_controls,
                 &mut self.checked_controls,
+                &mut self.handles,
                 800,
                 600,
                 800,
@@ -3075,6 +3206,7 @@ mod tests {
                 &mut self.document,
                 &mut self.text_controls,
                 &mut self.checked_controls,
+                &mut self.handles,
                 800,
                 600,
                 800,
@@ -3107,6 +3239,7 @@ mod tests {
                 &mut self.document,
                 &mut self.text_controls,
                 &mut self.checked_controls,
+                &mut self.handles,
                 800,
                 600,
                 800,
@@ -5144,6 +5277,163 @@ mod tests {
                 "{input_type} checkedness changed without a focus edge must still repaint",
             );
         }
+    }
+
+    #[test]
+    fn file_activation_preserves_author_value_attributes_and_hides_host_paths() {
+        struct SelectingShell;
+
+        impl ShellProvider for SelectingShell {
+            fn open_file_dialog(
+                &self,
+                _multiple: bool,
+                _filter: Option<blitz_traits::shell::FileDialogFilter>,
+            ) -> Vec<std::path::PathBuf> {
+                vec![std::path::PathBuf::from(r"C:\Users\Alice\selected.txt")]
+            }
+        }
+
+        for authored_value in [None, Some("author default")] {
+            let value_attribute = authored_value
+                .map(|value| format!(" value='{value}'"))
+                .unwrap_or_default();
+            let mut context = TestContext::with_shell(
+                &format!(
+                    "<input id='file' type='file'{value_attribute} \
+                     style='display:block;width:160px;height:24px'>"
+                ),
+                Arc::new(SelectingShell),
+            );
+            let file = context.element("file");
+            let (x, y) = context.center(file);
+            let click = stage_generated_with_metadata(
+                &mut context,
+                file,
+                DomEventData::Click(pointer(
+                    x,
+                    y,
+                    MouseEventButton::Main,
+                    MouseEventButtons::None,
+                )),
+                EventMetadata::pointer(
+                    10.0,
+                    native_pointer_coordinates(f64::from(x), f64::from(y), 0.0, 0.0),
+                    1,
+                ),
+            );
+
+            let step = context.resume(&click, false);
+            let _ = drain(&mut context, step);
+            assert_eq!(
+                context
+                    .document
+                    .get_node(file)
+                    .and_then(blitz_dom::Node::element_data)
+                    .and_then(|element| element.attr(LocalName::from("value"))),
+                authored_value,
+                "native selection must not replace the author content attribute",
+            );
+            assert_eq!(
+                context
+                    .text_controls
+                    .value(&mut context.document, file)
+                    .as_deref(),
+                Some(r"C:\fakepath\selected.txt"),
+            );
+            let rendered_text = context.document.get_node(file).unwrap().text_content();
+            assert!(rendered_text.contains("selected.txt"));
+            assert!(!rendered_text.contains("Users"));
+            assert!(!rendered_text.contains("Alice"));
+            assert!(!rendered_text.contains(r"C:\"));
+        }
+    }
+
+    #[test]
+    fn connected_file_type_transitions_rebuild_only_the_private_click_structure() {
+        struct SelectingShell;
+
+        impl ShellProvider for SelectingShell {
+            fn open_file_dialog(
+                &self,
+                _multiple: bool,
+                _filter: Option<blitz_traits::shell::FileDialogFilter>,
+            ) -> Vec<std::path::PathBuf> {
+                vec![std::path::PathBuf::from(r"C:\private\transition.txt")]
+            }
+        }
+
+        let mut context = TestContext::with_shell(
+            "<input id='file' type='text' style='display:block;width:160px;height:24px'>",
+            Arc::new(SelectingShell),
+        );
+        let file = context.element("file");
+        let authored_text = {
+            let mut mutator = context.document.mutate();
+            let text = mutator.create_text_node("author child");
+            mutator.append_children(file, &[text]);
+            text
+        };
+
+        context.set_input_type(file, "file");
+
+        let file_children = &context.document.get_node(file).unwrap().children;
+        assert_eq!(file_children.len(), 3);
+        assert_eq!(file_children[2], authored_text);
+        assert_eq!(
+            context
+                .document
+                .get_node(file_children[0])
+                .and_then(blitz_dom::Node::element_data)
+                .map(|element| element.name.local.as_ref()),
+            Some("button"),
+        );
+        assert_eq!(
+            context
+                .document
+                .get_node(file_children[1])
+                .and_then(blitz_dom::Node::element_data)
+                .map(|element| element.name.local.as_ref()),
+            Some("label"),
+        );
+
+        let click = stage_generated_with_metadata(
+            &mut context,
+            file,
+            DomEventData::Click(pointer(
+                1.0,
+                1.0,
+                MouseEventButton::Main,
+                MouseEventButtons::None,
+            )),
+            EventMetadata::pointer(10.0, native_pointer_coordinates(1.0, 1.0, 0.0, 0.0), 1),
+        );
+        let step = context.resume(&click, false);
+        let _ = drain(&mut context, step);
+        assert_eq!(
+            context
+                .text_controls
+                .value(&mut context.document, file)
+                .as_deref(),
+            Some(r"C:\fakepath\transition.txt"),
+        );
+        assert!(
+            !context
+                .document
+                .get_node(file)
+                .unwrap()
+                .text_content()
+                .contains("private")
+        );
+
+        context.set_input_type(file, "text");
+        assert_eq!(
+            context.document.get_node(file).unwrap().children,
+            vec![authored_text],
+        );
+        assert_eq!(
+            context.document.get_node(file).unwrap().text_content(),
+            "author child",
+        );
     }
 
     #[test]

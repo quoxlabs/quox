@@ -1,6 +1,8 @@
 use super::{QuoxRenderer, QuoxRendererState};
 use crate::ffi_numbers::{NumericArgumentError, integer_range, uint32};
-use crate::form_controls::{TextControlSelectionDirection, restore_text_editor};
+use crate::form_controls::{
+    TextControlSelectionDirection, input_uses_filename_mode, restore_text_editor,
+};
 use blitz_dom::{BaseDocument, DocumentMutator, LocalName, NodeData, Point, QualName, ns};
 use style::computed_values::visibility::T as Visibility;
 use style::values::computed::Overflow;
@@ -741,8 +743,9 @@ impl QuoxRendererState {
         }
     }
 
-    fn reconcile_form_controls(&mut self) {
-        self.text_controls.reconcile_document(&mut self.document);
+    pub(super) fn reconcile_form_controls(&mut self) {
+        self.text_controls
+            .reconcile_document_with_handles(&mut self.document, &mut self.node_handles);
         self.checked_controls.reconcile_document(&mut self.document);
     }
 
@@ -1175,13 +1178,16 @@ impl QuoxRenderer {
             .ok_or_else(|| unsupported_form_control_value(node_handle))
     }
 
-    /// Set a supported form-control value without dispatching an event.
-    /// Returns whether its rendered or attribute state changed.
-    pub fn set_form_control_value(&self, node_handle: f64, value: &str) -> Result<bool, JsValue> {
+    /// Set a supported form-control value without dispatching an event. Returns 0 for no visible
+    /// change, 1 for a change, and 2 when filename mode rejects a nonempty assignment.
+    pub fn set_form_control_value(&self, node_handle: f64, value: &str) -> Result<u8, JsValue> {
         let node_handle =
             uint32(node_handle, "nodeHandle").map_err(NumericArgumentError::into_js)?;
         let mut state = self.state.borrow_mut();
         let node_id = state.resolve_element(node_handle)?;
+        if input_uses_filename_mode(&state.document, node_id) && !value.is_empty() {
+            return Ok(2);
+        }
         let ime_before = state.focused_editor_snapshot();
         let changed = {
             let QuoxRendererState {
@@ -1194,7 +1200,7 @@ impl QuoxRenderer {
                 .ok_or_else(|| unsupported_form_control_value(node_handle))?
         };
         state.reconcile_native_ime_after_editor_mutation(ime_before);
-        Ok(changed)
+        Ok(u8::from(changed))
     }
 
     /// Return the current checkedness of an HTML input, including states whose current type does

@@ -369,8 +369,7 @@ impl QuoxRendererState {
     /// (via `viewport_scroll()`/`scroll_by`) — quox keeps no mirror of it, which would otherwise
     /// clobber Blitz's own wheel-driven scroll updates.
     fn sync_layout(&mut self) {
-        self.text_controls.reconcile_document(&mut self.document);
-        self.checked_controls.reconcile_document(&mut self.document);
+        self.reconcile_form_controls();
         sync_document_layout(
             &mut self.document,
             self.framebuffer_width,

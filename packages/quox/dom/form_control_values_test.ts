@@ -11,6 +11,7 @@ interface ControlState {
   dirty: boolean;
   checked: boolean;
   dirtyCheckedness: boolean;
+  files: string[];
   selectionStart: number;
   selectionEnd: number;
   selectionDirection: 0 | 1 | 2;
@@ -486,6 +487,7 @@ class FakeLiveControlRenderer {
       dirty: false,
       checked: false,
       dirtyCheckedness: false,
+      files: [],
       selectionStart: 0,
       selectionEnd: 0,
       selectionDirection: 0,
@@ -523,24 +525,27 @@ class FakeLiveControlRenderer {
       case "default-on":
         return control.attributes.get("value") ?? "on";
       case "filename":
-        throw new TypeError("fake input value mode is intentionally unsupported");
+        return control.files[0] === undefined ? "" : `C:\\fakepath\\${control.files[0]}`;
     }
   }
 
-  set_form_control_value(nodeHandle: number, value: string): boolean {
+  set_form_control_value(nodeHandle: number, value: string): number {
     const control = this.#control(nodeHandle);
     if (control.tagName === "input") {
       switch (inputValueMode(control)) {
         case "default":
         case "default-on": {
           if (control.attributes.get("value") === value && control.attributes.has("value")) {
-            return false;
+            return 0;
           }
           control.attributes.set("value", value);
-          return true;
+          return 1;
         }
         case "filename":
-          throw new TypeError("fake input value mode is intentionally unsupported");
+          if (value !== "") return 2;
+          if (control.files.length === 0) return 0;
+          control.files = [];
+          return 1;
         case "date-time-value":
         case "range-value":
         case "color-value":
@@ -557,7 +562,7 @@ class FakeLiveControlRenderer {
       control.selectionEnd = value.length;
       control.selectionDirection = 0;
     }
-    return changed;
+    return Number(changed);
   }
 
   form_control_checked(nodeHandle: number): boolean {
@@ -620,6 +625,12 @@ class FakeLiveControlRenderer {
   selectionForTest(nodeHandle: number): readonly [number, number, number] {
     const control = this.#control(nodeHandle);
     return [control.selectionStart, control.selectionEnd, control.selectionDirection];
+  }
+
+  selectFilesForTest(nodeHandle: number, ...files: string[]): void {
+    const control = this.#control(nodeHandle);
+    if (inputValueMode(control) !== "filename") throw new TypeError("fake node is not a file input");
+    control.files = files;
   }
 
   get_attribute(nodeHandle: number, name: string): string | undefined {
@@ -773,6 +784,8 @@ class FakeLiveControlRenderer {
 
   #applyTypeTransition(control: ControlState, previousMode: InputValueMode): void {
     const nextMode = inputValueMode(control);
+    if (previousMode !== "filename" && nextMode === "filename") control.files = [];
+    if (previousMode === "filename" && nextMode !== "filename") control.files = [];
     if (
       isValueMode(previousMode) && !isValueMode(nextMode) && nextMode !== "filename" &&
       control.value !== ""
@@ -1339,20 +1352,103 @@ Deno.test("clean color configuration reparses the raw default while dirty config
   );
 });
 
-Deno.test("filename input values remain explicitly unsupported", () => {
-  const { document } = createDocument();
+Deno.test("filename values expose fake paths and only accept empty assignments", () => {
+  const { document, renderer, renders } = createDocument();
   const input = document.createElement("input");
+  input.defaultValue = "sentinel";
   input.setAttribute("type", "file");
+  let inputs = 0;
+  let changes = 0;
+  input.addEventListener("input", () => inputs++);
+  input.addEventListener("change", () => changes++);
 
-  assertThrows(() => input.value, TypeError, "intentionally unsupported");
-  assertThrows(
+  assertEquals(input.value, "", "the content value is never a selected filename");
+  assertEquals(input.defaultValue, "sentinel");
+  renderer.selectFilesForTest(input.nodeId, "secret.txt", "second.png");
+  assertEquals(input.value, "C:\\fakepath\\secret.txt");
+
+  const invalid = assertThrows(
     () => {
       input.value = "replacement";
     },
-    TypeError,
-    "intentionally unsupported",
+    DOMException,
   );
-  assertEquals(input.getAttribute("value"), null);
+  assertEquals(invalid.name, "InvalidStateError");
+  assertEquals(input.value, "C:\\fakepath\\secret.txt", "a rejected assignment keeps the selection");
+  assertEquals(input.defaultValue, "sentinel");
+
+  const beforeClear = renders.count;
+  input.value = "";
+  assertEquals(input.value, "");
+  assertEquals(renders.count, beforeClear + 1);
+  input.value = "";
+  assertEquals(renders.count, beforeClear + 1, "clearing an already-empty selection is a no-op");
+
+  renderer.selectFilesForTest(input.nodeId, "again.txt");
+  (input as unknown as { value: unknown }).value = null;
+  assertEquals(input.value, "", "LegacyNullToEmptyString also clears files");
+  assertThrows(
+    () => {
+      (input as unknown as { value: unknown }).value = undefined;
+    },
+    DOMException,
+  );
+  assertThrows(
+    () => {
+      (input as unknown as { value: unknown }).value = Symbol("file");
+    },
+    TypeError,
+  );
+  assertEquals(inputs, 0);
+  assertEquals(changes, 0);
+});
+
+Deno.test("filename setter conversion precedes its current-type restriction", () => {
+  const { document } = createDocument();
+  const lying = document.createElement("input");
+  lying.setAttribute("type", "file");
+  (lying as unknown as { getAttribute: () => string }).getAttribute = () => "text";
+  const lyingError = assertThrows(
+    () => {
+      lying.value = "forbidden";
+    },
+    DOMException,
+  );
+  assertEquals(lyingError.name, "InvalidStateError", "author overrides cannot change the internal value mode");
+
+  const fromFile = document.createElement("input");
+  fromFile.defaultValue = "default";
+  fromFile.setAttribute("type", "file");
+  let conversions = 0;
+  (fromFile as unknown as { value: unknown }).value = {
+    toString() {
+      conversions++;
+      fromFile.setAttribute("type", "text");
+      return "text value";
+    },
+  };
+  assertEquals(conversions, 1);
+  assertEquals(fromFile.value, "text value");
+
+  const toFile = document.createElement("input");
+  toFile.defaultValue = "default";
+  toFile.value = "dirty";
+  const error = assertThrows(
+    () => {
+      (toFile as unknown as { value: unknown }).value = {
+        toString() {
+          toFile.setAttribute("type", "file");
+          return "forbidden";
+        },
+      };
+    },
+    DOMException,
+  );
+  assertEquals(error.name, "InvalidStateError");
+  assertEquals(toFile.value, "");
+  assertEquals(toFile.defaultValue, "default");
+  toFile.setAttribute("type", "text");
+  assertEquals(toFile.value, "default", "leaving filename mode reloads a clean content value");
 });
 
 Deno.test("a native edit is visible before its first input listener", () => {

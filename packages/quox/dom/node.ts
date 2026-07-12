@@ -24,7 +24,7 @@ type LiveScrollRenderer = {
 
 type LiveTextControlRenderer = {
   form_control_value(nodeHandle: number): string;
-  set_form_control_value(nodeHandle: number, value: string): boolean;
+  set_form_control_value(nodeHandle: number, value: string): number;
 };
 
 type LiveCheckedControlRenderer = {
@@ -164,6 +164,28 @@ function controlValueString(value: unknown): string {
   return value === null ? "" : boundaryString(value);
 }
 
+function setLiveControlValue(element: QuoxElement, value: string): void {
+  const { renderer, requestRender } = documentInternals(element.ownerDocument);
+  const result = (renderer as unknown as LiveTextControlRenderer).set_form_control_value(
+    element.nodeId,
+    value,
+  );
+  switch (result) {
+    case 0:
+      return;
+    case 1:
+      requestRender();
+      return;
+    case 2:
+      throw new DOMException(
+        "A file input's value may only be set to the empty string.",
+        "InvalidStateError",
+      );
+    default:
+      throw new RangeError("quox: invalid form-control value result");
+  }
+}
+
 /** Web IDL `unrestricted double` conversion plus CSSOM View's non-finite normalization. */
 function scrollOffsetNumber(value: unknown): number {
   // Unary plus performs ToNumber exactly once and throws for Symbol and BigInt.
@@ -299,12 +321,7 @@ export class QuoxInputElement extends QuoxElement {
   }
 
   set value(value: string) {
-    const { renderer, requestRender } = documentInternals(this.ownerDocument);
-    const changed = (renderer as unknown as LiveTextControlRenderer).set_form_control_value(
-      this.nodeId,
-      controlValueString(value),
-    );
-    if (changed) requestRender();
+    setLiveControlValue(this, controlValueString(value));
   }
 
   get defaultValue(): string {
@@ -412,12 +429,7 @@ export class QuoxTextAreaElement extends QuoxElement {
   }
 
   set value(value: string) {
-    const { renderer, requestRender } = documentInternals(this.ownerDocument);
-    const changed = (renderer as unknown as LiveTextControlRenderer).set_form_control_value(
-      this.nodeId,
-      controlValueString(value),
-    );
-    if (changed) requestRender();
+    setLiveControlValue(this, controlValueString(value));
   }
 
   get defaultValue(): string {

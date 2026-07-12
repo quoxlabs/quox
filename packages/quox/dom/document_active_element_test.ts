@@ -63,10 +63,10 @@ class FakeActiveElementRenderer {
     return value;
   }
 
-  set_form_control_value(nodeHandle: number, value: string): boolean {
+  set_form_control_value(nodeHandle: number, value: string): number {
     const previous = this.form_control_value(nodeHandle);
     this.#values.set(nodeHandle, value);
-    return previous !== value;
+    return Number(previous !== value);
   }
 }
 

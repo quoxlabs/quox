@@ -1,5 +1,6 @@
+use crate::node_handles::NodeHandles;
 use blitz_dom::node::{SpecialElementData, TextInputData};
-use blitz_dom::{BaseDocument, LocalName, NodeData, QualName, local_name, ns};
+use blitz_dom::{Attribute, BaseDocument, LocalName, NodeData, QualName, local_name, ns};
 use cssparser::{Parser, ParserInput};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -445,6 +446,15 @@ pub(crate) struct TextControlStates {
     /// Constraint setters must run range sanitization even when their new text parses to the same
     /// number. The final document alone cannot distinguish that mutation from a value-only read.
     range_constraint_mutations: HashSet<usize>,
+    /// Tracks Blitz's renderer-only file-control children separately from author DOM children.
+    file_inputs: HashMap<usize, FileInputControlState>,
+}
+
+#[derive(Clone, Copy)]
+struct FileInputControlState {
+    filename_mode: bool,
+    connected: bool,
+    structure: Option<FileInputStructure>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1025,6 +1035,28 @@ impl TextControlStates {
 
     /// Reconcile every live text control before layout or immediately after a DOM mutation.
     pub(crate) fn reconcile_document(&mut self, document: &mut BaseDocument) {
+        self.reconcile_document_before_drop(document, &mut |_| {});
+    }
+
+    /// Production reconciliation invalidates stable public handles before private renderer nodes
+    /// are dropped and Blitz can recycle their slab ids.
+    pub(crate) fn reconcile_document_with_handles(
+        &mut self,
+        document: &mut BaseDocument,
+        handles: &mut NodeHandles,
+    ) {
+        self.reconcile_document_before_drop(document, &mut |node_ids| {
+            handles.invalidate_nodes(node_ids.iter().copied());
+        });
+    }
+
+    fn reconcile_document_before_drop(
+        &mut self,
+        document: &mut BaseDocument,
+        before_drop: &mut dyn FnMut(&[usize]),
+    ) {
+        self.reconcile_file_inputs(document, before_drop);
+
         // Detached nodes are still returned by get_node and must keep their value. Only actually
         // destroyed nodes are removed here; ordinary Quox replacement paths additionally purge
         // before mutation so a recycled raw id cannot inherit this state even transiently.
@@ -1055,6 +1087,100 @@ impl TextControlStates {
 
         for (node_id, kind, default_value) in controls {
             self.reconcile_known_control(document, node_id, kind, default_value);
+        }
+    }
+
+    fn reconcile_file_inputs(
+        &mut self,
+        document: &mut BaseDocument,
+        before_drop: &mut dyn FnMut(&[usize]),
+    ) {
+        self.file_inputs
+            .retain(|node_id, _| document.get_node(*node_id).is_some());
+        let inputs = document
+            .tree()
+            .iter()
+            .filter_map(|(node_id, node)| {
+                let element = node.element_data()?;
+                (element.name.ns == ns!(html) && element.name.local.as_ref() == "input").then_some(
+                    (
+                        node_id,
+                        node.flags.is_in_document(),
+                        input_uses_filename_mode(document, node_id),
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        for (node_id, connected, filename_mode) in inputs {
+            let previous = self.file_inputs.remove(&node_id);
+            let previously_filename = previous.is_some_and(|state| state.filename_mode);
+            let previously_connected = previous.is_some_and(|state| state.connected);
+            let mut structure = previous
+                .and_then(|state| state.structure)
+                .filter(|structure| file_input_structure_is_live(document, node_id, *structure));
+
+            if !filename_mode {
+                if previously_filename {
+                    clear_file_input_selection_data(document, node_id);
+                    if let Some(structure) = structure {
+                        drop_file_input_structure(document, structure, before_drop);
+                    }
+                }
+                self.file_inputs.insert(
+                    node_id,
+                    FileInputControlState {
+                        filename_mode: false,
+                        connected,
+                        structure: None,
+                    },
+                );
+                continue;
+            }
+
+            if !previously_filename {
+                clear_file_input_selection_data(document, node_id);
+                structure = if previous.is_none() {
+                    // A newly parsed or mounted file input already owns the private pair Blitz
+                    // appended. Existing non-file inputs instead need a new private pair.
+                    blitz_file_input_structures(document, node_id).pop()
+                } else {
+                    None
+                };
+            } else if !previously_connected && connected {
+                // Blitz appends a new pair every time a detached file input is mounted. Keep the
+                // tracked pair when it survived and discard only the final newly appended pair;
+                // author-created lookalikes use ordinary unnamespaced attributes and are ignored.
+                let appended = blitz_file_input_structures(document, node_id)
+                    .into_iter()
+                    .rev()
+                    .find(|candidate| Some(*candidate) != structure);
+                if let Some(appended) = appended {
+                    if structure.is_some() {
+                        drop_file_input_structure(document, appended, before_drop);
+                    } else {
+                        structure = Some(appended);
+                    }
+                }
+            }
+
+            if connected && structure.is_none() {
+                structure = Some(create_file_input_structure(document, node_id));
+            }
+            if let Some(structure) = structure
+                && connected
+                && !file_input_structure_is_first(document, node_id, structure)
+            {
+                move_file_input_structure_first(document, node_id, structure);
+            }
+            self.file_inputs.insert(
+                node_id,
+                FileInputControlState {
+                    filename_mode: true,
+                    connected,
+                    structure,
+                },
+            );
         }
     }
 
@@ -1201,7 +1327,7 @@ impl TextControlStates {
             UnmanagedInputMode::DefaultOn => {
                 Some(input_value_attribute(document, node_id).unwrap_or_else(|| "on".to_owned()))
             }
-            UnmanagedInputMode::Filename => None,
+            UnmanagedInputMode::Filename => Some(file_input_value(document, node_id)),
         }
     }
 
@@ -1219,7 +1345,9 @@ impl TextControlStates {
                 UnmanagedInputMode::Default | UnmanagedInputMode::DefaultOn => {
                     Some(set_input_value_attribute(document, node_id, value))
                 }
-                UnmanagedInputMode::Filename => None,
+                UnmanagedInputMode::Filename => value
+                    .is_empty()
+                    .then(|| self.clear_file_input_selection(document, node_id)),
             };
         }
 
@@ -1511,10 +1639,24 @@ impl TextControlStates {
 
     /// Purge before Blitz destroys nodes, not after, because its slab may immediately reuse ids.
     pub(crate) fn invalidate_nodes(&mut self, node_ids: impl IntoIterator<Item = usize>) {
-        for node_id in node_ids {
-            self.controls.remove(&node_id);
-            self.range_constraint_mutations.remove(&node_id);
+        let node_ids = node_ids.into_iter().collect::<HashSet<_>>();
+        for node_id in &node_ids {
+            self.controls.remove(node_id);
+            self.range_constraint_mutations.remove(node_id);
         }
+        self.file_inputs.retain(|node_id, state| {
+            if node_ids.contains(node_id) {
+                return false;
+            }
+            if state.structure.is_some_and(|structure| {
+                node_ids.contains(&structure.button)
+                    || node_ids.contains(&structure.label)
+                    || node_ids.contains(&structure.label_text)
+            }) {
+                state.structure = None;
+            }
+            true
+        });
     }
 
     #[cfg(test)]
@@ -1586,6 +1728,266 @@ fn input_value_attribute(document: &BaseDocument, node_id: usize) -> Option<Stri
     html_input_element(document, node_id)?
         .attr(local_name!("value"))
         .map(str::to_owned)
+}
+
+pub(crate) fn input_uses_filename_mode(document: &BaseDocument, node_id: usize) -> bool {
+    unmanaged_input_mode(document, node_id) == Some(UnmanagedInputMode::Filename)
+}
+
+impl TextControlStates {
+    /// Clear a file selection when script empties `.value`. Type transitions use the same data
+    /// reset while reconciliation separately maintains the private renderer structure.
+    fn clear_file_input_selection(&mut self, document: &mut BaseDocument, node_id: usize) -> bool {
+        let selection_changed = clear_file_input_selection_data(document, node_id);
+        let label_changed = self
+            .file_inputs
+            .get(&node_id)
+            .and_then(|state| state.structure)
+            .is_some_and(|structure| set_file_input_label(document, structure, "No File Selected"));
+        selection_changed || label_changed
+    }
+
+    /// Replace Blitz's platform-dependent single-file label with the same host-path-safe basename
+    /// used by `.value`. Multiple-file labels contain only a count.
+    pub(crate) fn sanitize_file_input_label(
+        &mut self,
+        document: &mut BaseDocument,
+        node_id: usize,
+    ) -> bool {
+        let label = html_input_element(document, node_id)
+            .and_then(blitz_dom::ElementData::file_data)
+            .map_or_else(
+                || "No File Selected".to_owned(),
+                |files| match files.len() {
+                    0 => "No File Selected".to_owned(),
+                    1 => file_name_from_any_host_path(&files[0].to_string_lossy()).to_owned(),
+                    count => format!("{count} Files Selected"),
+                },
+            );
+        self.file_inputs
+            .get(&node_id)
+            .and_then(|state| state.structure)
+            .is_some_and(|structure| set_file_input_label(document, structure, &label))
+    }
+}
+
+fn clear_file_input_selection_data(document: &mut BaseDocument, node_id: usize) -> bool {
+    document
+        .get_node_mut(node_id)
+        .and_then(blitz_dom::Node::element_data_mut)
+        .is_some_and(|element| {
+            if matches!(&element.special_data, SpecialElementData::FileInput(_)) {
+                element.special_data = SpecialElementData::None;
+                true
+            } else {
+                false
+            }
+        })
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct FileInputStructure {
+    button: usize,
+    label: usize,
+    label_text: usize,
+}
+
+fn file_input_structure_at(
+    document: &BaseDocument,
+    node_id: usize,
+    button: usize,
+    label: usize,
+) -> Option<FileInputStructure> {
+    let button_node = document.get_node(button)?;
+    let button_element = button_node.element_data()?;
+    if button_element.name.ns != ns!(html)
+        || button_element.name.local.as_ref() != "button"
+        || button_node.parent != Some(node_id)
+        || !has_blitz_private_attribute(button_element, "type", "button")
+        || !has_blitz_private_attribute(button_element, "tabindex", "-1")
+    {
+        return None;
+    }
+    let label_node = document.get_node(label)?;
+    let label_element = label_node.element_data()?;
+    if label_element.name.ns != ns!(html)
+        || label_element.name.local.as_ref() != "label"
+        || label_node.parent != Some(node_id)
+    {
+        return None;
+    }
+    let label_text = *label_node.children.first()?;
+    let label_text_node = document.get_node(label_text)?;
+    label_text_node.text_data()?;
+    if label_text_node.parent != Some(label) {
+        return None;
+    }
+    Some(FileInputStructure {
+        button,
+        label,
+        label_text,
+    })
+}
+
+fn has_blitz_private_attribute(element: &blitz_dom::ElementData, local: &str, value: &str) -> bool {
+    element.attrs.iter().any(|attribute| {
+        attribute.name.ns == ns!(html)
+            && attribute.name.local.as_ref() == local
+            && attribute.value == value
+    })
+}
+
+fn blitz_file_input_structures(document: &BaseDocument, node_id: usize) -> Vec<FileInputStructure> {
+    let Some(node) = document.get_node(node_id) else {
+        return Vec::new();
+    };
+    node.children
+        .windows(2)
+        .filter_map(|pair| file_input_structure_at(document, node_id, pair[0], pair[1]))
+        .collect()
+}
+
+fn create_file_input_structure(document: &mut BaseDocument, node_id: usize) -> FileInputStructure {
+    let anchor = document
+        .get_node(node_id)
+        .and_then(|node| node.children.first())
+        .copied();
+    let mut mutator = document.mutate();
+    let html_name = |local: &str| QualName {
+        prefix: None,
+        ns: ns!(html),
+        local: LocalName::from(local),
+    };
+    let button = mutator.create_element(
+        html_name("button"),
+        vec![
+            Attribute {
+                name: html_name("type"),
+                value: "button".to_owned(),
+            },
+            Attribute {
+                name: html_name("tabindex"),
+                value: "-1".to_owned(),
+            },
+        ],
+    );
+    let label = mutator.create_element(html_name("label"), Vec::new());
+    let label_text = mutator.create_text_node("No File Selected");
+    let button_text = mutator.create_text_node("Browse");
+    if let Some(anchor) = anchor {
+        mutator.insert_nodes_before(anchor, &[button, label]);
+    } else {
+        mutator.append_children(node_id, &[button, label]);
+    }
+    mutator.append_children(label, &[label_text]);
+    mutator.append_children(button, &[button_text]);
+    FileInputStructure {
+        button,
+        label,
+        label_text,
+    }
+}
+
+fn move_file_input_structure_first(
+    document: &mut BaseDocument,
+    node_id: usize,
+    structure: FileInputStructure,
+) {
+    let anchor = document.get_node(node_id).and_then(|node| {
+        node.children
+            .iter()
+            .copied()
+            .find(|child| *child != structure.button && *child != structure.label)
+    });
+    let mut mutator = document.mutate();
+    mutator.remove_node(structure.button);
+    mutator.remove_node(structure.label);
+    if let Some(anchor) = anchor {
+        mutator.insert_nodes_before(anchor, &[structure.button, structure.label]);
+    } else {
+        mutator.append_children(node_id, &[structure.button, structure.label]);
+    }
+}
+
+fn file_input_structure_is_live(
+    document: &BaseDocument,
+    node_id: usize,
+    structure: FileInputStructure,
+) -> bool {
+    file_input_structure_at(document, node_id, structure.button, structure.label) == Some(structure)
+}
+
+fn file_input_structure_is_first(
+    document: &BaseDocument,
+    node_id: usize,
+    structure: FileInputStructure,
+) -> bool {
+    document.get_node(node_id).is_some_and(|node| {
+        node.children.first() == Some(&structure.button)
+            && node.children.get(1) == Some(&structure.label)
+    })
+}
+
+fn drop_file_input_structure(
+    document: &mut BaseDocument,
+    structure: FileInputStructure,
+    before_drop: &mut dyn FnMut(&[usize]),
+) {
+    let mut node_ids = Vec::new();
+    collect_subtree_node_ids(document, structure.button, &mut node_ids);
+    collect_subtree_node_ids(document, structure.label, &mut node_ids);
+    before_drop(&node_ids);
+    let mut mutator = document.mutate();
+    if mutator.doc.get_node(structure.button).is_some() {
+        mutator.remove_and_drop_node(structure.button);
+    }
+    if mutator.doc.get_node(structure.label).is_some() {
+        mutator.remove_and_drop_node(structure.label);
+    }
+}
+
+fn collect_subtree_node_ids(document: &BaseDocument, node_id: usize, output: &mut Vec<usize>) {
+    let Some(node) = document.get_node(node_id) else {
+        return;
+    };
+    output.push(node_id);
+    for child_id in &node.children {
+        collect_subtree_node_ids(document, *child_id, output);
+    }
+}
+
+fn set_file_input_label(
+    document: &mut BaseDocument,
+    structure: FileInputStructure,
+    value: &str,
+) -> bool {
+    let text_id = structure.label_text;
+    let changed = document
+        .get_node(text_id)
+        .and_then(blitz_dom::Node::text_data)
+        .is_some_and(|text| text.content != value);
+    if changed {
+        document.mutate().set_node_text(text_id, value);
+    }
+    changed
+}
+
+fn file_name_from_any_host_path(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or_default()
+}
+
+fn file_input_value(document: &BaseDocument, node_id: usize) -> String {
+    let Some(path) = html_input_element(document, node_id)
+        .and_then(blitz_dom::ElementData::file_data)
+        .and_then(|files| files.first())
+    else {
+        return String::new();
+    };
+    // Treat both separators as path boundaries regardless of the host target. This prevents a
+    // Windows-shaped path retained in a Unix/WASM build (or vice versa) from escaping wholesale.
+    let path = path.to_string_lossy();
+    let file_name = file_name_from_any_host_path(&path);
+    format!(r"C:\fakepath\{file_name}")
 }
 
 /// Set an input value content attribute and report attribute identity, not exposed-value
@@ -2254,6 +2656,7 @@ mod tests {
         CheckedControlStates, CheckedInputKind, SpecialElementData, TextControlSelection,
         TextControlSelectionDirection, TextControlStates, restore_text_editor,
     };
+    use crate::node_handles::NodeHandles;
     use blitz_dom::{BaseDocument, DocumentConfig, LocalName, QualName, local_name, ns};
     use blitz_html::{HtmlDocument, HtmlProvider};
     use std::sync::Arc;
@@ -3587,8 +3990,9 @@ mod tests {
             Some("#ff0000")
         );
 
-        assert_eq!(controls.value(&mut document, file), None);
+        assert_eq!(controls.value(&mut document, file).as_deref(), Some(""));
         assert_eq!(controls.set_value(&mut document, file, "replacement"), None);
+        assert_eq!(controls.set_value(&mut document, file, ""), Some(false));
         assert_eq!(
             super::input_value_attribute(&document, file).as_deref(),
             Some("sentinel")
@@ -4194,6 +4598,205 @@ mod tests {
             Some("default")
         );
         assert!(!controls.state(input).unwrap().dirty_value);
+    }
+
+    #[test]
+    fn filename_values_hide_host_paths_and_empty_assignment_clears_selection() {
+        let mut document = document("<input id='field' type='file' value='sentinel'>");
+        let input = element(&document, "field");
+        let label_text = document
+            .get_node(input)
+            .and_then(|node| node.children.get(1))
+            .and_then(|label| document.get_node(*label))
+            .and_then(|label| label.children.first())
+            .copied()
+            .expect("Blitz should build the file input's internal label");
+        let mut controls = TextControlStates::default();
+        controls.reconcile_document(&mut document);
+
+        assert_eq!(controls.value(&mut document, input).as_deref(), Some(""));
+        assert_eq!(controls.set_value(&mut document, input, ""), Some(false));
+        assert_eq!(controls.set_value(&mut document, input, "forbidden"), None);
+
+        document
+            .get_node_mut(input)
+            .and_then(blitz_dom::Node::element_data_mut)
+            .unwrap()
+            .special_data = SpecialElementData::FileInput(
+            vec![
+                std::path::PathBuf::from(r"C:\Users\Alice\top-secret.txt"),
+                std::path::PathBuf::from("/private/second.png"),
+            ]
+            .into(),
+        );
+        document
+            .mutate()
+            .set_node_text(label_text, "2 Files Selected");
+
+        assert_eq!(
+            controls.value(&mut document, input).as_deref(),
+            Some(r"C:\fakepath\top-secret.txt"),
+        );
+        assert_eq!(
+            super::input_value_attribute(&document, input).as_deref(),
+            Some("sentinel"),
+            "neither reading nor clearing may expose a host path in the content attribute",
+        );
+        assert_eq!(controls.set_value(&mut document, input, ""), Some(true));
+        assert_eq!(controls.value(&mut document, input).as_deref(), Some(""));
+        assert!(
+            document
+                .get_node(input)
+                .and_then(blitz_dom::Node::element_data)
+                .and_then(blitz_dom::ElementData::file_data)
+                .is_none()
+        );
+        assert_eq!(
+            document.get_node(label_text).unwrap().text_content(),
+            "No File Selected"
+        );
+        assert_eq!(controls.set_value(&mut document, input, ""), Some(false));
+    }
+
+    #[test]
+    fn filename_mode_transitions_discard_latent_selected_paths() {
+        let mut document = document("<input id='field' type='file' value='default'>");
+        let input = element(&document, "field");
+        let mut controls = TextControlStates::default();
+        controls.reconcile_document(&mut document);
+        document
+            .get_node_mut(input)
+            .and_then(blitz_dom::Node::element_data_mut)
+            .unwrap()
+            .special_data = SpecialElementData::FileInput(
+            vec![std::path::PathBuf::from("/private/old.txt")].into(),
+        );
+
+        set_input_type(&mut document, input, "hidden");
+        controls.reconcile_document(&mut document);
+        assert!(
+            document
+                .get_node(input)
+                .and_then(blitz_dom::Node::element_data)
+                .and_then(blitz_dom::ElementData::file_data)
+                .is_none()
+        );
+
+        document
+            .get_node_mut(input)
+            .and_then(blitz_dom::Node::element_data_mut)
+            .unwrap()
+            .special_data = SpecialElementData::FileInput(
+            vec![std::path::PathBuf::from("/private/stale.txt")].into(),
+        );
+        set_input_type(&mut document, input, "FILE");
+        controls.reconcile_document(&mut document);
+        assert_eq!(controls.value(&mut document, input).as_deref(), Some(""),);
+    }
+
+    #[test]
+    fn file_controls_deduplicate_remounts_and_preserve_author_lookalikes() {
+        let mut document = document("<div id='host'><input id='field' type='file'></div>");
+        let host = element(&document, "host");
+        let input = element(&document, "field");
+        let mut controls = TextControlStates::default();
+        controls.reconcile_document(&mut document);
+        assert_eq!(
+            super::blitz_file_input_structures(&document, input).len(),
+            1
+        );
+
+        let (author_button, author_label, author_label_text) = {
+            let mut mutator = document.mutate();
+            let button = mutator.create_element(
+                QualName {
+                    prefix: None,
+                    ns: ns!(html),
+                    local: LocalName::from("button"),
+                },
+                vec![
+                    blitz_dom::Attribute {
+                        name: input_attribute("type"),
+                        value: "button".to_owned(),
+                    },
+                    blitz_dom::Attribute {
+                        name: input_attribute("tabindex"),
+                        value: "-1".to_owned(),
+                    },
+                ],
+            );
+            let label = mutator.create_element(
+                QualName {
+                    prefix: None,
+                    ns: ns!(html),
+                    local: LocalName::from("label"),
+                },
+                Vec::new(),
+            );
+            let text = mutator.create_text_node("author label");
+            mutator.append_children(label, &[text]);
+            mutator.append_children(input, &[button, label]);
+            (button, label, text)
+        };
+        controls.reconcile_document(&mut document);
+
+        for _ in 0..3 {
+            document.mutate().remove_node(input);
+            controls.reconcile_document(&mut document);
+            document.mutate().append_children(host, &[input]);
+            controls.reconcile_document(&mut document);
+            assert_eq!(
+                super::blitz_file_input_structures(&document, input).len(),
+                1,
+                "every remount must discard Blitz's newly appended duplicate",
+            );
+        }
+
+        set_input_type(&mut document, input, "text");
+        controls.reconcile_document(&mut document);
+        assert!(document.get_node(author_button).is_some());
+        assert!(document.get_node(author_label).is_some());
+        assert_eq!(
+            document.get_node(author_label_text).unwrap().text_content(),
+            "author label",
+        );
+        assert_eq!(
+            super::blitz_file_input_structures(&document, input).len(),
+            0
+        );
+    }
+
+    #[test]
+    fn dropping_private_file_controls_invalidates_public_handles_before_id_reuse() {
+        let mut document = document("<input id='field' type='file'>");
+        let input = element(&document, "field");
+        let mut controls = TextControlStates::default();
+        let mut handles = NodeHandles::default();
+        controls.reconcile_document_with_handles(&mut document, &mut handles);
+        let structure = controls.file_inputs[&input]
+            .structure
+            .expect("connected file input should have private controls");
+        let old_button_handle = handles.expose(structure.button).unwrap();
+        let old_text_handle = handles.expose(structure.label_text).unwrap();
+
+        set_input_type(&mut document, input, "text");
+        controls.reconcile_document_with_handles(&mut document, &mut handles);
+        assert_eq!(handles.resolve(old_button_handle), None);
+        assert_eq!(handles.resolve(old_text_handle), None);
+
+        let replacements = {
+            let mut mutator = document.mutate();
+            (0..4)
+                .map(|_| mutator.create_text_node("replacement"))
+                .collect::<Vec<_>>()
+        };
+        let reused = replacements
+            .into_iter()
+            .find(|node_id| *node_id == structure.button || *node_id == structure.label_text)
+            .expect("Blitz should reuse one of the released private slab ids");
+        let replacement_handle = handles.expose(reused).unwrap();
+        assert_ne!(replacement_handle, old_button_handle);
+        assert_ne!(replacement_handle, old_text_handle);
     }
 
     #[test]
