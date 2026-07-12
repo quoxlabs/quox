@@ -1,6 +1,6 @@
 use blitz_dom::node::{SpecialElementData, TextInputData};
 use blitz_dom::{BaseDocument, NodeData, QualName, local_name, ns};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use style::invalidation::element::restyle_hints::RestyleHint;
 
 /// Browser-facing checkedness which Blitz's render-only checkbox data cannot own correctly.
@@ -432,6 +432,9 @@ fn mark_checkedness_restyle(document: &mut BaseDocument, node_id: usize) {
 #[derive(Default)]
 pub(crate) struct TextControlStates {
     controls: HashMap<usize, TextControlState>,
+    /// Constraint setters must run range sanitization even when their new text parses to the same
+    /// number. The final document alone cannot distinguish that mutation from a value-only read.
+    range_constraint_mutations: HashSet<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -487,6 +490,7 @@ enum TextControlKind {
     InputWeek,
     InputTime,
     InputDateTimeLocal,
+    InputRange,
     TextArea,
 }
 
@@ -567,11 +571,232 @@ impl TextControlKind {
             Self::InputWeek => sanitize_week(value),
             Self::InputTime => sanitize_time(value),
             Self::InputDateTimeLocal => sanitize_local_date_time(value),
+            // Range depends on the element's live min/max/step attributes. Production value paths
+            // use `ControlValueSanitizer`; range has no native text editor to normalize here.
+            Self::InputRange => value.to_owned(),
             // DOM text normally reaches us with LF line endings, but script can still provide CR
             // through a Text node. The textarea value API exposes normalized LF line endings.
             Self::TextArea => value.replace("\r\n", "\n").replace('\r', "\n"),
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum ControlValueSanitizer {
+    Static(TextControlKind),
+    Range(RangeSanitizer),
+}
+
+impl ControlValueSanitizer {
+    fn for_control(document: &BaseDocument, node_id: usize, kind: TextControlKind) -> Self {
+        if kind == TextControlKind::InputRange {
+            Self::Range(RangeSanitizer::for_control(document, node_id))
+        } else {
+            Self::Static(kind)
+        }
+    }
+
+    fn normalize(self, value: &str) -> String {
+        match self {
+            Self::Static(kind) => kind.normalize_value(value),
+            Self::Range(range) => range.normalize(value),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RangeSanitizer {
+    constraints: RangeConstraints,
+    minimum: f64,
+    maximum: f64,
+    midpoint_decimal_places: Option<usize>,
+    step: Option<f64>,
+    step_base: f64,
+    snapped_decimal_places: Option<usize>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct RangeConstraints {
+    parsed_minimum: Option<f64>,
+    parsed_maximum: Option<f64>,
+    allowed_step: Option<f64>,
+}
+
+impl RangeSanitizer {
+    fn for_control(document: &BaseDocument, node_id: usize) -> Self {
+        let element = html_input_element(document, node_id)
+            .expect("a range sanitizer is created only for an HTML input");
+        let minimum_attribute = element.attr(local_name!("min"));
+        let maximum_attribute = element.attr(local_name!("max"));
+        let value_attribute = element.attr(local_name!("value"));
+        let step_attribute = element.attr(local_name!("step"));
+        let parsed_minimum = minimum_attribute.and_then(parse_html_floating_point);
+        let parsed_maximum = maximum_attribute.and_then(parse_html_floating_point);
+        let parsed_value_attribute = value_attribute.and_then(parse_html_floating_point);
+        let parsed_step = step_attribute.and_then(parse_html_floating_point);
+        let step = match step_attribute {
+            Some(value) if value.eq_ignore_ascii_case("any") => None,
+            _ => Some(
+                parsed_step
+                    .filter(|parsed| parsed.value > 0.0)
+                    .map_or(1.0, |parsed| parsed.value),
+            ),
+        };
+        let step_base = parsed_minimum
+            .or(parsed_value_attribute)
+            .map_or(ParsedHtmlFloat::ZERO, |parsed| parsed);
+        let step_places = parsed_step
+            .filter(|parsed| parsed.value > 0.0)
+            .and_then(|parsed| parsed.decimal_places);
+        let midpoint_decimal_places = max_optional(
+            parsed_minimum.and_then(|parsed| parsed.decimal_places),
+            parsed_maximum.and_then(|parsed| parsed.decimal_places),
+        )
+        .and_then(|places| places.checked_add(1));
+
+        Self {
+            constraints: RangeConstraints {
+                parsed_minimum: parsed_minimum.map(|parsed| parsed.value),
+                parsed_maximum: parsed_maximum.map(|parsed| parsed.value),
+                allowed_step: step,
+            },
+            minimum: parsed_minimum.map_or(0.0, |parsed| parsed.value),
+            maximum: parsed_maximum.map_or(100.0, |parsed| parsed.value),
+            midpoint_decimal_places,
+            step,
+            step_base: step_base.value,
+            snapped_decimal_places: match step {
+                Some(_) => max_optional(step_base.decimal_places, step_places),
+                None => None,
+            },
+        }
+    }
+
+    fn normalize(self, value: &str) -> String {
+        let parsed = parse_valid_floating_point_number(value);
+        let mut number = parsed.unwrap_or_else(|| self.default_value());
+        let mut serialize = parsed.is_none();
+
+        if number < self.minimum {
+            number = self.minimum;
+            serialize = true;
+        }
+        if self.maximum >= self.minimum && number > self.maximum {
+            number = self.maximum;
+            serialize = true;
+        }
+        if let Some(step) = self.step
+            && let Some(snapped) = self.nearest_allowed_value(number, step)
+        {
+            number = snapped;
+            serialize = true;
+        }
+
+        if serialize {
+            format_range_number(number, self.snapped_decimal_places)
+        } else {
+            value.to_owned()
+        }
+    }
+
+    fn default_value(self) -> f64 {
+        if self.maximum < self.minimum {
+            self.minimum
+        } else {
+            let difference = self.maximum - self.minimum;
+            let midpoint = if difference.is_finite() {
+                self.minimum + difference / 2.0
+            } else {
+                self.minimum / 2.0 + self.maximum / 2.0
+            };
+            canonicalize_decimal(midpoint, self.midpoint_decimal_places)
+        }
+    }
+
+    fn nearest_allowed_value(self, number: f64, step: f64) -> Option<f64> {
+        let difference = number - self.step_base;
+        let direct_steps = difference / step;
+        let steps = if direct_steps.is_finite() {
+            direct_steps
+        } else {
+            // Opposite-sign finite endpoints can overflow their subtraction even though scaling
+            // each operand first produces a small, usable quotient.
+            number / step - self.step_base / step
+        };
+        if !steps.is_finite() {
+            return None;
+        }
+        let lower = canonicalize_decimal(
+            steps.floor().mul_add(step, self.step_base),
+            self.snapped_decimal_places,
+        );
+        let upper = canonicalize_decimal(
+            steps.ceil().mul_add(step, self.step_base),
+            self.snapped_decimal_places,
+        );
+        if same_float(number, lower) || same_float(number, upper) {
+            return None;
+        }
+        let lower = self.allowed_candidate(lower);
+        let upper = self.allowed_candidate(upper);
+        match (lower, upper) {
+            (Some(lower), Some(upper)) => {
+                let lower_distance = (number - lower).abs();
+                let upper_distance = (upper - number).abs();
+                if upper_distance < lower_distance || ulp_equal(upper_distance, lower_distance) {
+                    Some(upper)
+                } else {
+                    Some(lower)
+                }
+            }
+            (Some(candidate), None) | (None, Some(candidate)) => Some(candidate),
+            (None, None) => None,
+        }
+    }
+
+    fn allowed_candidate(self, candidate: f64) -> Option<f64> {
+        (candidate.is_finite()
+            && candidate >= self.minimum
+            && (self.maximum < self.minimum || candidate <= self.maximum))
+            .then_some(candidate)
+    }
+}
+
+fn max_optional(left: Option<usize>, right: Option<usize>) -> Option<usize> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn canonicalize_decimal(value: f64, decimal_places: Option<usize>) -> f64 {
+    let Some(decimal_places) = decimal_places
+        .filter(|places| *places <= 100)
+        .and_then(|places| u8::try_from(places).ok())
+    else {
+        return value;
+    };
+    let mut buffer = ryu_js::Buffer::new();
+    buffer
+        .format_to_fixed(value, decimal_places)
+        .parse()
+        .unwrap_or(value)
+}
+
+fn ulp_equal(left: f64, right: f64) -> bool {
+    debug_assert!(left >= 0.0 && right >= 0.0);
+    left.to_bits().abs_diff(right.to_bits()) <= 2
+}
+
+fn same_float(left: f64, right: f64) -> bool {
+    left.to_bits() == right.to_bits()
+}
+
+fn format_range_number(value: f64, decimal_places: Option<usize>) -> String {
+    let value = canonicalize_decimal(value, decimal_places);
+    let mut buffer = ryu_js::Buffer::new();
+    buffer.format_finite(value).to_owned()
 }
 
 struct TextControlState {
@@ -587,8 +812,11 @@ struct TextControlState {
     /// independently (most importantly, a non-collapsed selection with direction `none`).
     selection: EditorSelectionState,
     dirty_value: bool,
+    /// Last range constraints applied to the live value. The raw `value` attribute can change the
+    /// step base while dirty, but browsers do not re-sanitize until an actual constraint changes.
+    range_constraints: Option<RangeConstraints>,
     /// False while an otherwise-retained value is passing through a value-mode which Quox cannot
-    /// yet expose or sanitize (currently range and color).
+    /// yet expose or sanitize (currently color).
     active: bool,
 }
 
@@ -601,6 +829,26 @@ enum UnmanagedInputMode {
 }
 
 impl TextControlStates {
+    /// Record the observable mutation edge which cannot be recovered by comparing final parsed
+    /// constraint values. HTML re-runs range sanitization even when a setter repeats the same
+    /// `min`, `max`, or `step` text.
+    pub(crate) fn note_range_constraint_attribute_mutation(
+        &mut self,
+        document: &BaseDocument,
+        node_id: usize,
+        name: &str,
+    ) {
+        if !(name.eq_ignore_ascii_case("min")
+            || name.eq_ignore_ascii_case("max")
+            || name.eq_ignore_ascii_case("step"))
+            || !control_descriptor(document, node_id)
+                .is_some_and(|(kind, _)| kind == TextControlKind::InputRange)
+        {
+            return;
+        }
+        self.range_constraint_mutations.insert(node_id);
+    }
+
     /// Reconcile every live text control before layout or immediately after a DOM mutation.
     pub(crate) fn reconcile_document(&mut self, document: &mut BaseDocument) {
         // Detached nodes are still returned by get_node and must keep their value. Only actually
@@ -676,6 +924,8 @@ impl TextControlStates {
         kind: TextControlKind,
         default_value: String,
     ) {
+        let sanitizer = ControlValueSanitizer::for_control(document, node_id, kind);
+        let range_constraint_mutated = self.range_constraint_mutations.remove(&node_id);
         // A script type mutation can move directly from an editor-backed value state into a
         // non-editor date/time state. Capture the old editor before choosing the destination
         // sanitizer or clearing Blitz's special data.
@@ -692,34 +942,50 @@ impl TextControlStates {
             .entry(node_id)
             .or_insert_with(|| TextControlState {
                 kind,
-                value: kind.normalize_value(&default_value),
-                editor_value: kind.normalize_value(&default_value),
+                value: sanitizer.normalize(&default_value),
+                editor_value: sanitizer.normalize(&default_value),
                 default_value: default_value.clone(),
                 selection: EditorSelectionState::default(),
                 dirty_value: false,
+                range_constraints: match sanitizer {
+                    ControlValueSanitizer::Range(range) => Some(range.constraints),
+                    ControlValueSanitizer::Static(_) => None,
+                },
                 active: true,
             });
 
         let selection_projection_kind = control.kind;
         let previously_selectable = control.active && control.kind.supports_selection();
         let reactivating = !control.active;
+        let range_constraints = match sanitizer {
+            ControlValueSanitizer::Range(range) => Some(range.constraints),
+            ControlValueSanitizer::Static(_) => None,
+        };
+        let range_constraints_changed = control.kind == kind
+            && !reactivating
+            && (range_constraint_mutated || control.range_constraints != range_constraints);
         let mut move_selection_to_start = false;
         if control.kind != kind || reactivating {
             // These input states all use HTML's value mode. Type/`multiple` transitions preserve
             // the live value and dirty flag, then apply the new state's sanitizer.
             move_selection_to_start = !previously_selectable && kind.supports_selection();
             control.kind = kind;
-            control.value = kind.normalize_value(&control.value);
+            control.value = sanitizer.normalize(&control.value);
             control.editor_value.clone_from(&control.value);
             control.active = true;
         }
         if control.default_value != default_value {
             control.default_value = default_value;
             if !control.dirty_value {
-                control.value = kind.normalize_value(&control.default_value);
+                control.value = sanitizer.normalize(&control.default_value);
                 control.editor_value.clone_from(&control.value);
             }
         }
+        if kind == TextControlKind::InputRange && range_constraints_changed {
+            control.value = sanitizer.normalize(&control.value);
+            control.editor_value.clone_from(&control.value);
+        }
+        control.range_constraints = range_constraints;
 
         let editor_value = control.editor_value.clone();
         let preserved_direction = control.selection.direction;
@@ -789,12 +1055,18 @@ impl TextControlStates {
         }
 
         self.sync_editor_selection(document, node_id);
+        let kind = self
+            .controls
+            .get(&node_id)
+            .expect("reconcile_control inserted the form control")
+            .kind;
+        let sanitizer = ControlValueSanitizer::for_control(document, node_id, kind);
         let (value, value_changed, editor_changed, preserved_direction, kind) = {
             let control = self
                 .controls
                 .get_mut(&node_id)
                 .expect("reconcile_control inserted the text control");
-            let value = control.kind.normalize_value(value);
+            let value = sanitizer.normalize(value);
             let value_changed = control.value != value;
             let editor_changed = control.editor_value != value;
             control.value.clone_from(&value);
@@ -1075,6 +1347,7 @@ impl TextControlStates {
     pub(crate) fn invalidate_nodes(&mut self, node_ids: impl IntoIterator<Item = usize>) {
         for node_id in node_ids {
             self.controls.remove(&node_id);
+            self.range_constraint_mutations.remove(&node_id);
         }
     }
 
@@ -1117,10 +1390,11 @@ fn control_descriptor(
                 "week" => TextControlKind::InputWeek,
                 "time" => TextControlKind::InputTime,
                 "datetime-local" => TextControlKind::InputDateTimeLocal,
+                "range" => TextControlKind::InputRange,
                 // Non-value modes and the remaining unsupported Blitz value modes are outside
                 // this live-value owner.
-                "hidden" | "range" | "color" | "checkbox" | "radio" | "file" | "submit"
-                | "image" | "reset" | "button" => return None,
+                "hidden" | "color" | "checkbox" | "radio" | "file" | "submit" | "image"
+                | "reset" | "button" => return None,
                 // Text-like keywords, the missing value, and the enumerated attribute's invalid
                 // value default all use the Text state.
                 _ => TextControlKind::InputText,
@@ -1179,7 +1453,7 @@ fn unmanaged_input_mode(document: &BaseDocument, node_id: usize) -> Option<Unman
         .unwrap_or("")
         .to_ascii_lowercase();
     match input_type.as_str() {
-        "range" | "color" => Some(UnmanagedInputMode::UnsupportedValue),
+        "color" => Some(UnmanagedInputMode::UnsupportedValue),
         "hidden" | "submit" | "image" | "reset" | "button" => Some(UnmanagedInputMode::Default),
         "checkbox" | "radio" => Some(UnmanagedInputMode::DefaultOn),
         "file" => Some(UnmanagedInputMode::Filename),
@@ -1373,6 +1647,110 @@ fn weeks_in_year(year: &[u8]) -> u8 {
     } else {
         52
     }
+}
+
+#[derive(Clone, Copy)]
+struct ParsedHtmlFloat {
+    value: f64,
+    decimal_places: Option<usize>,
+}
+
+impl ParsedHtmlFloat {
+    const ZERO: Self = Self {
+        value: 0.0,
+        decimal_places: Some(0),
+    };
+}
+
+/// Parse the permissive numeric prefix used by HTML's min/max/step algorithms. Unlike a value
+/// sanitizer, this skips leading ASCII whitespace and ignores trailing garbage.
+fn parse_html_floating_point(input: &str) -> Option<ParsedHtmlFloat> {
+    let bytes = input.as_bytes();
+    let mut index = 0;
+    while bytes
+        .get(index)
+        .is_some_and(|byte| matches!(byte, b'\t' | b'\n' | b'\x0c' | b'\r' | b' '))
+    {
+        index += 1;
+    }
+    let number_start = index;
+    if matches!(bytes.get(index), Some(b'+' | b'-')) {
+        index += 1;
+    }
+
+    let integer_start = index;
+    while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+        index += 1;
+    }
+    let integer_digits = index - integer_start;
+    let mut fraction_digits = 0;
+    if bytes.get(index) == Some(&b'.') {
+        index += 1;
+        let fraction_start = index;
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
+        fraction_digits = index - fraction_start;
+    }
+    if integer_digits == 0 && fraction_digits == 0 {
+        return None;
+    }
+
+    let mut exponent = 0i32;
+    let mut number_end = index;
+    if matches!(bytes.get(index), Some(b'e' | b'E')) {
+        let exponent_marker = index;
+        index += 1;
+        let negative_exponent = if bytes.get(index) == Some(&b'-') {
+            index += 1;
+            true
+        } else {
+            if bytes.get(index) == Some(&b'+') {
+                index += 1;
+            }
+            false
+        };
+        let exponent_start = index;
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            exponent = exponent
+                .saturating_mul(10)
+                .saturating_add(i32::from(bytes[index] - b'0'));
+            index += 1;
+        }
+        if index == exponent_start {
+            number_end = exponent_marker;
+        } else {
+            if negative_exponent {
+                exponent = -exponent;
+            }
+            number_end = index;
+        }
+    }
+
+    let value = input.get(number_start..number_end)?.parse::<f64>().ok()?;
+    if !value.is_finite() {
+        return None;
+    }
+    let decimal_places = if exponent >= 0 {
+        fraction_digits.saturating_sub(usize::try_from(exponent).unwrap_or(usize::MAX))
+    } else {
+        fraction_digits
+            .saturating_add(usize::try_from(exponent.unsigned_abs()).unwrap_or(usize::MAX))
+    };
+    Some(ParsedHtmlFloat {
+        value: if value == 0.0 { 0.0 } else { value },
+        decimal_places: Some(decimal_places),
+    })
+}
+
+fn parse_valid_floating_point_number(value: &str) -> Option<f64> {
+    if value.is_empty() || !is_valid_floating_point_number(value) {
+        return None;
+    }
+    let value = value.parse::<f64>().ok()?;
+    value
+        .is_finite()
+        .then_some(if value == 0.0 { 0.0 } else { value })
 }
 
 fn is_valid_floating_point_number(value: &str) -> bool {
@@ -1607,7 +1985,8 @@ impl SelectionProjection {
             | TextControlKind::InputMonth
             | TextControlKind::InputWeek
             | TextControlKind::InputTime
-            | TextControlKind::InputDateTimeLocal => raw_characters,
+            | TextControlKind::InputDateTimeLocal
+            | TextControlKind::InputRange => raw_characters,
         };
 
         let mut utf16_len = 0;
@@ -1776,6 +2155,14 @@ mod tests {
             prefix: None,
             ns: ns!(),
             local: local_name!("form"),
+        }
+    }
+
+    fn input_attribute(name: &str) -> QualName {
+        QualName {
+            prefix: None,
+            ns: ns!(),
+            local: LocalName::from(name),
         }
     }
 
@@ -2869,13 +3256,12 @@ mod tests {
     }
 
     #[test]
-    fn range_color_and_filename_modes_remain_explicitly_unsupported() {
+    fn color_and_filename_modes_remain_explicitly_unsupported() {
         let mut document = document(
-            "<input id='range' type='range' value='sentinel'>\
-             <input id='color' type='color' value='sentinel'>\
+            "<input id='color' type='color' value='sentinel'>\
              <input id='file' type='file' value='sentinel'>",
         );
-        let inputs = ["range", "color", "file"].map(|id| element(&document, id));
+        let inputs = ["color", "file"].map(|id| element(&document, id));
         let mut controls = TextControlStates::default();
         controls.reconcile_document(&mut document);
 
@@ -2890,6 +3276,274 @@ mod tests {
                 Some("sentinel")
             );
         }
+    }
+
+    #[test]
+    fn range_values_apply_defaults_bounds_and_step_correction() {
+        let mut document = document(
+            "<input id='default' type='range'>\
+             <input id='midpoint' type='range' min='0.1' max='0.2' step='any'>\
+             <input id='invalid' type='range' min='10' max='20' value='bad'>\
+             <input id='reversed' type='range' min='20' max='10' value='bad'>\
+             <input id='step-tie' type='range' min='0' max='100' step='20' value='50'>\
+             <input id='negative-tie' type='range' min='-100' max='100' step='20' value='-50'>\
+             <input id='boundary' type='range' min='0' max='.3' step='.1' value='.29'>\
+             <input id='negative-boundary' type='range' min='-.3' max='0' step='.1' value='-.29'>\
+             <input id='tiny-tie' type='range' min='0' max='1' step='1e-20' value='5e-21'>\
+             <input id='tiny-low' type='range' min='0' max='1' step='1e-20' value='1e-24'>\
+             <input id='small-exponent' type='range' min='0' max='1' step='1e-7' value='1.5e-7'>\
+             <input id='large-exponent' type='range' min='0' max='1e22' step='1e21' value='5e20'>\
+             <input id='overflow-grid' type='range' min='-1e308' max='1e308' step='1e308' value='9e307'>\
+             <input id='negative-zero' type='range' min='-1' max='0' step='1' value='-1e-24'>\
+             <input id='permissive' type='range' min='  +10junk' max='20junk' step='2junk' value='+12'>\
+             <input id='raw-base' type='range' max='10' step='.2' value='.1'>\
+             <input id='strict' type='range' step='any'>\
+             <input id='fallback-step' type='range' min='0' max='10'>",
+        );
+        let mut controls = TextControlStates::default();
+        controls.reconcile_document(&mut document);
+
+        let cases = [
+            ("default", "50"),
+            ("midpoint", "0.15"),
+            ("invalid", "15"),
+            ("reversed", "20"),
+            ("step-tie", "60"),
+            ("negative-tie", "-40"),
+            ("boundary", "0.3"),
+            ("negative-boundary", "-0.3"),
+            ("tiny-tie", "1e-20"),
+            ("tiny-low", "0"),
+            ("small-exponent", "2e-7"),
+            ("large-exponent", "1e+21"),
+            ("overflow-grid", "1e+308"),
+            ("negative-zero", "0"),
+            ("permissive", "16"),
+            ("raw-base", ".1"),
+            ("strict", "50"),
+            ("fallback-step", "5"),
+        ];
+        for (id, expected) in cases {
+            let input = element(&document, id);
+            assert_eq!(
+                controls.value(&mut document, input).as_deref(),
+                Some(expected),
+                "initial range value for #{id}",
+            );
+            assert!(
+                super::editor_value(&document, input).is_none(),
+                "range #{id} must remain data-only",
+            );
+        }
+
+        let raw_base = element(&document, "raw-base");
+        assert_eq!(
+            controls.set_value(&mut document, raw_base, ".2"),
+            Some(true)
+        );
+        assert_eq!(
+            controls.value(&mut document, raw_base).as_deref(),
+            Some("0.3")
+        );
+
+        let strict = element(&document, "strict");
+        for invalid in ["+12", "12junk", "1.", "1.e2", " 12"] {
+            controls.set_value(&mut document, strict, invalid);
+            assert_eq!(
+                controls.value(&mut document, strict).as_deref(),
+                Some("50"),
+                "strict live range value {invalid}",
+            );
+        }
+        controls.set_value(&mut document, strict, ".5");
+        assert_eq!(controls.value(&mut document, strict).as_deref(), Some(".5"));
+
+        let fallback_step = element(&document, "fallback-step");
+        for step in ["0", "-1", "garbage"] {
+            document
+                .mutate()
+                .set_attribute(fallback_step, input_attribute("step"), step);
+            controls.reconcile_document(&mut document);
+            controls.set_value(&mut document, fallback_step, ".5");
+            assert_eq!(
+                controls.value(&mut document, fallback_step).as_deref(),
+                Some("1"),
+                "fallback for step={step}",
+            );
+        }
+    }
+
+    #[test]
+    fn range_defaults_follow_until_dirty_and_constraints_resanitize() {
+        let mut document = document(
+            "<input id='field' type='range' min='0' max='100' step='1' value='25'>\
+             <input id='base' type='range' max='100' step='10' value='3'>\
+             <input id='removed-min' type='range' min='10' max='20' step='4' value='15'>",
+        );
+        let field = element(&document, "field");
+        let base = element(&document, "base");
+        let removed_min = element(&document, "removed-min");
+        let mut controls = TextControlStates::default();
+        controls.reconcile_document(&mut document);
+
+        document
+            .mutate()
+            .set_attribute(field, value_attribute(), "40");
+        controls.reconcile_document(&mut document);
+        assert_eq!(controls.value(&mut document, field).as_deref(), Some("40"));
+        assert_eq!(
+            controls.set_value(&mut document, field, "40"),
+            Some(false),
+            "an identical assignment still dirties a range value",
+        );
+        document
+            .mutate()
+            .set_attribute(field, value_attribute(), "60");
+        controls.reconcile_document(&mut document);
+        assert_eq!(
+            controls.value(&mut document, field).as_deref(),
+            Some("40"),
+            "a dirty live value does not follow its raw default",
+        );
+
+        document
+            .mutate()
+            .set_attribute(field, input_attribute("min"), "45");
+        controls.reconcile_document(&mut document);
+        assert_eq!(controls.value(&mut document, field).as_deref(), Some("45"));
+        document
+            .mutate()
+            .set_attribute(field, input_attribute("step"), "10");
+        controls.reconcile_document(&mut document);
+        assert_eq!(controls.value(&mut document, field).as_deref(), Some("45"));
+        controls.set_value(&mut document, field, "59");
+        assert_eq!(controls.value(&mut document, field).as_deref(), Some("55"));
+        document
+            .mutate()
+            .set_attribute(field, input_attribute("max"), "52");
+        controls.reconcile_document(&mut document);
+        assert_eq!(
+            controls.value(&mut document, field).as_deref(),
+            Some("45"),
+            "the maximum is applied before the nearest in-range step",
+        );
+        assert!(controls.state(field).unwrap().dirty_value);
+        assert_eq!(
+            super::input_value_attribute(&document, field).as_deref(),
+            Some("60"),
+            "the content default remains independent",
+        );
+
+        controls.set_value(&mut document, base, "14");
+        assert_eq!(controls.value(&mut document, base).as_deref(), Some("13"));
+        document
+            .mutate()
+            .set_attribute(base, value_attribute(), "7");
+        controls.reconcile_document(&mut document);
+        assert_eq!(
+            controls.value(&mut document, base).as_deref(),
+            Some("13"),
+            "changing only a dirty raw value does not immediately re-sanitize",
+        );
+        document
+            .mutate()
+            .set_attribute(base, input_attribute("step"), "10");
+        controls.note_range_constraint_attribute_mutation(&document, base, "step");
+        controls.reconcile_document(&mut document);
+        assert_eq!(
+            controls.value(&mut document, base).as_deref(),
+            Some("17"),
+            "repeating the same constraint still uses the new raw-value step base",
+        );
+        document
+            .mutate()
+            .set_attribute(base, input_attribute("step"), "8");
+        controls.reconcile_document(&mut document);
+        assert_eq!(
+            controls.value(&mut document, base).as_deref(),
+            Some("15"),
+            "the next constraint change uses the current raw-value step base",
+        );
+
+        assert_eq!(
+            controls.value(&mut document, removed_min).as_deref(),
+            Some("14")
+        );
+        document
+            .mutate()
+            .clear_attribute(removed_min, input_attribute("min"));
+        controls.reconcile_document(&mut document);
+        assert_eq!(
+            controls.value(&mut document, removed_min).as_deref(),
+            Some("15"),
+            "removing a constraint re-runs range sanitization",
+        );
+    }
+
+    #[test]
+    fn range_type_transitions_follow_value_mode_bookkeeping() {
+        let mut document = document(
+            "<input id='editor' value='old'>\
+             <input id='from-default' type='checkbox' value='30'>\
+             <input id='to-default' type='range' min='0' max='100' step='20' value='50'>",
+        );
+        let editor = element(&document, "editor");
+        let from_default = element(&document, "from-default");
+        let to_default = element(&document, "to-default");
+        let mut controls = TextControlStates::default();
+        controls.reconcile_document(&mut document);
+
+        document.with_text_input(editor, |mut driver| {
+            driver.editor.set_text("61");
+            driver.refresh_layout();
+        });
+        set_input_type(&mut document, editor, "range");
+        document
+            .mutate()
+            .set_attribute(editor, input_attribute("min"), "0");
+        document
+            .mutate()
+            .set_attribute(editor, input_attribute("max"), "100");
+        document
+            .mutate()
+            .set_attribute(editor, input_attribute("step"), "20");
+        controls.reconcile_document(&mut document);
+        assert_eq!(controls.value(&mut document, editor).as_deref(), Some("60"));
+        assert!(controls.state(editor).unwrap().dirty_value);
+        assert!(super::editor_value(&document, editor).is_none());
+
+        set_input_type(&mut document, editor, "text");
+        controls.reconcile_document(&mut document);
+        assert_eq!(controls.value(&mut document, editor).as_deref(), Some("60"));
+        assert_eq!(editor_selection(&document, editor), 0..0);
+
+        set_input_type(&mut document, from_default, "range");
+        document
+            .mutate()
+            .set_attribute(from_default, input_attribute("min"), "0");
+        document
+            .mutate()
+            .set_attribute(from_default, input_attribute("step"), "20");
+        controls.reconcile_document(&mut document);
+        assert_eq!(
+            controls.value(&mut document, from_default).as_deref(),
+            Some("40")
+        );
+        assert!(!controls.state(from_default).unwrap().dirty_value);
+        assert!(super::editor_value(&document, from_default).is_none());
+
+        controls.set_value(&mut document, to_default, "70");
+        assert_eq!(
+            controls.value(&mut document, to_default).as_deref(),
+            Some("80")
+        );
+        set_input_type(&mut document, to_default, "checkbox");
+        controls.reconcile_document(&mut document);
+        assert_eq!(
+            super::input_value_attribute(&document, to_default).as_deref(),
+            Some("80")
+        );
+        assert!(controls.state(to_default).is_none());
     }
 
     #[test]

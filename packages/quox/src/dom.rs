@@ -881,6 +881,14 @@ impl QuoxRenderer {
         });
         restore_text_editor(&mut state.document, node_id, editor);
         result?;
+        {
+            let QuoxRendererState {
+                document,
+                text_controls,
+                ..
+            } = &mut *state;
+            text_controls.note_range_constraint_attribute_mutation(document, node_id, name);
+        }
         state.reconcile_form_controls();
         state.reconcile_native_ime_after_editor_mutation(ime_before);
         Ok(())
@@ -1002,6 +1010,7 @@ impl QuoxRenderer {
             uint32(node_handle, "nodeHandle").map_err(NumericArgumentError::into_js)?;
         let mut state = self.state.borrow_mut();
         let node_id = state.resolve_element(node_handle)?;
+        let had_attribute = attribute_value(&state.document, node_id, name).is_some();
         let ime_before = state.focused_editor_snapshot();
         let editor = if name.eq_ignore_ascii_case("value") {
             let QuoxRendererState {
@@ -1019,6 +1028,14 @@ impl QuoxRenderer {
         });
         restore_text_editor(&mut state.document, node_id, editor);
         result?;
+        if had_attribute {
+            let QuoxRendererState {
+                document,
+                text_controls,
+                ..
+            } = &mut *state;
+            text_controls.note_range_constraint_attribute_mutation(document, node_id, name);
+        }
         state.reconcile_form_controls();
         state.reconcile_native_ime_after_editor_mutation(ime_before);
         Ok(())

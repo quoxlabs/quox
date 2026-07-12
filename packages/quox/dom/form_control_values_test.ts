@@ -16,7 +16,14 @@ interface ControlState {
   selectionDirection: 0 | 1 | 2;
 }
 
-type InputValueMode = "value" | "date-time-value" | "unsupported-value" | "default" | "default-on" | "filename";
+type InputValueMode =
+  | "value"
+  | "date-time-value"
+  | "range-value"
+  | "unsupported-value"
+  | "default"
+  | "default-on"
+  | "filename";
 
 function inputValueMode(control: ControlState): InputValueMode {
   const type = (control.attributes.get("type") ?? "").toLowerCase();
@@ -28,6 +35,7 @@ function inputValueMode(control: ControlState): InputValueMode {
     case "time":
       return "date-time-value";
     case "range":
+      return "range-value";
     case "color":
       return "unsupported-value";
     case "hidden":
@@ -47,7 +55,8 @@ function inputValueMode(control: ControlState): InputValueMode {
 }
 
 function isValueMode(mode: InputValueMode): boolean {
-  return mode === "value" || mode === "date-time-value" || mode === "unsupported-value";
+  return mode === "value" || mode === "date-time-value" || mode === "range-value" ||
+    mode === "unsupported-value";
 }
 
 function decimalModulo(value: string, divisor: number): number {
@@ -127,6 +136,146 @@ function sanitizeDateTimeValue(control: ControlState, value: string): string {
     default:
       return value;
   }
+}
+
+interface ParsedHtmlFloat {
+  readonly value: number;
+  readonly decimalPlaces: number;
+}
+
+interface RangeConfig {
+  readonly minimum: number;
+  readonly maximum: number;
+  readonly midpointDecimalPlaces: number | null;
+  readonly step: number | null;
+  readonly stepBase: number;
+  readonly snappedDecimalPlaces: number | null;
+}
+
+function parseHtmlFloatingPoint(value: string): ParsedHtmlFloat | null {
+  const match = /^[\t\n\f\r ]*[+-]?(?:(?:[0-9]+(?:\.[0-9]*)?)|(?:\.[0-9]+))(?:[eE][+-]?[0-9]+)?/.exec(
+    value,
+  );
+  if (match === null) return null;
+  const parsed = Number(match[0]);
+  if (!Number.isFinite(parsed)) return null;
+
+  const token = match[0].trim().replace(/^[+-]/, "");
+  const [significand, rawExponent] = token.toLowerCase().split("e");
+  const fractionDigits = significand.includes(".") ? significand.length - significand.indexOf(".") - 1 : 0;
+  const exponent = rawExponent === undefined ? 0 : Number(rawExponent);
+  const decimalPlaces = Number.isSafeInteger(exponent) ? Math.max(0, Math.min(101, fractionDigits - exponent)) : 101;
+  return { value: parsed === 0 ? 0 : parsed, decimalPlaces };
+}
+
+function parseValidFloatingPoint(value: string): number | null {
+  if (!/^-?(?:(?:[0-9]+(?:\.[0-9]+)?)|(?:\.[0-9]+))(?:[eE][+-]?[0-9]+)?$/.test(value)) {
+    return null;
+  }
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? (parsed === 0 ? 0 : parsed) : null;
+}
+
+function rangeConfig(control: ControlState): RangeConfig {
+  const parsedMinimum = control.attributes.has("min") ? parseHtmlFloatingPoint(control.attributes.get("min")!) : null;
+  const parsedMaximum = control.attributes.has("max") ? parseHtmlFloatingPoint(control.attributes.get("max")!) : null;
+  const parsedDefault = control.attributes.has("value")
+    ? parseHtmlFloatingPoint(control.attributes.get("value")!)
+    : null;
+  const stepAttribute = control.attributes.get("step");
+  const parsedStep = stepAttribute === undefined ? null : parseHtmlFloatingPoint(stepAttribute);
+  const step = stepAttribute?.toLowerCase() === "any"
+    ? null
+    : parsedStep !== null && parsedStep.value > 0
+    ? parsedStep.value
+    : 1;
+  const stepBase = parsedMinimum ?? parsedDefault ?? { value: 0, decimalPlaces: 0 };
+  const maximumPlaces = (...places: Array<number | undefined>): number | null => {
+    const present = places.filter((place): place is number => place !== undefined);
+    return present.length === 0 ? null : Math.max(...present);
+  };
+  const midpointPlaces = maximumPlaces(parsedMinimum?.decimalPlaces, parsedMaximum?.decimalPlaces);
+
+  return {
+    minimum: parsedMinimum?.value ?? 0,
+    maximum: parsedMaximum?.value ?? 100,
+    midpointDecimalPlaces: midpointPlaces === null ? null : midpointPlaces + 1,
+    step,
+    stepBase: stepBase.value,
+    snappedDecimalPlaces: step === null ? null : maximumPlaces(stepBase.decimalPlaces, parsedStep?.decimalPlaces),
+  };
+}
+
+function canonicalizeDecimal(value: number, decimalPlaces: number | null): number {
+  if (decimalPlaces === null || decimalPlaces < 0 || decimalPlaces > 100) return value;
+  return Number(value.toFixed(decimalPlaces));
+}
+
+function nearlyEqual(left: number, right: number): boolean {
+  if (left === right) return true;
+  return Math.abs(left - right) <= 2 * Number.EPSILON * Math.max(Math.abs(left), Math.abs(right));
+}
+
+function nearestRangeValue(number: number, config: RangeConfig): number | null {
+  const step = config.step;
+  if (step === null) return null;
+  const directSteps = (number - config.stepBase) / step;
+  const steps = Number.isFinite(directSteps) ? directSteps : number / step - config.stepBase / step;
+  if (!Number.isFinite(steps)) return null;
+  const candidate = (index: number): number | null => {
+    const direct = index * step + config.stepBase;
+    const value = canonicalizeDecimal(
+      Number.isFinite(direct) ? direct : (index + config.stepBase / step) * step,
+      config.snappedDecimalPlaces,
+    );
+    return Number.isFinite(value) && value >= config.minimum &&
+        (config.maximum < config.minimum || value <= config.maximum)
+      ? value
+      : null;
+  };
+  const lower = candidate(Math.floor(steps));
+  const upper = candidate(Math.ceil(steps));
+  if (number === lower || number === upper) return null;
+  if (lower === null) return upper;
+  if (upper === null) return lower;
+  const lowerDistance = Math.abs(number - lower);
+  const upperDistance = Math.abs(upper - number);
+  return upperDistance < lowerDistance || nearlyEqual(upperDistance, lowerDistance) ? upper : lower;
+}
+
+function sanitizeRangeValue(control: ControlState, value: string): string {
+  const config = rangeConfig(control);
+  const parsed = parseValidFloatingPoint(value);
+  let number = parsed;
+  let serialize = number === null;
+  if (number === null) {
+    number = config.maximum < config.minimum ? config.minimum : canonicalizeDecimal(
+      Number.isFinite(config.maximum - config.minimum)
+        ? config.minimum + (config.maximum - config.minimum) / 2
+        : config.minimum / 2 + config.maximum / 2,
+      config.midpointDecimalPlaces,
+    );
+  }
+  if (number < config.minimum) {
+    number = config.minimum;
+    serialize = true;
+  }
+  if (config.maximum >= config.minimum && number > config.maximum) {
+    number = config.maximum;
+    serialize = true;
+  }
+  const snapped = nearestRangeValue(number, config);
+  if (snapped !== null) {
+    number = snapped;
+    serialize = true;
+  }
+  return serialize ? String(canonicalizeDecimal(number, config.snappedDecimalPlaces) || 0) : value;
+}
+
+function sanitizeControlValue(control: ControlState, value: string): string {
+  return inputValueMode(control) === "range-value"
+    ? sanitizeRangeValue(control, value)
+    : sanitizeDateTimeValue(control, value);
 }
 
 function supportsSelectionRange(control: ControlState): boolean {
@@ -210,6 +359,7 @@ class FakeLiveControlRenderer {
     switch (inputValueMode(control)) {
       case "value":
       case "date-time-value":
+      case "range-value":
         return control.value;
       case "default":
         return control.attributes.get("value") ?? "";
@@ -237,11 +387,12 @@ class FakeLiveControlRenderer {
         case "filename":
           throw new TypeError("fake input value mode is intentionally unsupported");
         case "date-time-value":
+        case "range-value":
         case "value":
           break;
       }
     }
-    value = sanitizeDateTimeValue(control, value);
+    value = sanitizeControlValue(control, value);
     const changed = control.value !== value;
     control.value = value;
     control.dirty = true;
@@ -332,7 +483,11 @@ class FakeLiveControlRenderer {
       control.tagName === "input" && name === "value" &&
       isValueMode(inputValueMode(control)) && !control.dirty
     ) {
-      control.value = sanitizeDateTimeValue(control, value);
+      control.value = sanitizeControlValue(control, value);
+    } else if (
+      inputValueMode(control) === "range-value" && ["min", "max", "step"].includes(name)
+    ) {
+      control.value = sanitizeRangeValue(control, control.value);
     }
     if (
       control.tagName === "input" && name === "checked" && !hadChecked &&
@@ -352,6 +507,7 @@ class FakeLiveControlRenderer {
     name = name.toLowerCase();
     const previousMode = control.tagName === "input" && name === "type" ? inputValueMode(control) : undefined;
     const previouslySelectable = supportsSelectionRange(control);
+    const hadAttribute = control.attributes.has(name);
     const hadChecked = control.attributes.has("checked");
     control.attributes.delete(name);
     if (previousMode !== undefined) {
@@ -360,7 +516,12 @@ class FakeLiveControlRenderer {
       control.tagName === "input" && name === "value" &&
       isValueMode(inputValueMode(control)) && !control.dirty
     ) {
-      control.value = "";
+      control.value = sanitizeControlValue(control, "");
+    } else if (
+      hadAttribute &&
+      inputValueMode(control) === "range-value" && ["min", "max", "step"].includes(name)
+    ) {
+      control.value = sanitizeRangeValue(control, control.value);
     }
     if (
       control.tagName === "input" && name === "checked" && hadChecked &&
@@ -453,7 +614,7 @@ class FakeLiveControlRenderer {
     } else if (previousMode !== "filename" && nextMode === "filename") {
       control.value = "";
     }
-    if (isValueMode(nextMode)) control.value = sanitizeDateTimeValue(control, control.value);
+    if (isValueMode(nextMode)) control.value = sanitizeControlValue(control, control.value);
   }
 
   #control(nodeHandle: number): ControlState {
@@ -798,8 +959,140 @@ Deno.test("date values use Web IDL string conversion", () => {
   assertEquals(input.value, "", "failed conversion does not reach the renderer");
 });
 
-Deno.test("range, color, and filename input values remain explicitly unsupported", () => {
-  for (const type of ["range", "color", "file"]) {
+Deno.test("range values apply browser defaults, bounds, steps, and number serialization", () => {
+  const cases = [
+    [{}, "50"],
+    [{ min: "0.1", max: "0.2", step: "any" }, "0.15"],
+    [{ min: "10", max: "20", value: "bad" }, "15"],
+    [{ min: "20", max: "10", value: "bad" }, "20"],
+    [{ min: "0", max: "100", step: "20", value: "50" }, "60"],
+    [{ min: "-100", max: "100", step: "20", value: "-50" }, "-40"],
+    [{ min: "0", max: ".3", step: ".1", value: ".29" }, "0.3"],
+    [{ min: "0", max: "1", step: "1e-20", value: "5e-21" }, "1e-20"],
+    [{ min: "0", max: "1", step: "1e-20", value: "1e-24" }, "0"],
+    [{ min: "0", max: "1", step: "1e-7", value: "1.5e-7" }, "2e-7"],
+    [{ min: "0", max: "1e22", step: "1e21", value: "5e20" }, "1e+21"],
+    [{ min: "-1e308", max: "1e308", step: "1e308", value: "9e307" }, "1e+308"],
+    [{ min: "-1", max: "0", step: "1", value: "-1e-24" }, "0"],
+    [{ min: "  +10junk", max: "20junk", step: "2junk", value: "+12" }, "16"],
+  ] as const;
+
+  for (const [attributes, expected] of cases) {
+    const { document } = createDocument();
+    const input = document.createElement("input");
+    for (const [name, value] of Object.entries(attributes)) input.setAttribute(name, value);
+    input.setAttribute("type", "range");
+    assertEquals(input.value, expected, JSON.stringify(attributes));
+    assertEquals(
+      input.defaultValue,
+      (attributes as Readonly<Record<string, string>>).value ?? "",
+      "sanitization does not rewrite the raw default",
+    );
+  }
+
+  const { document } = createDocument();
+  const input = document.createElement("input");
+  input.setAttribute("min", "10");
+  input.setAttribute("max", "20");
+  input.setAttribute("step", "any");
+  input.setAttribute("type", "range");
+  let inputs = 0;
+  let changes = 0;
+  input.addEventListener("input", () => inputs++);
+  input.addEventListener("change", () => changes++);
+
+  input.value = ".5";
+  assertEquals(input.value, "10", "underflow clamps to the minimum");
+  (input as unknown as { value: unknown }).value = null;
+  assertEquals(input.value, "15", "LegacyNullToEmptyString selects the range midpoint");
+  assertThrows(
+    () => {
+      (input as unknown as { value: unknown }).value = Symbol("range");
+    },
+    TypeError,
+  );
+  assertEquals(input.value, "15", "failed conversion does not reach the renderer");
+  assertEquals(inputs, 0);
+  assertEquals(changes, 0);
+});
+
+Deno.test("range defaults, constraints, and type transitions retain browser value bookkeeping", () => {
+  const { document } = createDocument();
+  const input = document.createElement("input");
+  input.defaultValue = "25";
+  input.setAttribute("min", "0");
+  input.setAttribute("max", "100");
+  input.setAttribute("step", "1");
+  input.setAttribute("type", "range");
+
+  input.defaultValue = "40";
+  assertEquals(input.value, "40");
+  input.value = "40";
+  input.defaultValue = "60";
+  assertEquals(input.value, "40", "an identical assignment still makes the live value dirty");
+  input.setAttribute("min", "45");
+  assertEquals(input.value, "45");
+  input.setAttribute("step", "10");
+  input.value = "59";
+  assertEquals(input.value, "55");
+  input.setAttribute("max", "52");
+  assertEquals(input.value, "45");
+  assertEquals(input.defaultValue, "60");
+
+  const rawBase = document.createElement("input");
+  rawBase.defaultValue = "3";
+  rawBase.setAttribute("max", "100");
+  rawBase.setAttribute("step", "10");
+  rawBase.setAttribute("type", "range");
+  rawBase.value = "14";
+  assertEquals(rawBase.value, "13");
+  rawBase.defaultValue = "7";
+  assertEquals(rawBase.value, "13", "a dirty raw default does not immediately re-sanitize");
+  rawBase.removeAttribute("min");
+  assertEquals(rawBase.value, "13", "removing an absent constraint is a no-op");
+  rawBase.setAttribute("step", "10");
+  assertEquals(rawBase.value, "17", "repeating a constraint uses the new raw-value step base");
+  rawBase.setAttribute("step", "8");
+  assertEquals(rawBase.value, "15", "a constraint change uses the current raw-value step base");
+
+  const removedMin = document.createElement("input");
+  removedMin.defaultValue = "15";
+  removedMin.setAttribute("min", "10");
+  removedMin.setAttribute("max", "20");
+  removedMin.setAttribute("step", "4");
+  removedMin.setAttribute("type", "range");
+  assertEquals(removedMin.value, "14");
+  removedMin.removeAttribute("min");
+  assertEquals(removedMin.value, "15");
+
+  const editor = document.createElement("input");
+  editor.value = "61";
+  editor.setAttribute("min", "0");
+  editor.setAttribute("max", "100");
+  editor.setAttribute("step", "20");
+  editor.setAttribute("type", "range");
+  assertEquals(editor.value, "60");
+  assertEquals(editor.selectionStart, null);
+  editor.setAttribute("type", "text");
+  assertEquals(editor.value, "60");
+  assertEquals(editor.selectionStart, 0);
+
+  const fromDefault = document.createElement("input");
+  fromDefault.setAttribute("type", "checkbox");
+  fromDefault.value = "30";
+  fromDefault.setAttribute("min", "0");
+  fromDefault.setAttribute("step", "20");
+  fromDefault.setAttribute("type", "range");
+  assertEquals(fromDefault.value, "40");
+
+  input.value = "50";
+  input.setAttribute("type", "checkbox");
+  assertEquals(input.value, "45", "the constrained live value is copied into default-on mode");
+  assertEquals(input.defaultValue, "45");
+});
+
+Deno.test("color and filename input values remain explicitly unsupported", () => {
+  for (const type of ["color", "file"]) {
     const { document } = createDocument();
     const input = document.createElement("input");
     input.setAttribute("type", type);
