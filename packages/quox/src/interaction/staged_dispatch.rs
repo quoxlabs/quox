@@ -16,9 +16,11 @@ use blitz_traits::events::{
     BlitzWheelEvent, DomEvent, DomEventData, MouseEventButton, MouseEventButtons,
     Point as ElementPoint, PointerDetails,
 };
+use blitz_traits::shell::{ClipboardError, FileDialogFilter, ShellProvider};
 use js_sys::{Array, Object, Reflect};
 use std::collections::VecDeque;
 use std::fmt::{Display, Formatter};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use wasm_bindgen::prelude::*;
 
@@ -90,6 +92,66 @@ struct DispatchFrame {
     generated: VecDeque<GuardedDomEvent>,
     pending: Option<PendingEvent>,
     redraw_requested: bool,
+}
+
+/// Delegate visible shell work while hiding focus transitions which pinned Blitz performs only
+/// as an implementation detail of an otherwise focus-neutral default.
+struct ImeSuppressingShellProvider {
+    inner: Arc<dyn ShellProvider>,
+}
+
+impl ShellProvider for ImeSuppressingShellProvider {
+    fn request_redraw(&self) {
+        self.inner.request_redraw();
+    }
+
+    fn set_cursor(&self, icon: cursor_icon::CursorIcon) {
+        self.inner.set_cursor(icon);
+    }
+
+    fn set_window_title(&self, title: String) {
+        self.inner.set_window_title(title);
+    }
+
+    fn get_clipboard_text(&self) -> Result<String, ClipboardError> {
+        self.inner.get_clipboard_text()
+    }
+
+    fn set_clipboard_text(&self, text: String) -> Result<(), ClipboardError> {
+        self.inner.set_clipboard_text(text)
+    }
+
+    fn open_file_dialog(
+        &self,
+        multiple: bool,
+        filter: Option<FileDialogFilter>,
+    ) -> Vec<std::path::PathBuf> {
+        self.inner.open_file_dialog(multiple, filter)
+    }
+
+    fn request_window_close(&self) {
+        self.inner.request_window_close();
+    }
+
+    fn set_window_minimized(&self, minimized: bool) {
+        self.inner.set_window_minimized(minimized);
+    }
+
+    fn set_window_maximized(&self, maximized: bool) {
+        self.inner.set_window_maximized(maximized);
+    }
+
+    fn is_window_maximized(&self) -> bool {
+        self.inner.is_window_maximized()
+    }
+
+    fn set_window_decorations(&self, decorations: bool) {
+        self.inner.set_window_decorations(decorations);
+    }
+
+    fn drag_window(&self) {
+        self.inner.drag_window();
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -343,6 +405,7 @@ enum PlannedWork {
         data: DomEventData,
         metadata: EventMetadata,
     },
+    GuardedDefault(Box<GuardedDomEvent>),
     DoubleClick(PendingDoubleClick),
     Action(DispatchAction),
 }
@@ -946,13 +1009,17 @@ impl DispatchStack {
                 if (!cancelled || release_default_survives_mouse_cancellation)
                     && !pointer_default_prevented
                 {
-                    self.run_default(
-                        document,
-                        text_controls,
-                        checked_controls,
-                        handles,
-                        *pointer_default,
-                    )?;
+                    if matches!(&pointer_default.event.data, DomEventData::PointerDown(_)) {
+                        self.queue_pointer_down_default(document, handles, *pointer_default)?;
+                    } else {
+                        self.run_default(
+                            document,
+                            text_controls,
+                            checked_controls,
+                            handles,
+                            *pointer_default,
+                        )?;
+                    }
                 }
                 self.queue_generated_pointer_release(release_auxclick);
             }
@@ -1316,6 +1383,21 @@ impl DispatchStack {
                         )?;
                     }
                 }
+                PlannedWork::GuardedDefault(guarded) => {
+                    if matches!(&guarded.event.data, DomEventData::PointerDown(_)) {
+                        // Focus listeners run before the pointer default and may invalidate the
+                        // layout or target which Blitz re-hits for caret and selection work.
+                        document.resolve(0.0);
+                        if !node_is_live(guarded.target, document, handles)
+                            || !document
+                                .get_node(guarded.target.raw)
+                                .is_some_and(|node| node.flags.is_in_document())
+                        {
+                            continue;
+                        }
+                    }
+                    self.run_default(document, text_controls, checked_controls, handles, *guarded)?;
+                }
                 PlannedWork::DoubleClick(pending) => {
                     if !node_is_live(pending.target, document, handles)
                         || !document
@@ -1459,6 +1541,60 @@ impl DispatchStack {
             });
     }
 
+    fn queue_pointer_down_default(
+        &mut self,
+        document: &mut BaseDocument,
+        handles: &mut NodeHandles,
+        guarded: GuardedDomEvent,
+    ) -> Result<(), DispatchError> {
+        // Mouse focus is the mousedown default, so listener mutations must be visible before
+        // choosing the nearest click-focusable ancestor. Keep Blitz's selection work behind the
+        // staged focus events so a focus listener runs before the ensuing caret placement.
+        document.resolve(0.0);
+        let destination = nearest_click_focusable_ancestor(document, handles, guarded.target)?;
+        let old_focus = actual_focus_node_id(document)
+            .map(|target| guard_node(document, handles, target))
+            .transpose()?
+            .flatten();
+        let metadata = guarded.metadata.clone();
+        let planned = &mut self
+            .frames
+            .last_mut()
+            .expect("pointer defaults run only for an active frame")
+            .planned;
+        let focuses = matches!(
+            &guarded.event.data,
+            DomEventData::PointerDown(BlitzPointerEvent {
+                button: MouseEventButton::Main
+                    | MouseEventButton::Auxiliary
+                    | MouseEventButton::Secondary,
+                ..
+            })
+        );
+        planned.push_front(PlannedWork::GuardedDefault(Box::new(guarded)));
+        if !focuses {
+            return Ok(());
+        }
+        if old_focus == destination {
+            return Ok(());
+        }
+        if let Some(destination) = destination {
+            planned.push_front(PlannedWork::Action(DispatchAction::GainFocus {
+                target: destination,
+                related_target: old_focus,
+                metadata: metadata.clone(),
+            }));
+        }
+        if let Some(old_focus) = old_focus {
+            planned.push_front(PlannedWork::Action(DispatchAction::LoseFocus {
+                target: old_focus,
+                related_target: destination,
+                metadata,
+            }));
+        }
+        Ok(())
+    }
+
     fn run_default(
         &mut self,
         document: &mut BaseDocument,
@@ -1487,6 +1623,8 @@ impl DispatchStack {
         }
 
         let old_focus = actual_focus_node_id(document);
+        let preserve_focus = default_must_preserve_focus(document, &guarded);
+        let original_shell = install_ime_suppressing_shell(document, preserve_focus);
         let source_metadata = guarded.metadata.clone();
         let viewport_scroll_before_default = document.viewport_scroll();
         let preserved_file_value = matches!(&guarded.event.data, DomEventData::Click(_))
@@ -1507,18 +1645,9 @@ impl DispatchStack {
                 (target, value)
             });
         let mut generated = Vec::new();
-        if matches!(&guarded.event.data, DomEventData::Wheel(_))
-            && wheel_target_forwards_default(document, guarded.default_target.raw)
-        {
-            // Blitz's event path maps coordinates and forwards wheel input to embedded documents
-            // and custom widgets. Those targets consume the event directly rather than consulting
-            // the outer document's hover state, so retain that specialized behavior.
-            document.handle_dom_event(&mut guarded.event, |event| generated.push(event));
-        } else if let DomEventData::Wheel(event) = &guarded.event.data {
-            run_wheel_default(document, guarded.default_target.raw, event, &mut generated);
-        } else {
-            document.handle_dom_event(&mut guarded.event, |event| generated.push(event));
-        }
+        run_engine_default(document, &mut guarded, &mut generated);
+        preserve_default_focus(document, &mut generated, old_focus, preserve_focus);
+        restore_shell_provider(document, original_shell);
         if document.viewport_scroll() != viewport_scroll_before_default {
             generated.push(viewport_scroll_event(document));
         }
@@ -1740,6 +1869,98 @@ fn viewport_scroll_event(document: &BaseDocument) -> DomEvent {
     )
 }
 
+fn nearest_click_focusable_ancestor(
+    document: &BaseDocument,
+    handles: &mut NodeHandles,
+    target: GuardedNode,
+) -> Result<Option<GuardedNode>, DispatchError> {
+    if !node_is_live(target, document, handles) {
+        return Ok(None);
+    }
+    for raw in document.node_chain(target.raw) {
+        if is_programmatically_focusable(document, raw) {
+            return guard_node(document, handles, raw);
+        }
+    }
+    Ok(None)
+}
+
+fn default_must_preserve_focus(document: &BaseDocument, guarded: &GuardedDomEvent) -> bool {
+    match &guarded.event.data {
+        DomEventData::PointerDown(pointer) => pointer.is_mouse(),
+        DomEventData::Click(pointer) => {
+            pointer.is_mouse()
+                && !click_default_delegates_focus(document, guarded.default_target.raw)
+        }
+        _ => false,
+    }
+}
+
+fn click_default_delegates_focus(document: &BaseDocument, mut target: usize) -> bool {
+    loop {
+        let Some(node) = document.get_node(target) else {
+            return false;
+        };
+        if let Some(element) = node
+            .element_data()
+            .filter(|element| element.name.ns == ns!(html))
+        {
+            match element.name.local.as_ref() {
+                "label" => return document.label_bound_input_element(target).is_some(),
+                // A directly activated control or interactive descendant owns its click. Only
+                // reaching a label through non-interactive descendants delegates focus later.
+                "a" | "button" | "input" | "select" | "textarea" => return false,
+                _ => {}
+            }
+        }
+        let Some(parent) = node.parent else {
+            return false;
+        };
+        target = parent;
+    }
+}
+
+fn restore_focus_owner(document: &mut BaseDocument, owner: Option<usize>) {
+    if let Some(owner) = owner
+        && is_programmatically_focusable(document, owner)
+        && document.set_focus_to(owner)
+    {
+        return;
+    }
+    document.clear_focus();
+}
+
+fn install_ime_suppressing_shell(
+    document: &mut BaseDocument,
+    suppress: bool,
+) -> Option<Arc<dyn ShellProvider>> {
+    suppress.then(|| {
+        let original = Arc::clone(&document.shell_provider);
+        document.set_shell_provider(Arc::new(ImeSuppressingShellProvider {
+            inner: Arc::clone(&original),
+        }));
+        original
+    })
+}
+
+fn restore_shell_provider(document: &mut BaseDocument, original: Option<Arc<dyn ShellProvider>>) {
+    if let Some(original) = original {
+        document.set_shell_provider(original);
+    }
+}
+
+fn preserve_default_focus(
+    document: &mut BaseDocument,
+    generated: &mut Vec<DomEvent>,
+    owner: Option<usize>,
+    preserve: bool,
+) {
+    if preserve && actual_focus_node_id(document) != owner {
+        restore_focus_owner(document, owner);
+        generated.retain(|event| !is_focus_event(&event.data));
+    }
+}
+
 fn plan_programmatic_focus(
     document: &BaseDocument,
     handles: &mut NodeHandles,
@@ -1842,6 +2063,23 @@ fn guard_focus_pair(
         }
     }
     Ok(guarded)
+}
+
+fn run_engine_default(
+    document: &mut BaseDocument,
+    guarded: &mut GuardedDomEvent,
+    generated: &mut Vec<DomEvent>,
+) {
+    if matches!(&guarded.event.data, DomEventData::Wheel(_))
+        && wheel_target_forwards_default(document, guarded.default_target.raw)
+    {
+        // Embedded documents and custom widgets consume wheel input through Blitz's event path.
+        document.handle_dom_event(&mut guarded.event, |event| generated.push(event));
+    } else if let DomEventData::Wheel(event) = &guarded.event.data {
+        run_wheel_default(document, guarded.default_target.raw, event, generated);
+    } else {
+        document.handle_dom_event(&mut guarded.event, |event| generated.push(event));
+    }
 }
 
 fn wheel_target_forwards_default(document: &BaseDocument, target: usize) -> bool {
@@ -4169,6 +4407,49 @@ mod tests {
             panic!("{} should carry a focus payload", event.event_type);
         };
         *related_target
+    }
+
+    fn is_focus_event_name(name: &str) -> bool {
+        matches!(name, "blur" | "focusout" | "focus" | "focusin")
+    }
+
+    #[allow(
+        clippy::float_cmp,
+        reason = "generated focus records must retain the exact causal native timestamp"
+    )]
+    fn assert_focus_transition_metadata(
+        context: &mut TestContext,
+        mut step: DispatchStep,
+        time_stamp: f64,
+        old_handle: u32,
+        new_handle: u32,
+    ) {
+        let mut saw_blur = false;
+        let mut saw_focus = false;
+        while let DispatchStep::Event(current) = step {
+            assert_eq!(current.time_stamp, time_stamp);
+            let expected_related_target = match current.event_type.as_str() {
+                "blur" => {
+                    saw_blur = true;
+                    Some(new_handle)
+                }
+                "focus" => {
+                    saw_focus = true;
+                    Some(old_handle)
+                }
+                _ => None,
+            };
+            if let Some(related_target) = expected_related_target {
+                assert_eq!(
+                    current.payload.as_deref(),
+                    Some(&DispatchEventPayload::Focus {
+                        related_target: Some(related_target),
+                    })
+                );
+            }
+            step = context.resume(&current, false);
+        }
+        assert!(saw_blur && saw_focus);
     }
 
     fn stage_generated(
@@ -6718,6 +6999,351 @@ mod tests {
     }
 
     #[test]
+    fn uncancelled_mousedown_focuses_the_nearest_focusable_ancestor_before_pointer_defaults() {
+        let mut context = TestContext::new(
+            "<input id='old'>\
+             <button id='button' type='button' style='display:block;width:120px;height:40px'>\
+               <span id='inner' style='display:block;width:80px;height:20px'>focus me</span>\
+             </button>",
+        );
+        let old = context.element("old");
+        let button = context.element("button");
+        let inner = context.element("inner");
+        assert!(context.document.set_focus_to(old));
+        let (x, y) = context.center(inner);
+        assert!(context.document.set_hover_to(x, y));
+
+        let pointer_down = event(context.begin(DispatchRequest::Pointer {
+            event: pointer(x, y, MouseEventButton::Main, MouseEventButtons::Primary),
+            flavor: PointerFlavor::Down,
+            metadata: EventMetadata::native(),
+        }));
+        assert_eq!(pointer_down.event_type, "pointerdown");
+        assert_eq!(context.handles.resolve(pointer_down.target), Some(inner));
+        assert_eq!(actual_focus_node_id(&context.document), Some(old));
+
+        let mouse_down = event(context.resume(&pointer_down, false));
+        assert_eq!(mouse_down.event_type, "mousedown");
+        assert_eq!(context.handles.resolve(mouse_down.target), Some(inner));
+        assert_eq!(actual_focus_node_id(&context.document), Some(old));
+
+        let blur = event(context.resume(&mouse_down, false));
+        assert_eq!(blur.event_type, "blur");
+        assert_eq!(context.handles.resolve(blur.target), Some(old));
+        assert_eq!(actual_focus_node_id(&context.document), None);
+        let focusout = event(context.resume(&blur, false));
+        assert_eq!(focusout.event_type, "focusout");
+        let focus = event(context.resume(&focusout, false));
+        assert_eq!(focus.event_type, "focus");
+        assert_eq!(context.handles.resolve(focus.target), Some(button));
+        assert_eq!(actual_focus_node_id(&context.document), Some(button));
+        let focusin = event(context.resume(&focus, false));
+        assert_eq!(focusin.event_type, "focusin");
+        complete(context.resume(&focusin, false));
+
+        let up = context.begin(DispatchRequest::Pointer {
+            event: pointer(x, y, MouseEventButton::Main, MouseEventButtons::None),
+            flavor: PointerFlavor::Up,
+            metadata: EventMetadata::native(),
+        });
+        let (types, _, _) = drain(&mut context, up);
+        assert!(!types.iter().any(|kind| is_focus_event_name(kind)));
+        assert_eq!(actual_focus_node_id(&context.document), Some(button));
+    }
+
+    #[test]
+    fn cancelled_pointer_or_mouse_down_cannot_focus_later_through_click() {
+        for cancel_pointer in [true, false] {
+            let mut context = TestContext::new(
+                "<input id='old'>\
+                 <input id='box' type='checkbox' style='display:block;width:24px;height:24px'>",
+            );
+            let old = context.element("old");
+            let checkbox = context.element("box");
+            assert!(context.document.set_focus_to(old));
+            let (x, y) = context.center(checkbox);
+            assert!(context.document.set_hover_to(x, y));
+
+            let pointer_down = event(context.begin(DispatchRequest::Pointer {
+                event: pointer(x, y, MouseEventButton::Main, MouseEventButtons::Primary),
+                flavor: PointerFlavor::Down,
+                metadata: EventMetadata::native(),
+            }));
+            let remainder = context.resume(&pointer_down, cancel_pointer);
+            if cancel_pointer {
+                complete(remainder);
+            } else {
+                let mouse_down = event(remainder);
+                assert_eq!(mouse_down.event_type, "mousedown");
+                complete(context.resume(&mouse_down, true));
+            }
+            assert_eq!(actual_focus_node_id(&context.document), Some(old));
+
+            let up = context.begin(DispatchRequest::Pointer {
+                event: pointer(x, y, MouseEventButton::Main, MouseEventButtons::None),
+                flavor: PointerFlavor::Up,
+                metadata: EventMetadata::native(),
+            });
+            let (types, _, _) = drain(&mut context, up);
+            assert!(types.iter().any(|kind| kind == "click"));
+            assert!(types.iter().any(|kind| kind == "input"));
+            assert!(!types.iter().any(|kind| is_focus_event_name(kind)));
+            assert_eq!(actual_focus_node_id(&context.document), Some(old));
+        }
+    }
+
+    #[test]
+    fn non_mouse_clicks_retain_the_pinned_focus_path() {
+        for pointer_id in [BlitzPointerId::Pen, BlitzPointerId::Finger(7)] {
+            let mut context = TestContext::new(
+                "<input id='old'>\
+                 <input id='box' type='checkbox' style='display:block;width:24px;height:24px'>",
+            );
+            let old = context.element("old");
+            let checkbox = context.element("box");
+            assert!(context.document.set_focus_to(old));
+            let (x, y) = context.center(checkbox);
+            let mut click_data = pointer(x, y, MouseEventButton::Main, MouseEventButtons::None);
+            click_data.id = pointer_id;
+            let click = stage_generated_with_metadata(
+                &mut context,
+                checkbox,
+                DomEventData::Click(click_data),
+                EventMetadata::native(),
+            );
+
+            let step = context.resume(&click, false);
+            let (types, _, _) = drain(&mut context, step);
+            assert!(types.iter().any(|kind| kind == "input"));
+            assert!(types.iter().any(|kind| kind == "focus"));
+            assert_eq!(actual_focus_node_id(&context.document), Some(checkbox));
+        }
+    }
+
+    #[test]
+    fn focus_neutral_click_defaults_do_not_restart_the_ime_context() {
+        let mut context = TestContext::new(
+            "<input id='editor' value='seed'>\
+             <input id='box' type='checkbox' style='display:block;width:24px;height:24px'>",
+        );
+        let editor = context.element("editor");
+        let checkbox = context.element("box");
+        assert!(context.document.set_focus_to(editor));
+        let initial_request = context
+            .ime_requests
+            .peek_snapshot()
+            .unwrap()
+            .expect("initial text focus should enable IME");
+        context
+            .ime_requests
+            .acknowledge_snapshot(uint32(initial_request[0], "revision").unwrap())
+            .unwrap();
+        assert!(context.ime_requests.peek_snapshot().unwrap().is_none());
+        context.document.with_text_input(editor, |mut driver| {
+            driver.move_to_text_end();
+            driver.set_compose("候補", None);
+        });
+        let (x, y) = context.center(checkbox);
+        let click = stage_generated_with_metadata(
+            &mut context,
+            checkbox,
+            DomEventData::Click(pointer(
+                x,
+                y,
+                MouseEventButton::Main,
+                MouseEventButtons::None,
+            )),
+            EventMetadata::native(),
+        );
+
+        let step = context.resume(&click, false);
+        let (types, _, _) = drain(&mut context, step);
+        assert_eq!(types, ["input"]);
+        assert_eq!(actual_focus_node_id(&context.document), Some(editor));
+        assert!(
+            context.ime_requests.peek_snapshot().unwrap().is_none(),
+            "a focus-neutral default must not publish a native IME restart"
+        );
+        let mut composition_survived = false;
+        context.document.with_text_input(editor, |driver| {
+            composition_survived = driver.editor.raw_compose().is_some();
+        });
+        assert!(composition_survived);
+    }
+
+    #[test]
+    fn ime_suppressing_shell_delegates_every_other_capability() {
+        struct RecordingShell {
+            close_requested: AtomicBool,
+            clipboard_written: AtomicBool,
+            ime_called: AtomicBool,
+        }
+
+        impl ShellProvider for RecordingShell {
+            fn set_ime_enabled(&self, _enabled: bool) {
+                self.ime_called.store(true, Ordering::Relaxed);
+            }
+
+            fn set_ime_cursor_area(&self, _x: f32, _y: f32, _width: f32, _height: f32) {
+                self.ime_called.store(true, Ordering::Relaxed);
+            }
+
+            fn get_clipboard_text(&self) -> Result<String, ClipboardError> {
+                Ok("clipboard".to_owned())
+            }
+
+            fn set_clipboard_text(&self, _text: String) -> Result<(), ClipboardError> {
+                self.clipboard_written.store(true, Ordering::Relaxed);
+                Err(ClipboardError)
+            }
+
+            fn request_window_close(&self) {
+                self.close_requested.store(true, Ordering::Relaxed);
+            }
+
+            fn is_window_maximized(&self) -> bool {
+                true
+            }
+        }
+
+        let inner = Arc::new(RecordingShell {
+            close_requested: AtomicBool::new(false),
+            clipboard_written: AtomicBool::new(false),
+            ime_called: AtomicBool::new(false),
+        });
+        let shell = ImeSuppressingShellProvider {
+            inner: inner.clone(),
+        };
+
+        shell.request_window_close();
+        assert!(inner.close_requested.load(Ordering::Relaxed));
+        assert!(shell.is_window_maximized());
+        assert_eq!(
+            shell.get_clipboard_text().ok().as_deref(),
+            Some("clipboard")
+        );
+        assert!(shell.set_clipboard_text("write".to_owned()).is_err());
+        assert!(inner.clipboard_written.load(Ordering::Relaxed));
+        shell.set_ime_enabled(true);
+        shell.set_ime_cursor_area(1.0, 2.0, 3.0, 4.0);
+        assert!(!inner.ime_called.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn nested_blur_listener_focus_wins_over_deferred_pointer_default() {
+        let mut context = TestContext::new(
+            "<input id='old'>\
+             <input id='target' style='display:block;width:120px;height:30px'>\
+             <input id='redirect'>",
+        );
+        let old = context.element("old");
+        let target = context.element("target");
+        let redirect = context.element("redirect");
+        assert!(context.document.set_focus_to(old));
+        let (x, y) = context.center(target);
+        assert!(context.document.set_hover_to(x, y));
+
+        let pointer_down = event(context.begin(DispatchRequest::Pointer {
+            event: pointer(x, y, MouseEventButton::Main, MouseEventButtons::Primary),
+            flavor: PointerFlavor::Down,
+            metadata: EventMetadata::native(),
+        }));
+        let mouse_down = event(context.resume(&pointer_down, false));
+        let blur = event(context.resume(&mouse_down, false));
+        assert_eq!(blur.event_type, "blur");
+        assert_eq!(actual_focus_node_id(&context.document), None);
+
+        let nested = context.begin_programmatic_focus(redirect);
+        let (nested_types, _, _) = drain(&mut context, nested);
+        assert_eq!(nested_types, ["focus", "focusin"]);
+        assert_eq!(actual_focus_node_id(&context.document), Some(redirect));
+
+        let remainder = context.resume(&blur, false);
+        let (outer_types, _, _) = drain(&mut context, remainder);
+        assert_eq!(outer_types, ["focusout"]);
+        assert_eq!(actual_focus_node_id(&context.document), Some(redirect));
+    }
+
+    #[test]
+    fn deferred_pointer_default_resolves_layout_after_focus_listeners() {
+        let mut context = TestContext::new(
+            "<input id='target' value='abcdefghij' \
+             style='display:block;width:240px;height:30px'>",
+        );
+        let target = context.element("target");
+        let initial = context
+            .text_controls
+            .selection(&mut context.document, target)
+            .unwrap();
+        assert_eq!((initial.start, initial.end), (0, 0));
+        let (x, y) = context.center(target);
+        assert!(context.document.set_hover_to(x, y));
+
+        let pointer_down = event(context.begin(DispatchRequest::Pointer {
+            event: pointer(x, y, MouseEventButton::Main, MouseEventButtons::Primary),
+            flavor: PointerFlavor::Down,
+            metadata: EventMetadata::native(),
+        }));
+        let mouse_down = event(context.resume(&pointer_down, false));
+        let focus = event(context.resume(&mouse_down, false));
+        assert_eq!(focus.event_type, "focus");
+
+        context.set_style(
+            target,
+            "display:block;width:240px;height:30px;margin-left:400px",
+        );
+        let focusin = event(context.resume(&focus, false));
+        assert_eq!(focusin.event_type, "focusin");
+        complete(context.resume(&focusin, false));
+
+        let selection = context
+            .text_controls
+            .selection(&mut context.document, target)
+            .unwrap();
+        assert_eq!(
+            (selection.start, selection.end),
+            (0, 0),
+            "the stale pre-focus layout must not place the caret"
+        );
+    }
+
+    #[test]
+    fn browser_navigation_buttons_do_not_change_mouse_focus() {
+        for (button, buttons) in [
+            (MouseEventButton::Fourth, MouseEventButtons::Fourth),
+            (MouseEventButton::Fifth, MouseEventButtons::Fifth),
+        ] {
+            let mut context = TestContext::new(
+                "<input id='old'><button id='target' type='button' \
+                 style='display:block;width:100px;height:30px'>target</button>",
+            );
+            let old = context.element("old");
+            let target = context.element("target");
+            assert!(context.document.set_focus_to(old));
+            let (x, y) = context.center(target);
+            assert!(context.document.set_hover_to(x, y));
+
+            let down = context.begin(DispatchRequest::Pointer {
+                event: pointer(x, y, button, buttons),
+                flavor: PointerFlavor::Down,
+                metadata: EventMetadata::native(),
+            });
+            let (down_types, _, _) = drain(&mut context, down);
+            assert_eq!(down_types, ["pointerdown", "mousedown"]);
+            assert_eq!(actual_focus_node_id(&context.document), Some(old));
+
+            let up = context.begin(DispatchRequest::Pointer {
+                event: pointer(x, y, button, MouseEventButtons::None),
+                flavor: PointerFlavor::Up,
+                metadata: EventMetadata::native(),
+            });
+            let (up_types, _, _) = drain(&mut context, up);
+            assert_eq!(up_types, ["pointerup", "mouseup", "auxclick"]);
+            assert_eq!(actual_focus_node_id(&context.document), Some(old));
+        }
+    }
+
+    #[test]
     fn generated_events_keep_fifo_order_and_multiplicity() {
         let mut context = TestContext::new(
             "<input id='box' type='checkbox' style='display:block;width:24px;height:24px'>",
@@ -6731,7 +7357,8 @@ mod tests {
             flavor: PointerFlavor::Down,
             metadata: EventMetadata::native(),
         });
-        let _ = drain(&mut context, down);
+        let (down_types, _, _) = drain(&mut context, down);
+        assert_eq!(down_types, ["pointerdown", "mousedown", "focus", "focusin"]);
 
         let up = context.begin(DispatchRequest::Pointer {
             event: pointer(x, y, MouseEventButton::Main, MouseEventButtons::None),
@@ -6739,19 +7366,7 @@ mod tests {
             metadata: EventMetadata::native(),
         });
         let (types, _, _) = drain(&mut context, up);
-        assert_eq!(
-            types,
-            [
-                "pointerup",
-                "mouseup",
-                "click",
-                "input",
-                "blur",
-                "focusout",
-                "focus",
-                "focusin",
-            ]
-        );
+        assert_eq!(types, ["pointerup", "mouseup", "click", "input"]);
     }
 
     #[test]
@@ -7832,7 +8447,7 @@ mod tests {
                 2,
             ),
         });
-        let _ = drain(&mut context, down);
+        assert_focus_transition_metadata(&mut context, down, 776.0, old_handle, checkbox_handle);
         let metadata = EventMetadata::pointer(
             777.0,
             native_pointer_coordinates(f64::from(x), f64::from(y), 0.0, 0.0),
@@ -7847,8 +8462,6 @@ mod tests {
         let mut saw_pointer_up = false;
         let mut saw_mouse_up = false;
         let mut saw_input = false;
-        let mut saw_blur = false;
-        let mut saw_focus = false;
         while let DispatchStep::Event(current) = step {
             assert_eq!(current.time_stamp, 777.0);
             match current.event_type.as_str() {
@@ -7890,29 +8503,11 @@ mod tests {
                         Some(&DispatchEventPayload::Input)
                     );
                 }
-                "blur" => {
-                    saw_blur = true;
-                    assert_eq!(
-                        current.payload.as_deref(),
-                        Some(&DispatchEventPayload::Focus {
-                            related_target: Some(checkbox_handle),
-                        })
-                    );
-                }
-                "focus" => {
-                    saw_focus = true;
-                    assert_eq!(
-                        current.payload.as_deref(),
-                        Some(&DispatchEventPayload::Focus {
-                            related_target: Some(old_handle),
-                        })
-                    );
-                }
                 _ => {}
             }
             step = context.resume(&current, false);
         }
-        assert!(saw_pointer_up && saw_mouse_up && saw_click && saw_input && saw_blur && saw_focus);
+        assert!(saw_pointer_up && saw_mouse_up && saw_click && saw_input);
     }
 
     #[test]
@@ -8111,19 +8706,22 @@ mod tests {
 
     #[test]
     fn initial_focus_related_target_ignores_blitz_root_fallback() {
-        let mut context =
-            TestContext::new("<input id='box' type='checkbox' style='width:24px;height:24px'>");
+        let mut context = TestContext::new(
+            "<input id='box' type='checkbox'>\
+             <label id='label' for='box' style='display:block;width:80px;height:24px'>box</label>",
+        );
         let checkbox = context.element("box");
+        let label = context.element("label");
         assert!(actual_focus_node_id(&context.document).is_none());
         assert_eq!(
             context.document.get_focussed_node_id(),
             Some(context.document.root_element().id),
             "pinned Blitz exposes the root as a keyboard target when nothing is focused"
         );
-        let (x, y) = context.center(checkbox);
+        let (x, y) = context.center(label);
         let click = stage_generated_with_metadata(
             &mut context,
-            checkbox,
+            label,
             DomEventData::Click(pointer(
                 x,
                 y,
@@ -8165,23 +8763,17 @@ mod tests {
         let target = context.element("target");
         assert!(context.document.set_focus_to(old));
         let (x, y) = context.center(target);
-        let click = stage_generated_with_metadata(
-            &mut context,
-            target,
-            DomEventData::Click(pointer(
-                x,
-                y,
-                MouseEventButton::Main,
-                MouseEventButtons::None,
-            )),
-            EventMetadata::pointer(
+        assert!(context.document.set_hover_to(x, y));
+        let mut step = context.begin(DispatchRequest::Pointer {
+            event: pointer(x, y, MouseEventButton::Main, MouseEventButtons::Primary),
+            flavor: PointerFlavor::Down,
+            metadata: EventMetadata::pointer(
                 10.0,
                 native_pointer_coordinates(f64::from(x), f64::from(y), 0.0, 0.0),
                 1,
             ),
-        );
+        });
 
-        let mut step = context.resume(&click, false);
         let mut saw_blur = false;
         while let DispatchStep::Event(current) = step {
             if current.event_type == "blur" && context.handles.resolve(current.target) == Some(old)
