@@ -2482,18 +2482,15 @@ fn event_payload(data: &DomEventData, metadata: &EventMetadata) -> Option<Dispat
                 0,
             )))
         }
-        DomEventData::Click(event) => Some(DispatchEventPayload::Pointer(pointer_payload(
+        DomEventData::Click(event) => Some(DispatchEventPayload::Pointer(click_pointer_payload(
             event,
             metadata,
             mouse_button_number(event.button),
             pointer_detail(metadata),
         ))),
-        DomEventData::ContextMenu(event) => Some(DispatchEventPayload::Pointer(pointer_payload(
-            event,
-            metadata,
-            mouse_button_number(event.button),
-            0,
-        ))),
+        DomEventData::ContextMenu(event) => Some(DispatchEventPayload::Pointer(
+            click_pointer_payload(event, metadata, mouse_button_number(event.button), 0),
+        )),
         DomEventData::MouseMove(event)
         | DomEventData::MouseEnter(event)
         | DomEventData::MouseLeave(event)
@@ -2589,6 +2586,27 @@ fn pointer_payload(
         azimuth_angle: event.details.azimuth,
         persistent_device_id: 0,
     }
+}
+
+fn click_pointer_payload(
+    event: &BlitzPointerEvent,
+    metadata: &EventMetadata,
+    button: i16,
+    detail: u32,
+) -> PointerPayload {
+    let mut payload = pointer_payload(event, metadata, button, detail);
+    payload.is_primary = false;
+    payload.width = 1.0;
+    payload.height = 1.0;
+    payload.pressure = 0.0;
+    payload.tangential_pressure = 0.0;
+    payload.tilt_x = 0;
+    payload.tilt_y = 0;
+    payload.twist = 0;
+    payload.altitude_angle = std::f64::consts::FRAC_PI_2;
+    payload.azimuth_angle = 0.0;
+    payload.persistent_device_id = 0;
+    payload
 }
 
 fn mouse_payload(
@@ -6488,6 +6506,57 @@ mod tests {
         assert_eq!(payload.height, 1.0);
         assert_eq!(payload.pressure, 0.5);
         assert_eq!(payload.altitude_angle, std::f64::consts::FRAC_PI_2);
+    }
+
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "the Pointer Events click-family defaults and retained pointer id are exact constants"
+    )]
+    fn click_family_pointer_specific_fields_use_defaults() {
+        let mut pointer = pointer(
+            1.0,
+            2.0,
+            MouseEventButton::Auxiliary,
+            MouseEventButtons::Primary,
+        );
+        pointer.id = BlitzPointerId::Pen;
+        pointer.is_primary = true;
+        pointer.details = PointerDetails {
+            pressure: 0.75,
+            tangential_pressure: 0.25,
+            tilt_x: 30,
+            tilt_y: -20,
+            twist: 123,
+            altitude: 0.75,
+            azimuth: 1.25,
+        };
+        let metadata =
+            EventMetadata::pointer(1.0, native_pointer_coordinates(1.0, 2.0, 0.0, 0.0), 2);
+
+        for data in [
+            DomEventData::Click(pointer.clone()),
+            DomEventData::ContextMenu(pointer.clone()),
+        ] {
+            let Some(DispatchEventPayload::Pointer(payload)) = event_payload(&data, &metadata)
+            else {
+                panic!("click-family events should carry pointer payloads");
+            };
+            assert_eq!(payload.pointer_id, 2.0);
+            assert_eq!(payload.pointer_type, "pen");
+            assert!(!payload.is_primary);
+            assert_eq!(payload.width, 1.0);
+            assert_eq!(payload.height, 1.0);
+            assert_eq!(payload.pressure, 0.0);
+            assert_eq!(payload.tangential_pressure, 0.0);
+            assert_eq!(payload.tilt_x, 0);
+            assert_eq!(payload.tilt_y, 0);
+            assert_eq!(payload.twist, 0);
+            assert_eq!(payload.altitude_angle, std::f64::consts::FRAC_PI_2);
+            assert_eq!(payload.azimuth_angle, 0.0);
+            assert_eq!(payload.persistent_device_id, 0);
+            assert_eq!(payload.mouse.buttons, 1);
+        }
     }
 
     #[test]
