@@ -19,7 +19,7 @@ function formatModifiers(event: QuoxKeyboardEvent): string {
 if (import.meta.main) {
   const window = await openWindow({ body });
 
-  window.addEventListener((event) => {
+  window.addInputListener((event) => {
     switch (event.type) {
       case "mousemove": {
         const hit = window.document.nodeFromPoint(event.x, event.y);

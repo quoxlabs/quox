@@ -115,7 +115,7 @@ const body = `
 if (import.meta.main) {
   const window = await openWindow({ width: 760, height: 520, head, body });
 
-  window.addEventListener((event) => {
+  window.addInputListener((event) => {
     switch (event.type) {
       case "wheel":
         console.log(`Scroll delta: (${event.deltaX}, ${event.deltaY})`);
