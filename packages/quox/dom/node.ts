@@ -44,6 +44,7 @@ type TextControlSelectionRenderer = {
 };
 
 export type QuoxSelectionDirection = "none" | "forward" | "backward";
+export type QuoxColorSpace = "limited-srgb" | "display-p3";
 
 type TextControlSelection = {
   readonly start: number;
@@ -312,6 +313,25 @@ export class QuoxInputElement extends QuoxElement {
 
   set defaultValue(value: string) {
     this.setAttribute("value", boundaryString(value));
+  }
+
+  get alpha(): boolean {
+    return this.hasAttribute("alpha");
+  }
+
+  set alpha(value: boolean) {
+    const alpha = Boolean(value);
+    if (alpha === this.hasAttribute("alpha")) return;
+    if (alpha) this.setAttribute("alpha", "");
+    else this.removeAttribute("alpha");
+  }
+
+  get colorSpace(): QuoxColorSpace {
+    return this.getAttribute("colorspace")?.toLowerCase() === "display-p3" ? "display-p3" : "limited-srgb";
+  }
+
+  set colorSpace(value: QuoxColorSpace) {
+    this.setAttribute("colorspace", boundaryString(value));
   }
 
   get checked(): boolean {

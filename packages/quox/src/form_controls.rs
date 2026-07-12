@@ -1,7 +1,17 @@
 use blitz_dom::node::{SpecialElementData, TextInputData};
-use blitz_dom::{BaseDocument, NodeData, QualName, local_name, ns};
+use blitz_dom::{BaseDocument, LocalName, NodeData, QualName, local_name, ns};
+use cssparser::{Parser, ParserInput};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use style::color::{AbsoluteColor, ColorSpace};
+use style::context::QuirksMode;
+use style::custom_properties::AttrTaint;
 use style::invalidation::element::restyle_hints::RestyleHint;
+use style::parser::ParserContext;
+use style::stylesheets::{Origin, UrlExtraData};
+use style::values::specified::Color as SpecifiedColor;
+use style_traits::{ParsingMode, ToCss};
+use url::Url;
 
 /// Browser-facing checkedness which Blitz's render-only checkbox data cannot own correctly.
 ///
@@ -491,6 +501,7 @@ enum TextControlKind {
     InputTime,
     InputDateTimeLocal,
     InputRange,
+    InputColor,
     TextArea,
 }
 
@@ -571,9 +582,9 @@ impl TextControlKind {
             Self::InputWeek => sanitize_week(value),
             Self::InputTime => sanitize_time(value),
             Self::InputDateTimeLocal => sanitize_local_date_time(value),
-            // Range depends on the element's live min/max/step attributes. Production value paths
-            // use `ControlValueSanitizer`; range has no native text editor to normalize here.
-            Self::InputRange => value.to_owned(),
+            // Range and color depend on live element attributes. Production value paths use
+            // `ControlValueSanitizer`; neither state has a native text editor to normalize here.
+            Self::InputRange | Self::InputColor => value.to_owned(),
             // DOM text normally reaches us with LF line endings, but script can still provide CR
             // through a Text node. The textarea value API exposes normalized LF line endings.
             Self::TextArea => value.replace("\r\n", "\n").replace('\r', "\n"),
@@ -585,23 +596,187 @@ impl TextControlKind {
 enum ControlValueSanitizer {
     Static(TextControlKind),
     Range(RangeSanitizer),
+    Color(ColorSanitizer),
 }
 
 impl ControlValueSanitizer {
     fn for_control(document: &BaseDocument, node_id: usize, kind: TextControlKind) -> Self {
         if kind == TextControlKind::InputRange {
             Self::Range(RangeSanitizer::for_control(document, node_id))
+        } else if kind == TextControlKind::InputColor {
+            Self::Color(ColorSanitizer::for_control(document, node_id))
         } else {
             Self::Static(kind)
         }
     }
 
-    fn normalize(self, value: &str) -> String {
+    fn normalize(self, document: &mut BaseDocument, value: &str) -> String {
         match self {
             Self::Static(kind) => kind.normalize_value(value),
             Self::Range(range) => range.normalize(value),
+            Self::Color(color) => color.normalize(document, value),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ColorSpaceMode {
+    LimitedSrgb,
+    DisplayP3,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ColorConfig {
+    alpha: bool,
+    color_space: ColorSpaceMode,
+}
+
+#[derive(Clone, Copy)]
+struct ColorSanitizer {
+    config: ColorConfig,
+}
+
+impl ColorSanitizer {
+    fn for_control(document: &BaseDocument, node_id: usize) -> Self {
+        let element = html_input_element(document, node_id)
+            .expect("a color sanitizer is created only for an HTML input");
+        let color_space = if element
+            .attr(LocalName::from("colorspace"))
+            .is_some_and(|value| value.eq_ignore_ascii_case("display-p3"))
+        {
+            ColorSpaceMode::DisplayP3
+        } else {
+            ColorSpaceMode::LimitedSrgb
+        };
+        Self {
+            config: ColorConfig {
+                alpha: element.has_attr(LocalName::from("alpha")),
+                color_space,
+            },
+        }
+    }
+
+    fn normalize(self, document: &mut BaseDocument, value: &str) -> String {
+        let parsed = parse_css_color(document, value).unwrap_or(AbsoluteColor::BLACK);
+        match self.config.color_space {
+            ColorSpaceMode::LimitedSrgb => self.serialize_limited_srgb(parsed),
+            ColorSpaceMode::DisplayP3 => self.serialize_display_p3(parsed),
+        }
+    }
+
+    fn serialize_limited_srgb(self, color: AbsoluteColor) -> String {
+        let color = color.to_color_space(ColorSpace::Srgb);
+        let red = quantize_color_component(color.c0().unwrap_or(0.0));
+        let green = quantize_color_component(color.c1().unwrap_or(0.0));
+        let blue = quantize_color_component(color.c2().unwrap_or(0.0));
+        if !self.config.alpha {
+            return format!("#{red:02x}{green:02x}{blue:02x}");
+        }
+
+        serialize_color_function(
+            "srgb",
+            [
+                f32::from(red) / 255.0,
+                f32::from(green) / 255.0,
+                f32::from(blue) / 255.0,
+            ],
+            color.alpha().unwrap_or(0.0),
+        )
+    }
+
+    fn serialize_display_p3(self, color: AbsoluteColor) -> String {
+        let color = color.to_color_space(ColorSpace::DisplayP3);
+        serialize_color_function(
+            "display-p3",
+            [
+                color.c0().unwrap_or(0.0),
+                color.c1().unwrap_or(0.0),
+                color.c2().unwrap_or(0.0),
+            ],
+            if self.config.alpha {
+                color.alpha().unwrap_or(0.0)
+            } else {
+                1.0
+            },
+        )
+    }
+}
+
+fn parse_css_color(document: &mut BaseDocument, value: &str) -> Option<AbsoluteColor> {
+    let url_data = UrlExtraData::from(Url::parse("about:blank").ok()?);
+    let context = ParserContext::new(
+        Origin::Author,
+        &url_data,
+        None,
+        ParsingMode::DEFAULT,
+        QuirksMode::NoQuirks,
+        Cow::default(),
+        None,
+        None,
+        AttrTaint::default(),
+    );
+    let mut input = ParserInput::new(value);
+    let mut parser = Parser::new(&mut input);
+    SpecifiedColor::parse_and_compute(&context, &mut parser, Some(document.stylist_device()))
+        .ok()
+        .map(|color| color.resolve_to_absolute(&AbsoluteColor::BLACK))
+}
+
+fn quantize_color_component(component: f32) -> u8 {
+    // HTML's limited-sRGB color-well algorithm clamps to the 8-bit gamut and resolves an exact
+    // half toward positive infinity. Components are non-negative after clamping, so `round()`
+    // has precisely that tie behavior.
+    let byte = (f64::from(component).clamp(0.0, 1.0) * 255.0).round();
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "clamping and rounding prove the value is an integer in the inclusive u8 range"
+    )]
+    let byte = byte as u8;
+    byte
+}
+
+#[allow(
+    clippy::float_cmp,
+    reason = "CSS omits alpha only for the exact opaque value"
+)]
+fn serialize_color_function(space: &str, components: [f32; 3], alpha: f32) -> String {
+    let mut serialized = format!(
+        "color({space} {} {} {}",
+        serialize_color_component(components[0]),
+        serialize_color_component(components[1]),
+        serialize_color_component(components[2]),
+    );
+    if alpha != 1.0 {
+        serialized.push_str(" / ");
+        serialized.push_str(&serialize_color_alpha(alpha));
+    }
+    serialized.push(')');
+    serialized
+}
+
+fn serialize_color_component(component: f32) -> String {
+    if component.is_finite() {
+        component.to_css_string()
+    } else if component.is_nan() {
+        "calc(NaN)".to_owned()
+    } else if component.is_sign_negative() {
+        "calc(-infinity)".to_owned()
+    } else {
+        "calc(infinity)".to_owned()
+    }
+}
+
+fn serialize_color_alpha(alpha: f32) -> String {
+    if !alpha.is_finite() {
+        return serialize_color_component(alpha);
+    }
+    let alpha = f64::from(alpha.clamp(0.0, 1.0));
+    let rounded = (alpha * 1_000_000.0).round() / 1_000_000.0;
+    let mut buffer = ryu_js::Buffer::new();
+    buffer
+        .format_finite(if rounded == 0.0 { 0.0 } else { rounded })
+        .to_owned()
 }
 
 #[derive(Clone, Copy)]
@@ -815,14 +990,13 @@ struct TextControlState {
     /// Last range constraints applied to the live value. The raw `value` attribute can change the
     /// step base while dirty, but browsers do not re-sanitize until an actual constraint changes.
     range_constraints: Option<RangeConstraints>,
-    /// False while an otherwise-retained value is passing through a value-mode which Quox cannot
-    /// yet expose or sanitize (currently color).
-    active: bool,
+    /// Last color-well configuration applied to the live value. Changing either `alpha` or
+    /// `colorspace` re-sanitizes the raw default while clean and the live value while dirty.
+    color_config: Option<ColorConfig>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UnmanagedInputMode {
-    UnsupportedValue,
     Default,
     DefaultOn,
     Filename,
@@ -864,27 +1038,7 @@ impl TextControlStates {
                 // the value which a transition to default/default-on mode can copy to the
                 // content attribute.
                 self.sync_editor_value(document, node_id);
-                if unmanaged_input_mode(document, node_id)
-                    == Some(UnmanagedInputMode::UnsupportedValue)
-                {
-                    // Preserve valid internal values and the dirty flag across unsupported
-                    // value-mode states so returning to a supported mode does not resurrect the
-                    // old default. Destination-specific sanitizers remain deliberately outside
-                    // this text-control slice; `.value` is unavailable while this state is held.
-                    self.sync_editor_value(document, node_id);
-                    if let Some(control) = self.controls.get_mut(&node_id) {
-                        let default_value = input_default_value(document, node_id);
-                        if control.default_value != default_value {
-                            control.default_value.clone_from(&default_value);
-                            if !control.dirty_value {
-                                control.value.clone_from(&default_value);
-                                control.editor_value = default_value;
-                            }
-                        }
-                        control.active = false;
-                    }
-                    clear_text_editor(document, node_id);
-                } else if let Some(control) = self.controls.remove(&node_id) {
+                if let Some(control) = self.controls.remove(&node_id) {
                     transition_out_of_text_value_mode(document, node_id, &control.value);
                 }
             }
@@ -937,55 +1091,70 @@ impl TextControlStates {
             self.sync_editor_value(document, node_id);
         }
         self.sync_editor_selection(document, node_id);
-        let control = self
-            .controls
-            .entry(node_id)
-            .or_insert_with(|| TextControlState {
+        let control = self.controls.entry(node_id).or_insert_with(|| {
+            let value = sanitizer.normalize(document, &default_value);
+            TextControlState {
                 kind,
-                value: sanitizer.normalize(&default_value),
-                editor_value: sanitizer.normalize(&default_value),
+                editor_value: value.clone(),
+                value,
                 default_value: default_value.clone(),
                 selection: EditorSelectionState::default(),
                 dirty_value: false,
                 range_constraints: match sanitizer {
                     ControlValueSanitizer::Range(range) => Some(range.constraints),
-                    ControlValueSanitizer::Static(_) => None,
+                    ControlValueSanitizer::Static(_) | ControlValueSanitizer::Color(_) => None,
                 },
-                active: true,
-            });
+                color_config: match sanitizer {
+                    ControlValueSanitizer::Color(color) => Some(color.config),
+                    ControlValueSanitizer::Static(_) | ControlValueSanitizer::Range(_) => None,
+                },
+            }
+        });
 
         let selection_projection_kind = control.kind;
-        let previously_selectable = control.active && control.kind.supports_selection();
-        let reactivating = !control.active;
+        let previously_selectable = control.kind.supports_selection();
         let range_constraints = match sanitizer {
             ControlValueSanitizer::Range(range) => Some(range.constraints),
-            ControlValueSanitizer::Static(_) => None,
+            ControlValueSanitizer::Static(_) | ControlValueSanitizer::Color(_) => None,
+        };
+        let color_config = match sanitizer {
+            ControlValueSanitizer::Color(color) => Some(color.config),
+            ControlValueSanitizer::Static(_) | ControlValueSanitizer::Range(_) => None,
         };
         let range_constraints_changed = control.kind == kind
-            && !reactivating
             && (range_constraint_mutated || control.range_constraints != range_constraints);
+        let color_config_changed = control.kind == kind && control.color_config != color_config;
         let mut move_selection_to_start = false;
-        if control.kind != kind || reactivating {
+        if control.kind != kind {
             // These input states all use HTML's value mode. Type/`multiple` transitions preserve
             // the live value and dirty flag, then apply the new state's sanitizer.
             move_selection_to_start = !previously_selectable && kind.supports_selection();
             control.kind = kind;
-            control.value = sanitizer.normalize(&control.value);
+            control.value = sanitizer.normalize(document, &control.value);
             control.editor_value.clone_from(&control.value);
-            control.active = true;
         }
         if control.default_value != default_value {
             control.default_value = default_value;
             if !control.dirty_value {
-                control.value = sanitizer.normalize(&control.default_value);
+                control.value = sanitizer.normalize(document, &control.default_value);
                 control.editor_value.clone_from(&control.value);
             }
         }
         if kind == TextControlKind::InputRange && range_constraints_changed {
-            control.value = sanitizer.normalize(&control.value);
+            control.value = sanitizer.normalize(document, &control.value);
+            control.editor_value.clone_from(&control.value);
+        }
+        if kind == TextControlKind::InputColor && color_config_changed {
+            let source = if control.dirty_value {
+                &control.value
+            } else {
+                &control.default_value
+            };
+            control.value = sanitizer.normalize(document, source);
             control.editor_value.clone_from(&control.value);
         }
         control.range_constraints = range_constraints;
+        control.color_config = color_config;
 
         let editor_value = control.editor_value.clone();
         let preserved_direction = control.selection.direction;
@@ -1032,7 +1201,7 @@ impl TextControlStates {
             UnmanagedInputMode::DefaultOn => {
                 Some(input_value_attribute(document, node_id).unwrap_or_else(|| "on".to_owned()))
             }
-            UnmanagedInputMode::UnsupportedValue | UnmanagedInputMode::Filename => None,
+            UnmanagedInputMode::Filename => None,
         }
     }
 
@@ -1050,7 +1219,7 @@ impl TextControlStates {
                 UnmanagedInputMode::Default | UnmanagedInputMode::DefaultOn => {
                     Some(set_input_value_attribute(document, node_id, value))
                 }
-                UnmanagedInputMode::UnsupportedValue | UnmanagedInputMode::Filename => None,
+                UnmanagedInputMode::Filename => None,
             };
         }
 
@@ -1066,7 +1235,7 @@ impl TextControlStates {
                 .controls
                 .get_mut(&node_id)
                 .expect("reconcile_control inserted the text control");
-            let value = sanitizer.normalize(value);
+            let value = sanitizer.normalize(document, value);
             let value_changed = control.value != value;
             let editor_changed = control.editor_value != value;
             control.value.clone_from(&value);
@@ -1259,9 +1428,6 @@ impl TextControlStates {
         let Some(control) = self.controls.get(&node_id) else {
             return false;
         };
-        if !control.active {
-            return false;
-        }
         if control.kind.supports_selection() {
             let value_len = control.value.encode_utf16().count();
             return self
@@ -1312,7 +1478,7 @@ impl TextControlStates {
         node_id: usize,
     ) -> Option<TextControlSelection> {
         let control = self.controls.get(&node_id)?;
-        if !control.active || !control.kind.supports_selection() {
+        if !control.kind.supports_selection() {
             return None;
         }
         let snapshot = editor_snapshot(document, node_id)?;
@@ -1391,10 +1557,11 @@ fn control_descriptor(
                 "time" => TextControlKind::InputTime,
                 "datetime-local" => TextControlKind::InputDateTimeLocal,
                 "range" => TextControlKind::InputRange,
+                "color" => TextControlKind::InputColor,
                 // Non-value modes and the remaining unsupported Blitz value modes are outside
                 // this live-value owner.
-                "hidden" | "color" | "checkbox" | "radio" | "file" | "submit" | "image"
-                | "reset" | "button" => return None,
+                "hidden" | "checkbox" | "radio" | "file" | "submit" | "image" | "reset"
+                | "button" => return None,
                 // Text-like keywords, the missing value, and the enumerated attribute's invalid
                 // value default all use the Text state.
                 _ => TextControlKind::InputText,
@@ -1413,10 +1580,6 @@ fn html_input_element(document: &BaseDocument, node_id: usize) -> Option<&blitz_
     let node = document.get_node(node_id)?;
     let element = node.element_data()?;
     (element.name.ns == ns!(html) && element.name.local.as_ref() == "input").then_some(element)
-}
-
-fn input_default_value(document: &BaseDocument, node_id: usize) -> String {
-    input_value_attribute(document, node_id).unwrap_or_default()
 }
 
 fn input_value_attribute(document: &BaseDocument, node_id: usize) -> Option<String> {
@@ -1453,7 +1616,6 @@ fn unmanaged_input_mode(document: &BaseDocument, node_id: usize) -> Option<Unman
         .unwrap_or("")
         .to_ascii_lowercase();
     match input_type.as_str() {
-        "color" => Some(UnmanagedInputMode::UnsupportedValue),
         "hidden" | "submit" | "image" | "reset" | "button" => Some(UnmanagedInputMode::Default),
         "checkbox" | "radio" => Some(UnmanagedInputMode::DefaultOn),
         "file" => Some(UnmanagedInputMode::Filename),
@@ -1986,7 +2148,8 @@ impl SelectionProjection {
             | TextControlKind::InputWeek
             | TextControlKind::InputTime
             | TextControlKind::InputDateTimeLocal
-            | TextControlKind::InputRange => raw_characters,
+            | TextControlKind::InputRange
+            | TextControlKind::InputColor => raw_characters,
         };
 
         let mut utf16_len = 0;
@@ -3256,26 +3419,180 @@ mod tests {
     }
 
     #[test]
-    fn color_and_filename_modes_remain_explicitly_unsupported() {
+    fn color_values_parse_css_colors_and_use_configured_serialization() {
         let mut document = document(
-            "<input id='color' type='color' value='sentinel'>\
-             <input id='file' type='file' value='sentinel'>",
+            "<input id='missing' type='color'>\
+             <input id='invalid' type='color' value='not-a-color'>\
+             <input id='short' type='color' value='#AbC'>\
+             <input id='named' type='color' value='red'>\
+             <input id='rounded' type='color' value='rgb(1.5 2.5 3.5)'>\
+             <input id='wide' type='color' value='color(display-p3 1 .5 0)'>\
+             <input id='alpha' type='color' alpha value='#ffffff08'>\
+             <input id='half-alpha' type='color' alpha value='color(srgb 1 0 0 / .5)'>\
+             <input id='transparent' type='color' alpha value='transparent'>\
+             <input id='mixed-legacy' type='color' value='rgb(100%, 0, 0)'>\
+             <input id='none-legacy' type='color' value='rgb(none, 255, 0)'>\
+             <input id='current' type='color' value='currentcolor'>\
+             <input id='mixed' type='color' value='color-mix(in srgb, red 50%, blue)'>\
+             <input id='p3' type='color' colorspace='display-p3' alpha value='color(display-p3 3 none .2 / .6)'>\
+             <input id='p3-black' type='color' colorspace='display-p3' value='invalid'>",
         );
-        let inputs = ["color", "file"].map(|id| element(&document, id));
         let mut controls = TextControlStates::default();
         controls.reconcile_document(&mut document);
 
-        for input in inputs {
-            assert_eq!(controls.value(&mut document, input), None);
+        for (id, expected) in [
+            ("missing", "#000000"),
+            ("invalid", "#000000"),
+            ("short", "#aabbcc"),
+            ("named", "#ff0000"),
+            ("rounded", "#020304"),
+            ("wide", "#ff7600"),
+            ("alpha", "color(srgb 1 1 1 / 0.031373)"),
+            ("half-alpha", "color(srgb 1 0 0 / 0.5)"),
+            ("transparent", "color(srgb 0 0 0 / 0)"),
+            ("mixed-legacy", "#000000"),
+            ("none-legacy", "#000000"),
+            ("current", "#000000"),
+            ("mixed", "#800080"),
+            ("p3", "color(display-p3 3 0 0.2 / 0.6)"),
+            ("p3-black", "color(display-p3 0 0 0)"),
+        ] {
+            let input = element(&document, id);
             assert_eq!(
-                controls.set_value(&mut document, input, "replacement"),
-                None
+                controls.value(&mut document, input).as_deref(),
+                Some(expected),
+                "sanitized color for #{id}",
             );
-            assert_eq!(
-                super::input_value_attribute(&document, input).as_deref(),
-                Some("sentinel")
+            assert!(
+                super::editor_value(&document, input).is_none(),
+                "color #{id} remains data-only",
             );
         }
+    }
+
+    #[test]
+    fn color_configuration_resanitizes_the_correct_clean_or_dirty_source() {
+        let mut document = document(
+            "<input id='clean-alpha' type='color' value='#ffffff08'>\
+             <input id='dirty-alpha' type='color' value='#000000'>\
+             <input id='clean-p3' type='color' value='color(display-p3 1 .5 0 / .4)'>\
+             <input id='invalid-space' type='color' colorspace='future-space' value='red'>",
+        );
+        let clean_alpha = element(&document, "clean-alpha");
+        let dirty_alpha = element(&document, "dirty-alpha");
+        let clean_p3 = element(&document, "clean-p3");
+        let invalid_space = element(&document, "invalid-space");
+        let mut controls = TextControlStates::default();
+        controls.reconcile_document(&mut document);
+
+        assert_eq!(
+            controls.value(&mut document, clean_alpha).as_deref(),
+            Some("#ffffff")
+        );
+        document
+            .mutate()
+            .set_attribute(clean_alpha, input_attribute("alpha"), "");
+        controls.reconcile_document(&mut document);
+        assert_eq!(
+            controls.value(&mut document, clean_alpha).as_deref(),
+            Some("color(srgb 1 1 1 / 0.031373)"),
+            "a clean control reparses the unsanitized content attribute",
+        );
+
+        controls.set_value(&mut document, dirty_alpha, "#11223344");
+        assert_eq!(
+            controls.value(&mut document, dirty_alpha).as_deref(),
+            Some("#112233")
+        );
+        document
+            .mutate()
+            .set_attribute(dirty_alpha, input_attribute("alpha"), "");
+        controls.reconcile_document(&mut document);
+        assert_eq!(
+            controls.value(&mut document, dirty_alpha).as_deref(),
+            Some("color(srgb 0.0666667 0.133333 0.2)"),
+            "a dirty control reparses its already-sanitized live value",
+        );
+        assert_eq!(
+            super::input_value_attribute(&document, dirty_alpha).as_deref(),
+            Some("#000000"),
+            "configuration changes do not rewrite the raw default",
+        );
+
+        assert_eq!(
+            controls.value(&mut document, clean_p3).as_deref(),
+            Some("#ff7600")
+        );
+        document
+            .mutate()
+            .set_attribute(clean_p3, input_attribute("colorspace"), "DISPLAY-P3");
+        controls.reconcile_document(&mut document);
+        assert_eq!(
+            controls.value(&mut document, clean_p3).as_deref(),
+            Some("color(display-p3 1 0.5 0)"),
+            "the alpha channel is forced opaque when alpha is absent",
+        );
+        assert_eq!(
+            controls.value(&mut document, invalid_space).as_deref(),
+            Some("#ff0000"),
+            "an invalid colorspace uses limited-srgb",
+        );
+    }
+
+    #[test]
+    fn color_type_transitions_preserve_html_value_mode_bookkeeping() {
+        let mut document = document(
+            "<input id='editor' value='red'>\
+             <input id='from-default' type='checkbox' value='#abcdef'>\
+             <input id='to-default' type='color' value='#000000'>\
+             <input id='file' type='file' value='sentinel'>",
+        );
+        let editor = element(&document, "editor");
+        let from_default = element(&document, "from-default");
+        let to_default = element(&document, "to-default");
+        let file = element(&document, "file");
+        let mut controls = TextControlStates::default();
+        controls.reconcile_document(&mut document);
+
+        controls.set_value(&mut document, editor, "rgb(0 255 0)");
+        set_input_type(&mut document, editor, "color");
+        controls.reconcile_document(&mut document);
+        assert_eq!(
+            controls.value(&mut document, editor).as_deref(),
+            Some("#00ff00")
+        );
+        assert!(controls.state(editor).unwrap().dirty_value);
+        assert!(super::editor_value(&document, editor).is_none());
+
+        set_input_type(&mut document, editor, "text");
+        controls.reconcile_document(&mut document);
+        assert_eq!(
+            controls.value(&mut document, editor).as_deref(),
+            Some("#00ff00")
+        );
+
+        set_input_type(&mut document, from_default, "color");
+        controls.reconcile_document(&mut document);
+        assert_eq!(
+            controls.value(&mut document, from_default).as_deref(),
+            Some("#abcdef")
+        );
+        assert!(!controls.state(from_default).unwrap().dirty_value);
+
+        controls.set_value(&mut document, to_default, "red");
+        set_input_type(&mut document, to_default, "checkbox");
+        controls.reconcile_document(&mut document);
+        assert_eq!(
+            super::input_value_attribute(&document, to_default).as_deref(),
+            Some("#ff0000")
+        );
+
+        assert_eq!(controls.value(&mut document, file), None);
+        assert_eq!(controls.set_value(&mut document, file, "replacement"), None);
+        assert_eq!(
+            super::input_value_attribute(&document, file).as_deref(),
+            Some("sentinel")
+        );
     }
 
     #[test]
@@ -3702,7 +4019,6 @@ mod tests {
                 .set_attribute(node_id, type_attribute(), "date");
         }
         controls.reconcile_document(&mut document);
-        assert!(controls.state(dirty).unwrap().active);
         assert!(super::editor_value(&document, dirty).is_none());
         assert_eq!(
             controls.value(&mut document, dirty).as_deref(),

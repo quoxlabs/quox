@@ -20,7 +20,7 @@ type InputValueMode =
   | "value"
   | "date-time-value"
   | "range-value"
-  | "unsupported-value"
+  | "color-value"
   | "default"
   | "default-on"
   | "filename";
@@ -37,7 +37,7 @@ function inputValueMode(control: ControlState): InputValueMode {
     case "range":
       return "range-value";
     case "color":
-      return "unsupported-value";
+      return "color-value";
     case "hidden":
     case "submit":
     case "image":
@@ -56,7 +56,7 @@ function inputValueMode(control: ControlState): InputValueMode {
 
 function isValueMode(mode: InputValueMode): boolean {
   return mode === "value" || mode === "date-time-value" || mode === "range-value" ||
-    mode === "unsupported-value";
+    mode === "color-value";
 }
 
 function decimalModulo(value: string, divisor: number): number {
@@ -272,10 +272,166 @@ function sanitizeRangeValue(control: ControlState, value: string): string {
   return serialize ? String(canonicalizeDecimal(number, config.snappedDecimalPlaces) || 0) : value;
 }
 
+interface FakeColor {
+  readonly space: "srgb" | "display-p3";
+  readonly red: number;
+  readonly green: number;
+  readonly blue: number;
+  readonly alpha: number;
+}
+
+function parseHexPair(value: string): number {
+  return Number.parseInt(value, 16) / 255;
+}
+
+function parseFakeColor(value: string): FakeColor | null {
+  value = value.trim().toLowerCase();
+  const hex = /^#([0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/.exec(value)?.[1];
+  if (hex !== undefined) {
+    const expanded = hex.length <= 4 ? [...hex].map((digit) => digit + digit).join("") : hex;
+    return {
+      space: "srgb",
+      red: parseHexPair(expanded.slice(0, 2)),
+      green: parseHexPair(expanded.slice(2, 4)),
+      blue: parseHexPair(expanded.slice(4, 6)),
+      alpha: expanded.length === 8 ? parseHexPair(expanded.slice(6, 8)) : 1,
+    };
+  }
+  if (value === "red") return { space: "srgb", red: 1, green: 0, blue: 0, alpha: 1 };
+  if (value === "transparent") return { space: "srgb", red: 0, green: 0, blue: 0, alpha: 0 };
+
+  const rgb =
+    /^rgba?\(\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))[, ]+([+-]?(?:\d+(?:\.\d*)?|\.\d+))[, ]+([+-]?(?:\d+(?:\.\d*)?|\.\d+))(?:\s*[/,]\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)))?\s*\)$/
+      .exec(
+        value,
+      );
+  if (rgb !== null) {
+    return {
+      space: "srgb",
+      red: Number(rgb[1]) / 255,
+      green: Number(rgb[2]) / 255,
+      blue: Number(rgb[3]) / 255,
+      alpha: rgb[4] === undefined ? 1 : Number(rgb[4]),
+    };
+  }
+
+  const color = /^color\((srgb|display-p3)\s+([^\s]+)\s+([^\s]+)\s+([^\s/]+)(?:\s*\/\s*([^\s]+))?\s*\)$/.exec(
+    value,
+  );
+  if (color === null) return null;
+  const components = color.slice(2, 6).map((component, index) =>
+    component === undefined ? (index === 3 ? 1 : 0) : component === "none" ? 0 : Number(component)
+  );
+  if (components.some((component) => !Number.isFinite(component))) return null;
+  return {
+    space: color[1] as "srgb" | "display-p3",
+    red: components[0],
+    green: components[1],
+    blue: components[2],
+    alpha: components[3],
+  };
+}
+
+function quantizeColorComponent(component: number): number {
+  return Math.round(Math.max(0, Math.min(1, component)) * 255);
+}
+
+function decodeRgbComponent(component: number): number {
+  const sign = Math.sign(component) || 1;
+  const absolute = Math.abs(component);
+  return sign * (absolute <= 0.04045 ? absolute / 12.92 : ((absolute + 0.055) / 1.055) ** 2.4);
+}
+
+function encodeRgbComponent(component: number): number {
+  const sign = Math.sign(component) || 1;
+  const absolute = Math.abs(component);
+  return sign * (absolute <= 0.0031308 ? absolute * 12.92 : 1.055 * absolute ** (1 / 2.4) - 0.055);
+}
+
+function multiplyColorMatrix(matrix: readonly (readonly number[])[], vector: readonly number[]): number[] {
+  return matrix.map((row) => row.reduce((sum, coefficient, index) => sum + coefficient * vector[index], 0));
+}
+
+function convertFakeColor(color: FakeColor, space: FakeColor["space"]): FakeColor {
+  if (color.space === space) return color;
+  const linear = [color.red, color.green, color.blue].map(decodeRgbComponent);
+  const toXyz = color.space === "srgb"
+    ? [
+      [0.4123907993, 0.3575843394, 0.1804807884],
+      [0.2126390059, 0.7151686788, 0.0721923154],
+      [0.0193308187, 0.1191947798, 0.9505321522],
+    ]
+    : [
+      [0.4865709486, 0.2656676932, 0.1982172852],
+      [0.2289745641, 0.6917385218, 0.0792869141],
+      [0, 0.0451133819, 1.0439443689],
+    ];
+  const fromXyz = space === "srgb"
+    ? [
+      [3.2409699419, -1.5373831776, -0.4986107603],
+      [-0.9692436363, 1.8759675015, 0.0415550574],
+      [0.0556300797, -0.2039769589, 1.0569715142],
+    ]
+    : [
+      [2.4934969119, -0.9313836179, -0.4027107845],
+      [-0.8294889696, 1.7626640603, 0.0236246858],
+      [0.0358458302, -0.0761723893, 0.956884524],
+    ];
+  const converted = multiplyColorMatrix(fromXyz, multiplyColorMatrix(toXyz, linear)).map(encodeRgbComponent);
+  return {
+    space,
+    red: converted[0],
+    green: converted[1],
+    blue: converted[2],
+    alpha: color.alpha,
+  };
+}
+
+function cssColorNumber(component: number): number {
+  return component === 0 ? 0 : Number(Math.fround(component).toPrecision(6));
+}
+
+function cssAlpha(alpha: number): number {
+  alpha = Math.max(0, Math.min(1, alpha));
+  return Math.round(alpha * 1_000_000) / 1_000_000;
+}
+
+function hexByte(component: number): string {
+  return quantizeColorComponent(component).toString(16).padStart(2, "0");
+}
+
+function sanitizeColorValue(control: ControlState, value: string): string {
+  const parsed = parseFakeColor(value) ?? { space: "srgb", red: 0, green: 0, blue: 0, alpha: 1 };
+  const alphaEnabled = control.attributes.has("alpha");
+  const displayP3 = control.attributes.get("colorspace")?.toLowerCase() === "display-p3";
+  if (displayP3) {
+    const components = convertFakeColor(parsed, "display-p3");
+    const alpha = alphaEnabled ? cssAlpha(components.alpha) : 1;
+    return `color(display-p3 ${cssColorNumber(components.red)} ${cssColorNumber(components.green)} ${
+      cssColorNumber(components.blue)
+    }${alpha < 1 ? ` / ${alpha}` : ""})`;
+  }
+
+  const converted = convertFakeColor(parsed, "srgb");
+  const red = quantizeColorComponent(converted.red);
+  const green = quantizeColorComponent(converted.green);
+  const blue = quantizeColorComponent(converted.blue);
+  if (!alphaEnabled) return `#${hexByte(converted.red)}${hexByte(converted.green)}${hexByte(converted.blue)}`;
+  const alpha = cssAlpha(converted.alpha);
+  return `color(srgb ${cssColorNumber(red / 255)} ${cssColorNumber(green / 255)} ${cssColorNumber(blue / 255)}${
+    alpha < 1 ? ` / ${alpha}` : ""
+  })`;
+}
+
 function sanitizeControlValue(control: ControlState, value: string): string {
-  return inputValueMode(control) === "range-value"
-    ? sanitizeRangeValue(control, value)
-    : sanitizeDateTimeValue(control, value);
+  switch (inputValueMode(control)) {
+    case "range-value":
+      return sanitizeRangeValue(control, value);
+    case "color-value":
+      return sanitizeColorValue(control, value);
+    default:
+      return sanitizeDateTimeValue(control, value);
+  }
 }
 
 function supportsSelectionRange(control: ControlState): boolean {
@@ -360,12 +516,12 @@ class FakeLiveControlRenderer {
       case "value":
       case "date-time-value":
       case "range-value":
+      case "color-value":
         return control.value;
       case "default":
         return control.attributes.get("value") ?? "";
       case "default-on":
         return control.attributes.get("value") ?? "on";
-      case "unsupported-value":
       case "filename":
         throw new TypeError("fake input value mode is intentionally unsupported");
     }
@@ -383,11 +539,11 @@ class FakeLiveControlRenderer {
           control.attributes.set("value", value);
           return true;
         }
-        case "unsupported-value":
         case "filename":
           throw new TypeError("fake input value mode is intentionally unsupported");
         case "date-time-value":
         case "range-value":
+        case "color-value":
         case "value":
           break;
       }
@@ -488,6 +644,13 @@ class FakeLiveControlRenderer {
       inputValueMode(control) === "range-value" && ["min", "max", "step"].includes(name)
     ) {
       control.value = sanitizeRangeValue(control, control.value);
+    } else if (
+      inputValueMode(control) === "color-value" && ["alpha", "colorspace"].includes(name)
+    ) {
+      control.value = sanitizeColorValue(
+        control,
+        control.dirty ? control.value : control.attributes.get("value") ?? "",
+      );
     }
     if (
       control.tagName === "input" && name === "checked" && !hadChecked &&
@@ -522,6 +685,13 @@ class FakeLiveControlRenderer {
       inputValueMode(control) === "range-value" && ["min", "max", "step"].includes(name)
     ) {
       control.value = sanitizeRangeValue(control, control.value);
+    } else if (
+      hadAttribute && inputValueMode(control) === "color-value" && ["alpha", "colorspace"].includes(name)
+    ) {
+      control.value = sanitizeColorValue(
+        control,
+        control.dirty ? control.value : control.attributes.get("value") ?? "",
+      );
     }
     if (
       control.tagName === "input" && name === "checked" && hadChecked &&
@@ -1091,22 +1261,98 @@ Deno.test("range defaults, constraints, and type transitions retain browser valu
   assertEquals(input.defaultValue, "45");
 });
 
-Deno.test("color and filename input values remain explicitly unsupported", () => {
-  for (const type of ["color", "file"]) {
-    const { document } = createDocument();
-    const input = document.createElement("input");
-    input.setAttribute("type", type);
+Deno.test("color inputs expose sanitized live values and modern color configuration", () => {
+  const { document } = createDocument();
+  const input = document.createElement("input");
+  input.setAttribute("type", "color");
+  let inputs = 0;
+  let changes = 0;
+  input.addEventListener("input", () => inputs++);
+  input.addEventListener("change", () => changes++);
 
-    assertThrows(() => input.value, TypeError, "intentionally unsupported");
-    assertThrows(
-      () => {
-        input.value = "replacement";
-      },
-      TypeError,
-      "intentionally unsupported",
-    );
-    assertEquals(input.getAttribute("value"), null);
-  }
+  assertEquals(input.value, "#000000");
+  assertEquals(input.defaultValue, "");
+  assertEquals(input.alpha, false);
+  assertEquals(input.colorSpace, "limited-srgb");
+
+  input.defaultValue = "#AbC";
+  assertEquals(input.value, "#aabbcc");
+  assertEquals(input.defaultValue, "#AbC", "sanitization leaves the content attribute raw");
+  input.value = "red";
+  assertEquals(input.value, "#ff0000");
+  assertEquals(input.defaultValue, "#AbC");
+  input.defaultValue = "#00ff00";
+  assertEquals(input.value, "#ff0000", "a dirty color stops following its default");
+  input.value = "color(display-p3 1 .5 0)";
+  assertEquals(input.value, "#ff7600", "wide colors convert before limited-srgb quantization");
+
+  input.alpha = true;
+  assertEquals(input.getAttribute("alpha"), "");
+  input.value = "color(srgb 1 0 0 / .5)";
+  assertEquals(input.value, "color(srgb 1 0 0 / 0.5)", "authored alpha is not reduced to eight bits");
+  input.value = "#ffffff08";
+  assertEquals(input.value, "color(srgb 1 1 1 / 0.031373)");
+  input.alpha = false;
+  assertEquals(input.getAttribute("alpha"), null);
+  assertEquals(input.value, "#ffffff");
+
+  input.colorSpace = "display-p3";
+  assertEquals(input.getAttribute("colorspace"), "display-p3");
+  input.value = "color(display-p3 3 none .2 / .6)";
+  assertEquals(input.value, "color(display-p3 3 0 0.2)");
+  (input as unknown as { colorSpace: string }).colorSpace = "future-space";
+  assertEquals(input.getAttribute("colorspace"), "future-space");
+  assertEquals(input.colorSpace, "limited-srgb", "invalid keywords use the missing-value default");
+  assertEquals(inputs, 0);
+  assertEquals(changes, 0);
+});
+
+Deno.test("clean color configuration reparses the raw default while dirty configuration uses the live value", () => {
+  const { document } = createDocument();
+  const clean = document.createElement("input");
+  clean.defaultValue = "#ffffff08";
+  clean.setAttribute("type", "color");
+  assertEquals(clean.value, "#ffffff");
+  clean.alpha = true;
+  assertEquals(clean.value, "color(srgb 1 1 1 / 0.031373)");
+
+  const dirty = document.createElement("input");
+  dirty.defaultValue = "#000000";
+  dirty.setAttribute("type", "color");
+  dirty.value = "#11223344";
+  assertEquals(dirty.value, "#112233");
+  dirty.alpha = true;
+  assertEquals(
+    dirty.value,
+    "color(srgb 0.0666667 0.133333 0.2)",
+    "the discarded alpha is not recovered from a dirty default",
+  );
+  assertEquals(dirty.defaultValue, "#000000");
+
+  dirty.setAttribute("type", "text");
+  assertEquals(dirty.value, "color(srgb 0.0666667 0.133333 0.2)");
+  dirty.setAttribute("type", "color");
+  assertEquals(
+    dirty.value,
+    "color(srgb 0.0666667 0.133333 0.2)",
+    "returning from text applies the current color configuration",
+  );
+});
+
+Deno.test("filename input values remain explicitly unsupported", () => {
+  const { document } = createDocument();
+  const input = document.createElement("input");
+  input.setAttribute("type", "file");
+
+  assertThrows(() => input.value, TypeError, "intentionally unsupported");
+  assertThrows(
+    () => {
+      input.value = "replacement";
+    },
+    TypeError,
+    "intentionally unsupported",
+  );
+  assertEquals(input.getAttribute("value"), null);
 });
 
 Deno.test("a native edit is visible before its first input listener", () => {
