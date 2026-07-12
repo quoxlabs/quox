@@ -6,12 +6,14 @@ import type { QuoxEventTarget } from "./event_target.ts";
 export type RequestRender = () => void;
 export type AssertActive = () => void;
 export type InvalidateNodeHandles = (nodeHandles: Iterable<number>) => void;
+export type QueueScrollEvent = (nodeHandle: number) => void;
 
 type DocumentInternals = {
   readonly renderer: WasmRenderer;
   readonly requestRender: RequestRender;
   readonly assertActive: AssertActive;
   readonly invalidateNodeHandles: InvalidateNodeHandles;
+  readonly queueScrollEvent: QueueScrollEvent;
   readonly isDispatching: () => boolean;
   readonly focusElement: (nodeHandle: number) => void;
   readonly blurElement: (nodeHandle: number) => void;

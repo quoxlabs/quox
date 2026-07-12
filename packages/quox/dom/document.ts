@@ -118,6 +118,9 @@ export class QuoxDocument extends QuoxEventTarget {
       requestRender,
       assertActive,
       invalidateNodeHandles: (nodeHandles) => this.#nodes.invalidate(nodeHandles),
+      queueScrollEvent: (nodeHandle) => {
+        if (this.#queuePendingScrollTarget(nodeHandle)) this.#requestRender();
+      },
       isDispatching: () => this.#dispatchDepth !== 0,
       focusElement: (nodeHandle) => {
         this.#dispatchInputEvent(() => this.#dispatchPort.beginFocus(nodeHandle));
@@ -544,15 +547,16 @@ export class QuoxDocument extends QuoxEventTarget {
     }
   }
 
-  #queuePendingScrollTarget(nodeHandle: number): void {
+  #queuePendingScrollTarget(nodeHandle: number): boolean {
     const element = this.#nodeForHandle(nodeHandle);
     if (!(element instanceof QuoxElement)) {
       throw new TypeError("quox: a trusted scroll target must be an element");
     }
     const target = nodeHandle === this.#renderer.document_element() ? this : element;
-    if (this.#pendingScrollTargetSet.has(target)) return;
+    if (this.#pendingScrollTargetSet.has(target)) return false;
     this.#pendingScrollTargetSet.add(target);
     this.#pendingScrollTargets.push(target);
+    return true;
   }
 
   #createTrustedEvent(step: DomDispatchEventStep): QuoxEvent {

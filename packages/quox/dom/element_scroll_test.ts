@@ -44,26 +44,32 @@ function createElement(): {
   readonly element: QuoxElement;
   readonly renderer: FakeScrollRenderer;
   readonly renders: { count: number };
+  readonly scrollTargets: number[];
 } {
   const document = {} as QuoxDocument;
   const renderer = new FakeScrollRenderer();
   const renders = { count: 0 };
+  const scrollTargets: number[] = [];
   const element = new QuoxElement(document, 7);
   attachDocumentInternals(document, {
     renderer: renderer as unknown as WasmRenderer,
     requestRender: () => renders.count++,
     assertActive: () => undefined,
     invalidateNodeHandles: () => undefined,
+    queueScrollEvent: (nodeHandle) => {
+      scrollTargets.push(nodeHandle);
+      renders.count++;
+    },
     isDispatching: () => false,
     focusElement: () => undefined,
     blurElement: () => undefined,
     syntheticEventPath: () => [element],
   });
-  return { element, renderer, renders };
+  return { element, renderer, renders, scrollTargets };
 }
 
-Deno.test("element scroll offsets stay live and repaint only after effective movement", () => {
-  const { element, renderer, renders } = createElement();
+Deno.test("element scroll offsets stay live and queue events only after effective movement", () => {
+  const { element, renderer, renders, scrollTargets } = createElement();
 
   renderer.simulateNativeScroll(33.25, 44.75);
   assertEquals(element.scrollLeft, 33.25);
@@ -84,6 +90,7 @@ Deno.test("element scroll offsets stay live and repaint only after effective mov
   element.scrollTop = -25;
   assertEquals(element.scrollTop, 0);
   assertEquals(renders.count, 3);
+  assertEquals(scrollTargets, [7, 7, 7]);
 });
 
 Deno.test("scroll setters perform Web IDL conversion once and normalize non-finite values", () => {

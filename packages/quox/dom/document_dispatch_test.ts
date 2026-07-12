@@ -149,6 +149,7 @@ class FakeDispatchRenderer {
   readonly #plans: FramePlan[] = [];
   readonly #pending = new Map<number, unknown[]>();
   readonly syntheticEventPaths = new Map<number, Uint32Array>();
+  readonly #scrollOffsets = new Map<number, { left: number; top: number }>();
   #nextNodeId = 1;
   #nextFrameId = 1;
   #nextEventId = 1;
@@ -193,6 +194,28 @@ class FakeDispatchRenderer {
 
   set_inner_html(_nodeHandle: number, _html: string): Uint32Array {
     return this.invalidatedByInnerHtml;
+  }
+
+  element_scroll_left(nodeHandle: number): number {
+    return this.#scrollOffsets.get(nodeHandle)?.left ?? 0;
+  }
+
+  element_scroll_top(nodeHandle: number): number {
+    return this.#scrollOffsets.get(nodeHandle)?.top ?? 0;
+  }
+
+  set_element_scroll_left(nodeHandle: number, value: number): boolean {
+    const current = this.#scrollOffsets.get(nodeHandle) ?? { left: 0, top: 0 };
+    if (current.left === value) return false;
+    this.#scrollOffsets.set(nodeHandle, { left: value, top: current.top });
+    return true;
+  }
+
+  set_element_scroll_top(nodeHandle: number, value: number): boolean {
+    const current = this.#scrollOffsets.get(nodeHandle) ?? { left: 0, top: 0 };
+    if (current.top === value) return false;
+    this.#scrollOffsets.set(nodeHandle, { left: current.left, top: value });
+    return true;
   }
 
   queueFrame(events: EventSpec[], redrawRequested = false, resumeValue?: unknown): void {
@@ -809,6 +832,38 @@ Deno.test("scroll events wait for rendering, coalesce targets, and use browser p
   calls.length = 0;
   document.flushPendingScrollEvents();
   assertEquals(calls, []);
+});
+
+Deno.test("CSSOM scroll setters queue changed element and document targets", () => {
+  const { document, renderer, window, renders } = createHarness();
+  const root = document.createElement("main");
+  const scroller = document.createElement("section");
+  renderer.documentElementHandle = root.nodeId;
+  renderer.syntheticEventPaths.set(scroller.nodeId, Uint32Array.of(scroller.nodeId, root.nodeId, 0));
+  const calls: string[] = [];
+
+  scroller.addEventListener("scroll", () => calls.push("element"));
+  root.addEventListener("scroll", () => calls.push("root"));
+  document.addEventListener("scroll", (event) => {
+    if (event.target === document) calls.push("document");
+  });
+  window.addEventListener("scroll", () => calls.push("window"));
+
+  scroller.scrollTop = 12;
+  scroller.scrollLeft = 8;
+  scroller.scrollTop = 12;
+  assertEquals([scroller.scrollLeft, scroller.scrollTop], [8, 12]);
+  assertEquals(renders, ["render"], "one pending target needs one rendering opportunity");
+  assertEquals(calls, []);
+
+  document.flushPendingScrollEvents();
+  assertEquals(calls, ["element"]);
+
+  root.scrollTop = 20;
+  root.scrollLeft = 4;
+  assertEquals(renders, ["render", "render"]);
+  document.flushPendingScrollEvents();
+  assertEquals(calls, ["element", "document", "window"]);
 });
 
 Deno.test("scroll flushing stops cleanly when a listener deactivates the document", () => {

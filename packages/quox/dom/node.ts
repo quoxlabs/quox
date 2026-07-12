@@ -265,9 +265,9 @@ export class QuoxElement extends QuoxNode {
 
   set scrollLeft(value: number) {
     const converted = scrollOffsetNumber(value);
-    const { renderer, requestRender } = documentInternals(this.ownerDocument);
+    const { queueScrollEvent, renderer } = documentInternals(this.ownerDocument);
     if ((renderer as unknown as LiveScrollRenderer).set_element_scroll_left(this.nodeId, converted)) {
-      requestRender();
+      queueScrollEvent(this.nodeId);
     }
   }
 
@@ -278,9 +278,9 @@ export class QuoxElement extends QuoxNode {
 
   set scrollTop(value: number) {
     const converted = scrollOffsetNumber(value);
-    const { renderer, requestRender } = documentInternals(this.ownerDocument);
+    const { queueScrollEvent, renderer } = documentInternals(this.ownerDocument);
     if ((renderer as unknown as LiveScrollRenderer).set_element_scroll_top(this.nodeId, converted)) {
-      requestRender();
+      queueScrollEvent(this.nodeId);
     }
   }
 

@@ -47,6 +47,7 @@ function createElement(): QuoxElement {
     requestRender: () => undefined,
     assertActive: () => undefined,
     invalidateNodeHandles: () => undefined,
+    queueScrollEvent: () => undefined,
     isDispatching: () => false,
     focusElement: () => undefined,
     blurElement: () => undefined,
