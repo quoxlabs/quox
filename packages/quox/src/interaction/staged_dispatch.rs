@@ -899,7 +899,11 @@ impl DispatchStack {
                         pointer_default.metadata.clone().into_auxclick(),
                     )
                 });
-                if !cancelled && !pointer_default_prevented {
+                let release_default_survives_mouse_cancellation =
+                    matches!(&pointer_default.event.data, DomEventData::PointerUp(_));
+                if (!cancelled || release_default_survives_mouse_cancellation)
+                    && !pointer_default_prevented
+                {
                     self.run_default(
                         document,
                         text_controls,
@@ -4472,6 +4476,34 @@ mod tests {
         let mouse_up = event(context.resume(&up, true));
         assert_eq!(mouse_up.event_type, "mouseup");
         let after_mouse_up = context.resume(&mouse_up, false);
+        let (types, _, _) = drain(&mut context, after_mouse_up);
+        assert!(types.iter().any(|event_type| event_type == "click"));
+    }
+
+    #[test]
+    fn cancelled_mouseup_still_runs_the_click_default() {
+        let mut context = TestContext::new(
+            "<div id='target' style='display:block;width:100px;height:40px'></div>",
+        );
+        let target = context.element("target");
+        let (x, y) = context.center(target);
+        assert!(context.document.set_hover_to(x, y));
+        let down = context.begin(DispatchRequest::Pointer {
+            event: pointer(x, y, MouseEventButton::Main, MouseEventButtons::Primary),
+            flavor: PointerFlavor::Down,
+            metadata: EventMetadata::native(),
+        });
+        let _ = drain(&mut context, down);
+
+        let pointer_up = event(context.begin(DispatchRequest::Pointer {
+            event: pointer(x, y, MouseEventButton::Main, MouseEventButtons::None),
+            flavor: PointerFlavor::Up,
+            metadata: EventMetadata::native(),
+        }));
+        assert_eq!(pointer_up.event_type, "pointerup");
+        let mouse_up = event(context.resume(&pointer_up, false));
+        assert_eq!(mouse_up.event_type, "mouseup");
+        let after_mouse_up = context.resume(&mouse_up, true);
         let (types, _, _) = drain(&mut context, after_mouse_up);
         assert!(types.iter().any(|event_type| event_type == "click"));
     }
