@@ -13,8 +13,8 @@ use crate::{QuoxRenderer, QuoxRendererState, sync_document_layout};
 use blitz_dom::{BaseDocument, LocalName, QualName, local_name, ns};
 use blitz_traits::events::{
     BlitzImeEvent, BlitzPointerEvent, BlitzPointerId, BlitzScrollEvent, BlitzWheelDelta,
-    BlitzWheelEvent, DomEvent, DomEventData, MouseEventButton, Point as ElementPoint,
-    PointerDetails,
+    BlitzWheelEvent, DomEvent, DomEventData, MouseEventButton, MouseEventButtons,
+    Point as ElementPoint, PointerDetails,
 };
 use js_sys::{Array, Object, Reflect};
 use std::collections::VecDeque;
@@ -40,6 +40,8 @@ pub(crate) struct DispatchStack {
     next_frame_id: Option<u32>,
     next_event_id: Option<u32>,
     wheel_transaction: Option<WheelTransaction>,
+    prevent_compatibility_mouse: bool,
+    mouse_button_presses: [Option<MouseButtonPress>; 5],
 }
 
 #[derive(Clone, Copy)]
@@ -47,6 +49,19 @@ struct WheelTransaction {
     default_target: GuardedRawNode,
     author_target: GuardedNode,
     last_time_stamp: f64,
+}
+
+#[derive(Clone, Copy)]
+struct MouseButtonPress {
+    page_x: f32,
+    page_y: f32,
+    dragged: bool,
+}
+
+#[derive(Clone, Copy)]
+struct PointerStreamState {
+    suppress_compatibility_mouse: bool,
+    release_activation_eligible: bool,
 }
 
 struct DispatchFrame {
@@ -119,6 +134,7 @@ struct NativeKeyMetadata {
 struct EventMetadata {
     time_stamp: f64,
     pointer: Option<NativePointerMetadata>,
+    pointer_move_button: Option<i16>,
     wheel: Option<NativeWheelMetadata>,
     key: Option<NativeKeyMetadata>,
     related_target: Option<GuardedNode>,
@@ -129,6 +145,7 @@ impl EventMetadata {
         Self {
             time_stamp: event_time_stamp(),
             pointer: None,
+            pointer_move_button: None,
             wheel: None,
             key: None,
             related_target: None,
@@ -139,6 +156,7 @@ impl EventMetadata {
         Self {
             time_stamp,
             pointer: Some(NativePointerMetadata { coords, detail }),
+            pointer_move_button: None,
             wheel: None,
             key: None,
             related_target: None,
@@ -155,6 +173,7 @@ impl EventMetadata {
         Self {
             time_stamp,
             pointer: None,
+            pointer_move_button: None,
             wheel: Some(NativeWheelMetadata {
                 coords,
                 delta_x,
@@ -170,6 +189,7 @@ impl EventMetadata {
         Self {
             time_stamp,
             pointer: None,
+            pointer_move_button: None,
             wheel: None,
             key: Some(key),
             related_target: None,
@@ -178,6 +198,11 @@ impl EventMetadata {
 
     fn with_related_target(mut self, related_target: Option<GuardedNode>) -> Self {
         self.related_target = related_target;
+        self
+    }
+
+    fn with_pointer_move_button(mut self, button: Option<MouseEventButton>) -> Self {
+        self.pointer_move_button = button.map(mouse_button_number);
         self
     }
 
@@ -238,7 +263,10 @@ enum PlannedWork {
         default_target: GuardedRawNode,
         author_target: GuardedNode,
         data: BlitzPointerEvent,
-        flavor: PointerFlavor,
+        pointer_flavor: PointerFlavor,
+        physical_flavor: PointerFlavor,
+        suppress_compatibility_mouse: bool,
+        release_activation_eligible: bool,
         metadata: EventMetadata,
     },
     Wheel {
@@ -294,11 +322,17 @@ enum ResumeAction {
         suppress_default: bool,
     },
     PointerLead {
-        pointer_default: GuardedDomEvent,
+        pointer_default: Box<GuardedDomEvent>,
+        pointer_fallback_default: Box<GuardedDomEvent>,
         mouse_data: Option<DomEventData>,
+        suppressed_release_activation: Option<Box<DomEventData>>,
+        pointer_cancellation_suppresses_default: bool,
+        starts_compatibility_mouse: bool,
+        suppress_compatibility_mouse: bool,
     },
     PointerMouse {
-        pointer_default: GuardedDomEvent,
+        pointer_default: Box<GuardedDomEvent>,
+        pointer_default_prevented: bool,
     },
 }
 
@@ -605,6 +639,8 @@ impl Default for DispatchStack {
             next_frame_id: Some(1),
             next_event_id: Some(1),
             wheel_transaction: None,
+            prevent_compatibility_mouse: false,
+            mouse_button_presses: [None; 5],
         }
     }
 }
@@ -673,7 +709,8 @@ impl DispatchStack {
 
     #[allow(
         clippy::too_many_arguments,
-        reason = "a continuation validates both ids while sharing the document's value, handle, and redraw state"
+        clippy::too_many_lines,
+        reason = "a continuation validates both ids while sharing dispatch state across each resumable event flavor"
     )]
     fn resume(
         &mut self,
@@ -730,24 +767,62 @@ impl DispatchStack {
             }
             ResumeAction::PointerLead {
                 pointer_default,
+                pointer_fallback_default,
                 mouse_data,
+                suppressed_release_activation,
+                pointer_cancellation_suppresses_default,
+                starts_compatibility_mouse,
+                suppress_compatibility_mouse,
             } => {
-                if !cancelled {
-                    if let Some(mouse_data) = mouse_data
-                        && let Some(mouse_event) = guard_event_with_target(
-                            document,
-                            handles,
-                            pointer_default.target,
-                            mouse_data,
-                            pointer_default.metadata.clone(),
-                        )?
-                    {
-                        return self.stage(
-                            redraw,
-                            mouse_event,
-                            ResumeAction::PointerMouse { pointer_default },
+                let pointer_default_prevented =
+                    cancelled && pointer_cancellation_suppresses_default;
+                if starts_compatibility_mouse && cancelled {
+                    self.prevent_compatibility_mouse = true;
+                }
+                let suppress_mouse =
+                    suppress_compatibility_mouse || self.prevent_compatibility_mouse;
+                let suppressed_release_activation = suppress_mouse
+                    .then(|| {
+                        suppressed_release_activation.map(|data| {
+                            (
+                                pointer_default.default_target,
+                                pointer_default.target,
+                                *data,
+                                pointer_default.metadata.clone(),
+                            )
+                        })
+                    })
+                    .flatten();
+                if !suppress_mouse
+                    && let Some(mouse_data) = mouse_data
+                    && let Some(mouse_event) = guard_event_with_target(
+                        document,
+                        handles,
+                        pointer_default.target,
+                        mouse_data,
+                        pointer_default.metadata.clone(),
+                    )?
+                {
+                    return self.stage(
+                        redraw,
+                        mouse_event,
+                        ResumeAction::PointerMouse {
+                            pointer_default,
+                            pointer_default_prevented,
+                        },
+                    );
+                }
+                let (pointer_default, pointer_default_prevented) = if suppress_mouse {
+                    let prevented = cancelled
+                        && !matches!(
+                            &pointer_fallback_default.event.data,
+                            DomEventData::PointerUp(_)
                         );
-                    }
+                    (*pointer_fallback_default, prevented)
+                } else {
+                    (*pointer_default, pointer_default_prevented)
+                };
+                if !pointer_default_prevented {
                     self.run_default(
                         document,
                         text_controls,
@@ -756,15 +831,35 @@ impl DispatchStack {
                         pointer_default,
                     )?;
                 }
+                if let Some((default_target, author_target, data, metadata)) =
+                    suppressed_release_activation
+                    && let Some(event) = guard_event_with_targets(
+                        document,
+                        handles,
+                        default_target,
+                        author_target,
+                        data,
+                        metadata,
+                    )?
+                {
+                    self.frames
+                        .last_mut()
+                        .expect("pointer defaults run only for an active frame")
+                        .generated
+                        .push_back(event);
+                }
             }
-            ResumeAction::PointerMouse { pointer_default } => {
-                if !cancelled {
+            ResumeAction::PointerMouse {
+                pointer_default,
+                pointer_default_prevented,
+            } => {
+                if !cancelled && !pointer_default_prevented {
                     self.run_default(
                         document,
                         text_controls,
                         checked_controls,
                         handles,
-                        pointer_default,
+                        *pointer_default,
                     )?;
                 }
             }
@@ -797,6 +892,8 @@ impl DispatchStack {
         request: DispatchRequest,
     ) -> Result<(), DispatchError> {
         let wheel_transaction = &mut self.wheel_transaction;
+        let prevent_compatibility_mouse = &mut self.prevent_compatibility_mouse;
+        let mouse_button_presses = &mut self.mouse_button_presses;
         let planned = &mut self
             .frames
             .last_mut()
@@ -811,7 +908,13 @@ impl DispatchStack {
                 metadata,
             } => {
                 end_wheel_transaction_for_pointer_down(wheel_transaction, flavor);
-                plan_pointer(document, handles, planned, &event, flavor, metadata)?;
+                let stream = update_pointer_stream_state(
+                    prevent_compatibility_mouse,
+                    mouse_button_presses,
+                    &event,
+                    flavor,
+                );
+                plan_pointer(document, handles, planned, &event, flavor, stream, metadata)?;
             }
             DispatchRequest::Wheel {
                 event,
@@ -958,7 +1061,10 @@ impl DispatchStack {
                     default_target,
                     author_target,
                     mut data,
-                    flavor,
+                    pointer_flavor,
+                    physical_flavor,
+                    suppress_compatibility_mouse,
+                    release_activation_eligible,
                     metadata,
                 } => {
                     if !raw_node_is_live(default_target, document, handles)
@@ -970,8 +1076,8 @@ impl DispatchStack {
                         data.element.x = data.coords.client_x - rect.x as f32;
                         data.element.y = data.coords.client_y - rect.y as f32;
                     }
-                    let pointer_data = pointer_dom_data(flavor, data.clone(), false);
-                    let Some(pointer_default) = guard_event_with_targets(
+                    let pointer_data = pointer_dom_data(pointer_flavor, data.clone(), false);
+                    let Some(pointer_event) = guard_event_with_targets(
                         document,
                         handles,
                         default_target,
@@ -982,15 +1088,54 @@ impl DispatchStack {
                     else {
                         continue;
                     };
+                    let physical_data = pointer_dom_data(physical_flavor, data.clone(), false);
+                    let Some(pointer_default) = guard_event_with_targets(
+                        document,
+                        handles,
+                        default_target,
+                        author_target,
+                        physical_data,
+                        metadata.clone(),
+                    )?
+                    else {
+                        continue;
+                    };
                     let mouse_data = data
                         .is_mouse()
-                        .then(|| pointer_dom_data(flavor, data, true));
+                        .then(|| pointer_dom_data(physical_flavor, data.clone(), true));
+                    let chord_transition = matches!(pointer_flavor, PointerFlavor::Move)
+                        && !matches!(physical_flavor, PointerFlavor::Move);
+                    let starts_compatibility_mouse = data.is_mouse()
+                        && data.is_primary
+                        && matches!(pointer_flavor, PointerFlavor::Down);
+                    let suppressed_release_activation = chord_transition
+                        .then(|| match data.button {
+                            MouseEventButton::Main => Some(DomEventData::Click(data.clone())),
+                            MouseEventButton::Secondary => {
+                                Some(DomEventData::ContextMenu(data.clone()))
+                            }
+                            MouseEventButton::Auxiliary
+                            | MouseEventButton::Fourth
+                            | MouseEventButton::Fifth => None,
+                        })
+                        .flatten()
+                        .filter(|_| {
+                            matches!(physical_flavor, PointerFlavor::Up)
+                                && release_activation_eligible
+                        })
+                        .map(Box::new);
                     return self.stage(
                         redraw,
-                        pointer_default.clone(),
+                        pointer_event.clone(),
                         ResumeAction::PointerLead {
-                            pointer_default,
+                            pointer_default: Box::new(pointer_default),
+                            pointer_fallback_default: Box::new(pointer_event),
                             mouse_data,
+                            suppressed_release_activation,
+                            pointer_cancellation_suppresses_default: !chord_transition
+                                && !matches!(physical_flavor, PointerFlavor::Up),
+                            starts_compatibility_mouse,
+                            suppress_compatibility_mouse,
                         },
                     );
                 }
@@ -1525,11 +1670,17 @@ fn plan_pointer(
     planned: &mut VecDeque<PlannedWork>,
     event: &BlitzPointerEvent,
     flavor: PointerFlavor,
+    stream: PointerStreamState,
     metadata: EventMetadata,
 ) -> Result<(), DispatchError> {
     let hover = plan_hover_transitions(document, handles, planned, event, &metadata)?;
+    let pointer_flavor = exposed_pointer_flavor(event, flavor);
+    let metadata = metadata.with_pointer_move_button(
+        (matches!(pointer_flavor, PointerFlavor::Move) && !matches!(flavor, PointerFlavor::Move))
+            .then_some(event.button),
+    );
 
-    match flavor {
+    match pointer_flavor {
         PointerFlavor::Down => {
             planned.push_back(PlannedWork::Action(DispatchAction::PointerDownState(hover)));
         }
@@ -1549,7 +1700,10 @@ fn plan_pointer(
         default_target,
         author_target,
         data: event.clone(),
-        flavor,
+        pointer_flavor,
+        physical_flavor: flavor,
+        suppress_compatibility_mouse: stream.suppress_compatibility_mouse,
+        release_activation_eligible: stream.release_activation_eligible,
         metadata,
     });
 
@@ -1560,6 +1714,75 @@ fn plan_pointer(
         planned.push_back(PlannedWork::Action(DispatchAction::ClearHover));
     }
     Ok(())
+}
+
+fn exposed_pointer_flavor(event: &BlitzPointerEvent, physical: PointerFlavor) -> PointerFlavor {
+    if !event.is_mouse() {
+        return physical;
+    }
+    match physical {
+        PointerFlavor::Down
+            if !event
+                .buttons
+                .difference(MouseEventButtons::from(event.button))
+                .is_empty() =>
+        {
+            PointerFlavor::Move
+        }
+        PointerFlavor::Up if !event.buttons.is_empty() => PointerFlavor::Move,
+        _ => physical,
+    }
+}
+
+fn update_pointer_stream_state(
+    prevent_compatibility_mouse: &mut bool,
+    presses: &mut [Option<MouseButtonPress>; 5],
+    event: &BlitzPointerEvent,
+    physical: PointerFlavor,
+) -> PointerStreamState {
+    let suppress_compatibility_mouse = *prevent_compatibility_mouse;
+    if event.is_mouse() && matches!(physical, PointerFlavor::Up) && event.buttons.is_empty() {
+        // The physical stream has ended even if its final pointerup frame later aborts while
+        // waiting in JavaScript.
+        *prevent_compatibility_mouse = false;
+    }
+    PointerStreamState {
+        suppress_compatibility_mouse,
+        release_activation_eligible: update_mouse_button_presses(presses, event, physical),
+    }
+}
+
+fn update_mouse_button_presses(
+    presses: &mut [Option<MouseButtonPress>; 5],
+    event: &BlitzPointerEvent,
+    physical: PointerFlavor,
+) -> bool {
+    if !event.is_mouse() {
+        return false;
+    }
+    match physical {
+        PointerFlavor::Down => {
+            presses[mouse_button_index(event.button)] = Some(MouseButtonPress {
+                page_x: event.page_x(),
+                page_y: event.page_y(),
+                dragged: false,
+            });
+            false
+        }
+        PointerFlavor::Move => {
+            for press in presses.iter_mut().flatten() {
+                if (event.page_x() - press.page_x).abs() > 2.0
+                    || (event.page_y() - press.page_y).abs() > 2.0
+                {
+                    press.dragged = true;
+                }
+            }
+            false
+        }
+        PointerFlavor::Up => presses[mouse_button_index(event.button)]
+            .take()
+            .is_some_and(|press| !press.dragged),
+    }
 }
 
 #[allow(
@@ -2129,8 +2352,13 @@ fn event_is_composed(data: &DomEventData) -> bool {
 
 fn event_payload(data: &DomEventData, metadata: &EventMetadata) -> Option<DispatchEventPayload> {
     match data {
-        DomEventData::PointerMove(event)
-        | DomEventData::PointerEnter(event)
+        DomEventData::PointerMove(event) => Some(DispatchEventPayload::Pointer(pointer_payload(
+            event,
+            metadata,
+            metadata.pointer_move_button.unwrap_or(-1),
+            0,
+        ))),
+        DomEventData::PointerEnter(event)
         | DomEventData::PointerLeave(event)
         | DomEventData::PointerOver(event)
         | DomEventData::PointerOut(event) => Some(DispatchEventPayload::Pointer(pointer_payload(
@@ -2377,6 +2605,16 @@ fn keyboard_payload(
 }
 
 const fn mouse_button_number(button: MouseEventButton) -> i16 {
+    match button {
+        MouseEventButton::Main => 0,
+        MouseEventButton::Auxiliary => 1,
+        MouseEventButton::Secondary => 2,
+        MouseEventButton::Fourth => 3,
+        MouseEventButton::Fifth => 4,
+    }
+}
+
+const fn mouse_button_index(button: MouseEventButton) -> usize {
     match button {
         MouseEventButton::Main => 0,
         MouseEventButton::Auxiliary => 1,
@@ -3407,6 +3645,39 @@ mod tests {
         }
     }
 
+    fn drain_pointer_mouse_records(
+        context: &mut TestContext,
+        mut step: DispatchStep,
+    ) -> Vec<(String, i16, u8)> {
+        let mut records = Vec::new();
+        while let DispatchStep::Event(current) = step {
+            let fields = match current.payload.as_deref() {
+                Some(DispatchEventPayload::Pointer(payload))
+                    if matches!(
+                        current.event_type.as_str(),
+                        "pointermove" | "pointerdown" | "pointerup"
+                    ) =>
+                {
+                    Some((payload.mouse.button, payload.mouse.buttons))
+                }
+                Some(DispatchEventPayload::Mouse(payload))
+                    if matches!(
+                        current.event_type.as_str(),
+                        "mousemove" | "mousedown" | "mouseup"
+                    ) =>
+                {
+                    Some((payload.button, payload.buttons))
+                }
+                _ => None,
+            };
+            if let Some((button, buttons)) = fields {
+                records.push((current.event_type.clone(), button, buttons));
+            }
+            step = context.resume(&current, false);
+        }
+        records
+    }
+
     fn next_event_of_type(
         context: &mut TestContext,
         mut step: DispatchStep,
@@ -3562,6 +3833,434 @@ mod tests {
                 "mouseenter",
                 "pointermove",
                 "mousemove",
+            ]
+        );
+    }
+
+    #[test]
+    fn chorded_mouse_buttons_emit_only_first_down_and_final_up_pointer_events() {
+        let mut context = TestContext::new(
+            "<div id='target' style='display:block;width:100px;height:40px'></div>",
+        );
+        let target = context.element("target");
+        let (x, y) = context.center(target);
+        assert!(context.document.set_hover_to(x, y));
+        let _ = context.redraw.swap(false, Ordering::Relaxed);
+
+        let first_down = context.begin(DispatchRequest::Pointer {
+            event: pointer(x, y, MouseEventButton::Main, MouseEventButtons::Primary),
+            flavor: PointerFlavor::Down,
+            metadata: EventMetadata::native(),
+        });
+        assert_eq!(
+            drain_pointer_mouse_records(&mut context, first_down),
+            [
+                ("pointerdown".to_owned(), 0, 1),
+                ("mousedown".to_owned(), 0, 1)
+            ]
+        );
+
+        let chord_down = context.begin(DispatchRequest::Pointer {
+            event: pointer(
+                x,
+                y,
+                MouseEventButton::Secondary,
+                MouseEventButtons::Primary | MouseEventButtons::Secondary,
+            ),
+            flavor: PointerFlavor::Down,
+            metadata: EventMetadata::native(),
+        });
+        assert_eq!(
+            drain_pointer_mouse_records(&mut context, chord_down),
+            [
+                ("pointermove".to_owned(), 2, 3),
+                ("mousedown".to_owned(), 2, 3)
+            ]
+        );
+
+        let chord_up = context.begin(DispatchRequest::Pointer {
+            event: pointer(
+                x,
+                y,
+                MouseEventButton::Secondary,
+                MouseEventButtons::Primary,
+            ),
+            flavor: PointerFlavor::Up,
+            metadata: EventMetadata::native(),
+        });
+        assert_eq!(
+            drain_pointer_mouse_records(&mut context, chord_up),
+            [
+                ("pointermove".to_owned(), 2, 1),
+                ("mouseup".to_owned(), 2, 1)
+            ]
+        );
+
+        let final_up = context.begin(DispatchRequest::Pointer {
+            event: pointer(x, y, MouseEventButton::Main, MouseEventButtons::None),
+            flavor: PointerFlavor::Up,
+            metadata: EventMetadata::native(),
+        });
+        assert_eq!(
+            drain_pointer_mouse_records(&mut context, final_up),
+            [("pointerup".to_owned(), 0, 0), ("mouseup".to_owned(), 0, 0)]
+        );
+    }
+
+    #[test]
+    fn every_extended_button_keeps_its_chord_mask_and_changed_button() {
+        for (button, bit, number) in [
+            (MouseEventButton::Auxiliary, MouseEventButtons::Auxiliary, 1),
+            (MouseEventButton::Fourth, MouseEventButtons::Fourth, 3),
+            (MouseEventButton::Fifth, MouseEventButtons::Fifth, 4),
+        ] {
+            let mut context = TestContext::new(
+                "<div id='target' style='display:block;width:100px;height:40px'></div>",
+            );
+            let target = context.element("target");
+            let (x, y) = context.center(target);
+            assert!(context.document.set_hover_to(x, y));
+            let _ = context.redraw.swap(false, Ordering::Relaxed);
+            let primary = context.begin(DispatchRequest::Pointer {
+                event: pointer(x, y, MouseEventButton::Main, MouseEventButtons::Primary),
+                flavor: PointerFlavor::Down,
+                metadata: EventMetadata::native(),
+            });
+            let _ = drain(&mut context, primary);
+
+            let chord_down = context.begin(DispatchRequest::Pointer {
+                event: pointer(x, y, button, MouseEventButtons::Primary | bit),
+                flavor: PointerFlavor::Down,
+                metadata: EventMetadata::native(),
+            });
+            assert_eq!(
+                drain_pointer_mouse_records(&mut context, chord_down),
+                [
+                    ("pointermove".to_owned(), number, 1 | bit.bits()),
+                    ("mousedown".to_owned(), number, 1 | bit.bits()),
+                ]
+            );
+
+            let chord_up = context.begin(DispatchRequest::Pointer {
+                event: pointer(x, y, button, MouseEventButtons::Primary),
+                flavor: PointerFlavor::Up,
+                metadata: EventMetadata::native(),
+            });
+            assert_eq!(
+                drain_pointer_mouse_records(&mut context, chord_up),
+                [
+                    ("pointermove".to_owned(), number, 1),
+                    ("mouseup".to_owned(), number, 1),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn cancelled_first_pointerdown_suppresses_compatibility_mouse_until_final_up() {
+        let mut context = TestContext::new(
+            "<div id='a' style='display:inline-block;width:100px;height:40px'></div>\
+             <div id='b' style='display:inline-block;width:100px;height:40px'></div>",
+        );
+        let a = context.element("a");
+        let b = context.element("b");
+        let (ax, ay) = context.center(a);
+        let (bx, by) = context.center(b);
+        assert!(context.document.set_hover_to(ax, ay));
+        let _ = context.redraw.swap(false, Ordering::Relaxed);
+
+        let down = event(context.begin(DispatchRequest::Pointer {
+            event: pointer(ax, ay, MouseEventButton::Main, MouseEventButtons::Primary),
+            flavor: PointerFlavor::Down,
+            metadata: EventMetadata::native(),
+        }));
+        assert_eq!(down.event_type, "pointerdown");
+        complete(context.resume(&down, true));
+
+        let moved = context.begin(DispatchRequest::Pointer {
+            event: pointer(bx, by, MouseEventButton::Main, MouseEventButtons::Primary),
+            flavor: PointerFlavor::Move,
+            metadata: EventMetadata::native(),
+        });
+        let (move_types, _, _) = drain(&mut context, moved);
+        assert!(move_types.iter().any(|event_type| event_type == "mouseout"));
+        assert!(
+            move_types
+                .iter()
+                .any(|event_type| event_type == "mouseenter")
+        );
+        assert!(
+            move_types
+                .iter()
+                .any(|event_type| event_type == "pointermove")
+        );
+        assert!(
+            !move_types
+                .iter()
+                .any(|event_type| event_type == "mousemove")
+        );
+
+        let up = context.begin(DispatchRequest::Pointer {
+            event: pointer(bx, by, MouseEventButton::Main, MouseEventButtons::None),
+            flavor: PointerFlavor::Up,
+            metadata: EventMetadata::native(),
+        });
+        let (up_types, _, _) = drain(&mut context, up);
+        assert!(up_types.iter().any(|event_type| event_type == "pointerup"));
+        assert!(!up_types.iter().any(|event_type| event_type == "mouseup"));
+
+        let next_down = context.begin(DispatchRequest::Pointer {
+            event: pointer(bx, by, MouseEventButton::Main, MouseEventButtons::Primary),
+            flavor: PointerFlavor::Down,
+            metadata: EventMetadata::native(),
+        });
+        assert_eq!(
+            drain_pointer_mouse_records(&mut context, next_down),
+            [
+                ("pointerdown".to_owned(), 0, 1),
+                ("mousedown".to_owned(), 0, 1)
+            ]
+        );
+    }
+
+    #[test]
+    fn cancelled_first_pointerdown_suppresses_chord_mouse_transitions() {
+        for (first_button, first_mask, chord_button, chord_mask, chord_number, activation) in [
+            (
+                MouseEventButton::Main,
+                MouseEventButtons::Primary,
+                MouseEventButton::Secondary,
+                MouseEventButtons::Secondary,
+                2,
+                "contextmenu",
+            ),
+            (
+                MouseEventButton::Secondary,
+                MouseEventButtons::Secondary,
+                MouseEventButton::Main,
+                MouseEventButtons::Primary,
+                0,
+                "click",
+            ),
+        ] {
+            let mut context = TestContext::new(
+                "<input id='target' style='display:block;width:100px;height:40px'>",
+            );
+            let target = context.element("target");
+            let (x, y) = context.center(target);
+            assert!(context.document.set_hover_to(x, y));
+            let down = event(context.begin(DispatchRequest::Pointer {
+                event: pointer(x, y, first_button, first_mask),
+                flavor: PointerFlavor::Down,
+                metadata: EventMetadata::native(),
+            }));
+            complete(context.resume(&down, true));
+
+            let chord_down = context.begin(DispatchRequest::Pointer {
+                event: pointer(x, y, chord_button, first_mask | chord_mask),
+                flavor: PointerFlavor::Down,
+                metadata: EventMetadata::native(),
+            });
+            assert_eq!(
+                drain_pointer_mouse_records(&mut context, chord_down),
+                [(
+                    "pointermove".to_owned(),
+                    chord_number,
+                    (first_mask | chord_mask).bits()
+                )]
+            );
+            assert_ne!(context.document.get_focussed_node_id(), Some(target));
+
+            let chord_up = context.begin(DispatchRequest::Pointer {
+                event: pointer(x, y, chord_button, first_mask),
+                flavor: PointerFlavor::Up,
+                metadata: EventMetadata::native(),
+            });
+            let (types, _, _) = drain(&mut context, chord_up);
+            assert!(types.iter().any(|event_type| event_type == "pointermove"));
+            assert!(!types.iter().any(|event_type| event_type == "mouseup"));
+            assert!(types.iter().any(|event_type| event_type == activation));
+        }
+    }
+
+    #[test]
+    fn suppressed_chord_drag_does_not_activate_on_release() {
+        let mut context = TestContext::new(
+            "<div id='target' style='display:block;width:100px;height:40px'>text</div>",
+        );
+        let target = context.element("target");
+        let (x, y) = context.center(target);
+        assert!(context.document.set_hover_to(x, y));
+        let down = event(context.begin(DispatchRequest::Pointer {
+            event: pointer(
+                x,
+                y,
+                MouseEventButton::Secondary,
+                MouseEventButtons::Secondary,
+            ),
+            flavor: PointerFlavor::Down,
+            metadata: EventMetadata::native(),
+        }));
+        complete(context.resume(&down, true));
+
+        let chord_down = context.begin(DispatchRequest::Pointer {
+            event: pointer(
+                x,
+                y,
+                MouseEventButton::Main,
+                MouseEventButtons::Primary | MouseEventButtons::Secondary,
+            ),
+            flavor: PointerFlavor::Down,
+            metadata: EventMetadata::native(),
+        });
+        let _ = drain(&mut context, chord_down);
+        let moved = context.begin(DispatchRequest::Pointer {
+            event: pointer(
+                x + 3.0,
+                y,
+                MouseEventButton::Main,
+                MouseEventButtons::Primary | MouseEventButtons::Secondary,
+            ),
+            flavor: PointerFlavor::Move,
+            metadata: EventMetadata::native(),
+        });
+        let _ = drain(&mut context, moved);
+
+        let chord_up = context.begin(DispatchRequest::Pointer {
+            event: pointer(
+                x + 3.0,
+                y,
+                MouseEventButton::Main,
+                MouseEventButtons::Secondary,
+            ),
+            flavor: PointerFlavor::Up,
+            metadata: EventMetadata::native(),
+        });
+        let (types, _, _) = drain(&mut context, chord_up);
+        assert!(types.iter().any(|event_type| event_type == "pointermove"));
+        assert!(!types.iter().any(|event_type| event_type == "mouseup"));
+        assert!(!types.iter().any(|event_type| event_type == "click"));
+    }
+
+    #[test]
+    fn chord_and_final_pointer_cancellation_do_not_hide_physical_mouse_transitions() {
+        let mut context = TestContext::new(
+            "<div id='target' style='display:block;width:100px;height:40px'></div>",
+        );
+        let target = context.element("target");
+        let (x, y) = context.center(target);
+        assert!(context.document.set_hover_to(x, y));
+        let _ = context.redraw.swap(false, Ordering::Relaxed);
+        let down = context.begin(DispatchRequest::Pointer {
+            event: pointer(x, y, MouseEventButton::Main, MouseEventButtons::Primary),
+            flavor: PointerFlavor::Down,
+            metadata: EventMetadata::native(),
+        });
+        let _ = drain(&mut context, down);
+
+        let chord = event(context.begin(DispatchRequest::Pointer {
+            event: pointer(
+                x,
+                y,
+                MouseEventButton::Secondary,
+                MouseEventButtons::Primary | MouseEventButtons::Secondary,
+            ),
+            flavor: PointerFlavor::Down,
+            metadata: EventMetadata::native(),
+        }));
+        assert_eq!(chord.event_type, "pointermove");
+        let mouse_down = event(context.resume(&chord, true));
+        assert_eq!(mouse_down.event_type, "mousedown");
+        let after_mouse_down = context.resume(&mouse_down, false);
+        let _ = drain(&mut context, after_mouse_down);
+
+        let chord_up = context.begin(DispatchRequest::Pointer {
+            event: pointer(
+                x,
+                y,
+                MouseEventButton::Secondary,
+                MouseEventButtons::Primary,
+            ),
+            flavor: PointerFlavor::Up,
+            metadata: EventMetadata::native(),
+        });
+        let _ = drain(&mut context, chord_up);
+
+        let final_up = event(context.begin(DispatchRequest::Pointer {
+            event: pointer(x, y, MouseEventButton::Main, MouseEventButtons::None),
+            flavor: PointerFlavor::Up,
+            metadata: EventMetadata::native(),
+        }));
+        assert_eq!(final_up.event_type, "pointerup");
+        let mouse_up = event(context.resume(&final_up, true));
+        assert_eq!(mouse_up.event_type, "mouseup");
+        let after_mouse_up = context.resume(&mouse_up, false);
+        let _ = drain(&mut context, after_mouse_up);
+    }
+
+    #[test]
+    fn cancelled_final_pointerup_still_runs_the_click_default() {
+        let mut context = TestContext::new(
+            "<div id='target' style='display:block;width:100px;height:40px'></div>",
+        );
+        let target = context.element("target");
+        let (x, y) = context.center(target);
+        assert!(context.document.set_hover_to(x, y));
+        let down = context.begin(DispatchRequest::Pointer {
+            event: pointer(x, y, MouseEventButton::Main, MouseEventButtons::Primary),
+            flavor: PointerFlavor::Down,
+            metadata: EventMetadata::native(),
+        });
+        let _ = drain(&mut context, down);
+
+        let up = event(context.begin(DispatchRequest::Pointer {
+            event: pointer(x, y, MouseEventButton::Main, MouseEventButtons::None),
+            flavor: PointerFlavor::Up,
+            metadata: EventMetadata::native(),
+        }));
+        let mouse_up = event(context.resume(&up, true));
+        assert_eq!(mouse_up.event_type, "mouseup");
+        let after_mouse_up = context.resume(&mouse_up, false);
+        let (types, _, _) = drain(&mut context, after_mouse_up);
+        assert!(types.iter().any(|event_type| event_type == "click"));
+    }
+
+    #[test]
+    fn aborting_final_pointerup_clears_compatibility_mouse_suppression() {
+        let mut context = TestContext::new(
+            "<div id='target' style='display:block;width:100px;height:40px'></div>",
+        );
+        let target = context.element("target");
+        let (x, y) = context.center(target);
+        assert!(context.document.set_hover_to(x, y));
+
+        let down = event(context.begin(DispatchRequest::Pointer {
+            event: pointer(x, y, MouseEventButton::Main, MouseEventButtons::Primary),
+            flavor: PointerFlavor::Down,
+            metadata: EventMetadata::native(),
+        }));
+        complete(context.resume(&down, true));
+
+        let final_up = event(context.begin(DispatchRequest::Pointer {
+            event: pointer(x, y, MouseEventButton::Main, MouseEventButtons::None),
+            flavor: PointerFlavor::Up,
+            metadata: EventMetadata::native(),
+        }));
+        assert_eq!(final_up.event_type, "pointerup");
+        let _ = context
+            .stack
+            .abort(context.redraw.as_ref(), final_up.frame_id);
+
+        let next_down = context.begin(DispatchRequest::Pointer {
+            event: pointer(x, y, MouseEventButton::Main, MouseEventButtons::Primary),
+            flavor: PointerFlavor::Down,
+            metadata: EventMetadata::native(),
+        });
+        assert_eq!(
+            drain_pointer_mouse_records(&mut context, next_down),
+            [
+                ("pointerdown".to_owned(), 0, 1),
+                ("mousedown".to_owned(), 0, 1)
             ]
         );
     }
