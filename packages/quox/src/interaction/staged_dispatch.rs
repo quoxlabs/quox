@@ -451,7 +451,11 @@ impl<'a> ResolvedInputLayout<'a> {
             let occurrence_target = self.document.hit(page_x, page_y).map(|hit| hit.node_id);
             DispatchRequest::Wheel {
                 event: BlitzWheelEvent {
-                    delta: BlitzWheelDelta::Pixels(input.blitz_delta_x, input.blitz_delta_y),
+                    delta: if input.delta_mode == 1 {
+                        BlitzWheelDelta::Lines(input.blitz_delta_x, input.blitz_delta_y)
+                    } else {
+                        BlitzWheelDelta::Pixels(input.blitz_delta_x, input.blitz_delta_y)
+                    },
                     coords: super::pointer_coords(input.x, input.y, page_x, page_y),
                     buttons: input.buttons,
                     mods: super::build_pointer_modifiers(input.modifier_bits),
@@ -3219,7 +3223,7 @@ mod tests {
                 x,
                 y,
                 blitz_delta_x: 0.0,
-                blitz_delta_y: -40.0,
+                blitz_delta_y: -1.0,
                 delta_x: 0.0,
                 delta_y: 1.0,
                 delta_mode: 1,
@@ -3576,7 +3580,7 @@ mod tests {
                 .expect("scroller should exist")
                 .scroll_offset
                 .y
-                - 40.0)
+                - 20.0)
                 .abs()
                 < f64::EPSILON
         );
@@ -3647,7 +3651,7 @@ mod tests {
                 .expect("scroller should exist")
                 .scroll_offset
                 .y
-                - 40.0)
+                - 20.0)
                 .abs()
                 < f64::EPSILON
         );
@@ -3702,7 +3706,7 @@ mod tests {
                 .expect("right scroller should exist")
                 .scroll_offset
                 .y
-                - 40.0)
+                - 20.0)
                 .abs()
                 < f64::EPSILON
         );
@@ -5081,7 +5085,7 @@ mod tests {
         clippy::float_cmp,
         reason = "the raw wheel values are copied exactly rather than recalculated"
     )]
-    fn wheel_payload_keeps_raw_units_separate_from_blitz_pixels() {
+    fn wheel_payload_keeps_raw_units_separate_from_blitz_defaults() {
         let mut context = TestContext::new(
             "<div id='target' style='display:block;width:120px;height:40px'></div>",
         );
@@ -5105,7 +5109,7 @@ mod tests {
             &mut context,
             target,
             DomEventData::Wheel(BlitzWheelEvent {
-                delta: BlitzWheelDelta::Pixels(-50.0, 100.0),
+                delta: BlitzWheelDelta::Lines(-1.25, 2.5),
                 coords: PointerCoords {
                     page_x: x + 10.0,
                     page_y: y + 20.0,
@@ -5138,7 +5142,7 @@ mod tests {
         assert!(matches!(
             pending.guarded.event.data,
             DomEventData::Wheel(BlitzWheelEvent {
-                delta: BlitzWheelDelta::Pixels(-50.0, 100.0),
+                delta: BlitzWheelDelta::Lines(-1.25, 2.5),
                 ..
             })
         ));

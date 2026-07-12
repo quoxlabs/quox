@@ -11,7 +11,7 @@ import type {
   WheelEvent as WindingWheelEvent,
 } from "@quoxlabs/winding";
 import { KeyEventFlag, KeyModifierMask, PointerModifierMask } from "../lib/quox.js";
-import { wheelPixelsForBlitz } from "./wheel.ts";
+import { wheelDeltaForBlitz } from "./wheel.ts";
 
 export {
   applyImeRequestSnapshot,
@@ -135,7 +135,7 @@ export class QuoxInputRouter {
         );
         return undefined;
       case "wheel": {
-        const [deltaX, deltaY] = wheelPixelsForBlitz(
+        const [deltaX, deltaY] = wheelDeltaForBlitz(
           event.deltaX,
           event.deltaY,
           event.deltaMode,

@@ -107,7 +107,7 @@ Deno.test("wheel adapter preserves browser units and translates Blitz scroll dir
 
   assertEquals(calls, [
     [7, 9, -2.25, 3.5, 5, 9, 2.25, -3.5, 0, 12],
-    [7, 9, -40, 80, 5, 9, 1, -2, 1, 12],
+    [7, 9, -1, 2, 5, 9, 1, -2, 1, 12],
     [7, 9, -400, 600, 5, 9, 0.5, -1, 2, 12],
   ]);
 });
