@@ -200,6 +200,15 @@ struct TemporaryRadioNameFacade {
     value: String,
 }
 
+enum LabelClickDefault {
+    NotLabel,
+    Suppressed,
+    Control {
+        target: usize,
+        event: BlitzPointerEvent,
+    },
+}
+
 impl GuardedRawNode {
     fn from_public(public: GuardedNode) -> Self {
         Self {
@@ -259,6 +268,7 @@ struct EventMetadata {
     click_detail: Option<u32>,
     event_type_override: Option<&'static str>,
     cancelable_override: Option<bool>,
+    label_activation: bool,
     suppress_default: bool,
     defer_click_target: bool,
 }
@@ -276,6 +286,7 @@ impl EventMetadata {
             click_detail: None,
             event_type_override: None,
             cancelable_override: None,
+            label_activation: false,
             suppress_default: false,
             defer_click_target: false,
         }
@@ -318,6 +329,7 @@ impl EventMetadata {
             click_detail: None,
             event_type_override: None,
             cancelable_override: None,
+            label_activation: false,
             suppress_default: false,
             defer_click_target: false,
         }
@@ -377,6 +389,7 @@ impl EventMetadata {
             click_detail: None,
             event_type_override: None,
             cancelable_override: None,
+            label_activation: false,
             suppress_default: false,
             defer_click_target: false,
         }
@@ -394,6 +407,7 @@ impl EventMetadata {
             click_detail: None,
             event_type_override: None,
             cancelable_override: None,
+            label_activation: false,
             suppress_default: false,
             defer_click_target: false,
         }
@@ -439,6 +453,19 @@ impl EventMetadata {
         self.event_type_override = Some("pointercancel");
         self.cancelable_override = Some(false);
         self.suppress_default = true;
+        self
+    }
+
+    fn into_label_activation(mut self) -> Self {
+        // The control click is caused by the label default, not by a second physical release.
+        // Retaining release metadata would retarget it back to the label and feed it into the
+        // native double-click sequence.
+        self.pointer_release_click = None;
+        self.event_type_override = None;
+        self.cancelable_override = None;
+        self.label_activation = true;
+        self.suppress_default = false;
+        self.defer_click_target = false;
         self
     }
 
@@ -2193,6 +2220,46 @@ impl DispatchStack {
         Ok(())
     }
 
+    fn queue_label_focus_default(
+        &mut self,
+        document: &mut BaseDocument,
+        handles: &mut NodeHandles,
+        destination: GuardedNode,
+        metadata: EventMetadata,
+    ) -> Result<(), DispatchError> {
+        document.resolve(0.0);
+        if !node_is_live(destination, document, handles)
+            || !is_programmatically_focusable(document, destination.raw)
+        {
+            return Ok(());
+        }
+        let old_focus = actual_focus_node_id(document)
+            .map(|target| guard_node(document, handles, target))
+            .transpose()?
+            .flatten();
+        if old_focus == Some(destination) {
+            return Ok(());
+        }
+        let planned = &mut self
+            .frames
+            .last_mut()
+            .expect("label defaults run only for an active frame")
+            .planned;
+        planned.push_front(PlannedWork::Action(DispatchAction::GainFocus {
+            target: destination,
+            related_target: old_focus,
+            metadata: metadata.clone(),
+        }));
+        if let Some(old_focus) = old_focus {
+            planned.push_front(PlannedWork::Action(DispatchAction::LoseFocus {
+                target: old_focus,
+                related_target: Some(destination),
+                metadata,
+            }));
+        }
+        Ok(())
+    }
+
     fn run_default(
         &mut self,
         document: &mut BaseDocument,
@@ -2224,28 +2291,19 @@ impl DispatchStack {
         let old_focus = actual_focus_node_id(document);
         let preserve_focus = default_must_preserve_focus(document, &guarded);
         let original_shell = install_ime_suppressing_shell(document, preserve_focus);
-        let source_metadata = guarded.metadata.clone();
+        let mut source_metadata = guarded.metadata.clone();
+        let label_default = label_click_default(document, &guarded);
         let viewport_scroll_before_default = document.viewport_scroll();
-        let preserved_file_value = matches!(&guarded.event.data, DomEventData::Click(_))
-            .then(|| activated_file_input(document, guarded.default_target.raw))
-            .flatten()
-            .map(|target| {
-                let value = document
-                    .get_node(target)
-                    .and_then(blitz_dom::Node::element_data)
-                    .and_then(|element| {
-                        element.attrs.iter().find(|attribute| {
-                            attribute.name.ns == ns!()
-                                && attribute.name.local == local_name!("value")
-                        })
-                    })
-                    .map(|attribute| attribute.value.as_str())
-                    .map(str::to_owned);
-                (target, value)
-            });
+        let preserved_file_value = file_value_preserved_during_click(document, &guarded);
         let mut generated = Vec::new();
         let temporary_radio_name = install_temporary_radio_name(document, protected_checked_target);
-        run_engine_default(document, &mut guarded, &mut generated);
+        run_engine_or_label_default(
+            document,
+            &mut guarded,
+            label_default,
+            &mut source_metadata,
+            &mut generated,
+        );
         restore_temporary_radio_name(document, temporary_radio_name);
         preserve_default_focus(document, &mut generated, old_focus, preserve_focus);
         restore_shell_provider(document, original_shell);
@@ -2299,6 +2357,9 @@ impl DispatchStack {
             .expect("defaults run only for an active frame")
             .generated
             .extend(guarded_generated);
+        if guarded.metadata.label_activation {
+            self.queue_label_focus_default(document, handles, guarded.target, source_metadata)?;
+        }
         Ok(())
     }
 
@@ -2480,6 +2541,9 @@ fn nearest_click_focusable_ancestor(
 }
 
 fn default_must_preserve_focus(document: &BaseDocument, guarded: &GuardedDomEvent) -> bool {
+    if guarded.metadata.label_activation {
+        return false;
+    }
     match &guarded.event.data {
         DomEventData::PointerDown(pointer) => pointer.is_mouse(),
         DomEventData::Click(pointer) => {
@@ -2487,6 +2551,60 @@ fn default_must_preserve_focus(document: &BaseDocument, guarded: &GuardedDomEven
                 && !click_default_delegates_focus(document, guarded.default_target.raw)
         }
         _ => false,
+    }
+}
+
+fn label_click_default(document: &BaseDocument, guarded: &GuardedDomEvent) -> LabelClickDefault {
+    let DomEventData::Click(event) = &guarded.event.data else {
+        return LabelClickDefault::NotLabel;
+    };
+    if guarded.metadata.event_type_override.is_some() || event.button != MouseEventButton::Main {
+        return LabelClickDefault::NotLabel;
+    }
+
+    let mut target = guarded.target.raw;
+    loop {
+        let Some(node) = document.get_node(target) else {
+            return LabelClickDefault::NotLabel;
+        };
+        if let Some(element) = node
+            .element_data()
+            .filter(|element| element.name.ns == ns!(html))
+        {
+            match element.name.local.as_ref() {
+                "label" => {
+                    let Some(control) = document.label_bound_input_element(target) else {
+                        return LabelClickDefault::Suppressed;
+                    };
+                    let labelable = control.flags.is_in_document()
+                        && control.element_data().is_some_and(|element| {
+                            element.name.ns == ns!(html)
+                                && element.name.local.as_ref() == "input"
+                                && !element
+                                    .attr(local_name!("type"))
+                                    .is_some_and(|value| value.eq_ignore_ascii_case("hidden"))
+                        });
+                    if !labelable || is_html_actually_disabled(document, control.id) {
+                        return LabelClickDefault::Suppressed;
+                    }
+                    return LabelClickDefault::Control {
+                        target: control.id,
+                        event: event.clone(),
+                    };
+                }
+                // Interactive descendants own their click instead of delegating through an
+                // enclosing label. Encountering the generated control first also prevents the
+                // control click from recursively activating its label.
+                "a" | "button" | "input" | "select" | "textarea" => {
+                    return LabelClickDefault::NotLabel;
+                }
+                _ => {}
+            }
+        }
+        let Some(parent) = node.parent else {
+            return LabelClickDefault::NotLabel;
+        };
+        target = parent;
     }
 }
 
@@ -2657,6 +2775,26 @@ fn guard_focus_pair(
         }
     }
     Ok(guarded)
+}
+
+fn run_engine_or_label_default(
+    document: &mut BaseDocument,
+    guarded: &mut GuardedDomEvent,
+    label_default: LabelClickDefault,
+    source_metadata: &mut EventMetadata,
+    generated: &mut Vec<DomEvent>,
+) {
+    match label_default {
+        LabelClickDefault::NotLabel => run_engine_default(document, guarded, generated),
+        LabelClickDefault::Suppressed => {}
+        LabelClickDefault::Control { target, event } => {
+            // Pinned Blitz invokes the associated input's click default directly, which skips
+            // the input's observable/cancelable click. Queue the click itself and let the
+            // ordinary staged path own preactivation, cancellation, and its default.
+            *source_metadata = source_metadata.clone().into_label_activation();
+            generated.push(DomEvent::new(target, DomEventData::Click(event)));
+        }
+    }
 }
 
 fn run_engine_default(
@@ -3106,6 +3244,26 @@ fn pointer_author_chain(
         chain.push(guard);
     }
     Ok(chain)
+}
+
+fn file_value_preserved_during_click(
+    document: &BaseDocument,
+    guarded: &GuardedDomEvent,
+) -> Option<(usize, Option<String>)> {
+    let target = matches!(&guarded.event.data, DomEventData::Click(_))
+        .then(|| activated_file_input(document, guarded.default_target.raw))
+        .flatten()?;
+    let value = document
+        .get_node(target)
+        .and_then(blitz_dom::Node::element_data)
+        .and_then(|element| {
+            element.attrs.iter().find(|attribute| {
+                attribute.name.ns == ns!() && attribute.name.local == local_name!("value")
+            })
+        })
+        .map(|attribute| attribute.value.as_str())
+        .map(str::to_owned);
+    Some((target, value))
 }
 
 fn activated_file_input(document: &BaseDocument, mut node_id: usize) -> Option<usize> {
@@ -8816,32 +8974,231 @@ mod tests {
             metadata: EventMetadata::native(),
         });
         let mut types = Vec::new();
+        let mut click_targets = Vec::new();
         while let DispatchStep::Event(current) = step {
             types.push(current.event_type.clone());
-            if matches!(
-                current.event_type.as_str(),
-                "pointerup" | "mouseup" | "click"
-            ) {
+            if matches!(current.event_type.as_str(), "pointerup" | "mouseup") {
                 assert_eq!(context.handles.resolve(current.target), Some(label));
                 assert_eq!(context.handles.resolve(current.path[0]), Some(label));
             }
             if current.event_type == "click" {
-                assert_eq!(
-                    context
-                        .stack
-                        .frames
-                        .last()
-                        .and_then(|frame| frame.pending.as_ref())
-                        .map(|pending| pending.guarded.default_target.raw),
-                    Some(hit.node_id)
-                );
+                let target = context.handles.resolve(current.target).unwrap();
+                click_targets.push(target);
+                let default_target = context
+                    .stack
+                    .frames
+                    .last()
+                    .and_then(|frame| frame.pending.as_ref())
+                    .map(|pending| pending.guarded.default_target.raw);
+                if click_targets.len() == 1 {
+                    assert_eq!(target, label);
+                    assert_eq!(default_target, Some(hit.node_id));
+                } else {
+                    assert_eq!(target, checkbox);
+                    assert_eq!(default_target, Some(checkbox));
+                    assert!(
+                        context
+                            .checked_controls
+                            .checked(&mut context.document, checkbox)
+                            .unwrap(),
+                        "the generated control click must expose preactivated checkedness",
+                    );
+                }
             }
             step = context.resume(&current, false);
         }
 
-        assert!(types.iter().any(|event_type| event_type == "click"));
+        assert_eq!(click_targets, [label, checkbox]);
         assert!(types.iter().any(|event_type| event_type == "input"));
         assert_eq!(context.document.get_focussed_node_id(), Some(checkbox));
+    }
+
+    #[test]
+    fn label_and_generated_control_clicks_are_independently_cancelable() {
+        let mut context = TestContext::new(
+            "<input id='box' type='checkbox'><label id='label' for='box'>Toggle</label>",
+        );
+        let checkbox = context.element("box");
+        let label = context.element("label");
+
+        let label_click = stage_generated(
+            &mut context,
+            label,
+            DomEventData::Click(pointer(
+                1.0,
+                1.0,
+                MouseEventButton::Main,
+                MouseEventButtons::None,
+            )),
+        );
+        complete(context.resume(&label_click, true));
+        assert!(
+            !context
+                .checked_controls
+                .checked(&mut context.document, checkbox)
+                .unwrap()
+        );
+
+        let label_click = stage_generated(
+            &mut context,
+            label,
+            DomEventData::Click(pointer(
+                1.0,
+                1.0,
+                MouseEventButton::Main,
+                MouseEventButtons::None,
+            )),
+        );
+        let control_click = event(context.resume(&label_click, false));
+        assert_eq!(control_click.event_type, "click");
+        assert_eq!(
+            context.handles.resolve(control_click.target),
+            Some(checkbox)
+        );
+        assert!(
+            context
+                .checked_controls
+                .checked(&mut context.document, checkbox)
+                .unwrap(),
+            "the generated click must use ordinary legacy preactivation",
+        );
+        let remainder = context.resume(&control_click, true);
+        let (types, _, _) = drain(&mut context, remainder);
+        assert!(!types.iter().any(|event_type| event_type == "input"));
+        assert!(
+            !context
+                .checked_controls
+                .checked(&mut context.document, checkbox)
+                .unwrap(),
+            "canceling the generated click must roll preactivation back",
+        );
+        assert_eq!(actual_focus_node_id(&context.document), None);
+    }
+
+    #[test]
+    fn label_activation_uses_the_live_association_after_its_click_listener() {
+        let mut context = TestContext::new(
+            "<input id='first' type='checkbox'><input id='second' type='checkbox'>\
+             <label id='label' for='first'>Toggle</label>",
+        );
+        let first = context.element("first");
+        let second = context.element("second");
+        let label = context.element("label");
+        let label_click = stage_generated(
+            &mut context,
+            label,
+            DomEventData::Click(pointer(
+                1.0,
+                1.0,
+                MouseEventButton::Main,
+                MouseEventButtons::None,
+            )),
+        );
+
+        context.document.mutate().set_attribute(
+            label,
+            QualName {
+                prefix: None,
+                ns: ns!(),
+                local: LocalName::from("for"),
+            },
+            "second",
+        );
+        let control_click = event(context.resume(&label_click, false));
+        assert_eq!(control_click.event_type, "click");
+        assert_eq!(context.handles.resolve(control_click.target), Some(second));
+        let remainder = context.resume(&control_click, false);
+        let (types, _, _) = drain(&mut context, remainder);
+        assert!(types.iter().any(|event_type| event_type == "input"));
+        assert!(
+            !context
+                .checked_controls
+                .checked(&mut context.document, first)
+                .unwrap()
+        );
+        assert!(
+            context
+                .checked_controls
+                .checked(&mut context.document, second)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn generated_label_click_focuses_text_inputs_after_the_control_listener() {
+        let mut context =
+            TestContext::new("<input id='editor'><label id='label' for='editor'>Edit</label>");
+        let editor = context.element("editor");
+        let label = context.element("label");
+        let label_click = stage_generated(
+            &mut context,
+            label,
+            DomEventData::Click(pointer(
+                1.0,
+                1.0,
+                MouseEventButton::Main,
+                MouseEventButtons::None,
+            )),
+        );
+        let control_click = event(context.resume(&label_click, false));
+        assert_eq!(context.handles.resolve(control_click.target), Some(editor));
+        let remainder = context.resume(&control_click, false);
+        let (types, _, _) = drain(&mut context, remainder);
+        assert!(types.iter().any(|event_type| event_type == "focus"));
+        assert_eq!(actual_focus_node_id(&context.document), Some(editor));
+    }
+
+    #[test]
+    fn labels_do_not_dispatch_control_clicks_for_disabled_or_interactive_targets() {
+        let mut disabled = TestContext::new(
+            "<input id='box' type='checkbox' disabled><label id='label' for='box'>Toggle</label>",
+        );
+        let checkbox = disabled.element("box");
+        let label = disabled.element("label");
+        let click = stage_generated(
+            &mut disabled,
+            label,
+            DomEventData::Click(pointer(
+                1.0,
+                1.0,
+                MouseEventButton::Main,
+                MouseEventButtons::None,
+            )),
+        );
+        complete(disabled.resume(&click, false));
+        assert!(
+            !disabled
+                .checked_controls
+                .checked(&mut disabled.document, checkbox)
+                .unwrap()
+        );
+
+        let mut interactive = TestContext::new(
+            "<input id='box' type='checkbox'><label id='label' for='box'>\
+               <button id='button' type='button'>Own click</button>\
+             </label>",
+        );
+        let button = interactive.element("button");
+        let guarded = guard_queued_event(
+            &interactive.document,
+            &mut interactive.handles,
+            DomEvent::new(
+                button,
+                DomEventData::Click(pointer(
+                    1.0,
+                    1.0,
+                    MouseEventButton::Main,
+                    MouseEventButtons::None,
+                )),
+            ),
+            EventMetadata::native(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            label_click_default(&interactive.document, &guarded),
+            LabelClickDefault::NotLabel
+        ));
     }
 
     #[test]
