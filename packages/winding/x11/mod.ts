@@ -45,6 +45,7 @@ import {
   x11ScreenPosition,
 } from "./input.ts";
 import { NativeXImage } from "./native_image.ts";
+import { claimX11LibraryOwnership, releaseX11LibraryOwnership } from "./ownership.ts";
 import { XimContext, XimManager } from "./xim.ts";
 
 // XStoreName sets the legacy WM_NAME property, which is read as Latin-1 by clients that don't
@@ -402,7 +403,7 @@ function openX11Library(): Deno.DynamicLibrary<typeof x11functions> {
   return library;
 }
 
-let libraryActive = false;
+let activeLibrary: X11Library | undefined;
 
 export function supportsX11Abi(os: string, arch: string, littleEndian: boolean): boolean {
   return os === "linux" && (arch === "x86_64" || arch === "aarch64") && littleEndian;
@@ -456,8 +457,10 @@ class X11Library implements Library {
   #errorCallback: Deno.UnsafeCallback<typeof X_ERROR_HANDLER_DEFINITION> | undefined;
   #previousErrorHandler: Deno.PointerValue = null;
   #pendingProtocolError: Error | undefined;
+  readonly #ownershipToken: object;
   #closed = false;
-  constructor() {
+  constructor(ownershipToken: object) {
+    this.#ownershipToken = ownershipToken;
     this.X11 = openX11Library();
     try {
       this.libc = Deno.dlopen("libc.so.6", libcFunctions);
@@ -845,7 +848,8 @@ class X11Library implements Library {
     cleanup(() => this.#restoreErrorHandler());
     cleanup(() => this.X11.close());
     cleanup(() => this.libc.close());
-    libraryActive = false;
+    if (activeLibrary === this) activeLibrary = undefined;
+    releaseX11LibraryOwnership(this.#ownershipToken);
     if (errors.length === 1) throw errors[0];
     if (errors.length > 1) {
       throw new AggregateError(errors, "winding(x11): errors while closing library");
@@ -924,7 +928,8 @@ class X11Library implements Library {
     cleanup(() => this.#restoreErrorHandler());
     cleanup(() => this.X11.close());
     cleanup(() => this.libc.close());
-    libraryActive = false;
+    if (activeLibrary === this) activeLibrary = undefined;
+    releaseX11LibraryOwnership(this.#ownershipToken);
     if (cleanupErrors.length > 0) {
       throw new AggregateError([error, ...cleanupErrors], "winding(x11): display loss cleanup failed");
     }
@@ -1249,12 +1254,19 @@ function pointerModifiers(modifiers: ReturnType<typeof x11ModifierSnapshot>): Po
 export const load: LoadLibrary = () => {
   assertSupportedX11Abi();
   assertMainIsolate();
-  if (libraryActive) throw new Error("winding(x11): only one library instance may be active");
-  libraryActive = true;
+  if (activeLibrary !== undefined) {
+    throw new Error("winding(x11): only one library instance may be active");
+  }
+  const ownershipToken = {};
+  if (!claimX11LibraryOwnership(ownershipToken)) {
+    throw new Error("winding(x11): only one library instance may be active");
+  }
   try {
-    return new X11Library();
+    const library = new X11Library(ownershipToken);
+    activeLibrary = library;
+    return library;
   } catch (error) {
-    libraryActive = false;
+    releaseX11LibraryOwnership(ownershipToken);
     throw error;
   }
 };
