@@ -329,6 +329,44 @@ Deno.test("Darwin text-client queries share one document-relative UTF-16 model",
   assertEquals(state.actualCaretRange(2, 0), { location: 2n, length: 0n });
 });
 
+Deno.test("Darwin rebases marked text onto canonical compose-removed surrounding text", () => {
+  const state = inputState();
+  // Start a composition which replaces B. AppKit retains the mark as an overlay while the
+  // application renders the preedit in its own editor buffer.
+  state.setSurroundingText("A🙂BC", 5, 6);
+  state.setMarkedText("候", 1, 0);
+  assertEquals(state.documentText, "A🙂候C");
+
+  // The application's next canonical snapshot omits the rendered preedit and collapses the
+  // selection at its insertion point. The C suffix must remain after rebasing the overlay.
+  state.setSurroundingText("A🙂C", 5, 5);
+  assertEquals(state.markedRange, { location: 3n, length: 1n });
+  assertEquals(state.selectedRange, { location: 4n, length: 0n });
+  assertEquals(state.documentText, "A🙂候C");
+  assertEquals(state.substringForRange(3, 2), {
+    text: "候C",
+    actualRange: { location: 3n, length: 2n },
+  });
+
+  state.setMarkedText("候補", 2, 0);
+  assertEquals(state.markedRange, { location: 3n, length: 2n });
+  assertEquals(state.documentText, "A🙂候補C");
+  assertEquals(state.substringForRange(3, 3), {
+    text: "候補C",
+    actualRange: { location: 3n, length: 3n },
+  });
+
+  // Once a mark exists, AppKit replacement ranges are relative to that marked string. Updating
+  // only its second character must continue to leave the rebased surrounding suffix untouched.
+  state.setMarkedText("X", 1, 0, 1, 1);
+  assertEquals(state.markedText, "候X");
+  assertEquals(state.documentText, "A🙂候XC");
+
+  state.cancelComposition();
+  assertEquals(state.markedRange, { location: NS_NOT_FOUND, length: 0n });
+  assertEquals(state.documentText, "A🙂C");
+});
+
 Deno.test("Darwin cursor geometry preserves subpixels and ignores invalid updates", () => {
   const state = inputState();
   state.setCursorArea(1.25, 2.5, 3.75, 4.5);

@@ -267,7 +267,9 @@ export interface Window {
   /**
    * Give the native text service the application's current editable text and
    * ordered selection. Offsets are UTF-8 byte boundaries; the application
-   * remains authoritative and must refresh this state after edits.
+   * remains authoritative and must refresh this state after edits. During an
+   * active composition, omit the rendered preedit text and collapse the
+   * selection at the preedit's insertion point.
    */
   setImeSurroundingText(text: string, selectionStartBytes: number, selectionEndBytes: number): void;
   /**

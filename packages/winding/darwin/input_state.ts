@@ -182,6 +182,14 @@ export class DarwinInputState {
       selectionStartUtf16,
       selectionEndUtf16,
     };
+    if (this.hasMarkedText) {
+      // The application republishes surrounding text with its rendered preedit removed and a
+      // caret in the preedit's place. Rebase the retained AppKit overlay to that caret; keeping
+      // the selection which the mark originally replaced would consume the same range twice and
+      // could drop committed text following the mark.
+      this.#markedDocumentStartUtf16 = selectionStartUtf16;
+      this.#markedDocumentEndUtf16 = selectionEndUtf16;
+    }
   }
 
   get modifierFlags(): bigint {
