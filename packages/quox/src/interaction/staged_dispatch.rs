@@ -590,6 +590,11 @@ enum DispatchRequest {
         flavor: PointerFlavor,
         metadata: EventMetadata,
     },
+    OutsidePointer {
+        event: BlitzPointerEvent,
+        flavor: PointerFlavor,
+        metadata: EventMetadata,
+    },
     PointerBoundary {
         event: BlitzPointerEvent,
         boundary: NativePointerBoundary,
@@ -701,6 +706,10 @@ impl<'a> ResolvedInputLayout<'a> {
         }
     }
 
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "Blitz stores page coordinates as f32; native metadata retains exact outside-viewport coordinates"
+    )]
     fn pointer_request(self, input: PointerInput) -> DispatchRequest {
         let scroll = self.document.viewport_scroll();
         let metadata = EventMetadata::pointer_with_modifiers(
@@ -715,31 +724,47 @@ impl<'a> ResolvedInputLayout<'a> {
             input.detail,
             input.modifier_bits,
         );
-        super::viewport_point_to_page(
+        let page = super::viewport_point_to_page(
             input.x,
             input.y,
             self.width,
             self.height,
             scroll.x,
             scroll.y,
-        )
-        .map_or(DispatchRequest::Empty, |(page_x, page_y)| {
+        );
+        let outside = page.is_none();
+        let (page_x, page_y) = page.unwrap_or_else(|| {
+            (
+                (f64::from(input.x) + scroll.x) as f32,
+                (f64::from(input.y) + scroll.y) as f32,
+            )
+        });
+        let event = BlitzPointerEvent {
+            id: BlitzPointerId::Mouse,
+            is_primary: true,
+            coords: super::pointer_coords(input.x, input.y, page_x, page_y),
+            button: input.button,
+            buttons: input.buttons,
+            mods: super::build_pointer_modifiers(input.modifier_bits),
+            details: PointerDetails::default(),
+            // Blitz overwrites this relative to the hit target before reading it.
+            element: ElementPoint::default(),
+        };
+        if !outside {
             DispatchRequest::Pointer {
-                event: BlitzPointerEvent {
-                    id: BlitzPointerId::Mouse,
-                    is_primary: true,
-                    coords: super::pointer_coords(input.x, input.y, page_x, page_y),
-                    button: input.button,
-                    buttons: input.buttons,
-                    mods: super::build_pointer_modifiers(input.modifier_bits),
-                    details: PointerDetails::default(),
-                    // Blitz overwrites this relative to the hit target before reading it.
-                    element: ElementPoint::default(),
-                },
+                event,
                 flavor: input.flavor,
                 metadata,
             }
-        })
+        } else if matches!(input.flavor, PointerFlavor::Move | PointerFlavor::Up) {
+            DispatchRequest::OutsidePointer {
+                event,
+                flavor: input.flavor,
+                metadata,
+            }
+        } else {
+            DispatchRequest::Empty
+        }
     }
 
     #[allow(
@@ -1333,6 +1358,31 @@ impl DispatchStack {
                     flavor,
                 );
                 plan_pointer(document, handles, planned, &event, flavor, stream, metadata)?;
+            }
+            DispatchRequest::OutsidePointer {
+                event,
+                flavor,
+                metadata,
+            } => {
+                // Native backends retain an ordinary mouse stream while a button is held. The
+                // pointer may therefore leave the viewport before its move/release records. Keep
+                // the stream bookkeeping authoritative without inventing an outside DOM target.
+                if mouse_button_presses.iter().any(Option::is_some) {
+                    if matches!(flavor, PointerFlavor::Move)
+                        && let Some(coords) = metadata.pointer.map(|pointer| pointer.coords)
+                    {
+                        let _ = mouse_movement(last_mouse_move, coords);
+                    }
+                    let _ = update_pointer_stream_state(
+                        prevent_compatibility_mouse,
+                        mouse_button_presses,
+                        &event,
+                        flavor,
+                    );
+                    if matches!(exposed_pointer_flavor(&event, flavor), PointerFlavor::Up) {
+                        planned.push_back(PlannedWork::Action(DispatchAction::PointerUpState));
+                    }
+                }
             }
             DispatchRequest::PointerBoundary {
                 event,
@@ -5622,6 +5672,163 @@ mod tests {
         assert!(types.iter().any(|event_type| event_type == "pointerout"));
         assert!(types.iter().any(|event_type| event_type == "mouseleave"));
         assert!(context.stack.mouse_button_presses[0].is_some());
+    }
+
+    #[test]
+    fn outside_pointer_move_marks_a_retained_press_as_dragged_without_dom_events() {
+        let mut context = TestContext::new(
+            "<div id='target' style='display:block;width:100px;height:40px'></div>",
+        );
+        let target = context.element("target");
+        let (x, y) = context.center(target);
+        assert!(context.document.set_hover_to(x, y));
+        let down = context.begin_trusted_pointer(
+            x,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            PointerFlavor::Down,
+        );
+        let _ = drain(&mut context, down);
+        assert!(
+            context
+                .document
+                .get_node(target)
+                .is_some_and(blitz_dom::Node::is_active)
+        );
+
+        let moved = context.begin_trusted_pointer(
+            -10.0,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            PointerFlavor::Move,
+        );
+        let (types, _, _) = drain(&mut context, moved);
+        assert!(types.is_empty());
+        assert!(context.stack.mouse_button_presses[0].unwrap().dragged);
+        assert!(
+            context
+                .document
+                .get_node(target)
+                .is_some_and(blitz_dom::Node::is_active)
+        );
+    }
+
+    #[test]
+    fn outside_final_up_clears_cancelled_press_state_without_clicking() {
+        let mut context = TestContext::new(
+            "<button id='target' style='display:block;width:100px;height:40px'>go</button>",
+        );
+        let target = context.element("target");
+        let (x, y) = context.center(target);
+        assert!(context.document.set_hover_to(x, y));
+        let down = context.begin_trusted_pointer(
+            x,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            PointerFlavor::Down,
+        );
+        let pointer_down = next_event_of_type(&mut context, down, "pointerdown");
+        let remainder = context.resume(&pointer_down, true);
+        let _ = drain(&mut context, remainder);
+        assert!(context.stack.prevent_compatibility_mouse);
+        assert!(context.stack.mouse_button_presses[0].is_some());
+        assert!(
+            context
+                .document
+                .get_node(target)
+                .is_some_and(blitz_dom::Node::is_active)
+        );
+
+        let up = context.begin_trusted_pointer(
+            810.0,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::None,
+            PointerFlavor::Up,
+        );
+        let (types, _, _) = drain(&mut context, up);
+        assert!(types.is_empty());
+        assert!(context.stack.mouse_button_presses[0].is_none());
+        assert!(!context.stack.prevent_compatibility_mouse);
+        assert!(
+            !context
+                .document
+                .get_node(target)
+                .is_some_and(blitz_dom::Node::is_active)
+        );
+        assert!(context.stack.click_sequence.is_none());
+    }
+
+    #[test]
+    fn outside_chord_releases_clear_each_press_and_unactive_only_on_final_up() {
+        let mut context = TestContext::new(
+            "<div id='target' style='display:block;width:100px;height:40px'></div>",
+        );
+        let target = context.element("target");
+        let (x, y) = context.center(target);
+        assert!(context.document.set_hover_to(x, y));
+        let first_down = context.begin_trusted_pointer(
+            x,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            PointerFlavor::Down,
+        );
+        let _ = drain(&mut context, first_down);
+        let chord_down = context.begin_trusted_pointer(
+            x,
+            y,
+            MouseEventButton::Secondary,
+            MouseEventButtons::Primary | MouseEventButtons::Secondary,
+            PointerFlavor::Down,
+        );
+        let _ = drain(&mut context, chord_down);
+        assert!(context.stack.mouse_button_presses[0].is_some());
+        assert!(context.stack.mouse_button_presses[2].is_some());
+
+        let chord_up = context.begin_trusted_pointer(
+            -10.0,
+            y,
+            MouseEventButton::Secondary,
+            MouseEventButtons::Primary,
+            PointerFlavor::Up,
+        );
+        let (chord_types, _, _) = drain(&mut context, chord_up);
+        assert!(chord_types.is_empty());
+        assert!(context.stack.mouse_button_presses[0].is_some());
+        assert!(context.stack.mouse_button_presses[2].is_none());
+        assert!(
+            context
+                .document
+                .get_node(target)
+                .is_some_and(blitz_dom::Node::is_active)
+        );
+
+        let final_up = context.begin_trusted_pointer(
+            -10.0,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::None,
+            PointerFlavor::Up,
+        );
+        let (final_types, _, _) = drain(&mut context, final_up);
+        assert!(final_types.is_empty());
+        assert!(
+            context
+                .stack
+                .mouse_button_presses
+                .iter()
+                .all(Option::is_none)
+        );
+        assert!(
+            !context
+                .document
+                .get_node(target)
+                .is_some_and(blitz_dom::Node::is_active)
+        );
     }
 
     #[test]
