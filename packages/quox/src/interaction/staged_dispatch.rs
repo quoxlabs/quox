@@ -4,7 +4,7 @@ use super::{
 };
 use crate::dom::{
     actual_focus_node_id, is_html_actually_disabled, is_programmatically_focusable,
-    public_dom_node_id,
+    public_dom_node_id, sequential_focus_target,
 };
 use crate::ffi_numbers::{
     NumericArgumentError, finite_f32, finite_f64, integer_range, known_mask, nonnegative_f64,
@@ -214,6 +214,11 @@ enum LabelClickDefault {
         target: usize,
         event: BlitzPointerEvent,
     },
+}
+
+enum TabKeyDefault {
+    Traverse { backwards: bool },
+    SuppressKeyUp,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2254,7 +2259,7 @@ impl DispatchStack {
         Ok(())
     }
 
-    fn queue_label_focus_default(
+    fn queue_focus_default(
         &mut self,
         document: &mut BaseDocument,
         handles: &mut NodeHandles,
@@ -2277,7 +2282,7 @@ impl DispatchStack {
         let planned = &mut self
             .frames
             .last_mut()
-            .expect("label defaults run only for an active frame")
+            .expect("focus defaults run only for an active frame")
             .planned;
         planned.push_front(PlannedWork::Action(DispatchAction::GainFocus {
             target: destination,
@@ -2294,6 +2299,25 @@ impl DispatchStack {
         Ok(())
     }
 
+    fn queue_tab_focus_default(
+        &mut self,
+        document: &mut BaseDocument,
+        handles: &mut NodeHandles,
+        backwards: bool,
+        metadata: EventMetadata,
+    ) -> Result<(), DispatchError> {
+        document.resolve(0.0);
+        let Some(destination) =
+            sequential_focus_target(document, actual_focus_node_id(document), backwards)
+        else {
+            return Ok(());
+        };
+        let Some(destination) = guard_node(document, handles, destination)? else {
+            return Ok(());
+        };
+        self.queue_focus_default(document, handles, destination, metadata)
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "default reconciliation keeps native mutations and their staged follow-ups atomic"
@@ -2307,6 +2331,14 @@ impl DispatchStack {
         mut guarded: GuardedDomEvent,
         protected_checked_activation: Option<&GuardedCheckableActivation>,
     ) -> Result<(), DispatchError> {
+        if let Some(tab_default) = tab_key_default(&guarded.event.data) {
+            return match tab_default {
+                TabKeyDefault::Traverse { backwards } => {
+                    self.queue_tab_focus_default(document, handles, backwards, guarded.metadata)
+                }
+                TabKeyDefault::SuppressKeyUp => Ok(()),
+            };
+        }
         if !node_is_live(guarded.target, document, handles) {
             return Ok(());
         }
@@ -2423,7 +2455,7 @@ impl DispatchStack {
             .generated
             .extend(guarded_generated);
         if guarded.metadata.label_activation {
-            self.queue_label_focus_default(document, handles, guarded.target, source_metadata)?;
+            self.queue_focus_default(document, handles, guarded.target, source_metadata)?;
         }
         Ok(())
     }
@@ -2616,6 +2648,20 @@ fn default_must_preserve_focus(document: &BaseDocument, guarded: &GuardedDomEven
                 && !click_default_delegates_focus(document, guarded.default_target.raw)
         }
         _ => false,
+    }
+}
+
+fn tab_key_default(data: &DomEventData) -> Option<TabKeyDefault> {
+    match data {
+        DomEventData::KeyDown(event) if event.key == keyboard_types::Key::Tab => {
+            Some(TabKeyDefault::Traverse {
+                backwards: event.modifiers.contains(keyboard_types::Modifiers::SHIFT),
+            })
+        }
+        DomEventData::KeyUp(event) if event.key == keyboard_types::Key::Tab => {
+            Some(TabKeyDefault::SuppressKeyUp)
+        }
+        _ => None,
     }
 }
 
@@ -5985,6 +6031,33 @@ mod tests {
                 location: 0,
             },
         )
+    }
+
+    fn tab_request(
+        state: KeyState,
+        shift: bool,
+        repeat: bool,
+        suppress_default: bool,
+    ) -> DispatchRequest {
+        let mut event = key(Key::Tab, Code::Tab, state);
+        event.is_auto_repeating = repeat;
+        if shift {
+            event.modifiers.insert(Modifiers::SHIFT);
+        }
+        DispatchRequest::Key {
+            event,
+            metadata: EventMetadata::key(
+                500.0,
+                NativeKeyMetadata {
+                    code: "Tab".to_owned(),
+                    key: "Tab".to_owned(),
+                    keycode: 9,
+                    modifier_bits: if shift { KEY_MOD_SHIFT } else { 0 },
+                    location: 0,
+                },
+            ),
+            suppress_default,
+        }
     }
 
     fn focus_related_target(event: &DispatchEventStep) -> Option<u32> {
@@ -10281,6 +10354,149 @@ mod tests {
         let remainder = context.resume(&focus, false);
         let _ = drain(&mut context, remainder);
         assert_eq!(actual_focus_node_id(&context.document), Some(new));
+    }
+
+    #[test]
+    fn tab_uses_sequential_order_in_both_directions_and_ignores_keyup() {
+        let mut context = TestContext::new(
+            "<button id='ordinary'>ordinary</button>\
+             <button id='positive-two' tabindex='2'>two</button>\
+             <div id='positive-one' tabindex=' +1junk'>one</div>\
+             <button id='disabled' disabled>disabled</button>\
+             <button id='hidden' style='display:none'>hidden</button>\
+             <button id='invisible' style='visibility:hidden'>invisible</button>\
+             <div inert><button id='inert'>inert</button></div>\
+             <button id='negative' tabindex='-1'>negative</button>\
+             <div id='zero' tabindex='0'>zero</div>",
+        );
+        let positive_one = context.element("positive-one");
+        let positive_two = context.element("positive-two");
+        let ordinary = context.element("ordinary");
+
+        let first = context.begin(tab_request(KeyState::Pressed, false, false, false));
+        let (types, _, _) = drain(&mut context, first);
+        assert_eq!(types, ["keydown", "focus", "focusin"]);
+        assert_eq!(actual_focus_node_id(&context.document), Some(positive_one));
+
+        let keyup = context.begin(tab_request(KeyState::Released, false, false, false));
+        let (types, _, _) = drain(&mut context, keyup);
+        assert_eq!(types, ["keyup"]);
+        assert_eq!(actual_focus_node_id(&context.document), Some(positive_one));
+
+        let repeated = context.begin(tab_request(KeyState::Pressed, false, true, false));
+        let (types, _, _) = drain(&mut context, repeated);
+        assert_eq!(types, ["keydown", "blur", "focusout", "focus", "focusin"]);
+        assert_eq!(actual_focus_node_id(&context.document), Some(positive_two));
+
+        let forward = context.begin(tab_request(KeyState::Pressed, false, false, false));
+        let _ = drain(&mut context, forward);
+        assert_eq!(actual_focus_node_id(&context.document), Some(ordinary));
+
+        let backward = context.begin(tab_request(KeyState::Pressed, true, false, false));
+        let _ = drain(&mut context, backward);
+        assert_eq!(actual_focus_node_id(&context.document), Some(positive_two));
+    }
+
+    #[test]
+    fn tab_starts_at_each_edge_wraps_and_reenters_after_negative_tabindex() {
+        let mut context = TestContext::new(
+            "<button id='first'>first</button>\
+             <button id='negative' tabindex='-1'>negative</button>\
+             <button id='last'>last</button>",
+        );
+        let first = context.element("first");
+        let negative = context.element("negative");
+        let last = context.element("last");
+
+        let backwards = context.begin(tab_request(KeyState::Pressed, true, false, false));
+        let _ = drain(&mut context, backwards);
+        assert_eq!(actual_focus_node_id(&context.document), Some(last));
+
+        let wrapped = context.begin(tab_request(KeyState::Pressed, false, false, false));
+        let _ = drain(&mut context, wrapped);
+        assert_eq!(actual_focus_node_id(&context.document), Some(first));
+
+        let focus_negative = context.begin_programmatic_focus(negative);
+        let _ = drain(&mut context, focus_negative);
+        assert_eq!(actual_focus_node_id(&context.document), Some(negative));
+        let reenter = context.begin(tab_request(KeyState::Pressed, false, false, false));
+        let _ = drain(&mut context, reenter);
+        assert_eq!(actual_focus_node_id(&context.document), Some(last));
+
+        let focus_negative = context.begin_programmatic_focus(negative);
+        let _ = drain(&mut context, focus_negative);
+        let reenter = context.begin(tab_request(KeyState::Pressed, true, false, false));
+        let _ = drain(&mut context, reenter);
+        assert_eq!(actual_focus_node_id(&context.document), Some(first));
+    }
+
+    #[test]
+    fn canceled_or_host_suppressed_tab_does_not_move_focus() {
+        let mut context = TestContext::new(
+            "<button id='first'>first</button><button id='second'>second</button>",
+        );
+        let first = context.element("first");
+        assert!(context.document.set_focus_to(first));
+
+        let canceled = event(context.begin(tab_request(KeyState::Pressed, false, false, false)));
+        assert_eq!(canceled.event_type, "keydown");
+        complete(context.resume(&canceled, true));
+        assert_eq!(actual_focus_node_id(&context.document), Some(first));
+
+        let suppressed = context.begin(tab_request(KeyState::Pressed, false, false, true));
+        let (types, _, _) = drain(&mut context, suppressed);
+        assert_eq!(types, ["keydown"]);
+        assert_eq!(actual_focus_node_id(&context.document), Some(first));
+    }
+
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "every staged focus record must retain the exact causal key timestamp"
+    )]
+    fn tab_recomputes_mutated_eligibility_and_stages_exact_focus_metadata() {
+        let mut context = TestContext::new(
+            "<button id='old'>old</button>\
+             <input id='type-target'>\
+             <button id='removed'>removed</button>\
+             <button id='destination'>destination</button>",
+        );
+        let old = context.element("old");
+        let type_target = context.element("type-target");
+        let removed = context.element("removed");
+        let destination = context.element("destination");
+        assert!(context.document.set_focus_to(old));
+        let old_handle = context.handles.expose(old).unwrap();
+        let destination_handle = context.handles.expose(destination).unwrap();
+
+        let keydown = event(context.begin(tab_request(KeyState::Pressed, false, false, false)));
+        context.document.mutate().set_attribute(
+            type_target,
+            QualName {
+                prefix: None,
+                ns: ns!(),
+                local: LocalName::from("type"),
+            },
+            "hidden",
+        );
+        context.document.mutate().remove_node(removed);
+        let mut step = context.resume(&keydown, false);
+        let mut focus_types = Vec::new();
+        while let DispatchStep::Event(current) = step {
+            assert_eq!(current.time_stamp, 500.0);
+            focus_types.push(current.event_type.clone());
+            if matches!(current.event_type.as_str(), "blur" | "focusout") {
+                assert_eq!(current.target, old_handle);
+                assert_eq!(focus_related_target(&current), Some(destination_handle));
+            } else {
+                assert!(matches!(current.event_type.as_str(), "focus" | "focusin"));
+                assert_eq!(current.target, destination_handle);
+                assert_eq!(focus_related_target(&current), Some(old_handle));
+            }
+            step = context.resume(&current, false);
+        }
+        assert_eq!(focus_types, ["blur", "focusout", "focus", "focusin"]);
+        assert_eq!(actual_focus_node_id(&context.document), Some(destination));
     }
 
     #[test]

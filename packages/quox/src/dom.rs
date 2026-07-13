@@ -277,8 +277,122 @@ pub(super) fn is_programmatically_focusable(document: &BaseDocument, node_id: us
     node.is_focussable()
         || element
             .attr(LocalName::from("tabindex"))
-            .and_then(|value| value.trim().parse::<i32>().ok())
+            .and_then(parse_html_integer)
             .is_some()
+}
+
+fn parse_html_integer(value: &str) -> Option<i32> {
+    let value = value.trim_start_matches(['\t', '\n', '\u{000C}', '\r', ' ']);
+    let (negative, digits) = match value.as_bytes().first() {
+        Some(b'+') => (false, &value[1..]),
+        Some(b'-') => (true, &value[1..]),
+        _ => (false, value),
+    };
+    let digit_count = digits.bytes().take_while(u8::is_ascii_digit).count();
+    if digit_count == 0 {
+        return None;
+    }
+    let magnitude = digits[..digit_count].parse::<i64>().ok()?;
+    let signed = if negative {
+        magnitude.checked_neg()?
+    } else {
+        magnitude
+    };
+    i32::try_from(signed).ok()
+}
+
+#[derive(Clone, Copy)]
+struct SequentialFocusCandidate {
+    node_id: usize,
+    tree_index: usize,
+    tab_index: i32,
+}
+
+/// Choose the next focus target in this standalone document's sequential navigation order.
+/// Positive tabindex values precede the ordinary tree-order group. Since Quox has no browser
+/// chrome to transfer focus to at an edge, navigation wraps within the document.
+pub(super) fn sequential_focus_target(
+    document: &BaseDocument,
+    current: Option<usize>,
+    backwards: bool,
+) -> Option<usize> {
+    let mut tree_order = Vec::new();
+    let mut pending = vec![document.root_element().id];
+    while let Some(node_id) = pending.pop() {
+        tree_order.push(node_id);
+        if let Some(node) = document.get_node(node_id) {
+            pending.extend(node.children.iter().rev());
+        }
+    }
+
+    let mut candidates = tree_order
+        .iter()
+        .copied()
+        .enumerate()
+        .filter_map(|(tree_index, node_id)| {
+            if !is_programmatically_focusable(document, node_id) {
+                return None;
+            }
+            let tab_index = document
+                .get_node(node_id)
+                .and_then(blitz_dom::Node::element_data)
+                .and_then(|element| element.attr(LocalName::from("tabindex")))
+                .and_then(parse_html_integer)
+                .unwrap_or(0);
+            (tab_index >= 0).then_some(SequentialFocusCandidate {
+                node_id,
+                tree_index,
+                tab_index,
+            })
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|candidate| {
+        if candidate.tab_index > 0 {
+            (0, candidate.tab_index, candidate.tree_index)
+        } else {
+            (1, 0, candidate.tree_index)
+        }
+    });
+    if candidates.is_empty() {
+        return None;
+    }
+
+    if let Some(current) = current
+        && let Some(position) = candidates
+            .iter()
+            .position(|candidate| candidate.node_id == current)
+    {
+        let next = if backwards {
+            position.checked_sub(1).unwrap_or(candidates.len() - 1)
+        } else {
+            (position + 1) % candidates.len()
+        };
+        return Some(candidates[next].node_id);
+    }
+
+    // A script can focus a negative-tabindex element. From such a starting point browsers use
+    // DOM-relative navigation until they re-enter the sequential order.
+    if let Some(current_tree_index) =
+        current.and_then(|current| tree_order.iter().position(|node_id| *node_id == current))
+    {
+        let relative = candidates
+            .iter()
+            .filter(|candidate| {
+                if backwards {
+                    candidate.tree_index < current_tree_index
+                } else {
+                    candidate.tree_index > current_tree_index
+                }
+            })
+            .min_by_key(|candidate| candidate.tree_index.abs_diff(current_tree_index));
+        if let Some(relative) = relative {
+            return Some(relative.node_id);
+        }
+    }
+
+    candidates
+        .get(if backwards { candidates.len() - 1 } else { 0 })
+        .map(|candidate| candidate.node_id)
 }
 
 /// Return Blitz's retained focus owner even if a previous tree mutation disconnected it. The
