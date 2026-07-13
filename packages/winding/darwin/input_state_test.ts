@@ -22,12 +22,12 @@ Deno.test("Darwin UTF-16 ranges become UTF-8 selections", () => {
 
 Deno.test("Darwin interpreted text follows its key and suppresses duplicate default editing", () => {
   const state = inputState();
-  state.beginKey(keyEvent({ key: "z", code: "KeyY" }));
+  state.beginKey(keyEvent({ key: "z", code: "KeyY", sourceKeyInputId: 17 }));
   state.insertText("z");
 
   assertEquals(state.finishKey(), [
-    keyEvent({ key: "z", code: "KeyY", editDisposition: "text-input" }),
-    { type: "ime", kind: "commit", text: "z", window: TEST_WINDOW },
+    keyEvent({ key: "z", code: "KeyY", editDisposition: "text-input", sourceKeyInputId: 17 }),
+    { type: "ime", kind: "commit", text: "z", window: TEST_WINDOW, sourceKeyInputId: 17 },
   ]);
 });
 
@@ -47,10 +47,10 @@ Deno.test("Darwin discards empty commits without ending an active preedit", () =
 
 Deno.test("Darwin composition updates and completion preserve callback ordering", () => {
   const state = inputState();
-  state.beginKey(keyEvent({ key: "Dead" }));
+  state.beginKey(keyEvent({ key: "Dead", sourceKeyInputId: 18 }));
   state.setMarkedText("🙂e", 2, 1);
   assertEquals(state.finishKey(), [
-    keyEvent({ key: "Dead", editDisposition: "text-input" }),
+    keyEvent({ key: "Dead", editDisposition: "text-input", sourceKeyInputId: 18 }),
     {
       type: "ime",
       kind: "preedit",
@@ -60,10 +60,10 @@ Deno.test("Darwin composition updates and completion preserve callback ordering"
     },
   ]);
 
-  state.beginKey(keyEvent({ key: "e", isComposing: true }));
+  state.beginKey(keyEvent({ key: "e", isComposing: true, sourceKeyInputId: 19 }));
   state.insertText("é");
   assertEquals(state.finishKey(), [
-    keyEvent({ key: "e", isComposing: true, editDisposition: "text-input" }),
+    keyEvent({ key: "e", isComposing: true, editDisposition: "text-input", sourceKeyInputId: 19 }),
     { type: "ime", kind: "commit", text: "é", window: TEST_WINDOW },
   ]);
   assertEquals(state.hasMarkedText, false);
@@ -142,12 +142,12 @@ Deno.test("Darwin commit retracts a synchronous marked-text clear", () => {
   const state = inputState();
   state.setMarkedText("é", 1, 0);
   state.drainEvents();
-  state.beginKey(keyEvent({ key: "e", isComposing: true }));
+  state.beginKey(keyEvent({ key: "e", isComposing: true, sourceKeyInputId: 20 }));
   state.setMarkedText("", 0, 0);
   state.insertText("é");
 
   assertEquals(state.finishKey(), [
-    keyEvent({ key: "e", isComposing: true, editDisposition: "text-input" }),
+    keyEvent({ key: "e", isComposing: true, editDisposition: "text-input", sourceKeyInputId: 20 }),
     { type: "ime", kind: "commit", text: "é", window: TEST_WINDOW },
   ]);
   assertEquals(state.composing, false);
@@ -204,11 +204,21 @@ Deno.test("Darwin unmark accepts composition while cancel and disable do not", (
 
 Deno.test("Darwin native commands follow their physical key exactly once", () => {
   const state = inputState();
-  state.beginKey(keyEvent({ key: "Backspace", code: "Backspace" }));
+  state.beginKey(keyEvent({ key: "Backspace", code: "Backspace", sourceKeyInputId: 21 }));
   state.performCommand("deleteBackward:");
   assertEquals(state.finishKey(), [
-    keyEvent({ key: "Backspace", code: "Backspace", editDisposition: "text-input" }),
-    { type: "apple-standard-keybinding", command: "deleteBackward:", window: TEST_WINDOW },
+    keyEvent({
+      key: "Backspace",
+      code: "Backspace",
+      editDisposition: "text-input",
+      sourceKeyInputId: 21,
+    }),
+    {
+      type: "apple-standard-keybinding",
+      command: "deleteBackward:",
+      window: TEST_WINDOW,
+      sourceKeyInputId: 21,
+    },
   ]);
 
   state.beginKey(keyEvent({ key: "ArrowLeft", code: "ArrowLeft" }));
@@ -219,6 +229,25 @@ Deno.test("Darwin native commands follow their physical key exactly once", () =>
   state.beginKey(keyEvent({ key: "F10", code: "F10", editDisposition: "platform" }));
   assertEquals(state.finishKey(), [
     keyEvent({ key: "F10", code: "F10", editDisposition: "platform" }),
+  ]);
+});
+
+Deno.test("Darwin claims a key source only for its first direct semantic callback", () => {
+  const state = inputState();
+  state.beginKey(keyEvent({ sourceKeyInputId: 22 }));
+  state.insertText("a");
+  state.performCommand("deleteBackward:");
+  assertEquals(state.finishKey(), [
+    keyEvent({ editDisposition: "text-input", sourceKeyInputId: 22 }),
+    { type: "ime", kind: "commit", text: "a", window: TEST_WINDOW, sourceKeyInputId: 22 },
+    { type: "apple-standard-keybinding", command: "deleteBackward:", window: TEST_WINDOW },
+  ]);
+
+  state.insertText("b");
+  state.performCommand("deleteBackward:");
+  assertEquals(state.drainEvents(), [
+    { type: "ime", kind: "commit", text: "b", window: TEST_WINDOW },
+    { type: "apple-standard-keybinding", command: "deleteBackward:", window: TEST_WINDOW },
   ]);
 });
 

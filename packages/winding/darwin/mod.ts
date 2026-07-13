@@ -17,6 +17,7 @@ import {
   keyLocationForKey,
   NativeEventClock,
   PressedLogicalKeyCache,
+  SourceKeyInputIdSequence,
 } from "../input/mod.ts";
 import { getDomCode } from "./dom_code.ts";
 import {
@@ -392,6 +393,7 @@ class DarwinWindow implements Window, DarwinNativeResponder {
   #keyDispatchActive = false;
   #producedText: string | undefined;
   #producedPreedit = false;
+  readonly #sourceKeyInputIds = new SourceKeyInputIdSequence();
   readonly #pressedKeys = new PressedLogicalKeyCache<number>();
   #pointerSnapshot: DarwinPointerSnapshot | undefined;
   #ready = false;
@@ -815,6 +817,7 @@ class DarwinWindow implements Window, DarwinNativeResponder {
       ...native.base,
       repeat: this.lib.ffi.send.bool(event, this.lib.ffi.sel("isARepeat")),
       editDisposition: "key-default",
+      sourceKeyInputId: this.#sourceKeyInputIds.take(),
     });
     this.inputState.beginKey(key);
     this.#keyDispatchActive = true;

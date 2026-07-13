@@ -326,8 +326,13 @@ function testKeydownOrdering(): void {
         assertEquals(key.code, "KeyA");
         assertEquals(key.key, "a");
         assertEquals(key.editDisposition, "text-input");
+        assert(
+          Number.isInteger(key.sourceKeyInputId) && (key.sourceKeyInputId ?? 0) > 0,
+          "keydown did not receive a causal source id",
+        );
         const commit = assertIme(library.event(), "commit");
         assertEquals(commit.text, "a");
+        assertEquals(commit.sourceKeyInputId, key.sourceKeyInputId);
 
         const repeatEvent = makeKeyEvent(
           getClass(runtime, "NSEvent"),
@@ -352,7 +357,10 @@ function testKeydownOrdering(): void {
         assert(repeat?.type === "keydown", "expected repeated keydown");
         assertEquals(repeat.repeat, true);
         assertEquals(repeat.key, "A");
-        assertEquals(assertIme(library.event(), "commit").text, "A");
+        assert(repeat.sourceKeyInputId !== key.sourceKeyInputId, "repeat reused its source id");
+        const repeatCommit = assertIme(library.event(), "commit");
+        assertEquals(repeatCommit.text, "A");
+        assertEquals(repeatCommit.sourceKeyInputId, repeat.sourceKeyInputId);
 
         const keyUpEvent = makeKeyEvent(
           getClass(runtime, "NSEvent"),

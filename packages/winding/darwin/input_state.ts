@@ -47,6 +47,8 @@ export function utf16RangeToUtf8(
 interface KeyBatch {
   key: KeyDownEvent;
   following: DarwinTextInputEvent[];
+  sourceClaimed: boolean;
+  sawCompositionCallback: boolean;
 }
 
 interface SurroundingText {
@@ -241,7 +243,12 @@ export class DarwinInputState {
 
   beginKey(key: KeyDownEvent): void {
     if (this.#batch !== null) throw new Error("winding(darwin): nested key input batch");
-    this.#batch = { key, following: [] };
+    this.#batch = {
+      key,
+      following: [],
+      sourceClaimed: false,
+      sawCompositionCallback: false,
+    };
   }
 
   finishKey(): DarwinInputEvent[] {
@@ -262,6 +269,7 @@ export class DarwinInputState {
     replacementLocation: number | bigint = NS_NOT_FOUND,
     replacementLength: number | bigint = 0,
   ): void {
+    if (this.#batch !== null) this.#batch.sawCompositionCallback = true;
     const hadMarkedText = this.hasMarkedText;
     const hasConcreteReplacement = !(
       replacementLocation === NS_NOT_FOUND || replacementLocation === -1 || replacementLocation === -1n
@@ -322,23 +330,31 @@ export class DarwinInputState {
   ): string | undefined {
     const committed = text.length === 0 ? undefined : text;
     if (committed === undefined) return undefined;
+    const sourceKeyInputId = this.#claimDirectKeySource();
     this.#removeTrailingPreeditClear();
     const replaced = this.#emitDocumentReplacement(replacementLocation, replacementLength, committed);
     this.#clearMarkedText();
     this.#composition.commit();
     if (!replaced) {
-      const event = createImeCommitEvent(this.window, committed);
+      const event = createImeCommitEvent(this.window, committed, sourceKeyInputId);
       if (event !== undefined) this.#emit(event);
     }
     return committed;
   }
 
   performCommand(command: string): void {
-    this.#emit({ type: "apple-standard-keybinding", command, window: this.window });
+    const sourceKeyInputId = this.#claimDirectKeySource();
+    this.#emit({
+      type: "apple-standard-keybinding",
+      command,
+      window: this.window,
+      ...(sourceKeyInputId === undefined ? {} : { sourceKeyInputId }),
+    });
   }
 
   /** Accept the current marked text, matching NSTextInputClient.unmarkText. */
   unmarkText(): string | undefined {
+    if (this.#batch !== null) this.#batch.sawCompositionCallback = true;
     if (!this.#composition.active) return undefined;
     if (!this.hasMarkedText) {
       this.#markedSelection = null;
@@ -378,6 +394,20 @@ export class DarwinInputState {
     this.#surrounding = null;
     this.#composition.reset();
     this.#activation.reset();
+  }
+
+  #claimDirectKeySource(): number | undefined {
+    const batch = this.#batch;
+    if (
+      batch === null || batch.sourceClaimed || batch.sawCompositionCallback ||
+      batch.key.isComposing || this.#composition.active
+    ) {
+      return undefined;
+    }
+    const sourceKeyInputId = batch.key.sourceKeyInputId;
+    if (sourceKeyInputId === undefined) return undefined;
+    batch.sourceClaimed = true;
+    return sourceKeyInputId;
   }
 
   #clearMarkedText(): void {
