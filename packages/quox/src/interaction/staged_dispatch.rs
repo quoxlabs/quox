@@ -1292,6 +1292,12 @@ impl DispatchStack {
                         .metadata
                         .with_target_offset(document, event.target.raw);
                 }
+                if suppress_disabled_trusted_pointer_click(document, handles, &event) {
+                    // HTML checks disabledness when a user-interaction click reaches the front of
+                    // its queue. In particular, a preceding mouseup listener may have changed the
+                    // control or fieldset state since the native release was received.
+                    continue;
+                }
                 if matches!(
                     &event.event.data,
                     DomEventData::Focus(_) | DomEventData::FocusIn(_)
@@ -1595,8 +1601,9 @@ impl DispatchStack {
                 if event.metadata.pointer.is_some()
                     && is_html_actually_disabled(document, event.target.raw)
                 {
-                    // Keep exposing the currently synthesized trusted click until I-02 removes
-                    // it, but do not let either Quox or Blitz activate an actually-disabled input.
+                    // Queue-front native release clicks are filtered before staging. Retain this
+                    // default guard for any future internal pointer-originated click path which is
+                    // not tied to a matched native release.
                     suppress_default = true;
                     None
                 } else {
@@ -2331,6 +2338,22 @@ fn generated_event_metadata(
 /// Blitz's `DoubleClick` uses one document-global counter which ignores button and target.
 fn not_blitz_double_click(event: &DomEvent) -> bool {
     !matches!(&event.data, DomEventData::DoubleClick(_))
+}
+
+fn suppress_disabled_trusted_pointer_click(
+    document: &BaseDocument,
+    handles: &NodeHandles,
+    event: &GuardedDomEvent,
+) -> bool {
+    event.metadata.pointer.is_some()
+        && matches!(
+            event.metadata.pointer_release_click,
+            Some(PointerReleaseClick::Matched { .. })
+        )
+        && event.metadata.event_type_override.is_none()
+        && matches!(&event.event.data, DomEventData::Click(_))
+        && node_is_live(event.target, document, handles)
+        && is_html_actually_disabled(document, event.target.raw)
 }
 
 fn is_focus_event(data: &DomEventData) -> bool {
@@ -4760,6 +4783,19 @@ mod tests {
                     panic!("dispatch completed before {event_type}")
                 }
             }
+        }
+    }
+
+    fn set_disabled(context: &mut TestContext, target: usize, disabled: bool) {
+        let name = QualName {
+            prefix: None,
+            ns: ns!(),
+            local: LocalName::from("disabled"),
+        };
+        if disabled {
+            context.document.mutate().set_attribute(target, name, "");
+        } else {
+            context.document.mutate().clear_attribute(target, name);
         }
     }
 
@@ -9720,7 +9756,7 @@ mod tests {
     }
 
     #[test]
-    fn trusted_pointer_click_does_not_activate_an_actually_disabled_checkbox() {
+    fn trusted_pointer_click_is_not_dispatched_to_an_actually_disabled_checkbox() {
         for body in [
             "<input id='target' type='checkbox' disabled style='width:24px;height:24px'>",
             "<fieldset disabled><input id='target' type='checkbox' \
@@ -9742,7 +9778,17 @@ mod tests {
                 MouseEventButtons::Primary,
                 PointerFlavor::Down,
             );
-            let _ = drain(&mut context, down);
+            let (down_types, _, _) = drain(&mut context, down);
+            assert!(
+                down_types
+                    .iter()
+                    .any(|event_type| event_type == "pointerdown")
+            );
+            assert!(
+                down_types
+                    .iter()
+                    .any(|event_type| event_type == "mousedown")
+            );
             let up = context.begin_trusted_pointer(
                 x,
                 y,
@@ -9751,11 +9797,11 @@ mod tests {
                 PointerFlavor::Up,
             );
             let (types, _, _) = drain(&mut context, up);
-            assert!(
-                types.iter().any(|event_type| event_type == "click"),
-                "I-02 will remove the currently exposed disabled-control click separately",
-            );
+            assert!(types.iter().any(|event_type| event_type == "pointerup"));
+            assert!(types.iter().any(|event_type| event_type == "mouseup"));
+            assert!(!types.iter().any(|event_type| event_type == "click"));
             assert!(!types.iter().any(|event_type| event_type == "input"));
+            assert!(context.stack.click_sequence.is_none());
             assert!(
                 !context
                     .checked_controls
@@ -9769,6 +9815,85 @@ mod tests {
                     .unwrap()
             );
         }
+    }
+
+    #[test]
+    fn mouseup_listener_disabling_the_target_suppresses_its_pending_trusted_click() {
+        let mut context =
+            TestContext::new("<input id='target' type='checkbox' style='width:24px;height:24px'>");
+        let target = context.element("target");
+        let (x, y) = context.center(target);
+        assert!(context.document.set_hover_to(x, y));
+        let down = context.begin_trusted_pointer(
+            x,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            PointerFlavor::Down,
+        );
+        let _ = drain(&mut context, down);
+        let up = context.begin_trusted_pointer(
+            x,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::None,
+            PointerFlavor::Up,
+        );
+        let mouse_up = next_event_of_type(&mut context, up, "mouseup");
+
+        set_disabled(&mut context, target, true);
+        let remainder = context.resume(&mouse_up, false);
+        let (types, _, _) = drain(&mut context, remainder);
+        assert!(!types.iter().any(|event_type| event_type == "click"));
+        assert!(!types.iter().any(|event_type| event_type == "input"));
+        assert!(context.stack.click_sequence.is_none());
+        assert!(
+            !context
+                .checked_controls
+                .checked(&mut context.document, target)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn mouseup_listener_enabling_the_target_allows_its_pending_trusted_click() {
+        let mut context = TestContext::new(
+            "<input id='target' type='checkbox' disabled style='width:24px;height:24px'>",
+        );
+        let target = context.element("target");
+        let target_handle = context.handles.expose(target).unwrap();
+        let (x, y) = context.center(target);
+        assert!(context.document.set_hover_to(x, y));
+        let down = context.begin_trusted_pointer(
+            x,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            PointerFlavor::Down,
+        );
+        let _ = drain(&mut context, down);
+        let up = context.begin_trusted_pointer(
+            x,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::None,
+            PointerFlavor::Up,
+        );
+        let mouse_up = next_event_of_type(&mut context, up, "mouseup");
+
+        set_disabled(&mut context, target, false);
+        let after_mouse_up = context.resume(&mouse_up, false);
+        let click = next_event_of_type(&mut context, after_mouse_up, "click");
+        assert_eq!(click.target, target_handle);
+        let after_click = context.resume(&click, false);
+        let (types, _, _) = drain(&mut context, after_click);
+        assert!(types.iter().any(|event_type| event_type == "input"));
+        assert!(
+            context
+                .checked_controls
+                .checked(&mut context.document, target)
+                .unwrap()
+        );
     }
 
     #[test]
