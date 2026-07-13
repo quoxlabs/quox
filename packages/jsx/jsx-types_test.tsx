@@ -29,6 +29,7 @@ type ExpectedBaseEventProp =
   | "onPointerMove"
   | "onPointerDown"
   | "onPointerUp"
+  | "onPointerCancel"
   | "onPointerEnter"
   | "onPointerLeave"
   | "onPointerOver"
@@ -83,6 +84,7 @@ const supportedEvents = (
     onBlur={null}
     onPointerDown={(event) => expectType<QuoxJsxPointerEvent>(event)}
     onPointerMoveCapture={(event) => expectType<QuoxJsxPointerEvent>(event)}
+    onPointerCancel={(event) => expectType<QuoxJsxPointerEvent>(event)}
     onMouseUp={(event) => expectType<QuoxJsxMouseEvent>(event)}
     onWheelCapture={(event) => expectType<QuoxJsxWheelEvent>(event)}
     onAuxClick={(event) => expectType<QuoxJsxPointerEvent>(event)}

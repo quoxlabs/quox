@@ -12,6 +12,7 @@ export const DOM_DISPATCH_EVENT_TYPES = Object.freeze(
     "pointermove",
     "pointerdown",
     "pointerup",
+    "pointercancel",
     "pointerenter",
     "pointerleave",
     "pointerover",
@@ -181,6 +182,16 @@ export interface DomDispatchRendererSource {
     screenX: number,
     screenY: number,
     buttons: number,
+    modifierBits: number,
+    timeStamp: number,
+  ): unknown;
+  begin_pointer_cancel(
+    x: number,
+    y: number,
+    screenKnown: boolean,
+    screenX: number,
+    screenY: number,
+    canceledButtons: number,
     modifierBits: number,
     timeStamp: number,
   ): unknown;
@@ -666,6 +677,7 @@ function validateEventPayload(
     case "pointermove":
     case "pointerdown":
     case "pointerup":
+    case "pointercancel":
     case "pointerenter":
     case "pointerleave":
     case "pointerover":
@@ -913,6 +925,30 @@ export class DomDispatchRendererPort {
         screenX,
         screenY,
         buttons,
+        modifierBits,
+        timeStamp,
+      ),
+    );
+  }
+
+  beginPointerCancel(
+    x: number,
+    y: number,
+    screenKnown: boolean,
+    screenX: number,
+    screenY: number,
+    canceledButtons: number,
+    modifierBits: number,
+    timeStamp: number,
+  ): DomDispatchStep {
+    return this.#validateInitial(
+      this.#renderer.begin_pointer_cancel(
+        x,
+        y,
+        screenKnown,
+        screenX,
+        screenY,
+        canceledButtons,
         modifierBits,
         timeStamp,
       ),

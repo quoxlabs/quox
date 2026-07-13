@@ -39,6 +39,10 @@ class FakeInputRenderer {
     return this.#complete(false);
   }
 
+  begin_pointer_cancel(..._args: unknown[]): unknown {
+    return this.#complete(false);
+  }
+
   begin_pointer_enter(..._args: unknown[]): unknown {
     return this.#complete(false);
   }
@@ -311,6 +315,7 @@ Deno.test("invalid numeric input is rejected before renderer or IME synchronizat
   const { document, renderer, renders, syncs } = createDocument();
 
   assertThrows(() => document.dispatchPointerMove(NaN, 20, 0, 0), RangeError);
+  assertThrows(() => document.dispatchPointerCancel(10, 20, 0x20, 0), RangeError);
   assertThrows(() => document.dispatchPointerMove(10, 20, 0, 0, -1), RangeError);
   assertThrows(() => document.dispatchPointerDown(10, 20, 256, 1, 0), RangeError);
   assertThrows(() => document.dispatchPointerDown(10, 20, 0, 1, 0, 1, 1.5), RangeError);

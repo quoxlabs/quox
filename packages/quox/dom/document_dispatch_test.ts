@@ -119,6 +119,7 @@ function payloadForType(type: DomDispatchEventType): Record<string, unknown> | u
     case "pointermove":
     case "pointerdown":
     case "pointerup":
+    case "pointercancel":
     case "pointerenter":
     case "pointerleave":
     case "pointerover":
@@ -235,6 +236,10 @@ class FakeDispatchRenderer {
 
   begin_pointer_move(...args: unknown[]): unknown {
     return this.#begin("begin_pointer_move", args);
+  }
+
+  begin_pointer_cancel(...args: unknown[]): unknown {
+    return this.#begin("begin_pointer_cancel", args);
   }
 
   begin_pointer_enter(...args: unknown[]): unknown {
@@ -594,6 +599,7 @@ Deno.test("trusted staged payloads create browser-style event subclasses with ex
   const events = new Map<string, QuoxEvent>();
   const eventTypes: DomDispatchEventType[] = [
     "pointermove",
+    "pointercancel",
     "click",
     "auxclick",
     "contextmenu",
@@ -615,6 +621,13 @@ Deno.test("trusted staged payloads create browser-style event subclasses with ex
       target: target.nodeId,
       path: [target.nodeId],
       payload: pointerPayload({ movementX: 2.25, movementY: -3.75 }),
+    },
+    {
+      type: "pointercancel",
+      target: target.nodeId,
+      path: [target.nodeId],
+      cancelable: false,
+      payload: pointerPayload({ button: -1, buttons: 0, detail: 0, pressure: 0 }),
     },
     {
       type: "click",
@@ -706,6 +719,11 @@ Deno.test("trusted staged payloads create browser-style event subclasses with ex
   const pointerMove = events.get("pointermove");
   assert(pointerMove instanceof QuoxPointerEvent);
   assertEquals([pointerMove.movementX, pointerMove.movementY], [2.25, -3.75]);
+
+  const pointerCancel = events.get("pointercancel");
+  assert(pointerCancel instanceof QuoxPointerEvent);
+  assertFalse(pointerCancel.cancelable);
+  assertEquals([pointerCancel.button, pointerCancel.buttons, pointerCancel.pressure], [-1, 0, 0]);
 
   const click = events.get("click");
   assert(click instanceof QuoxPointerEvent);
@@ -1027,6 +1045,7 @@ Deno.test("native pointer entry points preserve screen-coordinate availability",
   const { document, renderer } = createHarness();
 
   document.dispatchPointerMove(1, 2, 0, 0x1ff, 3, 101.5, 202.25);
+  document.dispatchPointerCancel(1, 2, 5, 0x1ff, 3.125, 101.5, 202.25);
   document.dispatchPointerEnter(1, 2, 5, 0x1ff, 3.25, 101.5, 202.25);
   document.dispatchPointerLeave(-1, 2, 5, 0x1ff, 3.5);
   document.dispatchPointerDown(1, 2, 0, 1, 0, 4, 1);
@@ -1036,6 +1055,7 @@ Deno.test("native pointer entry points preserve screen-coordinate availability",
     renderer.calls.map(([method, _frame, ...args]) => [method, ...args]),
     [
       ["begin_pointer_move", 1, 2, true, 101.5, 202.25, 0, 0x1ff, 3],
+      ["begin_pointer_cancel", 1, 2, true, 101.5, 202.25, 5, 0x1ff, 3.125],
       ["begin_pointer_enter", 1, 2, true, 101.5, 202.25, 5, 0x1ff, 3.25],
       ["begin_pointer_leave", -1, 2, false, 0, 0, 5, 0x1ff, 3.5],
       ["begin_pointer_down", 1, 2, false, 0, 0, 0, 1, 0, 4, 1],
@@ -1049,6 +1069,10 @@ Deno.test("native pointer entry points preserve screen-coordinate availability",
   );
   assertThrows(
     () => document.dispatchPointerMove(1, 2, 0, 0, 6, Number.NaN, 202.25),
+    RangeError,
+  );
+  assertThrows(
+    () => document.dispatchPointerCancel(1, 2, 0x20, 0, 6),
     RangeError,
   );
   assertThrows(

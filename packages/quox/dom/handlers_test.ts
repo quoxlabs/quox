@@ -11,6 +11,7 @@ const EVENT_TYPE_TO_PROP = {
   pointermove: "onPointerMove",
   pointerdown: "onPointerDown",
   pointerup: "onPointerUp",
+  pointercancel: "onPointerCancel",
   pointerenter: "onPointerEnter",
   pointerleave: "onPointerLeave",
   pointerover: "onPointerOver",

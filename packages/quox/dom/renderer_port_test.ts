@@ -94,6 +94,7 @@ function payloadForType(type: DomDispatchEventType): Record<string, unknown> | u
     case "pointermove":
     case "pointerdown":
     case "pointerup":
+    case "pointercancel":
     case "pointerenter":
     case "pointerleave":
     case "pointerover":
@@ -446,6 +447,29 @@ class FakeRenderer implements DomDispatchRendererSource {
     );
   }
 
+  begin_pointer_cancel(
+    x: number,
+    y: number,
+    screenKnown: boolean,
+    screenX: number,
+    screenY: number,
+    canceledButtons: number,
+    modifierBits: number,
+    timeStamp: number,
+  ): unknown {
+    return this.#call(
+      "begin_pointer_cancel",
+      x,
+      y,
+      screenKnown,
+      screenX,
+      screenY,
+      canceledButtons,
+      modifierBits,
+      timeStamp,
+    );
+  }
+
   begin_pointer_enter(
     x: number,
     y: number,
@@ -637,6 +661,7 @@ Deno.test("renderer port forwards every staged entry point and validates its res
   const port = new DomDispatchRendererPort(renderer);
 
   port.beginPointerMove(1, 2, true, 101.5, 202.25, 3, 4, 12.5);
+  port.beginPointerCancel(1, 2, true, 101.5, 202.25, 5, 4, 12.55);
   port.beginPointerEnter(1, 2, true, 101.5, 202.25, 3, 4, 12.625);
   port.beginPointerLeave(1, 2, false, 0, 0, 3, 4, 12.75);
   port.beginPointerDown(1, 2, true, 101.5, 202.25, 0, 3, 4, 13, 2);
@@ -654,6 +679,7 @@ Deno.test("renderer port forwards every staged entry point and validates its res
 
   assertEquals(renderer.calls, [
     ["begin_pointer_move", 1, 2, true, 101.5, 202.25, 3, 4, 12.5],
+    ["begin_pointer_cancel", 1, 2, true, 101.5, 202.25, 5, 4, 12.55],
     ["begin_pointer_enter", 1, 2, true, 101.5, 202.25, 3, 4, 12.625],
     ["begin_pointer_leave", 1, 2, false, 0, 0, 3, 4, 12.75],
     ["begin_pointer_down", 1, 2, true, 101.5, 202.25, 0, 3, 4, 13, 2],

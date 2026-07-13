@@ -298,6 +298,37 @@ export class QuoxDocument extends QuoxEventTarget {
     );
   }
 
+  /** Cancel a native pointer stream that the platform can no longer complete. */
+  dispatchPointerCancel(
+    x: number,
+    y: number,
+    canceledButtons: number,
+    modifierBits: number,
+    timeStamp = performance.now(),
+    screenX: number | null = null,
+    screenY: number | null = null,
+  ): void {
+    this.#assertActive();
+    x = assertFloat32(x, "x");
+    y = assertFloat32(y, "y");
+    canceledButtons = assertKnownMask(canceledButtons, POINTER_BUTTONS_MASK, "canceledButtons");
+    modifierBits = assertKnownMask(modifierBits, POINTER_MODIFIER_MASK, "modifierBits");
+    timeStamp = assertEventTimeStamp(timeStamp);
+    const screen = assertScreenCoordinates(screenX, screenY);
+    this.#dispatchInputEvent(() =>
+      this.#dispatchPort.beginPointerCancel(
+        x,
+        y,
+        screen.known,
+        screen.x,
+        screen.y,
+        canceledButtons,
+        modifierBits,
+        timeStamp,
+      )
+    );
+  }
+
   /** Feed a pointer-down event into Blitz. Drives `:active`, click timing, and focus. */
   dispatchPointerDown(
     x: number,
@@ -696,6 +727,7 @@ export class QuoxDocument extends QuoxEventTarget {
       case "pointermove":
       case "pointerdown":
       case "pointerup":
+      case "pointercancel":
       case "pointerenter":
       case "pointerleave":
       case "pointerover":

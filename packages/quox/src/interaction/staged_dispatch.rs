@@ -60,6 +60,7 @@ pub(crate) struct DispatchStack {
     wheel_transaction: Option<WheelTransaction>,
     prevent_compatibility_mouse: bool,
     mouse_button_presses: [Option<MouseButtonPress>; 5],
+    ignored_mouse_ups: MouseEventButtons,
     click_sequence: Option<ClickSequence>,
     // UI Events defines the movement baseline at Window scope and only advances it for native
     // mouse moves, so button, wheel, and generated boundary records cannot disturb the delta.
@@ -257,6 +258,7 @@ struct EventMetadata {
     related_target: Option<GuardedNode>,
     click_detail: Option<u32>,
     event_type_override: Option<&'static str>,
+    cancelable_override: Option<bool>,
     suppress_default: bool,
     defer_click_target: bool,
 }
@@ -273,6 +275,7 @@ impl EventMetadata {
             related_target: None,
             click_detail: None,
             event_type_override: None,
+            cancelable_override: None,
             suppress_default: false,
             defer_click_target: false,
         }
@@ -314,6 +317,7 @@ impl EventMetadata {
             related_target: None,
             click_detail: None,
             event_type_override: None,
+            cancelable_override: None,
             suppress_default: false,
             defer_click_target: false,
         }
@@ -372,6 +376,7 @@ impl EventMetadata {
             related_target: None,
             click_detail: None,
             event_type_override: None,
+            cancelable_override: None,
             suppress_default: false,
             defer_click_target: false,
         }
@@ -388,6 +393,7 @@ impl EventMetadata {
             related_target: None,
             click_detail: None,
             event_type_override: None,
+            cancelable_override: None,
             suppress_default: false,
             defer_click_target: false,
         }
@@ -425,6 +431,13 @@ impl EventMetadata {
         self.event_type_override = Some("auxclick");
         // Blitz has no auxclick primitive. Reusing its Click default would run primary-button
         // control activation and cannot express middle-click navigation in a new context.
+        self.suppress_default = true;
+        self
+    }
+
+    fn into_pointer_cancel(mut self) -> Self {
+        self.event_type_override = Some("pointercancel");
+        self.cancelable_override = Some(false);
         self.suppress_default = true;
         self
     }
@@ -600,6 +613,11 @@ enum DispatchRequest {
         boundary: NativePointerBoundary,
         metadata: EventMetadata,
     },
+    PointerCancel {
+        event: BlitzPointerEvent,
+        canceled_buttons: MouseEventButtons,
+        metadata: EventMetadata,
+    },
     Wheel {
         event: BlitzWheelEvent,
         metadata: EventMetadata,
@@ -647,6 +665,18 @@ struct PointerBoundaryInput {
     modifier_bits: u32,
     time_stamp: f64,
     boundary: NativePointerBoundary,
+}
+
+#[derive(Clone, Copy)]
+struct PointerCancelInput {
+    native_x: f64,
+    native_y: f64,
+    screen: Option<(f64, f64)>,
+    x: f32,
+    y: f32,
+    canceled_buttons: MouseEventButtons,
+    modifier_bits: u32,
+    time_stamp: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -815,6 +845,45 @@ impl<'a> ResolvedInputLayout<'a> {
                 metadata,
             }
         })
+    }
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "Blitz stores page coordinates as f32; native metadata retains exact cancellation coordinates"
+    )]
+    fn pointer_cancel_request(self, input: PointerCancelInput) -> DispatchRequest {
+        let scroll = self.document.viewport_scroll();
+        let metadata = EventMetadata::pointer_with_modifiers(
+            input.time_stamp,
+            native_pointer_coordinates(
+                input.native_x,
+                input.native_y,
+                input.screen,
+                scroll.x,
+                scroll.y,
+            ),
+            0,
+            input.modifier_bits,
+        );
+        DispatchRequest::PointerCancel {
+            event: BlitzPointerEvent {
+                id: BlitzPointerId::Mouse,
+                is_primary: true,
+                coords: super::pointer_coords(
+                    input.x,
+                    input.y,
+                    (f64::from(input.x) + scroll.x) as f32,
+                    (f64::from(input.y) + scroll.y) as f32,
+                ),
+                button: MouseEventButton::Main,
+                buttons: MouseEventButtons::None,
+                mods: super::build_pointer_modifiers(input.modifier_bits),
+                details: PointerDetails::default(),
+                element: ElementPoint::default(),
+            },
+            canceled_buttons: input.canceled_buttons,
+            metadata,
+        }
     }
 
     fn wheel_request(self, input: WheelInput) -> DispatchRequest {
@@ -1003,6 +1072,7 @@ impl Default for DispatchStack {
             wheel_transaction: None,
             prevent_compatibility_mouse: false,
             mouse_button_presses: [None; 5],
+            ignored_mouse_ups: MouseEventButtons::None,
             click_sequence: None,
             last_mouse_move: None,
         }
@@ -1326,6 +1396,25 @@ impl DispatchStack {
         handles: &mut NodeHandles,
         request: DispatchRequest,
     ) -> Result<(), DispatchError> {
+        let mut request = request;
+        if let Some(button) = physical_pointer_up_button(&request) {
+            let bit = MouseEventButtons::from(button);
+            if self.ignored_mouse_ups.contains(bit) {
+                self.ignored_mouse_ups.remove(bit);
+                request = DispatchRequest::Empty;
+            }
+        }
+        request = match request {
+            DispatchRequest::PointerCancel {
+                event,
+                canceled_buttons,
+                metadata,
+            } => {
+                self.plan_pointer_cancel(document, handles, &event, canceled_buttons, &metadata)?;
+                return Ok(());
+            }
+            request => request,
+        };
         let wheel_transaction = &mut self.wheel_transaction;
         let prevent_compatibility_mouse = &mut self.prevent_compatibility_mouse;
         let mouse_button_presses = &mut self.mouse_button_presses;
@@ -1399,10 +1488,13 @@ impl DispatchStack {
                     document.clear_hover();
                     *wheel_transaction = None;
                     let _ = plan_hover_transition_between(
-                        document, handles, planned, &event, &metadata, previous, None,
+                        document, handles, planned, &event, &metadata, previous, None, true,
                     )?;
                 }
             },
+            DispatchRequest::PointerCancel { .. } => {
+                unreachable!("pointer cancellation is planned before borrowing stream fields")
+            }
             DispatchRequest::Wheel {
                 event,
                 metadata,
@@ -1468,6 +1560,82 @@ impl DispatchStack {
             })),
         }
 
+        Ok(())
+    }
+
+    fn plan_pointer_cancel(
+        &mut self,
+        document: &mut BaseDocument,
+        handles: &mut NodeHandles,
+        event: &BlitzPointerEvent,
+        canceled_buttons: MouseEventButtons,
+        metadata: &EventMetadata,
+    ) -> Result<(), DispatchError> {
+        let active_buttons = active_mouse_buttons(&self.mouse_button_presses);
+        let interrupted_buttons = active_buttons & canceled_buttons;
+        if interrupted_buttons.is_empty() {
+            return Ok(());
+        }
+
+        let pressed_target = self
+            .mouse_button_presses
+            .iter()
+            .enumerate()
+            .find_map(|(index, press)| {
+                interrupted_buttons
+                    .contains(mouse_button_bit(index))
+                    .then_some(press.as_ref()?.author_target?)
+            })
+            .filter(|target| node_is_live(*target, document, handles));
+        let previous_hover = document.get_hover_node_id();
+        let hover_target = previous_hover
+            .and_then(|target| pointer_author_target_id(document, target))
+            .map(|target| guard_node(document, handles, target))
+            .transpose()?
+            .flatten();
+        let target = if let Some(target) = pressed_target.or(hover_target) {
+            target
+        } else {
+            guarded_target_or_root(document, handles, None)?
+        };
+
+        // The alpha.6 Blitz event enum has no PointerCancel variant. PointerMove is only an
+        // internal payload carrier here; the explicit Quox type/cancelability/default overrides
+        // ensure no move identity or default behavior crosses the staged boundary.
+        let cancel_metadata = metadata.clone().into_pointer_cancel();
+        let planned = &mut self
+            .frames
+            .last_mut()
+            .expect("begin pushed a frame before planning")
+            .planned;
+        planned.push_back(PlannedWork::Enqueue {
+            target: PlannedTarget::Guarded(target),
+            data: DomEventData::PointerMove(event.clone()),
+            metadata: cancel_metadata,
+            suppress_default: true,
+        });
+
+        // Publish interruption state before JavaScript sees pointercancel, so nested input cannot
+        // revive a canceled press or click sequence. Retain the old hover id solely to stage the
+        // required pointer-only exit records after pointercancel.
+        self.ignored_mouse_ups.insert(active_buttons);
+        self.mouse_button_presses.fill(None);
+        self.prevent_compatibility_mouse = false;
+        self.click_sequence = None;
+        self.wheel_transaction = None;
+        document.unactive_node();
+        document.set_mousedown_node_id(None);
+        document.clear_hover();
+        let _ = plan_hover_transition_between(
+            document,
+            handles,
+            planned,
+            event,
+            metadata,
+            previous_hover,
+            None,
+            false,
+        )?;
         Ok(())
     }
 
@@ -2667,6 +2835,43 @@ fn exposed_pointer_flavor(event: &BlitzPointerEvent, physical: PointerFlavor) ->
     }
 }
 
+fn physical_pointer_up_button(request: &DispatchRequest) -> Option<MouseEventButton> {
+    match request {
+        DispatchRequest::Pointer {
+            event,
+            flavor: PointerFlavor::Up,
+            ..
+        }
+        | DispatchRequest::OutsidePointer {
+            event,
+            flavor: PointerFlavor::Up,
+            ..
+        } if event.is_mouse() => Some(event.button),
+        _ => None,
+    }
+}
+
+const fn mouse_button_bit(index: usize) -> MouseEventButtons {
+    match index {
+        0 => MouseEventButtons::Primary,
+        1 => MouseEventButtons::Auxiliary,
+        2 => MouseEventButtons::Secondary,
+        3 => MouseEventButtons::Fourth,
+        4 => MouseEventButtons::Fifth,
+        _ => MouseEventButtons::None,
+    }
+}
+
+fn active_mouse_buttons(presses: &[Option<MouseButtonPress>; 5]) -> MouseEventButtons {
+    presses
+        .iter()
+        .enumerate()
+        .filter(|(_index, press)| press.is_some())
+        .fold(MouseEventButtons::None, |buttons, (index, _press)| {
+            buttons | mouse_button_bit(index)
+        })
+}
+
 fn update_pointer_stream_state(
     prevent_compatibility_mouse: &mut bool,
     presses: &mut [Option<MouseButtonPress>; 5],
@@ -2718,6 +2923,7 @@ fn update_mouse_button_presses(
 }
 
 #[allow(
+    clippy::too_many_arguments,
     clippy::too_many_lines,
     reason = "kept in the exact transition order used by pinned Blitz EventDriver"
 )]
@@ -2732,11 +2938,12 @@ fn plan_hover_transitions(
     document.set_hover_to(event.page_x(), event.page_y());
     let current = document.get_hover_node_id();
     plan_hover_transition_between(
-        document, handles, planned, event, metadata, previous, current,
+        document, handles, planned, event, metadata, previous, current, true,
     )
 }
 
 #[allow(
+    clippy::too_many_arguments,
     clippy::too_many_lines,
     reason = "kept in the exact transition order used by pinned Blitz EventDriver"
 )]
@@ -2748,6 +2955,7 @@ fn plan_hover_transition_between(
     metadata: &EventMetadata,
     previous: Option<usize>,
     current: Option<usize>,
+    compatibility_mouse: bool,
 ) -> Result<PlannedHover, DispatchError> {
     let default_target = current
         .map(|raw| guard_raw_node(document, handles, raw))
@@ -2793,7 +3001,7 @@ fn plan_hover_transition_between(
             DomEventData::PointerOut(event.clone()),
             metadata.clone().with_related_target(new_target),
         );
-        if event.is_mouse() {
+        if compatibility_mouse && event.is_mouse() {
             push_guarded_work(
                 planned,
                 target,
@@ -2808,7 +3016,7 @@ fn plan_hover_transition_between(
                 DomEventData::PointerLeave(event.clone()),
                 metadata.clone().with_related_target(new_target),
             );
-            if event.is_mouse() {
+            if compatibility_mouse && event.is_mouse() {
                 push_guarded_work(
                     planned,
                     *target,
@@ -2826,7 +3034,7 @@ fn plan_hover_transition_between(
             DomEventData::PointerOver(event.clone()),
             metadata.clone().with_related_target(old_target),
         );
-        if event.is_mouse() {
+        if compatibility_mouse && event.is_mouse() {
             push_guarded_work(
                 planned,
                 target,
@@ -2841,7 +3049,7 @@ fn plan_hover_transition_between(
                 DomEventData::PointerEnter(event.clone()),
                 metadata.clone().with_related_target(old_target),
             );
-            if event.is_mouse() {
+            if compatibility_mouse && event.is_mouse() {
                 push_guarded_work(
                     planned,
                     *target,
@@ -3092,12 +3300,16 @@ fn guard_event_with_targets(
     )? {
         return Ok(None);
     }
+    let mut event = DomEvent::new(default_target.raw, data);
+    if let Some(cancelable) = metadata.cancelable_override {
+        event.cancelable = cancelable;
+    }
     let metadata = metadata.with_target_offset(document, author_target.raw);
     freeze_event_path(
         document,
         handles,
         GuardedDomEvent {
-            event: DomEvent::new(default_target.raw, data),
+            event,
             default_target,
             target: author_target,
             path: Vec::new(),
@@ -4380,6 +4592,49 @@ impl QuoxRenderer {
         clippy::too_many_arguments,
         reason = "the flat WASM ABI carries browser event fields without allocating an input object"
     )]
+    pub fn begin_pointer_cancel(
+        &self,
+        x: f64,
+        y: f64,
+        screen_known: bool,
+        screen_x: f64,
+        screen_y: f64,
+        canceled_buttons: f64,
+        modifier_bits: f64,
+        time_stamp: f64,
+    ) -> Result<JsValue, JsValue> {
+        let native_x = finite_f64(x, "x").map_err(NumericArgumentError::into_js)?;
+        let native_y = finite_f64(y, "y").map_err(NumericArgumentError::into_js)?;
+        let screen = native_screen_coordinates(screen_known, screen_x, screen_y)
+            .map_err(NumericArgumentError::into_js)?;
+        let x = finite_f32(x, "x").map_err(NumericArgumentError::into_js)?;
+        let y = finite_f32(y, "y").map_err(NumericArgumentError::into_js)?;
+        let canceled_buttons =
+            pointer_buttons(canceled_buttons).map_err(NumericArgumentError::into_js)?;
+        let modifier_bits = known_mask(modifier_bits, POINTER_MOD_KNOWN, "modifierBits")
+            .map_err(NumericArgumentError::into_js)?;
+        let time_stamp =
+            nonnegative_f64(time_stamp, "timeStamp").map_err(NumericArgumentError::into_js)?;
+        let mut state = self.state.borrow_mut();
+        let request = resolve_input_layout(&mut state).pointer_cancel_request(PointerCancelInput {
+            native_x,
+            native_y,
+            screen,
+            x,
+            y,
+            canceled_buttons,
+            modifier_bits,
+            time_stamp,
+        });
+        state.refresh_ime_cursor_area();
+        let step = begin_request(&mut state, request);
+        finish_step(&mut state, step)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the flat WASM ABI carries browser event fields without allocating an input object"
+    )]
     pub fn begin_pointer_down(
         &self,
         x: f64,
@@ -5339,6 +5594,19 @@ mod tests {
         }
     }
 
+    fn pointer_cancel_request_at(
+        x: f32,
+        y: f32,
+        canceled_buttons: MouseEventButtons,
+        metadata: EventMetadata,
+    ) -> DispatchRequest {
+        DispatchRequest::PointerCancel {
+            event: pointer(x, y, MouseEventButton::Main, MouseEventButtons::None),
+            canceled_buttons,
+            metadata,
+        }
+    }
+
     fn key(key: Key, code: Code, state: KeyState) -> BlitzKeyEvent {
         BlitzKeyEvent {
             key,
@@ -5672,6 +5940,391 @@ mod tests {
         assert!(types.iter().any(|event_type| event_type == "pointerout"));
         assert!(types.iter().any(|event_type| event_type == "mouseleave"));
         assert!(context.stack.mouse_button_presses[0].is_some());
+    }
+
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        clippy::too_many_lines,
+        reason = "native cancellation metadata must retain exact f64 host values"
+    )]
+    fn interrupted_mouse_stream_dispatches_pointer_only_cancel_then_exit_and_cleans_state() {
+        let mut context = TestContext::new(
+            "<div id='a' style='display:inline-block;width:100px;height:40px'></div>\
+             <div id='b' style='display:inline-block;width:100px;height:40px'></div>",
+        );
+        let a = context.element("a");
+        let b = context.element("b");
+        let a_handle = context.handles.expose(a).unwrap();
+        let b_handle = context.handles.expose(b).unwrap();
+        let (ax, ay) = context.center(a);
+        let (bx, by) = context.center(b);
+
+        let moved = context.begin_trusted_pointer(
+            ax,
+            ay,
+            MouseEventButton::Main,
+            MouseEventButtons::None,
+            PointerFlavor::Move,
+        );
+        let _ = drain(&mut context, moved);
+        let down = context.begin_trusted_pointer(
+            ax,
+            ay,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            PointerFlavor::Down,
+        );
+        let _ = drain(&mut context, down);
+        let dragged = context.begin_trusted_pointer(
+            bx,
+            by,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            PointerFlavor::Move,
+        );
+        let _ = drain(&mut context, dragged);
+        let press = context.stack.mouse_button_presses[0].unwrap();
+        assert_eq!(press.author_target.unwrap().raw, a);
+        assert!(press.dragged);
+        let guarded_a = press.author_target.unwrap();
+        context.stack.prevent_compatibility_mouse = true;
+        context.stack.click_sequence = Some(ClickSequence {
+            button: 0,
+            target: guarded_a,
+            native_detail: 1,
+            detail: 1,
+        });
+        context.stack.wheel_transaction = Some(WheelTransaction {
+            default_target: GuardedRawNode::from_public(guarded_a),
+            author_target: guarded_a,
+            last_time_stamp: 80.0,
+        });
+
+        let client_x = f64::from(bx) + 0.123_456_789;
+        let client_y = f64::from(by) + 0.987_654_321;
+        let modifier_bits = POINTER_MOD_SHIFT | POINTER_MOD_META | POINTER_MOD_FN;
+        let metadata = EventMetadata::pointer_with_modifiers(
+            81.25,
+            native_pointer_coordinates(client_x, client_y, Some((1_301.125, 902.875)), 0.0, 0.0),
+            0,
+            modifier_bits,
+        );
+        let cancel = event(context.begin(pointer_cancel_request_at(
+            bx,
+            by,
+            MouseEventButtons::Primary,
+            metadata,
+        )));
+
+        assert_eq!(cancel.event_type, "pointercancel");
+        assert_eq!(
+            cancel.target, a_handle,
+            "the live pressed target beats hover"
+        );
+        assert!(cancel.bubbles && cancel.composed);
+        assert!(!cancel.cancelable);
+        assert_eq!(cancel.time_stamp, 81.25);
+        let Some(DispatchEventPayload::Pointer(payload)) = cancel.payload.as_deref() else {
+            panic!("pointercancel should carry a pointer payload");
+        };
+        assert_eq!(
+            (payload.mouse.client_x, payload.mouse.client_y),
+            (client_x, client_y)
+        );
+        assert_eq!(
+            (payload.mouse.screen_x, payload.mouse.screen_y),
+            (1_301.125, 902.875)
+        );
+        assert_eq!(
+            (payload.mouse.movement_x, payload.mouse.movement_y),
+            (0.0, 0.0)
+        );
+        assert_eq!(
+            (
+                payload.mouse.button,
+                payload.mouse.buttons,
+                payload.mouse.detail
+            ),
+            (-1, 0, 0)
+        );
+        assert!(payload.mouse.shift_key && payload.mouse.meta_key && payload.mouse.fn_key);
+        assert_eq!(payload.pointer_type, "mouse");
+        assert_eq!(payload.pointer_id, 1.0);
+        assert_eq!(payload.pressure, 0.0);
+
+        assert!(
+            context
+                .stack
+                .mouse_button_presses
+                .iter()
+                .all(Option::is_none)
+        );
+        assert!(
+            context
+                .stack
+                .ignored_mouse_ups
+                .contains(MouseEventButtons::Primary)
+        );
+        assert!(!context.stack.prevent_compatibility_mouse);
+        assert!(context.stack.click_sequence.is_none());
+        assert!(context.stack.wheel_transaction.is_none());
+        assert_eq!(context.document.get_hover_node_id(), None);
+        assert!(
+            context
+                .document
+                .get_node(a)
+                .is_some_and(|node| !node.is_active())
+        );
+
+        let resumed = context.resume(&cancel, true);
+        let exits = drain_steps(&mut context, resumed);
+        assert_eq!(
+            exits.first().map(|step| step.event_type.as_str()),
+            Some("pointerout")
+        );
+        assert_eq!(exits.first().map(|step| step.target), Some(b_handle));
+        assert!(
+            exits
+                .iter()
+                .skip(1)
+                .all(|step| step.event_type == "pointerleave")
+        );
+        assert!(
+            exits
+                .iter()
+                .all(|step| !step.event_type.starts_with("mouse"))
+        );
+
+        let duplicate = context.begin(pointer_cancel_request_at(
+            bx,
+            by,
+            MouseEventButtons::Primary,
+            EventMetadata::pointer(
+                81.5,
+                native_pointer_coordinates(f64::from(bx), f64::from(by), None, 0.0, 0.0),
+                0,
+            ),
+        ));
+        complete(duplicate);
+        assert!(
+            context
+                .stack
+                .ignored_mouse_ups
+                .contains(MouseEventButtons::Primary)
+        );
+
+        let ignored_up = context.begin(pointer_request_at(
+            bx,
+            by,
+            MouseEventButton::Main,
+            MouseEventButtons::None,
+            PointerFlavor::Up,
+            82.0,
+            1,
+        ));
+        complete(ignored_up);
+        assert!(
+            !context
+                .stack
+                .ignored_mouse_ups
+                .contains(MouseEventButtons::Primary)
+        );
+    }
+
+    #[test]
+    fn idle_pointer_cancel_is_a_noop_and_preserves_hover() {
+        let mut context = TestContext::new(
+            "<div id='target' style='display:block;width:100px;height:40px'></div>",
+        );
+        let target = context.element("target");
+        let (x, y) = context.center(target);
+        let moved = context.begin_trusted_pointer(
+            x,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::None,
+            PointerFlavor::Move,
+        );
+        let _ = drain(&mut context, moved);
+        assert_eq!(context.document.get_hover_node_id(), Some(target));
+
+        let cancel = context.begin(pointer_cancel_request_at(
+            x,
+            y,
+            MouseEventButtons::Primary,
+            EventMetadata::pointer(
+                1.0,
+                native_pointer_coordinates(f64::from(x), f64::from(y), None, 0.0, 0.0),
+                0,
+            ),
+        ));
+        complete(cancel);
+        assert_eq!(context.document.get_hover_node_id(), Some(target));
+        assert_eq!(context.stack.ignored_mouse_ups, MouseEventButtons::None);
+    }
+
+    #[test]
+    fn pointer_cancel_falls_back_from_a_stale_press_target_to_hover_then_root() {
+        let mut hovered = TestContext::new(
+            "<div id='a' style='display:inline-block;width:100px;height:40px'></div>\
+             <div id='b' style='display:inline-block;width:100px;height:40px'></div>",
+        );
+        let a = hovered.element("a");
+        let b = hovered.element("b");
+        let b_handle = hovered.handles.expose(b).unwrap();
+        let (ax, ay) = hovered.center(a);
+        let (bx, by) = hovered.center(b);
+        assert!(hovered.document.set_hover_to(ax, ay));
+        let down = hovered.begin_trusted_pointer(
+            ax,
+            ay,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            PointerFlavor::Down,
+        );
+        let _ = drain(&mut hovered, down);
+        let moved = hovered.begin_trusted_pointer(
+            bx,
+            by,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            PointerFlavor::Move,
+        );
+        let _ = drain(&mut hovered, moved);
+        hovered.document.mutate().remove_and_drop_node(a);
+        let cancel = event(hovered.begin(pointer_cancel_request_at(
+            bx,
+            by,
+            MouseEventButtons::Primary,
+            EventMetadata::pointer(
+                1.0,
+                native_pointer_coordinates(f64::from(bx), f64::from(by), None, 0.0, 0.0),
+                0,
+            ),
+        )));
+        assert_eq!(cancel.target, b_handle);
+        let _ = drain(&mut hovered, DispatchStep::Event(cancel));
+
+        let mut rooted = TestContext::new(
+            "<div id='target' style='display:block;width:100px;height:40px'></div>",
+        );
+        let target = rooted.element("target");
+        let root = rooted.document.root_element().id;
+        let root_handle = rooted.handles.expose(root).unwrap();
+        let (x, y) = rooted.center(target);
+        assert!(rooted.document.set_hover_to(x, y));
+        let down = rooted.begin_trusted_pointer(
+            x,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            PointerFlavor::Down,
+        );
+        let _ = drain(&mut rooted, down);
+        let left = rooted.begin_trusted_boundary(
+            x,
+            y,
+            MouseEventButtons::Primary,
+            0,
+            2.0,
+            None,
+            NativePointerBoundary::Leave,
+        );
+        let _ = drain(&mut rooted, left);
+        rooted.document.mutate().remove_and_drop_node(target);
+        let cancel = event(rooted.begin(pointer_cancel_request_at(
+            x,
+            y,
+            MouseEventButtons::Primary,
+            EventMetadata::pointer(
+                3.0,
+                native_pointer_coordinates(f64::from(x), f64::from(y), None, 0.0, 0.0),
+                0,
+            ),
+        )));
+        assert_eq!(cancel.target, root_handle);
+        let _ = drain(&mut rooted, DispatchStep::Event(cancel));
+    }
+
+    #[test]
+    fn subset_pointer_cancel_suppresses_late_ups_for_the_whole_active_stream() {
+        let mut context = TestContext::new(
+            "<div id='target' style='display:block;width:100px;height:40px'></div>",
+        );
+        let target = context.element("target");
+        let (x, y) = context.center(target);
+        assert!(context.document.set_hover_to(x, y));
+
+        let primary = context.begin(pointer_request_at(
+            x,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            PointerFlavor::Down,
+            1.0,
+            1,
+        ));
+        let _ = drain(&mut context, primary);
+        let secondary = context.begin(pointer_request_at(
+            x,
+            y,
+            MouseEventButton::Secondary,
+            MouseEventButtons::Primary | MouseEventButtons::Secondary,
+            PointerFlavor::Down,
+            2.0,
+            1,
+        ));
+        let _ = drain(&mut context, secondary);
+        assert!(context.stack.mouse_button_presses[0].is_some());
+        assert!(context.stack.mouse_button_presses[2].is_some());
+
+        let cancel = event(context.begin(pointer_cancel_request_at(
+            x,
+            y,
+            MouseEventButtons::Primary,
+            EventMetadata::pointer(
+                3.0,
+                native_pointer_coordinates(f64::from(x), f64::from(y), None, 0.0, 0.0),
+                0,
+            ),
+        )));
+        let _ = drain(&mut context, DispatchStep::Event(cancel));
+        assert!(
+            context
+                .stack
+                .mouse_button_presses
+                .iter()
+                .all(Option::is_none)
+        );
+        assert!(
+            context
+                .stack
+                .ignored_mouse_ups
+                .contains(MouseEventButtons::Primary | MouseEventButtons::Secondary)
+        );
+
+        let secondary_up = context.begin(pointer_request_at(
+            x,
+            y,
+            MouseEventButton::Secondary,
+            MouseEventButtons::Primary,
+            PointerFlavor::Up,
+            4.0,
+            1,
+        ));
+        complete(secondary_up);
+        let primary_up = context.begin(pointer_request_at(
+            x,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::None,
+            PointerFlavor::Up,
+            5.0,
+            1,
+        ));
+        complete(primary_up);
+        assert_eq!(context.stack.ignored_mouse_ups, MouseEventButtons::None);
     }
 
     #[test]

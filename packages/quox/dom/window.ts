@@ -136,9 +136,16 @@ export class QuoxWindow extends QuoxEventTarget implements Disposable {
             screenX,
             screenY,
           ),
-        // The native interruption remains visible to raw input observers. DOM stream
-        // cancellation is connected by the following isolated Quox change.
-        pointerCancel: () => {},
+        pointerCancel: (x, y, screenX, screenY, canceledButtons, modifiers, timeStamp) =>
+          this.document.dispatchPointerCancel(
+            x,
+            y,
+            canceledButtons,
+            modifiers,
+            timeStamp,
+            screenX,
+            screenY,
+          ),
         pointerDown: (x, y, screenX, screenY, button, buttons, modifiers, timeStamp, detail) =>
           this.document.dispatchPointerDown(
             x,

@@ -153,6 +153,7 @@ type QuoxBaseEventProps = {
   onPointerMove?: QuoxEventProp<QuoxJsxPointerEvent>;
   onPointerDown?: QuoxEventProp<QuoxJsxPointerEvent>;
   onPointerUp?: QuoxEventProp<QuoxJsxPointerEvent>;
+  onPointerCancel?: QuoxEventProp<QuoxJsxPointerEvent>;
   onPointerEnter?: QuoxEventProp<QuoxJsxPointerEvent>;
   onPointerLeave?: QuoxEventProp<QuoxJsxPointerEvent>;
   onPointerOver?: QuoxEventProp<QuoxJsxPointerEvent>;
