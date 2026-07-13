@@ -10,7 +10,10 @@ use crate::ffi_numbers::{
     NumericArgumentError, finite_f32, finite_f64, integer_range, known_mask, nonnegative_f64,
     uint32, wasm_usize,
 };
-use crate::form_controls::{CheckedControlStates, LegacyCheckableActivation, TextControlStates};
+use crate::form_controls::{
+    CheckedControlStates, LegacyCheckableActivation, TextControlStates, dom_child_preorder,
+    html_form_owner, is_html_form,
+};
 use crate::node_handles::NodeHandles;
 use crate::{QuoxRenderer, QuoxRendererState, sync_document_layout};
 use blitz_dom::node::SpecialElementData;
@@ -162,6 +165,13 @@ struct KeyboardDefaultContinuation {
     intent: Option<EditIntent>,
     clipboard: Option<ClipboardAction>,
     source_was_editor: bool,
+    implicit_submission: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FormSubmission {
+    form: GuardedNode,
+    submitter: Option<GuardedNode>,
 }
 
 #[derive(Clone, Copy)]
@@ -303,6 +313,7 @@ enum SpaceKeyEvent<'a> {
 enum EventShapeOverride {
     PlainInput,
     PlainChange,
+    Submit { submitter: Option<GuardedNode> },
 }
 
 #[derive(Clone, Copy)]
@@ -737,6 +748,18 @@ impl EventMetadata {
         self
     }
 
+    fn into_submit(mut self, submitter: Option<GuardedNode>) -> Self {
+        self.edit_intent = None;
+        self.clipboard_action = None;
+        self.composition_data = None;
+        self.observe_text_edit = false;
+        self.event_type_override = Some("submit");
+        self.cancelable_override = Some(true);
+        self.shape_override = Some(EventShapeOverride::Submit { submitter });
+        self.suppress_default = true;
+        self
+    }
+
     fn into_plain_input(mut self) -> Self {
         self.shape_override = Some(EventShapeOverride::PlainInput);
         self
@@ -836,6 +859,10 @@ enum PlannedWork {
         expected_completed_frame: Option<u32>,
         request: DeferredImeRequest,
     },
+    FormSubmission {
+        submission: FormSubmission,
+        metadata: EventMetadata,
+    },
     DoubleClick(PendingDoubleClick),
     Action(DispatchAction),
 }
@@ -889,6 +916,7 @@ enum ResumeAction {
         checkable_activation: Option<Box<GuardedCheckableActivation>>,
         space_key: Option<SpaceKeyContinuation>,
         keyboard_default: Option<KeyboardDefaultContinuation>,
+        click_activation_target: Option<GuardedNode>,
     },
     PointerLead {
         pointer_default: Box<GuardedDomEvent>,
@@ -906,6 +934,7 @@ enum ResumeAction {
         release_auxclick: Option<Box<DomEventData>>,
     },
     Clipboard(Box<PendingClipboardDefault>),
+    FormSubmission(FormSubmission),
     TextEdit(Box<PendingEdit>),
     CompositionStart(Box<PendingCompositionEdit>),
     CompositionUpdate(Box<PendingCompositionEdit>),
@@ -1505,6 +1534,7 @@ enum DispatchEventPayload {
     Keyboard(KeyboardPayload),
     Input(InputPayload),
     Clipboard { text: Option<String> },
+    Submit { submitter: Option<u32> },
     Composition { data: String },
     Focus { related_target: Option<u32> },
 }
@@ -1698,7 +1728,18 @@ impl DispatchStack {
                 checkable_activation,
                 space_key,
                 keyboard_default,
+                click_activation_target,
             } => {
+                // A submit event is part of the click activation default and therefore precedes
+                // the follow-up dblclick. Queue dblclick first so a form submission planned by
+                // the uncanceled click can take the front position below.
+                if let Some(double_click) = double_click {
+                    self.frames
+                        .last_mut()
+                        .expect("double-click follow-up belongs to the active frame")
+                        .planned
+                        .push_front(PlannedWork::DoubleClick(*double_click));
+                }
                 if cancelled {
                     if matches!(&pending.guarded.event.data, DomEventData::KeyDown(_))
                         && let Some(source_key_input_id) = pending
@@ -1729,9 +1770,18 @@ impl DispatchStack {
                         .is_some_and(|pending| pending.clipboard.is_some())
                 {
                     if let Some(keyboard_default) = keyboard_default {
-                        debug_assert!(double_click.is_none());
                         debug_assert!(checkable_activation.is_none());
-                        if let Some(action) = keyboard_default.clipboard {
+                        if keyboard_default.implicit_submission {
+                            let key_event = enter_keydown(&pending.guarded.event.data)
+                                .expect("an implicit-submission continuation belongs to Enter");
+                            self.queue_implicit_submission_default(
+                                document,
+                                handles,
+                                pending.guarded.target,
+                                key_event,
+                                pending.guarded.metadata,
+                            )?;
+                        } else if let Some(action) = keyboard_default.clipboard {
                             let clipboard = PendingClipboardDefault {
                                 target: pending.guarded.target,
                                 action,
@@ -1780,23 +1830,31 @@ impl DispatchStack {
                         // Listener mutations may invalidate either interpretation, but cannot
                         // turn the same native key into a different default after dispatch.
                     } else {
-                        self.run_default(
-                            document,
-                            text_controls,
-                            checked_controls,
-                            handles,
-                            pending.guarded,
-                            checkable_activation.as_deref(),
-                            space_key,
-                        )?;
+                        let submit_default_handled = if let Some(target) = click_activation_target {
+                            self.queue_submit_button_default(
+                                document,
+                                handles,
+                                target,
+                                checkable_activation
+                                    .as_deref()
+                                    .is_some_and(|activation| activation.state.began_checkable()),
+                                pending.guarded.metadata.clone(),
+                            )?
+                        } else {
+                            false
+                        };
+                        if !submit_default_handled {
+                            self.run_default(
+                                document,
+                                text_controls,
+                                checked_controls,
+                                handles,
+                                pending.guarded,
+                                checkable_activation.as_deref(),
+                                space_key,
+                            )?;
+                        }
                     }
-                }
-                if let Some(double_click) = double_click {
-                    self.frames
-                        .last_mut()
-                        .expect("double-click follow-up belongs to the active frame")
-                        .planned
-                        .push_front(PlannedWork::DoubleClick(*double_click));
                 }
             }
             ResumeAction::Clipboard(clipboard) => {
@@ -1845,6 +1903,16 @@ impl DispatchStack {
                             clipboard.space_key,
                         )?;
                     }
+                }
+            }
+            ResumeAction::FormSubmission(submission) => {
+                if !cancelled && form_submission_can_navigate(document, handles, submission) {
+                    document.submit_form(
+                        submission.form.raw,
+                        submission
+                            .submitter
+                            .map_or(submission.form.raw, |submitter| submitter.raw),
+                    );
                 }
             }
             ResumeAction::PointerLead {
@@ -3479,6 +3547,24 @@ impl DispatchStack {
                         self.absorb_post_terminal_deferred_ime(predecessor_generation);
                     }
                 }
+                PlannedWork::FormSubmission {
+                    submission,
+                    metadata,
+                } => {
+                    // HTML suppresses recursive submission of the same form while its submit
+                    // event is firing. Pending continuations are the staged equivalent of that
+                    // per-form flag and disappear automatically on resume or abort.
+                    if self.form_submission_is_firing(submission.form)
+                        || !form_submission_can_start(document, handles, submission)
+                    {
+                        continue;
+                    }
+                    if let Some(step) = self.stage_form_submission_event(
+                        document, handles, redraw, submission, metadata,
+                    )? {
+                        return Ok(step);
+                    }
+                }
                 PlannedWork::DoubleClick(pending) => {
                     if !node_is_live(pending.target, document, handles)
                         || !document
@@ -3593,6 +3679,48 @@ impl DispatchStack {
         )?))
     }
 
+    fn form_submission_is_firing(&self, form: GuardedNode) -> bool {
+        self.frames.iter().any(|frame| {
+            frame.pending.as_ref().is_some_and(|pending| {
+                matches!(
+                    &pending.resume,
+                    ResumeAction::FormSubmission(submission) if submission.form == form
+                )
+            })
+        })
+    }
+
+    fn stage_form_submission_event(
+        &mut self,
+        document: &BaseDocument,
+        handles: &mut NodeHandles,
+        redraw: &AtomicBool,
+        submission: FormSubmission,
+        metadata: EventMetadata,
+    ) -> Result<Option<DispatchStep>, DispatchError> {
+        let Some(mut event) = guard_event_with_target(
+            document,
+            handles,
+            submission.form,
+            // Pinned Blitz has no submit record. Input is an internal, otherwise unused carrier;
+            // the explicit event name, shape, and continuation own all observable semantics.
+            DomEventData::Input(blitz_traits::events::BlitzInputEvent {
+                value: String::new(),
+            }),
+            metadata.into_submit(submission.submitter),
+        )?
+        else {
+            return Ok(None);
+        };
+        event.event.bubbles = true;
+        event.event.cancelable = true;
+        Ok(Some(self.stage(
+            redraw,
+            event,
+            ResumeAction::FormSubmission(submission),
+        )?))
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "composition staging carries the guarded target, causal metadata, payload, and continuation"
@@ -3642,6 +3770,7 @@ impl DispatchStack {
         // Allocate every fallible dispatch identifier before applying state which JavaScript can
         // observe. A failed stage must never strand a checkbox in its pre-activated state.
         let event_id = self.allocate_event_id()?;
+        let click_activation_target = click_activation_target(document, &event);
         let checkable_activation = if !suppress_default
             && event.metadata.event_type_override.is_none()
             && matches!(
@@ -3695,10 +3824,16 @@ impl DispatchStack {
             .then(|| {
                 let intent = event.metadata.edit_intent.clone();
                 let clipboard = event.metadata.clipboard_action.clone();
-                (intent.is_some() || clipboard.is_some()).then(|| KeyboardDefaultContinuation {
-                    intent,
-                    clipboard,
-                    source_was_editor: editor_edit_snapshot(document, event.target.raw).is_some(),
+                let implicit_submission = enter_keydown(&event.event.data).is_some()
+                    && is_implicit_submission_text_control(document, event.target.raw);
+                (intent.is_some() || clipboard.is_some() || implicit_submission).then(|| {
+                    KeyboardDefaultContinuation {
+                        intent,
+                        clipboard,
+                        source_was_editor: editor_edit_snapshot(document, event.target.raw)
+                            .is_some(),
+                        implicit_submission,
+                    }
                 })
             })
             .flatten();
@@ -3708,6 +3843,7 @@ impl DispatchStack {
             checkable_activation,
             space_key,
             keyboard_default,
+            click_activation_target,
         };
         Ok(self.finish_stage(redraw, event_id, event, resume))
     }
@@ -3736,13 +3872,18 @@ impl DispatchStack {
             bubbles: event.event.bubbles,
             cancelable: event.event.cancelable,
             composed: match event.metadata.shape_override {
-                Some(EventShapeOverride::PlainChange) => false,
+                Some(EventShapeOverride::PlainChange | EventShapeOverride::Submit { .. }) => false,
                 Some(EventShapeOverride::PlainInput) => true,
                 None => event_is_composed(&event.event.data),
             },
             time_stamp: event.metadata.time_stamp,
             payload: match event.metadata.shape_override {
                 Some(EventShapeOverride::PlainInput | EventShapeOverride::PlainChange) => None,
+                Some(EventShapeOverride::Submit { submitter }) => {
+                    Some(Box::new(DispatchEventPayload::Submit {
+                        submitter: submitter.map(|submitter| submitter.handle),
+                    }))
+                }
                 None => event_payload(&event.event.data, &event.metadata).map(Box::new),
             },
         };
@@ -3972,6 +4113,138 @@ impl DispatchStack {
                 .generated
                 .push_back(event);
         }
+        Ok(())
+    }
+
+    fn queue_form_submission(&mut self, submission: FormSubmission, metadata: EventMetadata) {
+        self.frames
+            .last_mut()
+            .expect("form defaults run only for an active frame")
+            .planned
+            .push_front(PlannedWork::FormSubmission {
+                submission,
+                metadata,
+            });
+    }
+
+    /// Consume the activation default whenever the frozen click activation target is currently
+    /// a submit button. Returning true also covers disabled, detached, and ownerless submit
+    /// buttons: Blitz must not receive those clicks because its handler would either submit too
+    /// early or apply a different post-listener ancestor walk.
+    fn queue_submit_button_default(
+        &mut self,
+        document: &BaseDocument,
+        handles: &mut NodeHandles,
+        activation_target: GuardedNode,
+        began_checkable: bool,
+        metadata: EventMetadata,
+    ) -> Result<bool, DispatchError> {
+        if !node_is_live(activation_target, document, handles) {
+            return Ok(true);
+        }
+        if is_html_checkable_input(document, activation_target.raw) && !began_checkable {
+            // Legacy activation is captured before click listeners. A listener may turn another
+            // input into a checkbox/radio, but that cannot manufacture pre-click activation or
+            // its input/change events after the fact.
+            return Ok(true);
+        }
+        if !is_html_submit_button(document, activation_target.raw) {
+            return Ok(false);
+        }
+        if !document
+            .get_node(activation_target.raw)
+            .is_some_and(|node| node.flags.is_in_document())
+            || is_html_actually_disabled(document, activation_target.raw)
+        {
+            return Ok(true);
+        }
+        let Some(form_raw) = html_form_owner(document, activation_target.raw) else {
+            return Ok(true);
+        };
+        let Some(form) = guard_node(document, handles, form_raw)? else {
+            return Ok(true);
+        };
+        if !form_target_can_start_submission(document, handles, form) {
+            return Ok(true);
+        }
+        self.queue_form_submission(
+            FormSubmission {
+                form,
+                submitter: Some(activation_target),
+            },
+            metadata,
+        );
+        Ok(true)
+    }
+
+    fn queue_implicit_submission_default(
+        &mut self,
+        document: &BaseDocument,
+        handles: &mut NodeHandles,
+        target: GuardedNode,
+        key_event: &blitz_traits::events::BlitzKeyEvent,
+        metadata: EventMetadata,
+    ) -> Result<(), DispatchError> {
+        if !node_is_live(target, document, handles)
+            || actual_focus_node_id(document) != Some(target.raw)
+            || !is_implicit_submission_text_control(document, target.raw)
+            || is_html_actually_disabled(document, target.raw)
+        {
+            return Ok(());
+        }
+        let Some(form_raw) = html_form_owner(document, target.raw) else {
+            return Ok(());
+        };
+        let Some(form) = guard_node(document, handles, form_raw)? else {
+            return Ok(());
+        };
+        if !form_target_can_start_submission(document, handles, form) {
+            return Ok(());
+        }
+
+        let default_button = dom_child_preorder(document).into_iter().find(|candidate| {
+            document
+                .get_node(*candidate)
+                .is_some_and(|node| node.flags.is_in_document())
+                && is_html_submit_button(document, *candidate)
+                && html_form_owner(document, *candidate) == Some(form.raw)
+        });
+        if let Some(default_button) = default_button {
+            // The first submit button is the default even when disabled. HTML does not fall
+            // through to a later enabled button or to direct form submission in that case.
+            if is_html_actually_disabled(document, default_button) {
+                return Ok(());
+            }
+            let Some(default_button) = guard_node(document, handles, default_button)? else {
+                return Ok(());
+            };
+            return self.queue_keyboard_activation_default(
+                document,
+                handles,
+                default_button,
+                key_event,
+                metadata,
+            );
+        }
+
+        let blocking_fields = dom_child_preorder(document)
+            .into_iter()
+            .filter(|candidate| {
+                is_implicit_submission_text_control(document, *candidate)
+                    && html_form_owner(document, *candidate) == Some(form.raw)
+            })
+            .take(2)
+            .count();
+        if blocking_fields > 1 {
+            return Ok(());
+        }
+        self.queue_form_submission(
+            FormSubmission {
+                form,
+                submitter: None,
+            },
+            metadata.with_edit_intent(None).with_clipboard_action(None),
+        );
         Ok(())
     }
 
@@ -4946,6 +5219,187 @@ fn suppress_ineligible_enter_default(document: &BaseDocument, target: usize) -> 
                     "a" | "area" | "button" | "input"
                 )
         })
+}
+
+/// Capture the activation behavior from the click's frozen propagation path. Listener mutations
+/// can change what an already-captured button does, but cannot manufacture a new activation
+/// target by wrapping the click target in a button after dispatch began.
+fn click_activation_target(
+    document: &BaseDocument,
+    guarded: &GuardedDomEvent,
+) -> Option<GuardedNode> {
+    let DomEventData::Click(event) = &guarded.event.data else {
+        return None;
+    };
+    if guarded.metadata.event_type_override.is_some() || event.button != MouseEventButton::Main {
+        return None;
+    }
+
+    for candidate in &guarded.path {
+        let Some(element) = document
+            .get_node(candidate.raw)
+            .and_then(blitz_dom::Node::element_data)
+            .filter(|element| element.name.ns == ns!(html))
+        else {
+            continue;
+        };
+        match element.name.local.as_ref() {
+            "button" | "input" => return Some(*candidate),
+            // An interactive descendant owns its activation. Do not let malformed nesting turn
+            // its click into activation of a surrounding submit button.
+            "select" | "textarea" | "label" => return None,
+            "a" if element.has_attr(local_name!("href")) => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+fn is_html_submit_button(document: &BaseDocument, target: usize) -> bool {
+    let Some(element) = document
+        .get_node(target)
+        .and_then(blitz_dom::Node::element_data)
+        .filter(|element| element.name.ns == ns!(html))
+    else {
+        return false;
+    };
+    match element.name.local.as_ref() {
+        "input" => element.attr(local_name!("type")).is_some_and(|kind| {
+            kind.eq_ignore_ascii_case("submit") || kind.eq_ignore_ascii_case("image")
+        }),
+        "button" => match element
+            .attr(local_name!("type"))
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("submit") => true,
+            Some("reset" | "button") => false,
+            // Missing and invalid values are the HTML Auto state. Command buttons are excluded
+            // from Auto's submit behavior even though pinned Blitz does not implement commands.
+            _ => {
+                !element.has_attr(LocalName::from("command"))
+                    && !element.has_attr(LocalName::from("commandfor"))
+            }
+        },
+        _ => false,
+    }
+}
+
+fn is_html_checkable_input(document: &BaseDocument, target: usize) -> bool {
+    document
+        .get_node(target)
+        .and_then(blitz_dom::Node::element_data)
+        .is_some_and(|element| {
+            element.name.ns == ns!(html)
+                && element.name.local.as_ref() == "input"
+                && element.attr(local_name!("type")).is_some_and(|kind| {
+                    kind.eq_ignore_ascii_case("checkbox") || kind.eq_ignore_ascii_case("radio")
+                })
+        })
+}
+
+fn is_implicit_submission_text_control(document: &BaseDocument, target: usize) -> bool {
+    let Some(element) = document
+        .get_node(target)
+        .and_then(blitz_dom::Node::element_data)
+        .filter(|element| element.name.ns == ns!(html) && element.name.local.as_ref() == "input")
+    else {
+        return false;
+    };
+    matches!(
+        element
+            .attr(local_name!("type"))
+            .unwrap_or("text")
+            .to_ascii_lowercase()
+            .as_str(),
+        "" | "text"
+            | "search"
+            | "tel"
+            | "url"
+            | "email"
+            | "password"
+            | "date"
+            | "month"
+            | "week"
+            | "time"
+            | "datetime-local"
+            | "number"
+    ) || element
+        .attr(local_name!("type"))
+        .is_some_and(|kind| !is_known_html_input_type(kind))
+}
+
+fn is_known_html_input_type(kind: &str) -> bool {
+    matches!(
+        kind.to_ascii_lowercase().as_str(),
+        "hidden"
+            | "text"
+            | "search"
+            | "tel"
+            | "url"
+            | "email"
+            | "password"
+            | "date"
+            | "month"
+            | "week"
+            | "time"
+            | "datetime-local"
+            | "number"
+            | "range"
+            | "color"
+            | "checkbox"
+            | "radio"
+            | "file"
+            | "submit"
+            | "image"
+            | "reset"
+            | "button"
+    )
+}
+
+fn form_target_can_start_submission(
+    document: &BaseDocument,
+    handles: &NodeHandles,
+    form: GuardedNode,
+) -> bool {
+    node_is_live(form, document, handles)
+        && is_html_form(document, form.raw)
+        && document
+            .get_node(form.raw)
+            .is_some_and(|node| node.flags.is_in_document())
+}
+
+fn form_submission_can_start(
+    document: &BaseDocument,
+    handles: &NodeHandles,
+    submission: FormSubmission,
+) -> bool {
+    if !form_target_can_start_submission(document, handles, submission.form) {
+        return false;
+    }
+    submission.submitter.is_none_or(|submitter| {
+        node_is_live(submitter, document, handles)
+            && document
+                .get_node(submitter.raw)
+                .is_some_and(|node| node.flags.is_in_document())
+            && is_html_submit_button(document, submitter.raw)
+            && !is_html_actually_disabled(document, submitter.raw)
+            && html_form_owner(document, submitter.raw) == Some(submission.form.raw)
+    })
+}
+
+fn form_submission_can_navigate(
+    document: &BaseDocument,
+    handles: &NodeHandles,
+    submission: FormSubmission,
+) -> bool {
+    // Once the submit event has begun, changes to submitter type, owner, disabledness, or tree
+    // position do not undo it. The retained generation still prevents a recycled raw node from
+    // supplying unrelated override attributes to Blitz's submission algorithm.
+    form_target_can_start_submission(document, handles, submission.form)
+        && submission
+            .submitter
+            .is_none_or(|submitter| node_is_live(submitter, document, handles))
 }
 
 fn label_click_default(document: &BaseDocument, guarded: &GuardedDomEvent) -> LabelClickDefault {
@@ -7058,6 +7512,13 @@ impl DispatchEventPayload {
                     text.map_or(JsValue::NULL, |text| JsValue::from_str(&text)),
                 )?;
             }
+            Self::Submit { submitter } => {
+                set(
+                    &object,
+                    "submitter",
+                    submitter.map_or(JsValue::NULL, |submitter| f64::from(submitter).into()),
+                )?;
+            }
             Self::Composition { data } => {
                 set(&object, "data", JsValue::from_str(&data))?;
             }
@@ -7774,6 +8235,7 @@ mod tests {
         BlitzFocusEvent, BlitzInputEvent, BlitzKeyEvent, KeyState, MouseEventButtons,
         PointerCoords, PointerDetails,
     };
+    use blitz_traits::navigation::{NavigationOptions, NavigationProvider};
     use blitz_traits::shell::{ColorScheme, ShellProvider, Viewport};
     use keyboard_types::{Code, Key, Location, Modifiers};
     use std::sync::{Arc, Mutex};
@@ -7813,6 +8275,29 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = text;
             Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingNavigation {
+        options: Mutex<Vec<NavigationOptions>>,
+    }
+
+    impl RecordingNavigation {
+        fn count(&self) -> usize {
+            self.options
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len()
+        }
+    }
+
+    impl NavigationProvider for RecordingNavigation {
+        fn navigate_to(&self, options: NavigationOptions) {
+            self.options
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(options);
         }
     }
 
@@ -13332,14 +13817,13 @@ mod tests {
     }
 
     #[test]
-    fn enter_does_not_add_implicit_submit_or_activate_ineligible_inputs() {
+    fn enter_without_a_form_does_not_submit_or_activate_ineligible_inputs() {
         for markup in [
             "<input id='target'>",
             "<input id='target' type='checkbox'>",
             "<input id='target' type='radio'>",
             "<input id='target' type='file'>",
             "<a id='target' tabindex='0'>link</a>",
-            "<form><input id='target'><button id='default'>submit</button></form>",
         ] {
             let mut context = TestContext::new(markup);
             let target = context.element("target");
@@ -13351,6 +13835,309 @@ mod tests {
                 "{markup}: {types:?}"
             );
         }
+    }
+
+    #[test]
+    fn submit_button_click_stages_one_cancelable_submit_before_navigation() {
+        let mut context = TestContext::new(
+            "<form id='form' action='https://example.test/sent'>\
+               <button id='submitter' name='choice' value='go'>Submit</button>\
+             </form>",
+        );
+        let navigation = Arc::new(RecordingNavigation::default());
+        context.document.set_navigation_provider(navigation.clone());
+        let form = context.element("form");
+        let submitter = context.element("submitter");
+        let form_handle = context.handles.expose(form).unwrap();
+        let submitter_handle = context.handles.expose(submitter).unwrap();
+
+        let click = stage_generated(
+            &mut context,
+            submitter,
+            DomEventData::Click(pointer(
+                1.0,
+                1.0,
+                MouseEventButton::Main,
+                MouseEventButtons::None,
+            )),
+        );
+        assert_eq!(
+            navigation.count(),
+            0,
+            "Blitz must not submit during click staging"
+        );
+
+        let submit = event(context.resume(&click, false));
+        assert_eq!(submit.event_type, "submit");
+        assert_eq!(submit.target, form_handle);
+        assert_eq!(submit.path.first(), Some(&form_handle));
+        assert!(submit.bubbles && submit.cancelable);
+        assert!(!submit.composed);
+        assert_eq!(
+            submit.payload.as_deref(),
+            Some(&DispatchEventPayload::Submit {
+                submitter: Some(submitter_handle),
+            })
+        );
+        assert_eq!(
+            navigation.count(),
+            0,
+            "submit listeners run before navigation"
+        );
+
+        complete(context.resume(&submit, false));
+        assert_eq!(navigation.count(), 1);
+    }
+
+    #[test]
+    fn canceling_click_or_submit_prevents_form_navigation() {
+        let mut context = TestContext::new(
+            "<form id='form' action='https://example.test/sent'>\
+               <button id='submitter'>Submit</button>\
+             </form>",
+        );
+        let navigation = Arc::new(RecordingNavigation::default());
+        context.document.set_navigation_provider(navigation.clone());
+        let submitter = context.element("submitter");
+        let click = || {
+            DomEventData::Click(pointer(
+                1.0,
+                1.0,
+                MouseEventButton::Main,
+                MouseEventButtons::None,
+            ))
+        };
+
+        let canceled_click = stage_generated(&mut context, submitter, click());
+        complete(context.resume(&canceled_click, true));
+        assert_eq!(navigation.count(), 0);
+
+        let accepted_click = stage_generated(&mut context, submitter, click());
+        let submit = event(context.resume(&accepted_click, false));
+        assert_eq!(submit.event_type, "submit");
+        complete(context.resume(&submit, true));
+        assert_eq!(navigation.count(), 0);
+    }
+
+    #[test]
+    fn submit_click_revalidates_type_disabledness_owner_and_node_generation() {
+        let kind = QualName {
+            prefix: None,
+            ns: ns!(),
+            local: LocalName::from("type"),
+        };
+        let owner = QualName {
+            prefix: None,
+            ns: ns!(),
+            local: LocalName::from("form"),
+        };
+        let click_data = || {
+            DomEventData::Click(pointer(
+                1.0,
+                1.0,
+                MouseEventButton::Main,
+                MouseEventButtons::None,
+            ))
+        };
+
+        let mut changed_type =
+            TestContext::new("<form id='form'><button id='submitter'>Submit</button></form>");
+        let submitter = changed_type.element("submitter");
+        let click = stage_generated(&mut changed_type, submitter, click_data());
+        changed_type
+            .document
+            .mutate()
+            .set_attribute(submitter, kind, "button");
+        complete(changed_type.resume(&click, false));
+
+        for checkable_type in ["checkbox", "radio"] {
+            let mut newly_checkable =
+                TestContext::new("<form id='form'><input id='submitter' type='submit'></form>");
+            let submitter = newly_checkable.element("submitter");
+            let click = stage_generated(&mut newly_checkable, submitter, click_data());
+            newly_checkable.set_input_type(submitter, checkable_type);
+            let step = newly_checkable.resume(&click, false);
+            let (types, _, _) = drain(&mut newly_checkable, step);
+            assert!(
+                types.is_empty(),
+                "listener-created {checkable_type}: {types:?}"
+            );
+            assert!(
+                !newly_checkable
+                    .checked_controls
+                    .checked(&mut newly_checkable.document, submitter)
+                    .unwrap()
+            );
+            assert_eq!(actual_focus_node_id(&newly_checkable.document), None);
+        }
+
+        let mut disabled =
+            TestContext::new("<form id='form'><button id='submitter'>Submit</button></form>");
+        let submitter = disabled.element("submitter");
+        let click = stage_generated(&mut disabled, submitter, click_data());
+        set_disabled(&mut disabled, submitter, true);
+        complete(disabled.resume(&click, false));
+
+        let mut reassociated = TestContext::new(
+            "<form id='first'><button id='submitter'>Submit</button></form>\
+             <form id='second'></form>",
+        );
+        let submitter = reassociated.element("submitter");
+        let second = reassociated.element("second");
+        let second_handle = reassociated.handles.expose(second).unwrap();
+        let click = stage_generated(&mut reassociated, submitter, click_data());
+        reassociated
+            .document
+            .mutate()
+            .set_attribute(submitter, owner, "second");
+        let submit = event(reassociated.resume(&click, false));
+        assert_eq!(submit.event_type, "submit");
+        assert_eq!(submit.target, second_handle);
+        complete(reassociated.resume(&submit, true));
+
+        let mut stale =
+            TestContext::new("<form id='form'><button id='submitter'>Submit</button></form>");
+        let submitter = stale.element("submitter");
+        let click = stage_generated(&mut stale, submitter, click_data());
+        stale
+            .handles
+            .invalidate_node(submitter)
+            .expect("the staged submitter should have a retained handle");
+        complete(stale.resume(&click, false));
+    }
+
+    #[test]
+    fn button_whitespace_and_invalid_types_use_the_browser_auto_submit_state() {
+        let context = TestContext::new(
+            "<button id='exact-button' type='button'></button>\
+             <button id='exact-reset' type='reset'></button>\
+             <button id='space-button' type=' button '></button>\
+             <button id='space-reset' type=' reset '></button>\
+             <button id='space-submit' type=' submit '></button>\
+             <button id='invalid' type='future'></button>",
+        );
+
+        for id in ["exact-button", "exact-reset"] {
+            assert!(!is_html_submit_button(
+                &context.document,
+                context.element(id)
+            ));
+        }
+        for id in ["space-button", "space-reset", "space-submit", "invalid"] {
+            assert!(is_html_submit_button(
+                &context.document,
+                context.element(id)
+            ));
+        }
+    }
+
+    #[test]
+    fn implicit_submission_uses_the_default_button_or_the_form_itself() {
+        let mut with_button = TestContext::new(
+            "<form id='form'><input id='field'>\
+               <button id='default'>Submit</button>\
+             </form>",
+        );
+        let field = with_button.element("field");
+        let form = with_button.element("form");
+        let default_button = with_button.element("default");
+        let form_handle = with_button.handles.expose(form).unwrap();
+        let default_handle = with_button.handles.expose(default_button).unwrap();
+        assert!(with_button.document.set_focus_to(field));
+        let keydown =
+            event(with_button.begin(enter_request(KeyState::Pressed, false, false, false, 0)));
+        let click = event(with_button.resume(&keydown, false));
+        assert_eq!(click.event_type, "click");
+        assert_eq!(click.target, default_handle);
+        let submit = event(with_button.resume(&click, false));
+        assert_eq!(submit.target, form_handle);
+        assert_eq!(
+            submit.payload.as_deref(),
+            Some(&DispatchEventPayload::Submit {
+                submitter: Some(default_handle),
+            })
+        );
+        complete(with_button.resume(&submit, true));
+
+        let mut without_button =
+            TestContext::new("<form id='form'><input id='field' type='search'></form>");
+        let field = without_button.element("field");
+        let form = without_button.element("form");
+        let form_handle = without_button.handles.expose(form).unwrap();
+        assert!(without_button.document.set_focus_to(field));
+        let keydown =
+            event(without_button.begin(enter_request(KeyState::Pressed, false, false, false, 0)));
+        let submit = event(without_button.resume(&keydown, false));
+        assert_eq!(submit.event_type, "submit");
+        assert_eq!(submit.target, form_handle);
+        assert_eq!(
+            submit.payload.as_deref(),
+            Some(&DispatchEventPayload::Submit { submitter: None })
+        );
+        complete(without_button.resume(&submit, true));
+
+        for markup in [
+            "<form><input id='field'><input type='email'></form>",
+            "<form><input id='field'><input type=' checkbox '></form>",
+            "<form><input id='field'><input type=' submit '></form>",
+            "<form><input id='field'><button disabled>First</button><button>Second</button></form>",
+        ] {
+            let mut suppressed = TestContext::new(markup);
+            let field = suppressed.element("field");
+            assert!(suppressed.document.set_focus_to(field));
+            let first = suppressed.begin(enter_request(KeyState::Pressed, false, false, false, 0));
+            let (types, _, _) = drain(&mut suppressed, first);
+            assert!(!types.iter().any(|kind| kind == "click" || kind == "submit"));
+        }
+    }
+
+    #[test]
+    fn same_form_reentry_is_suppressed_and_detaching_before_resume_stops_navigation() {
+        let mut reentrant = TestContext::new(
+            "<form id='form' action='https://example.test/sent'>\
+               <button id='submitter'>Submit</button>\
+             </form>",
+        );
+        let navigation = Arc::new(RecordingNavigation::default());
+        reentrant
+            .document
+            .set_navigation_provider(navigation.clone());
+        let submitter = reentrant.element("submitter");
+        let click_data = || {
+            DomEventData::Click(pointer(
+                1.0,
+                1.0,
+                MouseEventButton::Main,
+                MouseEventButtons::None,
+            ))
+        };
+
+        let outer_click = stage_generated(&mut reentrant, submitter, click_data());
+        let outer_submit = event(reentrant.resume(&outer_click, false));
+        assert_eq!(outer_submit.event_type, "submit");
+
+        let nested_click = stage_generated(&mut reentrant, submitter, click_data());
+        complete(reentrant.resume(&nested_click, false));
+        assert_eq!(navigation.count(), 0);
+        complete(reentrant.resume(&outer_submit, false));
+        assert_eq!(navigation.count(), 1);
+
+        let mut detached = TestContext::new(
+            "<form id='form' action='https://example.test/sent'>\
+               <button id='submitter'>Submit</button>\
+             </form>",
+        );
+        let detached_navigation = Arc::new(RecordingNavigation::default());
+        detached
+            .document
+            .set_navigation_provider(detached_navigation.clone());
+        let form = detached.element("form");
+        let submitter = detached.element("submitter");
+        let click = stage_generated(&mut detached, submitter, click_data());
+        let submit = event(detached.resume(&click, false));
+        detached.document.mutate().remove_node(form);
+        complete(detached.resume(&submit, false));
+        assert_eq!(detached_navigation.count(), 0);
     }
 
     #[test]

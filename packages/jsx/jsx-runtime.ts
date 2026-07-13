@@ -141,6 +141,10 @@ export interface QuoxJsxClipboardEvent extends QuoxJsxEvent {
   readonly clipboardData: QuoxJsxDataTransfer | null;
 }
 
+export interface QuoxJsxSubmitEvent extends QuoxJsxEvent {
+  readonly submitter: object | null;
+}
+
 export interface QuoxJsxInputEvent extends QuoxJsxUIEvent {
   readonly data: string | null;
   readonly isComposing: boolean;
@@ -195,6 +199,7 @@ type QuoxBaseEventProps = {
   onBeforeInput?: QuoxEventProp<QuoxJsxInputEvent>;
   onInput?: QuoxEventProp<QuoxJsxInputEvent>;
   onChange?: QuoxEventProp<QuoxJsxEvent>;
+  onSubmit?: QuoxEventProp<QuoxJsxSubmitEvent>;
   onCompositionStart?: QuoxEventProp<QuoxJsxCompositionEvent>;
   onCompositionUpdate?: QuoxEventProp<QuoxJsxCompositionEvent>;
   onCompositionEnd?: QuoxEventProp<QuoxJsxCompositionEvent>;

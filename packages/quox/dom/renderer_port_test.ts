@@ -127,6 +127,8 @@ function payloadForType(type: DomDispatchEventType): Record<string, unknown> | u
       return { data: null, inputType: "", isComposing: false };
     case "change":
       return undefined;
+    case "submit":
+      return { submitter: null };
     case "compositionstart":
     case "compositionupdate":
     case "compositionend":
@@ -246,6 +248,17 @@ Deno.test("DOM dispatch validator preserves exact clipboard payloads", () => {
   }
 });
 
+Deno.test("DOM dispatch validator preserves a nullable submitter handle", () => {
+  for (const submitter of [null, 19] as const) {
+    const rawPayload = { submitter };
+    const step = validateDomDispatchStep(eventStep({ type: "submit", payload: rawPayload }));
+    assert(step.kind === "event");
+    assertEquals(step.payload, rawPayload);
+    assert(Object.isFrozen(step.payload));
+    assert(!Object.is(step.payload, rawPayload));
+  }
+});
+
 Deno.test("DOM dispatch validator accepts and freezes complete steps", () => {
   const step = validateDomDispatchStep(completeStep(9, true));
   assertEquals(step, { kind: "complete", frameId: 9, redrawRequested: true });
@@ -320,6 +333,7 @@ Deno.test("DOM dispatch validator requires exact payload families and rejects pl
     eventStep({ type: "copy", payload: { text: null, future: true } }),
     eventStep({ type: "beforeinput", payload: { data: null, inputType: "" } }),
     eventStep({ type: "input", payload: { data: null, inputType: "" } }),
+    eventStep({ type: "submit", payload: { submitter: null, future: true } }),
     eventStep({ type: "compositionupdate", payload: { data: "x", isComposing: true } }),
     eventStep({ type: "focus", payload: { relatedTarget: null, detail: 0 } }),
     eventStep({ type: "scroll", payload: undefined }),
@@ -370,6 +384,8 @@ Deno.test("DOM dispatch validator enforces payload types, finite values, ranges,
     eventStep({ type: "paste", payload: { text: 1 } }),
     eventStep({ type: "input", payload: { data: 1, inputType: "", isComposing: false } }),
     eventStep({ type: "beforeinput", payload: { data: null, inputType: 1, isComposing: false } }),
+    eventStep({ type: "submit", payload: { submitter: 0 } }),
+    eventStep({ type: "submit", payload: { submitter: 1.5 } }),
     eventStep({ type: "compositionstart", payload: { data: null } }),
     eventStep({ type: "focus", payload: { relatedTarget: 1.5 } }),
   ];

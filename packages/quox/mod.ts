@@ -19,6 +19,8 @@ export {
   type QuoxMouseEventInit,
   QuoxPointerEvent,
   type QuoxPointerEventInit,
+  QuoxSubmitEvent,
+  type QuoxSubmitEventInit,
   QuoxUIEvent,
   type QuoxUIEventInit,
   QuoxWheelEvent,

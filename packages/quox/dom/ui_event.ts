@@ -1,5 +1,6 @@
 import { QuoxEvent, type QuoxEventInit } from "./event.ts";
 import type { QuoxEventTarget } from "./event_target.ts";
+import type { QuoxElement } from "./node.ts";
 
 export interface QuoxUIEventInit extends QuoxEventInit {
   view?: QuoxEventTarget | null;
@@ -74,6 +75,10 @@ export interface QuoxKeyboardEventInit extends QuoxEventModifierInit {
 
 export interface QuoxClipboardEventInit extends QuoxEventInit {
   clipboardData?: QuoxDataTransfer | null;
+}
+
+export interface QuoxSubmitEventInit extends QuoxEventInit {
+  submitter?: QuoxElement | null;
 }
 
 export interface QuoxInputEventInit extends QuoxUIEventInit {
@@ -357,6 +362,21 @@ export class QuoxClipboardEvent extends QuoxEvent {
 
   get clipboardData(): QuoxDataTransfer | null {
     return this.#clipboardData;
+  }
+}
+
+/** Browser-shaped form submission event. */
+export class QuoxSubmitEvent extends QuoxEvent {
+  readonly #submitter: QuoxElement | null;
+
+  constructor(type: string, eventInit: QuoxSubmitEventInit = {}) {
+    eventInit = eventInit ?? {};
+    super(type, eventInit);
+    this.#submitter = eventInit.submitter ?? null;
+  }
+
+  get submitter(): QuoxElement | null {
+    return this.#submitter;
   }
 }
 

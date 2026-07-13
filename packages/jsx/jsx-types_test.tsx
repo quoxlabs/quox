@@ -14,6 +14,7 @@ import {
   type QuoxJsxKeyboardEvent,
   type QuoxJsxMouseEvent,
   type QuoxJsxPointerEvent,
+  type QuoxJsxSubmitEvent,
   type QuoxJsxWheelEvent,
 } from "./jsx-runtime.ts";
 import type { QuoxEvent } from "../quox/dom/event.ts";
@@ -26,6 +27,7 @@ import type {
   QuoxFocusEvent,
   QuoxMouseEvent,
   QuoxPointerEvent,
+  QuoxSubmitEvent,
   QuoxWheelEvent,
 } from "../quox/dom/ui_event.ts";
 
@@ -62,6 +64,7 @@ type ExpectedBaseEventProp =
   | "onBeforeInput"
   | "onInput"
   | "onChange"
+  | "onSubmit"
   | "onCompositionStart"
   | "onCompositionUpdate"
   | "onCompositionEnd"
@@ -86,9 +89,10 @@ const runtimeEventCompatibility: [
   QuoxClipboardEvent extends QuoxJsxClipboardEvent ? true : false,
   QuoxDataTransfer extends QuoxJsxDataTransfer ? true : false,
   QuoxDOMInputEvent extends QuoxJsxInputEvent ? true : false,
+  QuoxSubmitEvent extends QuoxJsxSubmitEvent ? true : false,
   QuoxCompositionEvent extends QuoxJsxCompositionEvent ? true : false,
   QuoxFocusEvent extends QuoxJsxFocusEvent ? true : false,
-] = [true, true, true, true, true, true, true, true, true, true, true];
+] = [true, true, true, true, true, true, true, true, true, true, true, true];
 
 const supportedEvents = (
   <input
@@ -114,6 +118,10 @@ const supportedEvents = (
     onBeforeInputCapture={(event) => expectType<QuoxJsxInputEvent>(event)}
     onInput={(event) => expectType<QuoxJsxInputEvent>(event)}
     onChange={(event) => expectType<QuoxJsxEvent>(event)}
+    onSubmitCapture={(event) => {
+      expectType<QuoxJsxSubmitEvent>(event);
+      expectType<object | null>(event.submitter);
+    }}
     onCompositionStart={(event) => expectType<QuoxJsxCompositionEvent>(event)}
     onCompositionUpdateCapture={(event) => expectType<QuoxJsxCompositionEvent>(event)}
     onCompositionEnd={(event) => expectType<QuoxJsxCompositionEvent>(event)}

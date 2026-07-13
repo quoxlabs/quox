@@ -95,6 +95,13 @@ impl LegacyCheckableActivation {
     pub(crate) fn previous_radio(&self) -> Option<usize> {
         self.previous_radio
     }
+
+    pub(crate) fn began_checkable(&self) -> bool {
+        matches!(
+            self.initial_kind,
+            CheckedInputKind::Checkbox | CheckedInputKind::Radio
+        )
+    }
 }
 
 impl CheckedControlStates {
@@ -526,14 +533,14 @@ fn input_checked_descriptor(
         kind,
         name: element.attr(local_name!("name")).map(str::to_owned),
         tree_root,
-        form_owner: input_form_owner(document, node_id, tree_root),
+        form_owner: html_form_owner_in_tree(document, node_id, tree_root),
         connected: node.flags.is_in_document(),
     })
 }
 
 /// Return every live DOM node in child preorder within each connected or detached tree. Root
 /// ordering is immaterial to radio exclusivity because distinct roots are distinct groups.
-fn dom_child_preorder(document: &BaseDocument) -> Vec<usize> {
+pub(crate) fn dom_child_preorder(document: &BaseDocument) -> Vec<usize> {
     let roots = document
         .tree()
         .iter()
@@ -567,7 +574,15 @@ fn input_tree_root(document: &BaseDocument, mut node_id: usize) -> usize {
     node_id
 }
 
-fn input_form_owner(document: &BaseDocument, node_id: usize, tree_root: usize) -> Option<usize> {
+pub(crate) fn html_form_owner(document: &BaseDocument, node_id: usize) -> Option<usize> {
+    html_form_owner_in_tree(document, node_id, input_tree_root(document, node_id))
+}
+
+fn html_form_owner_in_tree(
+    document: &BaseDocument,
+    node_id: usize,
+    tree_root: usize,
+) -> Option<usize> {
     let node = document.get_node(node_id)?;
     let element = node.element_data()?;
     if node.flags.is_in_document()
@@ -612,7 +627,7 @@ fn first_element_with_id(
     None
 }
 
-fn is_html_form(document: &BaseDocument, node_id: usize) -> bool {
+pub(crate) fn is_html_form(document: &BaseDocument, node_id: usize) -> bool {
     document
         .get_node(node_id)
         .and_then(blitz_dom::Node::element_data)

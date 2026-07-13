@@ -1,6 +1,7 @@
 import { assert, assertEquals, assertFalse, assertStrictEquals, assertThrows } from "@std/assert";
 import { QuoxEvent } from "./event.ts";
 import { QuoxEventTarget } from "./event_target.ts";
+import type { QuoxElement } from "./node.ts";
 import {
   createTrustedMouseEventInit,
   QuoxClipboardEvent,
@@ -12,6 +13,7 @@ import {
   QuoxMouseEvent,
   type QuoxMouseEventInit,
   QuoxPointerEvent,
+  QuoxSubmitEvent,
   QuoxUIEvent,
   QuoxWheelEvent,
 } from "./ui_event.ts";
@@ -261,6 +263,21 @@ Deno.test("clipboard events expose a read-only plaintext DataTransfer facade", (
   assertEquals(emptyCopy.types, []);
   assertEquals(emptyCopy.getData("text/plain"), "");
   assertStrictEquals(new QuoxClipboardEvent("copy").clipboardData, null);
+});
+
+Deno.test("submit events retain their submitter and default it to null", () => {
+  const submitter = new QuoxEventTarget() as unknown as QuoxElement;
+  const event = new QuoxSubmitEvent("submit", {
+    bubbles: true,
+    cancelable: true,
+    submitter,
+  });
+
+  assert(event instanceof QuoxEvent);
+  assertStrictEquals(event.submitter, submitter);
+  assert(event.bubbles);
+  assert(event.cancelable);
+  assertStrictEquals(new QuoxSubmitEvent("submit").submitter, null);
 });
 
 Deno.test("input and composition event data is not confused with a control value", () => {

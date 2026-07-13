@@ -38,6 +38,7 @@ export const DOM_DISPATCH_EVENT_TYPES = Object.freeze(
     "beforeinput",
     "input",
     "change",
+    "submit",
     "compositionstart",
     "compositionupdate",
     "compositionend",
@@ -128,6 +129,10 @@ export interface DomDispatchInputPayload {
   readonly isComposing: boolean;
 }
 
+export interface DomDispatchSubmitPayload {
+  readonly submitter: number | null;
+}
+
 export interface DomDispatchCompositionPayload {
   readonly data: string;
 }
@@ -143,6 +148,7 @@ export type DomDispatchEventPayload =
   | DomDispatchKeyboardPayload
   | DomDispatchClipboardPayload
   | DomDispatchInputPayload
+  | DomDispatchSubmitPayload
   | DomDispatchCompositionPayload
   | DomDispatchFocusPayload;
 
@@ -489,6 +495,7 @@ const KEYBOARD_PAYLOAD_PROPERTIES = Object.freeze(
 
 const CLIPBOARD_PAYLOAD_PROPERTIES = Object.freeze(["text"] as const);
 const INPUT_PAYLOAD_PROPERTIES = Object.freeze(["data", "inputType", "isComposing"] as const);
+const SUBMIT_PAYLOAD_PROPERTIES = Object.freeze(["submitter"] as const);
 const COMPOSITION_PAYLOAD_PROPERTIES = Object.freeze(["data"] as const);
 const FOCUS_PAYLOAD_PROPERTIES = Object.freeze(["relatedTarget"] as const);
 const COMPLETE_STEP_PROPERTIES = Object.freeze(["kind", "frameId", "redrawRequested"] as const);
@@ -692,6 +699,20 @@ function validateInputPayload(value: unknown): DomDispatchInputPayload {
   });
 }
 
+function validateSubmitPayload(value: unknown): DomDispatchSubmitPayload {
+  const descriptors = inspectExactPlainRecord(
+    value,
+    "DOM dispatch payload",
+    SUBMIT_PAYLOAD_PROPERTIES,
+  );
+  return Object.freeze({
+    submitter: assertNullableNodeHandle(
+      requiredValue(descriptors, "submitter", "DOM dispatch payload"),
+      "DOM dispatch payload.submitter",
+    ),
+  });
+}
+
 function validateCompositionPayload(value: unknown): DomDispatchCompositionPayload {
   const descriptors = inspectExactPlainRecord(
     value,
@@ -765,6 +786,8 @@ function validateEventPayload(
     case "beforeinput":
     case "input":
       return validateInputPayload(value);
+    case "submit":
+      return validateSubmitPayload(value);
     case "compositionstart":
     case "compositionupdate":
     case "compositionend":

@@ -54,6 +54,7 @@ const EVENT_TYPE_TO_PROP = Object.freeze(
     beforeinput: "onBeforeInput",
     input: "onInput",
     change: "onChange",
+    submit: "onSubmit",
     compositionstart: "onCompositionStart",
     compositionupdate: "onCompositionUpdate",
     compositionend: "onCompositionEnd",

@@ -16,6 +16,7 @@ import {
   QuoxFocusEvent,
   QuoxMouseEvent,
   QuoxPointerEvent,
+  QuoxSubmitEvent,
   QuoxWheelEvent,
 } from "./ui_event.ts";
 
@@ -153,6 +154,8 @@ function payloadForType(type: DomDispatchEventType): Record<string, unknown> | u
     case "beforeinput":
     case "input":
       return { data: null, inputType: "", isComposing: false };
+    case "submit":
+      return { submitter: null };
     case "compositionstart":
     case "compositionupdate":
     case "compositionend":
@@ -918,6 +921,61 @@ Deno.test("payloadless trusted input uses HTML's plain Event shape", () => {
   assertFalse(received.cancelable);
   assert(received.composed);
   assert(received.isTrusted);
+});
+
+Deno.test("trusted submit events expose the live submitter and browser metadata", () => {
+  const { document, renderer } = createHarness();
+  const ancestor = document.createElement("section");
+  const form = document.createElement("form");
+  const submitter = document.createElement("button");
+  const calls: string[] = [];
+  let received: QuoxEvent | undefined;
+
+  form.addEventListener("submit", (event) => {
+    calls.push("form");
+    received = event;
+    event.preventDefault();
+  });
+  ancestor.addEventListener("submit", () => calls.push("ancestor"));
+  renderer.queueFrame([{
+    type: "submit",
+    target: form.nodeId,
+    path: [form.nodeId, ancestor.nodeId],
+    bubbles: true,
+    cancelable: true,
+    composed: false,
+    payload: { submitter: submitter.nodeId },
+  }]);
+
+  document.dispatchPointerMove(1, 2, 0, 0);
+
+  assert(received instanceof QuoxSubmitEvent);
+  assertStrictEquals(received.submitter, submitter);
+  assert(received.isTrusted);
+  assert(received.bubbles);
+  assert(received.cancelable);
+  assertFalse(received.composed);
+  assertEquals(calls, ["form", "ancestor"]);
+  assertEquals(
+    renderer.calls.filter(([method]) => method === "resume").map((call) => call.at(-1)),
+    [true],
+  );
+
+  let implicit: QuoxSubmitEvent | undefined;
+  form.addEventListener("submit", (event) => {
+    if (event instanceof QuoxSubmitEvent) implicit = event;
+  });
+  renderer.queueFrame([{
+    type: "submit",
+    target: form.nodeId,
+    path: [form.nodeId],
+    bubbles: true,
+    cancelable: true,
+    composed: false,
+    payload: { submitter: null },
+  }]);
+  document.dispatchPointerMove(1, 2, 0, 0);
+  assertStrictEquals(implicit?.submitter, null);
 });
 
 Deno.test("trusted clipboard events expose read-only plaintext transfers and metadata", () => {

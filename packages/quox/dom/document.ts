@@ -32,6 +32,7 @@ import {
   type DomDispatchPointerPayload,
   DomDispatchRendererPort,
   type DomDispatchStep,
+  type DomDispatchSubmitPayload,
   type DomDispatchWheelPayload,
 } from "./renderer_port.ts";
 import {
@@ -45,6 +46,7 @@ import {
   QuoxMouseEvent,
   type QuoxMouseEventInit,
   QuoxPointerEvent,
+  QuoxSubmitEvent,
   QuoxWheelEvent,
 } from "./ui_event.ts";
 
@@ -857,6 +859,13 @@ export class QuoxDocument extends QuoxEventTarget {
       }
       case "change":
         return new QuoxEvent(step.type, eventInit);
+      case "submit": {
+        const payload = step.payload as DomDispatchSubmitPayload;
+        return new QuoxSubmitEvent(step.type, {
+          ...eventInit,
+          submitter: payload.submitter === null ? null : this.#elementForHandle(payload.submitter),
+        });
+      }
       case "compositionstart":
       case "compositionupdate":
       case "compositionend": {
