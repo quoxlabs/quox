@@ -21,7 +21,7 @@ import {
 } from "./xim_preedit.ts";
 import { packRgbaPixels } from "./native_image.ts";
 import { supportsX11Abi, validateX11Geometry } from "./mod.ts";
-import { selectXimStyles } from "./xim.ts";
+import { selectXimStyles, XimContext, type XimEvent, type XimManager } from "./xim.ts";
 
 Deno.test("X11 key locations follow remapped KeySyms instead of evdev positions alone", () => {
   assertEquals(keyLocationForKey("Control", "ControlLeft"), 1);
@@ -105,6 +105,42 @@ Deno.test("X11 shortcut modifiers do not turn lookup text into edits", () => {
   assertEquals(x11CommittedText("a", { ...plain, metaKey: true }, false, false, false), undefined);
   assertEquals(x11CommittedText("@", { ...plain, altKey: true, altGraphKey: true }, false, false, false), "@");
   assertEquals(x11CommittedText("a", { ...plain, altKey: true }, true, false, false), "a");
+});
+
+Deno.test("XIM retains sources only inside their synchronous lookup batch", () => {
+  const queued: XimEvent[] = [];
+  const manager = {
+    queue: (_window: bigint, event: XimEvent) => queued.push(event),
+  } as unknown as XimManager;
+  const context = new XimContext(manager, 1n);
+
+  context.commit("asynchronous");
+  context.beginLookup();
+  assertEquals(context.claimDirectKeySource(() => 17), 17);
+  assertEquals(context.claimDirectKeySource(() => 18), undefined);
+  context.commit("direct");
+  context.commit("second");
+  assertDeepEquals(queued, [{ type: "ime", kind: "commit", text: "asynchronous" }]);
+  context.finishLookup();
+  assertDeepEquals(queued, [
+    { type: "ime", kind: "commit", text: "asynchronous" },
+    { type: "ime", kind: "commit", text: "direct", sourceKeyInputId: 17 },
+    { type: "ime", kind: "commit", text: "second" },
+  ]);
+
+  context.beginLookup();
+  context.noteCompositionCallback();
+  assertEquals(context.claimDirectKeySource(() => 19), undefined);
+  context.commit("composition");
+  context.finishLookup();
+  assertDeepEquals(queued.at(-1), { type: "ime", kind: "commit", text: "composition" });
+
+  context.beginLookup();
+  assertEquals(context.claimDirectKeySource(() => 20), 20);
+  context.commit("");
+  context.commit("after-empty");
+  context.finishLookup();
+  assertDeepEquals(queued.at(-1), { type: "ime", kind: "commit", text: "after-empty" });
 });
 
 Deno.test("XIM preedit draw applies scalar-indexed replacements", () => {

@@ -38,6 +38,9 @@ Deno.test("X11 opens a window, configures XIM, and translates a basic keypress",
     const event = nextEvent(library, (candidate) => candidate.type === "keydown");
     if (event?.type !== "keydown") throw new Error("Expected an X11 keydown event");
     assertKey(event, { code: "KeyA", key: "a", editDisposition: "text-input" });
+    if (!Number.isInteger(event.sourceKeyInputId) || (event.sourceKeyInputId ?? 0) <= 0) {
+      throw new Error("Expected the X11 keydown to carry a causal source id");
+    }
     if (event.window !== window) throw new Error("X11 keydown was routed to the wrong window");
     const commit = nextEvent(
       library,
@@ -45,6 +48,31 @@ Deno.test("X11 opens a window, configures XIM, and translates a basic keypress",
     );
     if (commit?.type !== "ime" || commit.kind !== "commit" || commit.text !== "a") {
       throw new Error("Expected an X11 IME commit for the basic keypress");
+    }
+    if (commit.sourceKeyInputId !== event.sourceKeyInputId) {
+      throw new Error("Expected the X11 commit to match its keydown source id");
+    }
+
+    sendKeyPress(window, "a");
+    const repeat = nextEvent(library, (candidate) => candidate.type === "keydown");
+    if (repeat?.type !== "keydown" || !repeat.repeat) {
+      throw new Error("Expected the second X11 keypress to be a repeat");
+    }
+    if (!Number.isInteger(repeat.sourceKeyInputId) || (repeat.sourceKeyInputId ?? 0) <= 0) {
+      throw new Error("Expected the repeated X11 keydown to carry a causal source id");
+    }
+    if (repeat.sourceKeyInputId === event.sourceKeyInputId) {
+      throw new Error("Expected the X11 repeat to receive a fresh source id");
+    }
+    const repeatCommit = nextEvent(
+      library,
+      (candidate) => candidate.type === "ime" && candidate.kind === "commit",
+    );
+    if (
+      repeatCommit?.type !== "ime" || repeatCommit.kind !== "commit" ||
+      repeatCommit.sourceKeyInputId !== repeat.sourceKeyInputId
+    ) {
+      throw new Error("Expected the repeated X11 commit to match its keydown source id");
     }
   } finally {
     library.close();

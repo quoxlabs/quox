@@ -703,6 +703,10 @@ export class XimContext implements Disposable {
   #surrounding: { text: string; selectionStart: number; selectionEnd: number } | undefined;
   #conversionStorage: { bytes: Uint8Array; descriptor: ArrayBuffer } | undefined;
   #stagedEvents: XimEvent[] | null = null;
+  #lookupStartedComposing = false;
+  #lookupSawCompositionCallback = false;
+  #lookupSourceClaimed = false;
+  #lookupSourceKeyInputId: number | undefined;
   #resetPending = false;
   #closed = false;
 
@@ -787,6 +791,7 @@ export class XimContext implements Disposable {
       PREEDIT_START_DEFINITION,
       this.manager.guardCallback<XimCallbackArguments, number>(
         (_ic, _clientData, _callData) => {
+          this.noteCompositionCallback();
           this.#composition.start();
           this.#preedit = [];
           this.#cursor = 0;
@@ -794,6 +799,7 @@ export class XimContext implements Disposable {
           return -1;
         },
         (_ic, _clientData, _callData) => {
+          this.noteCompositionCallback();
           this.#resetAfterCallbackFailure();
           return -1;
         },
@@ -802,14 +808,21 @@ export class XimContext implements Disposable {
     const done = new Deno.UnsafeCallback(
       PREEDIT_CALLBACK_DEFINITION,
       this.manager.guardCallback<XimCallbackArguments, void>(
-        (_ic, _clientData, _callData) => this.#clearPreedit(true),
-        (_ic, _clientData, _callData) => this.#resetAfterCallbackFailure(),
+        (_ic, _clientData, _callData) => {
+          this.noteCompositionCallback();
+          this.#clearPreedit(true);
+        },
+        (_ic, _clientData, _callData) => {
+          this.noteCompositionCallback();
+          this.#resetAfterCallbackFailure();
+        },
       ),
     );
     const draw = new Deno.UnsafeCallback(
       PREEDIT_CALLBACK_DEFINITION,
       this.manager.guardCallback<XimCallbackArguments, void>(
         (_ic, _clientData, callData) => {
+          this.noteCompositionCallback();
           if (callData === null) return;
           const view = new Deno.UnsafePointerView(callData);
           const caret = view.getInt32(0);
@@ -838,13 +851,17 @@ export class XimContext implements Disposable {
           this.#composition.start();
           this.#emitPreedit();
         },
-        (_ic, _clientData, _callData) => this.#resetAfterCallbackFailure(),
+        (_ic, _clientData, _callData) => {
+          this.noteCompositionCallback();
+          this.#resetAfterCallbackFailure();
+        },
       ),
     );
     const caret = new Deno.UnsafeCallback(
       PREEDIT_CALLBACK_DEFINITION,
       this.manager.guardCallback<XimCallbackArguments, void>(
         (_ic, _clientData, callData) => {
+          this.noteCompositionCallback();
           if (callData === null) return;
           const view = new Deno.UnsafePointerView(callData);
           const direction = view.getInt32(4);
@@ -853,7 +870,10 @@ export class XimContext implements Disposable {
           this.manager.writeCaretPosition(callData, this.#cursor);
           this.#emitPreedit();
         },
-        (_ic, _clientData, _callData) => this.#resetAfterCallbackFailure(),
+        (_ic, _clientData, _callData) => {
+          this.noteCompositionCallback();
+          this.#resetAfterCallbackFailure();
+        },
       ),
     );
     const callbacks = [start, done, draw, caret];
@@ -884,6 +904,29 @@ export class XimContext implements Disposable {
     if (this.#closed) return;
     if (this.#stagedEvents !== null) throw new Error("winding(x11): nested XIM lookup");
     this.#stagedEvents = [];
+    this.#lookupStartedComposing = this.#composition.active;
+    this.#lookupSawCompositionCallback = false;
+    this.#lookupSourceClaimed = false;
+    this.#lookupSourceKeyInputId = undefined;
+  }
+
+  noteCompositionCallback(): void {
+    if (this.#stagedEvents !== null) this.#lookupSawCompositionCallback = true;
+  }
+
+  claimDirectKeySource(allocate: () => number | undefined): number | undefined {
+    if (
+      this.#stagedEvents === null || this.#lookupStartedComposing ||
+      this.#lookupSawCompositionCallback || this.#lookupSourceClaimed ||
+      this.#composition.active || this.#stagedEvents.length > 0
+    ) {
+      return undefined;
+    }
+    const sourceKeyInputId = allocate();
+    if (sourceKeyInputId === undefined) return undefined;
+    this.#lookupSourceClaimed = true;
+    this.#lookupSourceKeyInputId = sourceKeyInputId;
+    return sourceKeyInputId;
   }
 
   processDeferred(): void {
@@ -896,15 +939,23 @@ export class XimContext implements Disposable {
   finishLookup(): void {
     const events = this.#stagedEvents;
     this.#stagedEvents = null;
+    this.#lookupSourceKeyInputId = undefined;
     if (events === null) return;
     for (const event of events) this.manager.queue(this.window, event);
   }
 
   commit(text: string): void {
+    const sourceKeyInputId = this.#stagedEvents === null ? undefined : this.#lookupSourceKeyInputId;
+    this.#lookupSourceKeyInputId = undefined;
     this.#clearPreedit(false);
     if (text.length === 0) return;
     if (this.#stagedEvents !== null) discardTrailingPreeditClear(this.#stagedEvents);
-    this.#queue({ type: "ime", kind: "commit", text });
+    this.#queue({
+      type: "ime",
+      kind: "commit",
+      text,
+      ...(sourceKeyInputId === undefined ? {} : { sourceKeyInputId }),
+    });
   }
 
   invalidateFromServer(): void {
@@ -941,6 +992,7 @@ export class XimContext implements Disposable {
     if (this.#closed) return;
     this.#closed = true;
     this.#stagedEvents = null;
+    this.#lookupSourceKeyInputId = undefined;
     this.manager.removeContext(this);
   }
 

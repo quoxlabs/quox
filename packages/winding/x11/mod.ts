@@ -20,6 +20,7 @@ import {
   NativeEventClock,
   normalizeKeyboardText,
   PressedLogicalKeyCache,
+  SourceKeyInputIdSequence,
 } from "../input/mod.ts";
 import { domCodeFromXkbName, keyLocationHintForKeysym } from "../linux/mod.ts";
 import { utf8Bytes, utf8CString as cString } from "../text_encoding.ts";
@@ -433,6 +434,7 @@ class X11Library implements Library {
   readonly input: XimManager;
   readonly #events = new EventQueue<UIEvent>();
   readonly #eventClock = new NativeEventClock(2 ** 32);
+  readonly #sourceKeyInputIds = new SourceKeyInputIdSequence();
   readonly #clickCounter = new ClickCounter<MouseButton>();
   #modifierMapping: X11ModifierMapping = {
     shiftMask: X_SHIFT_MASK,
@@ -505,7 +507,7 @@ class X11Library implements Library {
               this.#events.push(createImePreeditEvent(window, event.text, event.cursorRange));
               return;
             case "commit": {
-              const commit = createImeCommitEvent(window, event.text);
+              const commit = createImeCommitEvent(window, event.text, event.sourceKeyInputId);
               if (commit !== undefined) this.#events.push(commit);
               return;
             }
@@ -725,6 +727,9 @@ class X11Library implements Library {
             window.input.composing,
             window.input.hasStagedEvents,
           );
+          const sourceKeyInputId = text === undefined
+            ? undefined
+            : window.input.claimDirectKeySource(() => this.#sourceKeyInputIds.take());
           const event: KeyDownEvent = createKeyDownEvent({
             keycode,
             code,
@@ -739,6 +744,7 @@ class X11Library implements Library {
               window.input.composing,
               window.input.hasStagedEvents,
             ),
+            sourceKeyInputId,
             ...modifiers,
             window,
           });
