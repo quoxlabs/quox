@@ -130,6 +130,11 @@ enum SpaceKeyContinuation {
     },
 }
 
+struct KeyboardEditContinuation {
+    intent: EditIntent,
+    source_was_editor: bool,
+}
+
 #[derive(Clone, Copy)]
 struct PointerStreamState {
     suppress_compatibility_mouse: bool,
@@ -565,6 +570,22 @@ impl EventMetadata {
         self
     }
 
+    fn into_before_input(mut self, intent: EditIntent) -> Self {
+        let cancelable = !matches!(
+            &intent,
+            EditIntent::InsertText {
+                is_composing: true,
+                ..
+            }
+        );
+        self.edit_intent = Some(intent);
+        self.observe_text_edit = false;
+        self.event_type_override = Some("beforeinput");
+        self.cancelable_override = Some(cancelable);
+        self.suppress_default = true;
+        self
+    }
+
     fn with_pointer_move_button(mut self, button: Option<MouseEventButton>) -> Self {
         self.pointer_move_button = button.map(mouse_button_number);
         self
@@ -701,6 +722,7 @@ enum PlannedWork {
         metadata: EventMetadata,
     },
     GuardedDefault(Box<GuardedDomEvent>),
+    TextEdit(PendingEdit),
     DoubleClick(PendingDoubleClick),
     Action(DispatchAction),
 }
@@ -724,10 +746,6 @@ enum DispatchAction {
         target: GuardedNode,
         related_target: Option<GuardedNode>,
         metadata: EventMetadata,
-    },
-    ImeDeleteSurrounding {
-        before_bytes: usize,
-        after_bytes: usize,
     },
 }
 
@@ -757,6 +775,7 @@ enum ResumeAction {
         double_click: Option<Box<PendingDoubleClick>>,
         checkable_activation: Option<Box<GuardedCheckableActivation>>,
         space_key: Option<SpaceKeyContinuation>,
+        keyboard_edit: Option<KeyboardEditContinuation>,
     },
     PointerLead {
         pointer_default: Box<GuardedDomEvent>,
@@ -772,6 +791,25 @@ enum ResumeAction {
         pointer_default: Box<GuardedDomEvent>,
         pointer_default_prevented: bool,
         release_auxclick: Option<Box<DomEventData>>,
+    },
+    TextEdit(Box<PendingEdit>),
+}
+
+struct PendingEdit {
+    target: GuardedNode,
+    intent: EditIntent,
+    metadata: EventMetadata,
+    action: PendingEditAction,
+}
+
+enum PendingEditAction {
+    Default {
+        guarded: Box<GuardedDomEvent>,
+        space_key: Option<SpaceKeyContinuation>,
+    },
+    ImeDeleteSurrounding {
+        before_bytes: usize,
+        after_bytes: usize,
     },
 }
 
@@ -1429,6 +1467,7 @@ impl DispatchStack {
                 double_click,
                 checkable_activation,
                 space_key,
+                keyboard_edit,
             } => {
                 if cancelled {
                     if let Some(activation) = checkable_activation.as_deref()
@@ -1445,15 +1484,49 @@ impl DispatchStack {
                             .redraw_requested = true;
                     }
                 } else if !suppress_default {
-                    self.run_default(
-                        document,
-                        text_controls,
-                        checked_controls,
-                        handles,
-                        pending.guarded,
-                        checkable_activation.as_deref(),
-                        space_key,
-                    )?;
+                    if let Some(keyboard_edit) = keyboard_edit {
+                        debug_assert!(double_click.is_none());
+                        debug_assert!(checkable_activation.is_none());
+                        if keyboard_edit.source_was_editor {
+                            let edit = PendingEdit {
+                                target: pending.guarded.target,
+                                intent: keyboard_edit.intent,
+                                metadata: pending.guarded.metadata.clone(),
+                                action: PendingEditAction::Default {
+                                    guarded: Box::new(pending.guarded.clone()),
+                                    space_key,
+                                },
+                            };
+                            if let Some(step) =
+                                self.stage_text_edit(document, handles, redraw, edit)?
+                            {
+                                return Ok(step);
+                            }
+                        } else if !text_edit_element(document, pending.guarded.target.raw) {
+                            self.run_default(
+                                document,
+                                text_controls,
+                                checked_controls,
+                                handles,
+                                pending.guarded,
+                                checkable_activation.as_deref(),
+                                space_key,
+                            )?;
+                        }
+                        // Keydown fixed whether this occurrence was an edit or an activation.
+                        // Listener mutations may invalidate either interpretation, but cannot
+                        // turn the same native key into a different default after dispatch.
+                    } else {
+                        self.run_default(
+                            document,
+                            text_controls,
+                            checked_controls,
+                            handles,
+                            pending.guarded,
+                            checkable_activation.as_deref(),
+                            space_key,
+                        )?;
+                    }
                 }
                 if let Some(double_click) = double_click {
                     self.frames
@@ -1577,6 +1650,19 @@ impl DispatchStack {
                     }
                 }
                 self.queue_generated_pointer_release(release_auxclick);
+            }
+            ResumeAction::TextEdit(edit) => {
+                if !cancelled
+                    && text_edit_target_accepts(document, handles, edit.target, &edit.intent)
+                {
+                    self.run_pending_edit(
+                        document,
+                        text_controls,
+                        checked_controls,
+                        handles,
+                        *edit,
+                    )?;
+                }
             }
         }
 
@@ -1858,10 +1944,20 @@ impl DispatchStack {
             DispatchRequest::ImeDeleteSurrounding {
                 before_bytes,
                 after_bytes,
-            } => planned.push_back(PlannedWork::Action(DispatchAction::ImeDeleteSurrounding {
-                before_bytes,
-                after_bytes,
-            })),
+            } => {
+                let target =
+                    guarded_target_or_root(document, handles, actual_focus_node_id(document))?;
+                let intent = EditIntent::DeleteByComposition;
+                planned.push_back(PlannedWork::TextEdit(PendingEdit {
+                    target,
+                    intent: intent.clone(),
+                    metadata: EventMetadata::native().with_edit_intent(Some(intent)),
+                    action: PendingEditAction::ImeDeleteSurrounding {
+                        before_bytes,
+                        after_bytes,
+                    },
+                }));
+            }
         }
 
         Ok(())
@@ -2186,6 +2282,32 @@ impl DispatchStack {
                     if let Some(event) =
                         guard_planned_event(document, handles, target, data, metadata)?
                     {
+                        let action = match &event.event.data {
+                            DomEventData::AppleStandardKeybinding(_)
+                            | DomEventData::Ime(BlitzImeEvent::Commit(_)) => {
+                                Some(PendingEditAction::Default {
+                                    guarded: Box::new(event.clone()),
+                                    space_key: None,
+                                })
+                            }
+                            _ => None,
+                        };
+                        if let (Some(intent), Some(action)) =
+                            (event.metadata.edit_intent.clone(), action)
+                        {
+                            let edit = PendingEdit {
+                                target: event.target,
+                                intent,
+                                metadata: event.metadata.clone(),
+                                action,
+                            };
+                            if let Some(step) =
+                                self.stage_text_edit(document, handles, redraw, edit)?
+                            {
+                                return Ok(step);
+                            }
+                            continue;
+                        }
                         self.run_default(
                             document,
                             text_controls,
@@ -2219,6 +2341,11 @@ impl DispatchStack {
                         None,
                         None,
                     )?;
+                }
+                PlannedWork::TextEdit(edit) => {
+                    if let Some(step) = self.stage_text_edit(document, handles, redraw, edit)? {
+                        return Ok(step);
+                    }
                 }
                 PlannedWork::DoubleClick(pending) => {
                     if !node_is_live(pending.target, document, handles)
@@ -2264,6 +2391,39 @@ impl DispatchStack {
     ) -> Result<DispatchStep, DispatchError> {
         let event_id = self.allocate_event_id()?;
         Ok(self.finish_stage(redraw, event_id, event, resume))
+    }
+
+    fn stage_text_edit(
+        &mut self,
+        document: &mut BaseDocument,
+        handles: &mut NodeHandles,
+        redraw: &AtomicBool,
+        edit: PendingEdit,
+    ) -> Result<Option<DispatchStep>, DispatchError> {
+        if !text_edit_target_accepts(document, handles, edit.target, &edit.intent) {
+            return Ok(None);
+        }
+        let metadata = edit.metadata.clone().into_before_input(edit.intent.clone());
+        let Some(mut event) = guard_event_with_target(
+            document,
+            handles,
+            edit.target,
+            DomEventData::Input(blitz_traits::events::BlitzInputEvent {
+                value: String::new(),
+            }),
+            metadata,
+        )?
+        else {
+            return Ok(None);
+        };
+        // Pinned Blitz's Input shape already bubbles, but this synthetic browser event owns its
+        // contract rather than inheriting it from the private payload carrier.
+        event.event.bubbles = true;
+        Ok(Some(self.stage(
+            redraw,
+            event,
+            ResumeAction::TextEdit(Box::new(edit)),
+        )?))
     }
 
     #[allow(
@@ -2333,11 +2493,19 @@ impl DispatchStack {
         } else {
             None
         };
+        let keyboard_edit = matches!(&event.event.data, DomEventData::KeyDown(_))
+            .then(|| event.metadata.edit_intent.clone())
+            .flatten()
+            .map(|intent| KeyboardEditContinuation {
+                intent,
+                source_was_editor: editor_edit_snapshot(document, event.target.raw).is_some(),
+            });
         let resume = ResumeAction::Normal {
             suppress_default,
             double_click,
             checkable_activation,
             space_key,
+            keyboard_edit,
         };
         Ok(self.finish_stage(redraw, event_id, event, resume))
     }
@@ -2848,6 +3016,50 @@ impl DispatchStack {
         Ok(())
     }
 
+    fn run_pending_edit(
+        &mut self,
+        document: &mut BaseDocument,
+        text_controls: &mut TextControlStates,
+        checked_controls: &mut CheckedControlStates,
+        handles: &mut NodeHandles,
+        edit: PendingEdit,
+    ) -> Result<(), DispatchError> {
+        match edit.action {
+            PendingEditAction::Default { guarded, space_key } => self.run_default(
+                document,
+                text_controls,
+                checked_controls,
+                handles,
+                *guarded,
+                None,
+                space_key,
+            ),
+            PendingEditAction::ImeDeleteSurrounding {
+                before_bytes,
+                after_bytes,
+            } => {
+                if let Some(event) =
+                    apply_ime_delete_surrounding(document, before_bytes, after_bytes)
+                {
+                    text_controls.sync_editor_value(document, edit.target.raw);
+                    self.frames
+                        .last_mut()
+                        .expect("text edits run only for an active frame")
+                        .redraw_requested = true;
+                    let metadata = edit.metadata.with_edit_intent(Some(edit.intent));
+                    if let Some(event) = guard_queued_event(document, handles, event, metadata)? {
+                        self.frames
+                            .last_mut()
+                            .expect("text edits run only for an active frame")
+                            .generated
+                            .push_back(event);
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
     fn run_action(
         &mut self,
         document: &mut BaseDocument,
@@ -2930,32 +3142,6 @@ impl DispatchStack {
                     .generated
                     .extend(generated);
             }
-            DispatchAction::ImeDeleteSurrounding {
-                before_bytes,
-                after_bytes,
-            } => {
-                let target = document.get_focussed_node_id();
-                if let Some(event) =
-                    apply_ime_delete_surrounding(document, before_bytes, after_bytes)
-                {
-                    if let Some(target) = target {
-                        text_controls.sync_editor_value(document, target);
-                    }
-                    self.frames
-                        .last_mut()
-                        .expect("actions run only for an active frame")
-                        .redraw_requested = true;
-                    let metadata = EventMetadata::native()
-                        .with_edit_intent(Some(EditIntent::DeleteByComposition));
-                    if let Some(event) = guard_queued_event(document, handles, event, metadata)? {
-                        self.frames
-                            .last_mut()
-                            .expect("actions run only for an active frame")
-                            .generated
-                            .push_back(event);
-                    }
-                }
-            }
         }
         Ok(())
     }
@@ -3003,6 +3189,67 @@ fn editor_edit_snapshot(document: &mut BaseDocument, target: usize) -> Option<Ed
         });
     });
     snapshot
+}
+
+fn text_edit_target_accepts(
+    document: &mut BaseDocument,
+    handles: &NodeHandles,
+    target: GuardedNode,
+    intent: &EditIntent,
+) -> bool {
+    if !node_is_live(target, document, handles)
+        || actual_focus_node_id(document) != Some(target.raw)
+        || is_html_actually_disabled(document, target.raw)
+    {
+        return false;
+    }
+    let Some(node) = document.get_node(target.raw) else {
+        return false;
+    };
+    if !node.flags.is_in_document() {
+        return false;
+    }
+    let Some(element) = node.element_data() else {
+        return false;
+    };
+    if !text_edit_element(document, target.raw) || element.has_attr(local_name!("readonly")) {
+        return false;
+    }
+    if matches!(intent, EditIntent::InsertLineBreak)
+        && !(element.name.ns == ns!(html) && element.name.local.as_ref() == "textarea")
+    {
+        // Enter activates/submits single-line controls; it is not a text insertion there.
+        return false;
+    }
+    editor_edit_snapshot(document, target.raw).is_some()
+}
+
+fn text_edit_element(document: &BaseDocument, target: usize) -> bool {
+    document
+        .get_node(target)
+        .and_then(blitz_dom::Node::element_data)
+        .is_some_and(|element| {
+            element.name.ns == ns!(html)
+                && match element.name.local.as_ref() {
+                    "textarea" => true,
+                    "input" => !matches!(
+                        element
+                            .attr(local_name!("type"))
+                            .unwrap_or("")
+                            .to_ascii_lowercase()
+                            .as_str(),
+                        "hidden"
+                            | "checkbox"
+                            | "radio"
+                            | "file"
+                            | "submit"
+                            | "image"
+                            | "reset"
+                            | "button"
+                    ),
+                    _ => false,
+                }
+        })
 }
 
 #[allow(
@@ -11508,9 +11755,7 @@ mod tests {
             .document
             .mutate()
             .set_attribute(target, kind.clone(), "button");
-        let click = event(added_type.resume(&keydown, false));
-        assert_eq!(click.event_type, "click");
-        complete(added_type.resume(&click, true));
+        complete(added_type.resume(&keydown, false));
 
         let mut changed_type = TestContext::new("<input id='target' type='button'>");
         let target = changed_type.element("target");
@@ -12049,7 +12294,12 @@ mod tests {
                 suppress_default: native_suppresses,
             }));
             assert_eq!(key_step.event_type, "keydown");
-            complete(context.resume(&key_step, javascript_cancels));
+            let resumed = context.resume(&key_step, javascript_cancels);
+            assert!(
+                matches!(resumed, DispatchStep::Complete { .. }),
+                "a canceled or host-suppressed keydown must not stage beforeinput"
+            );
+            complete(resumed);
             assert_eq!(context.raw_text(input), initial);
         }
 
@@ -12061,9 +12311,184 @@ mod tests {
             metadata: host_key_metadata("Delete"),
             suppress_default: false,
         }));
-        let input_step = event(context.resume(&key_step, false));
+        let before_input = event(context.resume(&key_step, false));
+        assert_eq!(before_input.event_type, "beforeinput");
+        assert_eq!(context.raw_text(input), "ab");
+        let input_step = event(context.resume(&before_input, false));
         assert_eq!(input_step.event_type, "input");
         assert_eq!(context.raw_text(input), "b");
+    }
+
+    #[test]
+    fn beforeinput_cancellation_detachment_replacement_and_abort_suppress_the_edit() {
+        let mut canceled = TestContext::new("<input id='editor' value='ab'>");
+        let input = canceled.element("editor");
+        assert!(canceled.document.set_focus_to(input));
+        canceled
+            .document
+            .with_text_input(input, |mut driver| driver.move_to_text_end());
+        let keydown = event(canceled.begin(DispatchRequest::Key {
+            event: key(Key::Character("x".into()), Code::KeyX, KeyState::Pressed),
+            metadata: host_key_metadata("x"),
+            suppress_default: false,
+        }));
+        let before_input = event(canceled.resume(&keydown, false));
+        complete(canceled.resume(&before_input, true));
+        assert_eq!(canceled.raw_text(input), "ab");
+
+        let mut detached = TestContext::new("<input id='editor' value='ab'>");
+        let input = detached.element("editor");
+        assert!(detached.document.set_focus_to(input));
+        detached
+            .document
+            .with_text_input(input, |mut driver| driver.move_to_text_end());
+        let keydown = event(detached.begin(DispatchRequest::Key {
+            event: key(Key::Character("x".into()), Code::KeyX, KeyState::Pressed),
+            metadata: host_key_metadata("x"),
+            suppress_default: false,
+        }));
+        let before_input = event(detached.resume(&keydown, false));
+        detached.document.mutate().remove_node(input);
+        complete(detached.resume(&before_input, false));
+        assert_eq!(detached.raw_text(input), "ab");
+
+        let mut replaced = TestContext::new("<input id='editor' value='ab'>");
+        let input = replaced.element("editor");
+        assert!(replaced.document.set_focus_to(input));
+        replaced
+            .document
+            .with_text_input(input, |mut driver| driver.move_to_text_end());
+        let keydown = event(replaced.begin(DispatchRequest::Key {
+            event: key(Key::Character("x".into()), Code::KeyX, KeyState::Pressed),
+            metadata: host_key_metadata("x"),
+            suppress_default: false,
+        }));
+        let before_input = event(replaced.resume(&keydown, false));
+        assert_eq!(
+            replaced.handles.invalidate_node(input),
+            Some(before_input.target)
+        );
+        let replacement = replaced.handles.expose(input).unwrap();
+        assert_ne!(replacement, before_input.target);
+        complete(replaced.resume(&before_input, false));
+        assert_eq!(replaced.raw_text(input), "ab");
+
+        let mut nested = TestContext::new("<input id='editor' value='ab'>");
+        let input = nested.element("editor");
+        assert!(nested.document.set_focus_to(input));
+        nested
+            .document
+            .with_text_input(input, |mut driver| driver.move_to_text_end());
+        let keydown = event(nested.begin(DispatchRequest::Key {
+            event: key(Key::Character("x".into()), Code::KeyX, KeyState::Pressed),
+            metadata: host_key_metadata("x"),
+            suppress_default: false,
+        }));
+        let before_input = event(nested.resume(&keydown, false));
+        let nested_before_input = event(nested.begin(DispatchRequest::ImeCommit("y".to_owned())));
+        assert_eq!(nested_before_input.event_type, "beforeinput");
+        let nested_input = event(nested.resume(&nested_before_input, false));
+        assert_eq!(nested_input.event_type, "input");
+        complete(nested.resume(&nested_input, false));
+        assert_eq!(nested.raw_text(input), "aby");
+        let input_event = event(nested.resume(&before_input, false));
+        assert_eq!(input_event.event_type, "input");
+        assert_eq!(nested.raw_text(input), "abyx");
+        complete(nested.resume(&input_event, false));
+
+        let mut aborted = TestContext::new("<input id='editor' value='ab'>");
+        let input = aborted.element("editor");
+        assert!(aborted.document.set_focus_to(input));
+        aborted
+            .document
+            .with_text_input(input, |mut driver| driver.move_to_text_end());
+        let keydown = event(aborted.begin(DispatchRequest::Key {
+            event: key(Key::Character("x".into()), Code::KeyX, KeyState::Pressed),
+            metadata: host_key_metadata("x"),
+            suppress_default: false,
+        }));
+        let before_input = event(aborted.resume(&keydown, false));
+        assert!(!aborted.abort(before_input.frame_id));
+        assert_eq!(aborted.raw_text(input), "ab");
+        assert!(
+            aborted
+                .stack
+                .resume(
+                    &mut aborted.document,
+                    &mut aborted.text_controls,
+                    &mut aborted.checked_controls,
+                    &mut aborted.handles,
+                    aborted.redraw.as_ref(),
+                    before_input.frame_id,
+                    before_input.event_id,
+                    false,
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn keydown_listener_mutations_cannot_reinterpret_edit_and_activation_defaults() {
+        let type_name = QualName {
+            prefix: None,
+            ns: ns!(),
+            local: local_name!("type"),
+        };
+
+        let mut editor_to_button = TestContext::new("<input id='target' value='ab'>");
+        let target = editor_to_button.element("target");
+        assert!(editor_to_button.document.set_focus_to(target));
+        let keydown = event(editor_to_button.begin(DispatchRequest::Key {
+            event: key(Key::Character("x".into()), Code::KeyX, KeyState::Pressed),
+            metadata: host_key_metadata("x"),
+            suppress_default: false,
+        }));
+        editor_to_button
+            .document
+            .mutate()
+            .set_attribute(target, type_name.clone(), "button");
+        complete(editor_to_button.resume(&keydown, false));
+        assert_eq!(editor_to_button.raw_text(target), "ab");
+
+        let mut checkbox_to_editor = TestContext::new("<input id='target' type='checkbox'>");
+        let target = checkbox_to_editor.element("target");
+        assert!(checkbox_to_editor.document.set_focus_to(target));
+        let keydown = event(checkbox_to_editor.begin(space_request(
+            KeyState::Pressed,
+            false,
+            false,
+            false,
+            0,
+            1.0,
+        )));
+        checkbox_to_editor
+            .document
+            .mutate()
+            .set_attribute(target, type_name, "text");
+        complete(checkbox_to_editor.resume(&keydown, false));
+        assert!(checkbox_to_editor.stack.space_activation_press.is_none());
+
+        for attribute in ["readonly", "disabled"] {
+            let mut context = TestContext::new("<input id='editor' value='ab'>");
+            let input = context.element("editor");
+            assert!(context.document.set_focus_to(input));
+            context.document.mutate().set_attribute(
+                input,
+                QualName {
+                    prefix: None,
+                    ns: ns!(),
+                    local: LocalName::from(attribute),
+                },
+                "",
+            );
+            let keydown = event(context.begin(DispatchRequest::Key {
+                event: key(Key::Character("x".into()), Code::KeyX, KeyState::Pressed),
+                metadata: host_key_metadata("x"),
+                suppress_default: false,
+            }));
+            complete(context.resume(&keydown, false));
+            assert_eq!(context.raw_text(input), "ab", "{attribute}");
+        }
     }
 
     #[test]
@@ -12205,7 +12630,19 @@ mod tests {
         let input = context.element("editor");
         assert!(context.document.set_focus_to(input));
 
-        let commit = event(context.begin(DispatchRequest::ImeCommit("é\n".to_owned())));
+        let before_commit = event(context.begin(DispatchRequest::ImeCommit("é\n".to_owned())));
+        assert_eq!(before_commit.event_type, "beforeinput");
+        assert!(before_commit.bubbles && before_commit.cancelable && before_commit.composed);
+        assert_eq!(
+            before_commit.payload.as_deref(),
+            Some(&DispatchEventPayload::Input(InputPayload {
+                data: Some("é\n".to_owned()),
+                input_type: "insertText",
+                is_composing: false,
+            }))
+        );
+        assert_eq!(context.raw_text(input), "");
+        let commit = event(context.resume(&before_commit, false));
         assert_eq!(commit.event_type, "input");
         assert_eq!(
             commit.payload.as_deref(),
@@ -12219,9 +12656,20 @@ mod tests {
         assert_eq!(context.live_value(input), "é");
         complete(context.resume(&commit, false));
 
-        let apple = event(context.begin(DispatchRequest::AppleStandardKeybinding(
+        let before_apple = event(context.begin(DispatchRequest::AppleStandardKeybinding(
             "deleteBackward:".to_owned(),
         )));
+        assert_eq!(before_apple.event_type, "beforeinput");
+        assert_eq!(
+            before_apple.payload.as_deref(),
+            Some(&DispatchEventPayload::Input(InputPayload {
+                data: None,
+                input_type: "deleteContentBackward",
+                is_composing: false,
+            }))
+        );
+        assert_eq!(context.raw_text(input), "é");
+        let apple = event(context.resume(&before_apple, false));
         assert_eq!(apple.event_type, "input");
         assert_eq!(
             apple.payload.as_deref(),
@@ -12234,6 +12682,57 @@ mod tests {
         assert_eq!(context.raw_text(input), "");
         assert_eq!(context.live_value(input), "");
         complete(context.resume(&apple, false));
+    }
+
+    #[test]
+    fn ime_commit_clears_preedit_before_cancelable_beforeinput() {
+        let mut context = TestContext::new("<input id='editor' value='base'>");
+        let input = context.element("editor");
+        assert!(context.document.set_focus_to(input));
+        context
+            .document
+            .with_text_input(input, |mut driver| driver.move_to_text_end());
+        complete(context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "候補".to_owned(),
+            None,
+        ))));
+        assert_eq!(context.raw_text(input), "base候補");
+
+        let before_input = event(context.begin(DispatchRequest::ImeCommit("確定".to_owned())));
+        assert_eq!(before_input.event_type, "beforeinput");
+        assert_eq!(context.raw_text(input), "base");
+        complete(context.resume(&before_input, true));
+        assert_eq!(context.raw_text(input), "base");
+    }
+
+    #[test]
+    fn nonediting_native_commands_do_not_dispatch_beforeinput() {
+        let mut context = TestContext::new("<input id='editor' value='ab'>");
+        let input = context.element("editor");
+        assert!(context.document.set_focus_to(input));
+
+        let mut copy = key(Key::Character("c".into()), Code::KeyC, KeyState::Pressed);
+        copy.modifiers = Modifiers::CONTROL;
+        let keydown = event(context.begin(DispatchRequest::Key {
+            event: copy,
+            metadata: host_key_metadata("c"),
+            suppress_default: false,
+        }));
+        complete(context.resume(&keydown, false));
+
+        complete(context.begin(DispatchRequest::AppleStandardKeybinding(
+            "moveLeft:".to_owned(),
+        )));
+        complete(context.begin(DispatchRequest::AppleStandardKeybinding(
+            "futureUnsupportedCommand:".to_owned(),
+        )));
+
+        let enter = event(context.begin(DispatchRequest::Key {
+            event: key(Key::Enter, Code::Enter, KeyState::Pressed),
+            metadata: host_key_metadata("Enter"),
+            suppress_default: false,
+        }));
+        complete(context.resume(&enter, false));
     }
 
     #[test]
@@ -12271,7 +12770,23 @@ mod tests {
             suppress_default: false,
         }));
         assert_eq!(keydown.event_type, "keydown");
-        let input_event = event(context.resume(&keydown, false));
+        let before_input = event(context.resume(&keydown, false));
+        assert_eq!(before_input.event_type, "beforeinput");
+        assert!(before_input.bubbles);
+        assert!(before_input.cancelable);
+        assert!(before_input.composed);
+        assert_eq!(before_input.target, keydown.target);
+        assert_eq!(before_input.path, keydown.path);
+        assert_eq!(
+            before_input.payload.as_deref(),
+            Some(&DispatchEventPayload::Input(InputPayload {
+                data: Some("x".to_owned()),
+                input_type: "insertText",
+                is_composing: false,
+            }))
+        );
+        assert_eq!(context.live_value(input), "before");
+        let input_event = event(context.resume(&before_input, false));
 
         assert_eq!(input_event.event_type, "input");
         assert_eq!(
@@ -12301,12 +12816,25 @@ mod tests {
             suppress_default: false,
         }));
         assert_eq!(keydown.event_type, "keydown");
-        complete(context.resume(&keydown, false));
+        let before_input = event(context.resume(&keydown, false));
+        assert_eq!(before_input.event_type, "beforeinput");
+        assert!(before_input.bubbles && before_input.cancelable && before_input.composed);
+        assert_eq!(
+            before_input.payload.as_deref(),
+            Some(&DispatchEventPayload::Input(InputPayload {
+                data: None,
+                input_type: "deleteContentBackward",
+                is_composing: false,
+            }))
+        );
+        complete(context.resume(&before_input, false));
         assert_eq!(context.raw_text(input), "abc");
 
-        complete(context.begin(DispatchRequest::AppleStandardKeybinding(
+        let before_input = event(context.begin(DispatchRequest::AppleStandardKeybinding(
             "deleteBackward:".to_owned(),
         )));
+        assert_eq!(before_input.event_type, "beforeinput");
+        complete(context.resume(&before_input, false));
         assert_eq!(context.raw_text(input), "abc");
 
         for (character, code) in [("c", Code::KeyC), ("v", Code::KeyV)] {
@@ -12317,7 +12845,14 @@ mod tests {
                 metadata: host_key_metadata(character),
                 suppress_default: false,
             }));
-            complete(context.resume(&keydown, false));
+            let resumed = context.resume(&keydown, false);
+            if character == "v" {
+                let before_input = event(resumed);
+                assert_eq!(before_input.event_type, "beforeinput");
+                complete(context.resume(&before_input, false));
+            } else {
+                complete(resumed);
+            }
             assert_eq!(context.raw_text(input), "abc");
         }
     }
@@ -12336,8 +12871,14 @@ mod tests {
             metadata: host_key_metadata("a"),
             suppress_default: false,
         }));
-        let input_event = event(context.resume(&keydown, false));
+        let before_input = event(context.resume(&keydown, false));
+        let input_event = event(context.resume(&before_input, false));
         assert_eq!(input_event.event_type, "input");
+        assert_eq!(input_event.target, before_input.target);
+        assert_eq!(
+            input_event.time_stamp.to_bits(),
+            before_input.time_stamp.to_bits()
+        );
         assert_eq!(context.raw_text(input), "a");
         assert_eq!(
             input_event.payload.as_deref(),
@@ -12364,7 +12905,8 @@ mod tests {
             metadata: host_key_metadata("Enter"),
             suppress_default: false,
         }));
-        let line_break = event(context.resume(&enter, false));
+        let before_line_break = event(context.resume(&enter, false));
+        let line_break = event(context.resume(&before_line_break, false));
         assert_eq!(
             line_break.payload.as_deref(),
             Some(&DispatchEventPayload::Input(InputPayload {
@@ -12382,7 +12924,18 @@ mod tests {
             metadata: host_key_metadata("候"),
             suppress_default: false,
         }));
-        let input_event = event(context.resume(&keydown, false));
+        let before_input = event(context.resume(&keydown, false));
+        assert_eq!(before_input.event_type, "beforeinput");
+        assert!(!before_input.cancelable);
+        assert_eq!(
+            before_input.payload.as_deref(),
+            Some(&DispatchEventPayload::Input(InputPayload {
+                data: Some("候".to_owned()),
+                input_type: "insertCompositionText",
+                is_composing: true,
+            }))
+        );
+        let input_event = event(context.resume(&before_input, true));
         assert_eq!(
             input_event.payload.as_deref(),
             Some(&DispatchEventPayload::Input(InputPayload {
@@ -14578,11 +15131,19 @@ mod tests {
         context
             .document
             .with_text_input(input, |mut driver| driver.move_to_byte(1));
-        let input_event = event(context.begin(DispatchRequest::ImeDeleteSurrounding {
+        let before_input = event(context.begin(DispatchRequest::ImeDeleteSurrounding {
             before_bytes: 1,
             after_bytes: 0,
         }));
+        assert_eq!(before_input.event_type, "beforeinput");
+        assert_eq!(context.raw_text(input), "abc");
+        let input_event = event(context.resume(&before_input, false));
         assert_eq!(input_event.event_type, "input");
+        assert_eq!(input_event.target, before_input.target);
+        assert_eq!(
+            input_event.time_stamp.to_bits(),
+            before_input.time_stamp.to_bits()
+        );
         assert_eq!(
             input_event.payload.as_deref(),
             Some(&DispatchEventPayload::Input(InputPayload {
@@ -14594,6 +15155,27 @@ mod tests {
         assert_eq!(context.raw_text(input), "bc");
         let (_, redraw_requested) = complete(context.resume(&input_event, false));
         assert!(redraw_requested);
+
+        let mut retargeted =
+            TestContext::new("<input id='first' value='abc'><input id='second' value='xyz'>");
+        let first = retargeted.element("first");
+        let second = retargeted.element("second");
+        assert!(retargeted.document.set_focus_to(first));
+        retargeted
+            .document
+            .with_text_input(first, |mut driver| driver.move_to_byte(1));
+        retargeted
+            .document
+            .with_text_input(second, |mut driver| driver.move_to_byte(1));
+        let before_input = event(retargeted.begin(DispatchRequest::ImeDeleteSurrounding {
+            before_bytes: 1,
+            after_bytes: 0,
+        }));
+        retargeted.document.clear_focus();
+        assert!(retargeted.document.set_focus_to(second));
+        complete(retargeted.resume(&before_input, false));
+        assert_eq!(retargeted.raw_text(first), "abc");
+        assert_eq!(retargeted.raw_text(second), "xyz");
     }
 
     #[test]

@@ -989,6 +989,58 @@ Deno.test("trusted beforeinput and composition steps preserve browser payloads a
   );
 });
 
+Deno.test("trusted text edits deliver beforeinput before input with matching details", () => {
+  const { document, renderer } = createHarness();
+  const target = document.createElement("input");
+  const observed: Array<[string, string | null, string, boolean, boolean]> = [];
+
+  for (const type of ["beforeinput", "input"] as const) {
+    target.addEventListener(type, (event) => {
+      assert(event instanceof QuoxDOMInputEvent);
+      observed.push([
+        event.type,
+        event.data,
+        event.inputType,
+        event.cancelable,
+        event.composed,
+      ]);
+    });
+  }
+
+  const payload = { data: "x", inputType: "insertText", isComposing: false };
+  renderer.queueFrame([
+    {
+      type: "beforeinput",
+      target: target.nodeId,
+      path: [target.nodeId],
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      payload,
+    },
+    {
+      type: "input",
+      target: target.nodeId,
+      path: [target.nodeId],
+      bubbles: true,
+      cancelable: false,
+      composed: true,
+      payload,
+    },
+  ]);
+
+  document.dispatchPointerMove(1, 2, 0, 0);
+
+  assertEquals(observed, [
+    ["beforeinput", "x", "insertText", true, true],
+    ["input", "x", "insertText", false, true],
+  ]);
+  assertEquals(
+    renderer.calls.filter(([method]) => method === "resume").map((call) => call[3]),
+    [false, false],
+  );
+});
+
 Deno.test("native boundary frames preserve DOM order, target, and null related targets", () => {
   const { document, renderer } = createHarness();
   const target = document.createElement("div");
