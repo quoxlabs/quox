@@ -27,6 +27,10 @@ type LiveTextControlRenderer = {
   set_form_control_value(nodeHandle: number, value: string): number;
 };
 
+type LiveFileSelectionRenderer = {
+  form_control_file_names(nodeHandle: number): unknown;
+};
+
 type LiveCheckedControlRenderer = {
   form_control_checked(nodeHandle: number): boolean;
   set_form_control_checked(nodeHandle: number, checked: boolean): boolean;
@@ -188,6 +192,161 @@ function setLiveControlValue(element: QuoxElement, value: string): void {
   }
 }
 
+/** A deliberately narrow selected-file facade. File bytes and host metadata are unavailable. */
+export class QuoxSelectedFile {
+  readonly #name: string;
+
+  constructor(name: string) {
+    this.#name = name;
+    Object.freeze(this);
+  }
+
+  get name(): string {
+    return this.#name;
+  }
+
+  get [Symbol.toStringTag](): string {
+    return "QuoxSelectedFile";
+  }
+}
+
+/** Live, read-only view of a file input's selected basenames. */
+export interface QuoxFileList extends Iterable<QuoxSelectedFile> {
+  readonly length: number;
+  readonly [index: number]: QuoxSelectedFile;
+  item(index: number): QuoxSelectedFile | null;
+}
+
+type FileSelectionSnapshot = {
+  readonly available: boolean;
+  readonly entries: readonly QuoxSelectedFile[];
+};
+
+type FileListState = {
+  readonly read: () => readonly string[] | null;
+  names: readonly string[];
+  entries: readonly QuoxSelectedFile[];
+};
+
+const EMPTY_FILE_NAMES: readonly string[] = Object.freeze([]);
+const EMPTY_FILE_ENTRIES: readonly QuoxSelectedFile[] = Object.freeze([]);
+const FILE_LIST_STATES = new WeakMap<LiveQuoxFileList, FileListState>();
+
+function fileListIndex(property: PropertyKey): number | undefined {
+  if (typeof property !== "string" || !/^(?:0|[1-9]\d*)$/.test(property)) return undefined;
+  const index = Number(property);
+  return Number.isSafeInteger(index) && index < UINT32_MODULUS - 1 ? index : undefined;
+}
+
+function selectedFileNames(element: QuoxInputElement): readonly string[] | null {
+  const { renderer } = documentInternals(element.ownerDocument);
+  const payload = (renderer as unknown as LiveFileSelectionRenderer).form_control_file_names(
+    element.nodeId,
+  );
+  if (payload === undefined) return null;
+  if (!Array.isArray(payload)) {
+    throw new TypeError("quox: invalid file-selection payload");
+  }
+  const names = payload.map((name, index) => {
+    if (typeof name !== "string" || name.includes("/") || name.includes("\\")) {
+      throw new TypeError(`quox: invalid selected-file basename at index ${index}`);
+    }
+    return name;
+  });
+  return Object.freeze(names);
+}
+
+function fileListState(list: LiveQuoxFileList): FileListState {
+  const state = FILE_LIST_STATES.get(list);
+  if (state === undefined) throw new TypeError("quox: invalid FileList receiver");
+  return state;
+}
+
+function syncFileList(list: LiveQuoxFileList): FileSelectionSnapshot {
+  const state = fileListState(list);
+  const selection = state.read();
+  const names = selection ?? EMPTY_FILE_NAMES;
+  if (
+    names.length !== state.names.length ||
+    names.some((name, index) => name !== state.names[index])
+  ) {
+    state.names = names;
+    state.entries = Object.freeze(names.map((name) => new QuoxSelectedFile(name)));
+  }
+  return { available: selection !== null, entries: state.entries };
+}
+
+function fileListAvailable(list: LiveQuoxFileList): boolean {
+  return syncFileList(list).available;
+}
+
+class LiveQuoxFileList implements QuoxFileList {
+  readonly [index: number]: QuoxSelectedFile;
+
+  constructor(read: () => readonly string[] | null) {
+    const proxy = new Proxy(this, {
+      get(target, property, receiver) {
+        const index = fileListIndex(property);
+        return index === undefined ? Reflect.get(target, property, receiver) : syncFileList(target).entries[index];
+      },
+      has(target, property) {
+        const index = fileListIndex(property);
+        return index === undefined ? Reflect.has(target, property) : index < syncFileList(target).entries.length;
+      },
+      ownKeys(target) {
+        const indexed = syncFileList(target).entries.map((_entry, index) => String(index));
+        return [...indexed, ...Reflect.ownKeys(target)];
+      },
+      getOwnPropertyDescriptor(target, property) {
+        const index = fileListIndex(property);
+        if (index === undefined) return Reflect.getOwnPropertyDescriptor(target, property);
+        const entry = syncFileList(target).entries[index];
+        return entry === undefined
+          ? undefined
+          : { configurable: true, enumerable: true, value: entry, writable: false };
+      },
+      set(target, property, value, receiver) {
+        return fileListIndex(property) === undefined && property !== "length"
+          ? Reflect.set(target, property, value, receiver)
+          : false;
+      },
+      defineProperty(target, property, attributes) {
+        return fileListIndex(property) === undefined && property !== "length"
+          ? Reflect.defineProperty(target, property, attributes)
+          : false;
+      },
+      deleteProperty(target, property) {
+        return fileListIndex(property) === undefined ? Reflect.deleteProperty(target, property) : false;
+      },
+      // Dynamic indexed own keys are incompatible with a non-extensible proxy target. Rejecting
+      // the transition keeps later native selections observable instead of poisoning reflection.
+      preventExtensions() {
+        return false;
+      },
+    });
+    const state = { read, names: EMPTY_FILE_NAMES, entries: EMPTY_FILE_ENTRIES };
+    FILE_LIST_STATES.set(this, state);
+    FILE_LIST_STATES.set(proxy, state);
+    return proxy;
+  }
+
+  get length(): number {
+    return syncFileList(this).entries.length;
+  }
+
+  item(index: number): QuoxSelectedFile | null {
+    return syncFileList(this).entries[unsignedLong(index)] ?? null;
+  }
+
+  [Symbol.iterator](): Iterator<QuoxSelectedFile> {
+    return syncFileList(this).entries[Symbol.iterator]();
+  }
+
+  get [Symbol.toStringTag](): string {
+    return "FileList";
+  }
+}
+
 /** Web IDL `unrestricted double` conversion plus CSSOM View's non-finite normalization. */
 function scrollOffsetNumber(value: unknown): number {
   // Unary plus performs ToNumber exactly once and throws for Symbol and BigInt.
@@ -317,6 +476,8 @@ export class QuoxElement extends QuoxNode {
 }
 
 export class QuoxInputElement extends QuoxElement {
+  readonly #files = new LiveQuoxFileList(() => selectedFileNames(this));
+
   get value(): string {
     const { renderer } = documentInternals(this.ownerDocument);
     return (renderer as unknown as LiveTextControlRenderer).form_control_value(this.nodeId);
@@ -324,6 +485,10 @@ export class QuoxInputElement extends QuoxElement {
 
   set value(value: string) {
     setLiveControlValue(this, controlValueString(value));
+  }
+
+  get files(): QuoxFileList | null {
+    return fileListAvailable(this.#files) ? this.#files : null;
   }
 
   get defaultValue(): string {

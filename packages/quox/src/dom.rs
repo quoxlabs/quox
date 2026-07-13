@@ -1,7 +1,8 @@
 use super::{QuoxRenderer, QuoxRendererState};
 use crate::ffi_numbers::{NumericArgumentError, integer_range, uint32};
 use crate::form_controls::{
-    TextControlSelectionDirection, input_uses_filename_mode, restore_text_editor,
+    TextControlSelectionDirection, file_input_selection_names, input_uses_filename_mode,
+    restore_text_editor,
 };
 use blitz_dom::{BaseDocument, DocumentMutator, LocalName, NodeData, Point, QualName, ns};
 use style::computed_values::visibility::T as Visibility;
@@ -1201,6 +1202,26 @@ impl QuoxRenderer {
         };
         state.reconcile_native_ime_after_editor_mutation(ime_before);
         Ok(u8::from(changed))
+    }
+
+    /// Return a file input's selected basenames in native picker order, or `undefined` when the
+    /// input's current type is not file. Host paths never cross this boundary.
+    pub fn form_control_file_names(
+        &self,
+        node_handle: f64,
+    ) -> Result<Option<js_sys::Array>, JsValue> {
+        let node_handle =
+            uint32(node_handle, "nodeHandle").map_err(NumericArgumentError::into_js)?;
+        let mut state = self.state.borrow_mut();
+        let node_id = state.resolve_element(node_handle)?;
+        let Some(names) = file_input_selection_names(&state.document, node_id) else {
+            return Ok(None);
+        };
+        let result = js_sys::Array::new();
+        for name in names {
+            result.push(&JsValue::from_str(&name));
+        }
+        Ok(Some(result))
     }
 
     /// Return the current checkedness of an HTML input, including states whose current type does

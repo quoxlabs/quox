@@ -61,6 +61,11 @@ function isValueMode(mode: InputValueMode): boolean {
     mode === "color-value";
 }
 
+function basenameFromAnyHostPath(path: string): string {
+  const basename = path.split(/[\\/]/).at(-1) ?? "";
+  return /^[A-Za-z]:/.test(basename) ? basename.slice(2) : basename;
+}
+
 function decimalModulo(value: string, divisor: number): number {
   let remainder = 0;
   for (const digit of value) remainder = (remainder * 10 + Number(digit)) % divisor;
@@ -527,8 +532,14 @@ class FakeLiveControlRenderer {
       case "default-on":
         return control.attributes.get("value") ?? "on";
       case "filename":
-        return control.files[0] === undefined ? "" : `C:\\fakepath\\${control.files[0]}`;
+        return control.files[0] === undefined ? "" : `C:\\fakepath\\${basenameFromAnyHostPath(control.files[0])}`;
     }
+  }
+
+  form_control_file_names(nodeHandle: number): string[] | undefined {
+    const control = this.#control(nodeHandle);
+    if (control.tagName !== "input" || inputValueMode(control) !== "filename") return undefined;
+    return control.files.map(basenameFromAnyHostPath);
   }
 
   set_form_control_value(nodeHandle: number, value: string): number {
@@ -1454,6 +1465,82 @@ Deno.test("filename values expose fake paths and only accept empty assignments",
   );
   assertEquals(inputs, 0);
   assertEquals(changes, 0);
+});
+
+Deno.test("file selections expose a stable live basename-only FileList", () => {
+  const { document, renderer } = createDocument();
+  const input = document.createElement("input");
+  assertEquals(input.files, null);
+
+  input.setAttribute("type", "file");
+  const files = input.files;
+  if (files === null) throw new TypeError("expected a file list");
+  assertStrictEquals(input.files, files);
+  assertEquals(files.length, 0);
+  assertEquals(files.item(0), null);
+  for (const lock of [Object.preventExtensions, Object.seal, Object.freeze]) {
+    assertThrows(() => lock(files), TypeError);
+    assertEquals(Object.isExtensible(files), true);
+  }
+
+  renderer.selectFilesForTest(
+    input.nodeId,
+    "/Users/alice/private/first.txt",
+    String.raw`C:\Users\bob\secret\second.png`,
+    String.raw`/tmp/mixed\third.pdf`,
+    "D:drive-relative.json",
+  );
+  assertStrictEquals(input.files, files);
+  assertEquals(files.length, 4);
+  assertEquals(Array.from(files, (file) => file.name), [
+    "first.txt",
+    "second.png",
+    "third.pdf",
+    "drive-relative.json",
+  ]);
+  assertEquals(Object.keys(files), ["0", "1", "2", "3"]);
+  assertEquals(Object.getOwnPropertySymbols(files), [], "the live reader and cache stay private");
+  assertStrictEquals(files[0], files.item(0));
+  assertEquals(files.item(99), null);
+
+  const first = files[0];
+  assertEquals(first.name, "first.txt");
+  assertEquals(Object.isFrozen(first), true);
+  assertEquals(Object.keys(first), []);
+  assertEquals("path" in first, false);
+  assertEquals("size" in first, false);
+  assertEquals("type" in first, false);
+  assertEquals("lastModified" in first, false);
+  assertEquals("arrayBuffer" in first, false);
+  assertEquals(JSON.stringify(first).includes("Users/alice"), false);
+  assertThrows(() => {
+    (first as unknown as { name: string }).name = "replacement.txt";
+  }, TypeError);
+  assertThrows(() => {
+    (files as unknown as Record<number, unknown>)[0] = first;
+  }, TypeError);
+  for (const lock of [Object.preventExtensions, Object.seal, Object.freeze]) {
+    assertThrows(() => lock(files), TypeError);
+  }
+  assertEquals(Object.isExtensible(files), true);
+  assertEquals(Object.keys(files), ["0", "1", "2", "3"]);
+  assertEquals(files[3].name, "drive-relative.json");
+
+  input.value = "";
+  assertStrictEquals(input.files, files);
+  assertEquals(files.length, 0);
+  assertEquals(files[0], undefined);
+
+  renderer.selectFilesForTest(input.nodeId, "C:reselected.txt");
+  assertEquals(files.length, 1);
+  assertEquals(files[0].name, "reselected.txt", "the failed locks do not block live updates");
+  assertEquals(input.value, "C:\\fakepath\\reselected.txt");
+  input.setAttribute("type", "text");
+  assertEquals(input.files, null);
+  assertEquals(files.length, 0, "the retained live facade observes the type-transition clear");
+  input.setAttribute("type", "file");
+  assertStrictEquals(input.files, files);
+  assertEquals(files.length, 0);
 });
 
 Deno.test("filename setter conversion precedes its current-type restriction", () => {

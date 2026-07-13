@@ -1936,6 +1936,31 @@ pub(crate) fn input_uses_filename_mode(document: &BaseDocument, node_id: usize) 
     unmanaged_input_mode(document, node_id) == Some(UnmanagedInputMode::Filename)
 }
 
+/// Return only browser-visible basenames for a file input's live selection. The native picker
+/// stores host paths for opening files, but no caller across the WASM boundary may observe them.
+/// Both separator styles are treated as path boundaries regardless of the build host.
+pub(crate) fn file_input_selection_names(
+    document: &BaseDocument,
+    node_id: usize,
+) -> Option<Vec<String>> {
+    if !input_uses_filename_mode(document, node_id) {
+        return None;
+    }
+    Some(
+        html_input_element(document, node_id)
+            .and_then(blitz_dom::ElementData::file_data)
+            .map_or_else(Vec::new, |files| {
+                files
+                    .iter()
+                    .map(|path| {
+                        let path = path.to_string_lossy();
+                        file_name_from_any_host_path(&path).to_owned()
+                    })
+                    .collect()
+            }),
+    )
+}
+
 impl TextControlStates {
     /// Clear a file selection when script empties `.value`. Type transitions use the same data
     /// reset while reconciliation separately maintains the private renderer structure.
@@ -2175,7 +2200,13 @@ fn set_file_input_label(
 }
 
 fn file_name_from_any_host_path(path: &str) -> &str {
-    path.rsplit(['/', '\\']).next().unwrap_or_default()
+    let basename = path.rsplit(['/', '\\']).next().unwrap_or_default();
+    let bytes = basename.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        &basename[2..]
+    } else {
+        basename
+    }
 }
 
 fn file_input_value(document: &BaseDocument, node_id: usize) -> String {
@@ -2856,7 +2887,8 @@ fn byte_offset_for_utf16(value: &str, utf16_offset: usize) -> usize {
 mod tests {
     use super::{
         CheckedControlStates, CheckedInputKind, SpecialElementData, TextControlSelection,
-        TextControlSelectionDirection, TextControlStates, restore_text_editor,
+        TextControlSelectionDirection, TextControlStates, file_input_selection_names,
+        restore_text_editor,
     };
     use crate::node_handles::NodeHandles;
     use blitz_dom::{BaseDocument, DocumentConfig, LocalName, QualName, local_name, ns};
@@ -4881,6 +4913,12 @@ mod tests {
             .set_node_text(label_text, "2 Files Selected");
 
         assert_eq!(
+            file_input_selection_names(&document, input),
+            Some(vec!["top-secret.txt".to_owned(), "second.png".to_owned()]),
+            "the public selection preserves order but never exposes either host path style",
+        );
+
+        assert_eq!(
             controls.value(&mut document, input).as_deref(),
             Some(r"C:\fakepath\top-secret.txt"),
         );
@@ -4903,6 +4941,57 @@ mod tests {
             "No File Selected"
         );
         assert_eq!(controls.set_value(&mut document, input, ""), Some(false));
+    }
+
+    #[test]
+    fn file_selection_names_follow_type_transitions_and_strip_every_host_path_form() {
+        let mut document = document("<input id='field' type='text'>");
+        let input = element(&document, "field");
+        let mut controls = TextControlStates::default();
+        controls.reconcile_document(&mut document);
+        assert_eq!(file_input_selection_names(&document, input), None);
+
+        set_input_type(&mut document, input, "file");
+        controls.reconcile_document(&mut document);
+        assert_eq!(
+            file_input_selection_names(&document, input),
+            Some(Vec::new())
+        );
+
+        document
+            .get_node_mut(input)
+            .and_then(blitz_dom::Node::element_data_mut)
+            .unwrap()
+            .special_data = SpecialElementData::FileInput(
+            vec![
+                std::path::PathBuf::from("C:drive-relative.txt"),
+                std::path::PathBuf::from("/home/alice/posix.png"),
+                std::path::PathBuf::from(r"D:\Users\bob\windows.pdf"),
+            ]
+            .into(),
+        );
+        assert_eq!(
+            file_input_selection_names(&document, input),
+            Some(vec![
+                "drive-relative.txt".to_owned(),
+                "posix.png".to_owned(),
+                "windows.pdf".to_owned(),
+            ]),
+        );
+        assert_eq!(
+            controls.value(&mut document, input).as_deref(),
+            Some(r"C:\fakepath\drive-relative.txt"),
+        );
+
+        set_input_type(&mut document, input, "text");
+        controls.reconcile_document(&mut document);
+        assert_eq!(file_input_selection_names(&document, input), None);
+        set_input_type(&mut document, input, "file");
+        controls.reconcile_document(&mut document);
+        assert_eq!(
+            file_input_selection_names(&document, input),
+            Some(Vec::new())
+        );
     }
 
     #[test]
