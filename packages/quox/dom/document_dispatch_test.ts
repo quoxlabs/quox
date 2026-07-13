@@ -52,6 +52,11 @@ function mousePayload(overrides: Record<string, unknown> = {}): Record<string, u
     ctrlKey: false,
     altKey: true,
     metaKey: false,
+    capsLock: true,
+    altGraphKey: true,
+    fnKey: true,
+    numLock: true,
+    scrollLock: true,
     relatedTarget: null,
     ...overrides,
   };
@@ -102,6 +107,9 @@ function keyboardPayload(overrides: Record<string, unknown> = {}): Record<string
     metaKey: true,
     capsLock: true,
     altGraphKey: false,
+    fnKey: true,
+    numLock: false,
+    scrollLock: true,
     ...overrides,
   };
 }
@@ -655,6 +663,9 @@ Deno.test("trusted staged payloads create browser-style event subclasses with ex
         keyCode: 0x1234,
         capsLock: true,
         altGraphKey: true,
+        fnKey: true,
+        numLock: true,
+        scrollLock: true,
       }),
     },
     {
@@ -729,6 +740,11 @@ Deno.test("trusted staged payloads create browser-style event subclasses with ex
   );
   assert(click.shiftKey);
   assert(click.altKey);
+  assert(click.getModifierState("CapsLock"));
+  assert(click.getModifierState("AltGraph"));
+  assert(click.getModifierState("Fn"));
+  assert(click.getModifierState("NumLock"));
+  assert(click.getModifierState("ScrollLock"));
   assertStrictEquals(click.relatedTarget, related);
   const auxClick = events.get("auxclick");
   assert(auxClick instanceof QuoxPointerEvent);
@@ -743,6 +759,8 @@ Deno.test("trusted staged payloads create browser-style event subclasses with ex
     [wheel.deltaX, wheel.deltaY, wheel.deltaZ, wheel.deltaMode],
     [1.125, -9.75, 0.5, QuoxWheelEvent.DOM_DELTA_PAGE],
   );
+  assert(wheel.getModifierState("Fn"));
+  assert(wheel.getModifierState("ScrollLock"));
 
   const key = events.get("keydown");
   assert(key instanceof QuoxDOMKeyboardEvent);
@@ -752,6 +770,9 @@ Deno.test("trusted staged payloads create browser-style event subclasses with ex
   );
   assert(key.getModifierState("CapsLock"));
   assert(key.getModifierState("AltGraph"));
+  assert(key.getModifierState("Fn"));
+  assert(key.getModifierState("NumLock"));
+  assert(key.getModifierState("ScrollLock"));
 
   const input = events.get("input");
   assert(input instanceof QuoxDOMInputEvent);
@@ -956,14 +977,14 @@ Deno.test("pointer detail stays within the signed DOM UIEvent range", () => {
 Deno.test("native pointer entry points preserve screen-coordinate availability", () => {
   const { document, renderer } = createHarness();
 
-  document.dispatchPointerMove(1, 2, 0, 0, 3, 101.5, 202.25);
+  document.dispatchPointerMove(1, 2, 0, 0x1ff, 3, 101.5, 202.25);
   document.dispatchPointerDown(1, 2, 0, 1, 0, 4, 1);
   document.dispatchWheel(1, 2, 3, 4, 0, 0, -3, -4, 0, 5, 101.5, 202.25);
 
   assertEquals(
     renderer.calls.map(([method, _frame, ...args]) => [method, ...args]),
     [
-      ["begin_pointer_move", 1, 2, true, 101.5, 202.25, 0, 0, 3],
+      ["begin_pointer_move", 1, 2, true, 101.5, 202.25, 0, 0x1ff, 3],
       ["begin_pointer_down", 1, 2, false, 0, 0, 0, 1, 0, 4, 1],
       ["begin_wheel", 1, 2, true, 101.5, 202.25, 3, 4, -3, -4, 0, 0, 0, 5],
     ],

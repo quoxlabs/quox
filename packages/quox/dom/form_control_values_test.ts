@@ -1614,6 +1614,9 @@ Deno.test("a native edit is visible before its first input listener", () => {
     accelKey: false,
     capsLock: false,
     altGraphKey: false,
+    fnKey: false,
+    numLock: false,
+    scrollLock: false,
   });
 
   assertEquals(seen, ["native edit"]);

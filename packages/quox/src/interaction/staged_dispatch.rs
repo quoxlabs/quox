@@ -33,9 +33,21 @@ const KEY_MOD_ALT: u32 = super::KEY_MOD_ALT;
 const KEY_MOD_ALT_GRAPH: u32 = super::KEY_MOD_ALT_GRAPH;
 const KEY_MOD_CAPS_LOCK: u32 = super::KEY_MOD_CAPS_LOCK;
 const KEY_MOD_CONTROL: u32 = super::KEY_MOD_CONTROL;
+const KEY_MOD_FN: u32 = super::KEY_MOD_FN;
 const KEY_MOD_META: u32 = super::KEY_MOD_META;
+const KEY_MOD_NUM_LOCK: u32 = super::KEY_MOD_NUM_LOCK;
+const KEY_MOD_SCROLL_LOCK: u32 = super::KEY_MOD_SCROLL_LOCK;
 const KEY_MOD_SHIFT: u32 = super::KEY_MOD_SHIFT;
+const POINTER_MOD_ALT: u32 = super::POINTER_MOD_ALT;
+const POINTER_MOD_ALT_GRAPH: u32 = super::POINTER_MOD_ALT_GRAPH;
+const POINTER_MOD_CAPS_LOCK: u32 = super::POINTER_MOD_CAPS_LOCK;
+const POINTER_MOD_CONTROL: u32 = super::POINTER_MOD_CONTROL;
+const POINTER_MOD_FN: u32 = super::POINTER_MOD_FN;
 const POINTER_MOD_KNOWN: u32 = super::POINTER_MOD_KNOWN;
+const POINTER_MOD_META: u32 = super::POINTER_MOD_META;
+const POINTER_MOD_NUM_LOCK: u32 = super::POINTER_MOD_NUM_LOCK;
+const POINTER_MOD_SCROLL_LOCK: u32 = super::POINTER_MOD_SCROLL_LOCK;
+const POINTER_MOD_SHIFT: u32 = super::POINTER_MOD_SHIFT;
 const WHEEL_TRANSACTION_TIMEOUT_MS: f64 = 1_500.0;
 const UI_EVENT_DETAIL_MAX: u32 = 2_147_483_647;
 
@@ -213,6 +225,7 @@ struct NativePointerMetadata {
     detail: u32,
     movement_x: f64,
     movement_y: f64,
+    modifier_bits: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -221,6 +234,7 @@ struct NativeWheelMetadata {
     delta_x: f64,
     delta_y: f64,
     delta_mode: u32,
+    modifier_bits: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -264,7 +278,26 @@ impl EventMetadata {
         }
     }
 
+    #[cfg(test)]
     fn pointer(time_stamp: f64, coords: NativePointerCoordinates, detail: u32) -> Self {
+        Self::pointer_metadata(time_stamp, coords, detail, None)
+    }
+
+    fn pointer_with_modifiers(
+        time_stamp: f64,
+        coords: NativePointerCoordinates,
+        detail: u32,
+        modifier_bits: u32,
+    ) -> Self {
+        Self::pointer_metadata(time_stamp, coords, detail, Some(modifier_bits))
+    }
+
+    fn pointer_metadata(
+        time_stamp: f64,
+        coords: NativePointerCoordinates,
+        detail: u32,
+        modifier_bits: Option<u32>,
+    ) -> Self {
         Self {
             time_stamp,
             pointer: Some(NativePointerMetadata {
@@ -272,6 +305,7 @@ impl EventMetadata {
                 detail,
                 movement_x: 0.0,
                 movement_y: 0.0,
+                modifier_bits,
             }),
             pointer_move_button: None,
             pointer_release_click: None,
@@ -285,12 +319,42 @@ impl EventMetadata {
         }
     }
 
+    #[cfg(test)]
     fn wheel(
         time_stamp: f64,
         coords: NativePointerCoordinates,
         delta_x: f64,
         delta_y: f64,
         delta_mode: u32,
+    ) -> Self {
+        Self::wheel_metadata(time_stamp, coords, delta_x, delta_y, delta_mode, None)
+    }
+
+    fn wheel_with_modifiers(
+        time_stamp: f64,
+        coords: NativePointerCoordinates,
+        delta_x: f64,
+        delta_y: f64,
+        delta_mode: u32,
+        modifier_bits: u32,
+    ) -> Self {
+        Self::wheel_metadata(
+            time_stamp,
+            coords,
+            delta_x,
+            delta_y,
+            delta_mode,
+            Some(modifier_bits),
+        )
+    }
+
+    fn wheel_metadata(
+        time_stamp: f64,
+        coords: NativePointerCoordinates,
+        delta_x: f64,
+        delta_y: f64,
+        delta_mode: u32,
+        modifier_bits: Option<u32>,
     ) -> Self {
         Self {
             time_stamp,
@@ -302,6 +366,7 @@ impl EventMetadata {
                 delta_x,
                 delta_y,
                 delta_mode,
+                modifier_bits,
             }),
             key: None,
             related_target: None,
@@ -614,7 +679,7 @@ impl<'a> ResolvedInputLayout<'a> {
 
     fn pointer_request(self, input: PointerInput) -> DispatchRequest {
         let scroll = self.document.viewport_scroll();
-        let metadata = EventMetadata::pointer(
+        let metadata = EventMetadata::pointer_with_modifiers(
             input.time_stamp,
             native_pointer_coordinates(
                 input.native_x,
@@ -624,6 +689,7 @@ impl<'a> ResolvedInputLayout<'a> {
                 scroll.y,
             ),
             input.detail,
+            input.modifier_bits,
         );
         super::viewport_point_to_page(
             input.x,
@@ -654,7 +720,7 @@ impl<'a> ResolvedInputLayout<'a> {
 
     fn wheel_request(self, input: WheelInput) -> DispatchRequest {
         let scroll = self.document.viewport_scroll();
-        let metadata = EventMetadata::wheel(
+        let metadata = EventMetadata::wheel_with_modifiers(
             input.time_stamp,
             native_pointer_coordinates(
                 input.native_x,
@@ -666,6 +732,7 @@ impl<'a> ResolvedInputLayout<'a> {
             input.delta_x,
             input.delta_y,
             input.delta_mode,
+            input.modifier_bits,
         );
         super::viewport_point_to_page(
             input.x,
@@ -741,6 +808,11 @@ struct MousePayload {
     ctrl_key: bool,
     alt_key: bool,
     meta_key: bool,
+    caps_lock: bool,
+    alt_graph_key: bool,
+    fn_key: bool,
+    num_lock: bool,
+    scroll_lock: bool,
     related_target: Option<u32>,
 }
 
@@ -789,6 +861,9 @@ struct KeyboardPayload {
     meta_key: bool,
     caps_lock: bool,
     alt_graph_key: bool,
+    fn_key: bool,
+    num_lock: bool,
+    scroll_lock: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -3458,6 +3533,7 @@ fn mouse_payload(
         event.buttons.bits(),
         detail,
         event.mods,
+        metadata.pointer.and_then(|pointer| pointer.modifier_bits),
         metadata.related_target,
     )
 }
@@ -3489,10 +3565,15 @@ fn wheel_mouse_payload(event: &BlitzWheelEvent, metadata: &EventMetadata) -> Mou
         event.buttons.bits(),
         0,
         event.mods,
+        metadata.wheel.and_then(|wheel| wheel.modifier_bits),
         metadata.related_target,
     )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the payload combines independent native coordinates, buttons, modifiers, and DOM relationship metadata"
+)]
 fn mouse_payload_from_parts(
     coords: NativePointerCoordinates,
     movement: (f64, f64),
@@ -3500,9 +3581,11 @@ fn mouse_payload_from_parts(
     buttons: u8,
     detail: u32,
     mods: keyboard_types::Modifiers,
+    modifier_bits: Option<u32>,
     related_target: Option<GuardedNode>,
 ) -> MousePayload {
     let (screen_x, screen_y) = coords.screen.unwrap_or((0.0, 0.0));
+    let modifier = |bit, fallback| modifier_bits.map_or(fallback, |bits| bits & bit != 0);
     MousePayload {
         client_x: coords.client_x,
         client_y: coords.client_y,
@@ -3517,10 +3600,39 @@ fn mouse_payload_from_parts(
         button,
         buttons,
         detail,
-        shift_key: mods.contains(keyboard_types::Modifiers::SHIFT),
-        ctrl_key: mods.contains(keyboard_types::Modifiers::CONTROL),
-        alt_key: mods.contains(keyboard_types::Modifiers::ALT),
-        meta_key: mods.contains(keyboard_types::Modifiers::META),
+        shift_key: modifier(
+            POINTER_MOD_SHIFT,
+            mods.contains(keyboard_types::Modifiers::SHIFT),
+        ),
+        ctrl_key: modifier(
+            POINTER_MOD_CONTROL,
+            mods.contains(keyboard_types::Modifiers::CONTROL),
+        ),
+        alt_key: modifier(
+            POINTER_MOD_ALT,
+            mods.contains(keyboard_types::Modifiers::ALT),
+        ),
+        meta_key: modifier(
+            POINTER_MOD_META,
+            mods.contains(keyboard_types::Modifiers::META),
+        ),
+        caps_lock: modifier(
+            POINTER_MOD_CAPS_LOCK,
+            mods.contains(keyboard_types::Modifiers::CAPS_LOCK),
+        ),
+        alt_graph_key: modifier(
+            POINTER_MOD_ALT_GRAPH,
+            mods.contains(keyboard_types::Modifiers::ALT_GRAPH),
+        ),
+        fn_key: modifier(POINTER_MOD_FN, mods.contains(keyboard_types::Modifiers::FN)),
+        num_lock: modifier(
+            POINTER_MOD_NUM_LOCK,
+            mods.contains(keyboard_types::Modifiers::NUM_LOCK),
+        ),
+        scroll_lock: modifier(
+            POINTER_MOD_SCROLL_LOCK,
+            mods.contains(keyboard_types::Modifiers::SCROLL_LOCK),
+        ),
         related_target: related_target.map(|target| target.handle),
     }
 }
@@ -3565,6 +3677,22 @@ fn keyboard_payload(
             event
                 .modifiers
                 .contains(keyboard_types::Modifiers::ALT_GRAPH),
+        ),
+        fn_key: modifier(
+            KEY_MOD_FN,
+            event.modifiers.contains(keyboard_types::Modifiers::FN),
+        ),
+        num_lock: modifier(
+            KEY_MOD_NUM_LOCK,
+            event
+                .modifiers
+                .contains(keyboard_types::Modifiers::NUM_LOCK),
+        ),
+        scroll_lock: modifier(
+            KEY_MOD_SCROLL_LOCK,
+            event
+                .modifiers
+                .contains(keyboard_types::Modifiers::SCROLL_LOCK),
         ),
     }
 }
@@ -3767,6 +3895,9 @@ impl DispatchEventPayload {
                 set(&object, "metaKey", keyboard.meta_key.into())?;
                 set(&object, "capsLock", keyboard.caps_lock.into())?;
                 set(&object, "altGraphKey", keyboard.alt_graph_key.into())?;
+                set(&object, "fnKey", keyboard.fn_key.into())?;
+                set(&object, "numLock", keyboard.num_lock.into())?;
+                set(&object, "scrollLock", keyboard.scroll_lock.into())?;
             }
             Self::Input => {
                 set(&object, "data", JsValue::NULL)?;
@@ -3803,6 +3934,11 @@ fn set_mouse_payload(object: &Object, mouse: &MousePayload) -> Result<(), JsValu
     set(object, "ctrlKey", mouse.ctrl_key.into())?;
     set(object, "altKey", mouse.alt_key.into())?;
     set(object, "metaKey", mouse.meta_key.into())?;
+    set(object, "capsLock", mouse.caps_lock.into())?;
+    set(object, "altGraphKey", mouse.alt_graph_key.into())?;
+    set(object, "fnKey", mouse.fn_key.into())?;
+    set(object, "numLock", mouse.num_lock.into())?;
+    set(object, "scrollLock", mouse.scroll_lock.into())?;
     set(
         object,
         "relatedTarget",
@@ -8652,7 +8788,10 @@ mod tests {
                     | KEY_MOD_CONTROL
                     | KEY_MOD_META
                     | KEY_MOD_CAPS_LOCK
-                    | KEY_MOD_ALT_GRAPH,
+                    | KEY_MOD_ALT_GRAPH
+                    | KEY_MOD_FN
+                    | KEY_MOD_NUM_LOCK
+                    | KEY_MOD_SCROLL_LOCK,
                 location: 2,
             },
         );
@@ -8681,6 +8820,9 @@ mod tests {
         assert!(payload.meta_key);
         assert!(payload.caps_lock);
         assert!(payload.alt_graph_key);
+        assert!(payload.fn_key);
+        assert!(payload.num_lock);
+        assert!(payload.scroll_lock);
         assert!(!payload.alt_key);
     }
 
@@ -8703,7 +8845,7 @@ mod tests {
         assert_eq!((border_left, border_top), (7.0, 7.0));
         let client_x = rect.x + 10.123_456_789;
         let client_y = rect.y + 5.987_654_321;
-        let metadata = EventMetadata::pointer(
+        let metadata = EventMetadata::pointer_with_modifiers(
             321.25,
             NativePointerCoordinates {
                 client_x,
@@ -8715,6 +8857,12 @@ mod tests {
                 offset_y: 0.0,
             },
             3,
+            POINTER_MOD_SHIFT
+                | POINTER_MOD_CAPS_LOCK
+                | POINTER_MOD_ALT_GRAPH
+                | POINTER_MOD_FN
+                | POINTER_MOD_NUM_LOCK
+                | POINTER_MOD_SCROLL_LOCK,
         );
         let mut pointer = pointer(
             client_x as f32,
@@ -8746,15 +8894,63 @@ mod tests {
         assert_eq!(payload.mouse.buttons, 1);
         assert_eq!(payload.mouse.detail, 0);
         assert!(payload.mouse.shift_key);
-        assert!(payload.mouse.ctrl_key);
-        assert!(payload.mouse.alt_key);
-        assert!(payload.mouse.meta_key);
+        assert!(!payload.mouse.ctrl_key);
+        assert!(!payload.mouse.alt_key);
+        assert!(!payload.mouse.meta_key);
+        assert!(payload.mouse.caps_lock);
+        assert!(payload.mouse.alt_graph_key);
+        assert!(payload.mouse.fn_key);
+        assert!(payload.mouse.num_lock);
+        assert!(payload.mouse.scroll_lock);
         assert_eq!(payload.pointer_id, 1.0);
         assert_eq!(payload.pointer_type, "mouse");
         assert_eq!(payload.width, 1.0);
         assert_eq!(payload.height, 1.0);
         assert_eq!(payload.pressure, 0.5);
         assert_eq!(payload.altitude_angle, std::f64::consts::FRAC_PI_2);
+    }
+
+    #[test]
+    fn pointer_payload_falls_back_only_without_an_exact_modifier_snapshot() {
+        let coords = NativePointerCoordinates {
+            client_x: 1.0,
+            client_y: 2.0,
+            screen: None,
+            page_x: 1.0,
+            page_y: 2.0,
+            offset_x: 0.0,
+            offset_y: 0.0,
+        };
+        let blitz = Modifiers::SHIFT | Modifiers::CAPS_LOCK | Modifiers::FN;
+        let fallback = mouse_payload_from_parts(coords, (0.0, 0.0), 0, 0, 0, blitz, None, None);
+        assert!(fallback.shift_key);
+        assert!(fallback.caps_lock);
+        assert!(fallback.fn_key);
+
+        let exact_zero =
+            mouse_payload_from_parts(coords, (0.0, 0.0), 0, 0, 0, blitz, Some(0), None);
+        assert!(!exact_zero.shift_key);
+        assert!(!exact_zero.caps_lock);
+        assert!(!exact_zero.fn_key);
+
+        let wheel = BlitzWheelEvent {
+            delta: BlitzWheelDelta::Pixels(0.0, 0.0),
+            coords: PointerCoords {
+                page_x: 1.0,
+                page_y: 2.0,
+                screen_x: 0.0,
+                screen_y: 0.0,
+                client_x: 1.0,
+                client_y: 2.0,
+            },
+            buttons: MouseEventButtons::None,
+            mods: blitz,
+        };
+        let wheel_fallback =
+            wheel_mouse_payload(&wheel, &EventMetadata::wheel(0.0, coords, 0.0, 0.0, 0));
+        assert!(wheel_fallback.shift_key);
+        assert!(wheel_fallback.caps_lock);
+        assert!(wheel_fallback.fn_key);
     }
 
     #[test]
@@ -9048,7 +9244,7 @@ mod tests {
         );
         let target = context.element("target");
         let (x, y) = context.center(target);
-        let metadata = EventMetadata::wheel(
+        let metadata = EventMetadata::wheel_with_modifiers(
             91.5,
             NativePointerCoordinates {
                 client_x: f64::from(x),
@@ -9062,6 +9258,11 @@ mod tests {
             1.25,
             -2.5,
             1,
+            POINTER_MOD_CAPS_LOCK
+                | POINTER_MOD_ALT_GRAPH
+                | POINTER_MOD_FN
+                | POINTER_MOD_NUM_LOCK
+                | POINTER_MOD_SCROLL_LOCK,
         );
         let staged = stage_generated_with_metadata(
             &mut context,
@@ -9092,7 +9293,12 @@ mod tests {
             (payload.mouse.screen_x, payload.mouse.screen_y),
             (401.25, 302.5)
         );
-        assert!(payload.mouse.meta_key);
+        assert!(!payload.mouse.meta_key);
+        assert!(payload.mouse.caps_lock);
+        assert!(payload.mouse.alt_graph_key);
+        assert!(payload.mouse.fn_key);
+        assert!(payload.mouse.num_lock);
+        assert!(payload.mouse.scroll_lock);
         let pending = context
             .stack
             .frames

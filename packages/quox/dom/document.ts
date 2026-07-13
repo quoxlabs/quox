@@ -55,8 +55,8 @@ type ElementInterfaceRenderer = { element_interface(nodeHandle: number): number 
 type ActiveElementRenderer = { active_element(): number | undefined };
 
 const POINTER_BUTTONS_MASK = 0x1f;
-const POINTER_MODIFIER_MASK = 0x0f;
-const KEY_MODIFIER_MASK = 0x7f;
+const POINTER_MODIFIER_MASK = 0x1ff;
+const KEY_MODIFIER_MASK = 0x3ff;
 const KEY_EVENT_PRESSED = 0x01;
 const KEY_EVENT_REPEAT = 0x02;
 const KEY_EVENT_PREVENT_DEFAULT = 0x08;
@@ -707,6 +707,9 @@ export class QuoxDocument extends QuoxEventTarget {
           metaKey: payload.metaKey,
           modifierCapsLock: payload.capsLock,
           modifierAltGraph: payload.altGraphKey,
+          modifierFn: payload.fnKey,
+          modifierNumLock: payload.numLock,
+          modifierScrollLock: payload.scrollLock,
         });
       }
       case "input": {
@@ -759,6 +762,11 @@ export class QuoxDocument extends QuoxEventTarget {
         ctrlKey: payload.ctrlKey,
         altKey: payload.altKey,
         metaKey: payload.metaKey,
+        modifierCapsLock: payload.capsLock,
+        modifierAltGraph: payload.altGraphKey,
+        modifierFn: payload.fnKey,
+        modifierNumLock: payload.numLock,
+        modifierScrollLock: payload.scrollLock,
         movementX: payload.movementX,
         movementY: payload.movementY,
         relatedTarget: this.#relatedTarget(payload.relatedTarget),

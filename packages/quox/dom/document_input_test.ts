@@ -184,12 +184,16 @@ Deno.test("keyboard dispatch forwards logical key, policy, and repeat without sy
     accelKey: false,
     capsLock: true,
     altGraphKey: false,
+    fnKey: true,
+    numLock: true,
+    scrollLock: true,
   });
 
   assertEquals(renderer.calls, [{
     method: "keyEvent",
-    // modifiers = Shift | Alt | CapsLock; flags = Pressed | Repeat | PreventDefault
-    args: ["KeyZ", "y", 44, 11, 0, 11],
+    // modifiers = Shift | Alt | CapsLock | Fn | NumLock | ScrollLock;
+    // flags = Pressed | Repeat | PreventDefault
+    args: ["KeyZ", "y", 44, 907, 0, 11],
   }]);
   assertEquals(renders.count, 1);
   assertEquals(syncs.count, 1);

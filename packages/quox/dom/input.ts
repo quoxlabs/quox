@@ -21,37 +21,19 @@ export {
 } from "./ime_requests.ts";
 
 type WithoutWindow<Event> = Event extends { window: unknown } ? Omit<Event, "window"> : never;
-type WithoutWindowOr<Event, Field extends PropertyKey> = Event extends { window: unknown }
-  ? Omit<Event, "window" | Field>
-  : never;
 
-// Winding transports these browser-visible states now, while Quox projects
-// them in a follow-up ABI change. Keep the intermediate event shape explicit
-// rather than making unrelated adapters manufacture false values.
-type DeferredKeyModifier = "fnKey" | "numLock" | "scrollLock";
-type DeferredPointerModifier = "capsLock" | "altGraphKey" | DeferredKeyModifier;
-type DirectPointerModifiers = Pick<
-  WindingPointerModifiers,
-  "shiftKey" | "ctrlKey" | "altKey" | "metaKey"
->;
-
-export type QuoxKeyboardEvent = WithoutWindowOr<WindingKeyEvent, DeferredKeyModifier>;
+export type QuoxKeyboardEvent = WithoutWindow<WindingKeyEvent>;
 export type QuoxImeEvent = WithoutWindow<WindingImeEvent>;
 export type QuoxAppleStandardKeybindingEvent = WithoutWindow<WindingAppleStandardKeybindingEvent>;
 
-export type QuoxMouseMoveEvent = WithoutWindowOr<WindingMoveEvent, DeferredPointerModifier>;
-export type QuoxMouseButtonEvent =
-  & Omit<
-    WithoutWindowOr<WindingButtonEvent, DeferredPointerModifier>,
-    "button"
-  >
-  & {
-    button: number;
-  };
-export type QuoxMouseWheelEvent = WithoutWindowOr<WindingWheelEvent, DeferredPointerModifier>;
+export type QuoxMouseMoveEvent = WithoutWindow<WindingMoveEvent>;
+export type QuoxMouseButtonEvent = Omit<WithoutWindow<WindingButtonEvent>, "button"> & {
+  button: number;
+};
+export type QuoxMouseWheelEvent = WithoutWindow<WindingWheelEvent>;
 export type QuoxResizeEvent = WithoutWindow<WindingResizeEvent>;
 export type QuoxCloseEvent = { type: "close" };
-export type QuoxMouseEnterLeaveEvent = WithoutWindowOr<WindingEnterLeaveEvent, DeferredPointerModifier>;
+export type QuoxMouseEnterLeaveEvent = WithoutWindow<WindingEnterLeaveEvent>;
 export type QuoxFocusChangeEvent = { type: "focus" | "blur" };
 export type QuoxVisibilityEvent = { type: "visibilitychange"; visible: boolean };
 
@@ -240,7 +222,7 @@ const BUTTON_INDEX: Record<WindingButtonEvent["button"], number> = {
 };
 
 function pointerFields(
-  event: DirectPointerModifiers & {
+  event: WindingPointerModifiers & {
     x: number;
     y: number;
     screenX: number | null;
@@ -260,15 +242,25 @@ function pointerFields(
     ctrlKey: event.ctrlKey,
     altKey: event.altKey,
     metaKey: event.metaKey,
+    capsLock: event.capsLock,
+    altGraphKey: event.altGraphKey,
+    fnKey: event.fnKey,
+    numLock: event.numLock,
+    scrollLock: event.scrollLock,
   };
 }
 
-export function encodePointerModifiers(event: DirectPointerModifiers): number {
+export function encodePointerModifiers(event: WindingPointerModifiers): number {
   let bits = 0;
   if (event.shiftKey) bits |= PointerModifierMask.Shift;
   if (event.ctrlKey) bits |= PointerModifierMask.Control;
   if (event.altKey) bits |= PointerModifierMask.Alt;
   if (event.metaKey) bits |= PointerModifierMask.Meta;
+  if (event.capsLock) bits |= PointerModifierMask.CapsLock;
+  if (event.altGraphKey) bits |= PointerModifierMask.AltGraph;
+  if (event.fnKey) bits |= PointerModifierMask.Fn;
+  if (event.numLock) bits |= PointerModifierMask.NumLock;
+  if (event.scrollLock) bits |= PointerModifierMask.ScrollLock;
   return bits;
 }
 
@@ -320,6 +312,9 @@ export function mapWindingEvent(event: WindingUIEvent): QuoxInputEvent {
         accelKey: event.accelKey,
         capsLock: event.capsLock,
         altGraphKey: event.altGraphKey,
+        fnKey: event.fnKey,
+        numLock: event.numLock,
+        scrollLock: event.scrollLock,
       };
     }
     case "keyup":
@@ -338,6 +333,9 @@ export function mapWindingEvent(event: WindingUIEvent): QuoxInputEvent {
         accelKey: event.accelKey,
         capsLock: event.capsLock,
         altGraphKey: event.altGraphKey,
+        fnKey: event.fnKey,
+        numLock: event.numLock,
+        scrollLock: event.scrollLock,
       };
     case "ime": {
       switch (event.kind) {
@@ -421,6 +419,9 @@ export function encodeKeyEvent(event: QuoxKeyboardEvent): EncodedKeyEvent {
   // Kept separate from Accelerator so Rust can preserve the physical DOM modifier without
   // changing Blitz's runtime-platform editor-command projection.
   if (event.ctrlKey) modifierBits |= KeyModifierMask.Control;
+  if (event.fnKey) modifierBits |= KeyModifierMask.Fn;
+  if (event.numLock) modifierBits |= KeyModifierMask.NumLock;
+  if (event.scrollLock) modifierBits |= KeyModifierMask.ScrollLock;
 
   let eventFlags = event.isComposing ? KeyEventFlag.Composing : 0;
   if (event.type === "keydown") {

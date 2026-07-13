@@ -60,6 +60,11 @@ export interface DomDispatchMousePayload {
   readonly ctrlKey: boolean;
   readonly altKey: boolean;
   readonly metaKey: boolean;
+  readonly capsLock: boolean;
+  readonly altGraphKey: boolean;
+  readonly fnKey: boolean;
+  readonly numLock: boolean;
+  readonly scrollLock: boolean;
   readonly relatedTarget: number | null;
 }
 
@@ -99,6 +104,9 @@ export interface DomDispatchKeyboardPayload {
   readonly metaKey: boolean;
   readonly capsLock: boolean;
   readonly altGraphKey: boolean;
+  readonly fnKey: boolean;
+  readonly numLock: boolean;
+  readonly scrollLock: boolean;
 }
 
 export interface DomDispatchInputPayload {
@@ -370,6 +378,11 @@ const MOUSE_PAYLOAD_PROPERTIES = Object.freeze(
     "ctrlKey",
     "altKey",
     "metaKey",
+    "capsLock",
+    "altGraphKey",
+    "fnKey",
+    "numLock",
+    "scrollLock",
     "relatedTarget",
   ] as const,
 );
@@ -417,6 +430,9 @@ const KEYBOARD_PAYLOAD_PROPERTIES = Object.freeze(
     "metaKey",
     "capsLock",
     "altGraphKey",
+    "fnKey",
+    "numLock",
+    "scrollLock",
   ] as const,
 );
 
@@ -464,6 +480,11 @@ function mousePayloadFields(descriptors: OwnPropertyDescriptors): DomDispatchMou
     ctrlKey: assertBoolean(field("ctrlKey"), "DOM dispatch payload.ctrlKey"),
     altKey: assertBoolean(field("altKey"), "DOM dispatch payload.altKey"),
     metaKey: assertBoolean(field("metaKey"), "DOM dispatch payload.metaKey"),
+    capsLock: assertBoolean(field("capsLock"), "DOM dispatch payload.capsLock"),
+    altGraphKey: assertBoolean(field("altGraphKey"), "DOM dispatch payload.altGraphKey"),
+    fnKey: assertBoolean(field("fnKey"), "DOM dispatch payload.fnKey"),
+    numLock: assertBoolean(field("numLock"), "DOM dispatch payload.numLock"),
+    scrollLock: assertBoolean(field("scrollLock"), "DOM dispatch payload.scrollLock"),
     relatedTarget: assertNullableNodeHandle(
       field("relatedTarget"),
       "DOM dispatch payload.relatedTarget",
@@ -572,6 +593,9 @@ function validateKeyboardPayload(value: unknown): DomDispatchKeyboardPayload {
     metaKey: assertBoolean(field("metaKey"), "DOM dispatch payload.metaKey"),
     capsLock: assertBoolean(field("capsLock"), "DOM dispatch payload.capsLock"),
     altGraphKey: assertBoolean(field("altGraphKey"), "DOM dispatch payload.altGraphKey"),
+    fnKey: assertBoolean(field("fnKey"), "DOM dispatch payload.fnKey"),
+    numLock: assertBoolean(field("numLock"), "DOM dispatch payload.numLock"),
+    scrollLock: assertBoolean(field("scrollLock"), "DOM dispatch payload.scrollLock"),
   });
 }
 

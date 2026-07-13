@@ -57,6 +57,9 @@ pub enum KeyModifierMask {
     Accelerator = 32,
     /// Physical Control, kept separate from the runtime platform accelerator.
     Control = 64,
+    Fn = 128,
+    NumLock = 256,
+    ScrollLock = 512,
 }
 
 /// Stable event-state bit values used by the generated TypeScript keyboard bridge.
@@ -74,6 +77,11 @@ pub enum PointerModifierMask {
     Control = 2,
     Alt = 4,
     Meta = 8,
+    CapsLock = 16,
+    AltGraph = 32,
+    Fn = 64,
+    NumLock = 128,
+    ScrollLock = 256,
 }
 
 const KEY_MOD_SHIFT: u32 = KeyModifierMask::Shift as u32;
@@ -83,13 +91,19 @@ const KEY_MOD_CAPS_LOCK: u32 = KeyModifierMask::CapsLock as u32;
 const KEY_MOD_ALT_GRAPH: u32 = KeyModifierMask::AltGraph as u32;
 const KEY_MOD_ACCEL: u32 = KeyModifierMask::Accelerator as u32;
 const KEY_MOD_CONTROL: u32 = KeyModifierMask::Control as u32;
+const KEY_MOD_FN: u32 = KeyModifierMask::Fn as u32;
+const KEY_MOD_NUM_LOCK: u32 = KeyModifierMask::NumLock as u32;
+const KEY_MOD_SCROLL_LOCK: u32 = KeyModifierMask::ScrollLock as u32;
 const KEY_MOD_KNOWN: u32 = KEY_MOD_SHIFT
     | KEY_MOD_ALT
     | KEY_MOD_META
     | KEY_MOD_CAPS_LOCK
     | KEY_MOD_ALT_GRAPH
     | KEY_MOD_ACCEL
-    | KEY_MOD_CONTROL;
+    | KEY_MOD_CONTROL
+    | KEY_MOD_FN
+    | KEY_MOD_NUM_LOCK
+    | KEY_MOD_SCROLL_LOCK;
 
 const KEY_EVENT_PRESSED: u32 = KeyEventFlag::Pressed as u32;
 const KEY_EVENT_REPEAT: u32 = KeyEventFlag::Repeat as u32;
@@ -101,8 +115,20 @@ const POINTER_MOD_SHIFT: u32 = PointerModifierMask::Shift as u32;
 const POINTER_MOD_CONTROL: u32 = PointerModifierMask::Control as u32;
 const POINTER_MOD_ALT: u32 = PointerModifierMask::Alt as u32;
 const POINTER_MOD_META: u32 = PointerModifierMask::Meta as u32;
-const POINTER_MOD_KNOWN: u32 =
-    POINTER_MOD_SHIFT | POINTER_MOD_CONTROL | POINTER_MOD_ALT | POINTER_MOD_META;
+const POINTER_MOD_CAPS_LOCK: u32 = PointerModifierMask::CapsLock as u32;
+const POINTER_MOD_ALT_GRAPH: u32 = PointerModifierMask::AltGraph as u32;
+const POINTER_MOD_FN: u32 = PointerModifierMask::Fn as u32;
+const POINTER_MOD_NUM_LOCK: u32 = PointerModifierMask::NumLock as u32;
+const POINTER_MOD_SCROLL_LOCK: u32 = PointerModifierMask::ScrollLock as u32;
+const POINTER_MOD_KNOWN: u32 = POINTER_MOD_SHIFT
+    | POINTER_MOD_CONTROL
+    | POINTER_MOD_ALT
+    | POINTER_MOD_META
+    | POINTER_MOD_CAPS_LOCK
+    | POINTER_MOD_ALT_GRAPH
+    | POINTER_MOD_FN
+    | POINTER_MOD_NUM_LOCK
+    | POINTER_MOD_SCROLL_LOCK;
 
 /// Build the modifier set used by Blitz's editor defaults. Quox itself exposes the exact
 /// physical flags to JS; this projection deliberately maps the runtime platform accelerator to
@@ -367,10 +393,10 @@ impl QuoxRenderer {
 mod tests {
     use super::{
         KEY_EVENT_COMPOSING, KEY_EVENT_PRESSED, KEY_EVENT_REPEAT, KEY_MOD_ACCEL, KEY_MOD_ALT,
-        KEY_MOD_ALT_GRAPH, KEY_MOD_CONTROL, KEY_MOD_META, KEY_MOD_SHIFT,
-        apply_ime_delete_surrounding, build_editor_modifiers, build_pointer_modifiers,
-        is_insertable_text, key_event, mouse_button, preedit_cursor, validate_key_abi,
-        viewport_point_to_page,
+        KEY_MOD_ALT_GRAPH, KEY_MOD_CONTROL, KEY_MOD_FN, KEY_MOD_META, KEY_MOD_NUM_LOCK,
+        KEY_MOD_SCROLL_LOCK, KEY_MOD_SHIFT, apply_ime_delete_surrounding, build_editor_modifiers,
+        build_pointer_modifiers, is_insertable_text, key_event, known_mask, mouse_button,
+        preedit_cursor, validate_key_abi, viewport_point_to_page,
     };
     use blitz_dom::{BaseDocument, DocumentConfig};
     use blitz_html::HtmlDocument;
@@ -547,6 +573,10 @@ mod tests {
         assert!(alt_graph.contains(Modifiers::ALT));
         assert!(alt_graph.contains(Modifiers::ALT_GRAPH));
         assert!(!alt_graph.contains(Modifiers::CONTROL));
+
+        let browser_only_locks =
+            build_editor_modifiers(KEY_MOD_FN | KEY_MOD_NUM_LOCK | KEY_MOD_SCROLL_LOCK);
+        assert!(browser_only_locks.is_empty());
     }
 
     #[test]
@@ -558,6 +588,37 @@ mod tests {
         assert!(modifiers.contains(Modifiers::CONTROL));
         assert!(modifiers.contains(Modifiers::META));
         assert!(!modifiers.contains(Modifiers::ALT));
+
+        let browser_only_states = build_pointer_modifiers(
+            super::POINTER_MOD_CAPS_LOCK
+                | super::POINTER_MOD_ALT_GRAPH
+                | super::POINTER_MOD_FN
+                | super::POINTER_MOD_NUM_LOCK
+                | super::POINTER_MOD_SCROLL_LOCK,
+        );
+        assert!(browser_only_states.is_empty());
+    }
+
+    #[test]
+    fn modifier_abis_accept_every_append_only_browser_state_bit() {
+        let key_bits = KEY_MOD_FN | KEY_MOD_NUM_LOCK | KEY_MOD_SCROLL_LOCK;
+        assert_eq!(
+            validate_key_abi(f64::from(key_bits), 0.0, 0.0),
+            Ok((key_bits, 0, 0))
+        );
+        let pointer_bits = super::POINTER_MOD_CAPS_LOCK
+            | super::POINTER_MOD_ALT_GRAPH
+            | super::POINTER_MOD_FN
+            | super::POINTER_MOD_NUM_LOCK
+            | super::POINTER_MOD_SCROLL_LOCK;
+        assert_eq!(
+            known_mask(
+                f64::from(pointer_bits),
+                super::POINTER_MOD_KNOWN,
+                "modifierBits"
+            ),
+            Ok(pointer_bits)
+        );
     }
 
     #[test]

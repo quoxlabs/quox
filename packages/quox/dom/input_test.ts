@@ -39,6 +39,11 @@ const pointer = {
   ctrlKey: false,
   altKey: false,
   metaKey: true,
+  capsLock: false,
+  altGraphKey: false,
+  fnKey: false,
+  numLock: false,
+  scrollLock: false,
 };
 
 Deno.test("pointer adapter forwards native timing and click detail", () => {
@@ -95,11 +100,11 @@ Deno.test("wheel adapter preserves browser units and translates Blitz scroll dir
     deltaY: -3.5,
     deltaMode: 0,
     ...pointer,
-    capsLock: false,
-    altGraphKey: false,
-    fnKey: false,
-    numLock: false,
-    scrollLock: false,
+    capsLock: true,
+    altGraphKey: true,
+    fnKey: true,
+    numLock: true,
+    scrollLock: true,
   });
   assertEquals(precise, {
     type: "wheel",
@@ -107,13 +112,18 @@ Deno.test("wheel adapter preserves browser units and translates Blitz scroll dir
     deltaY: -3.5,
     deltaMode: 0,
     ...pointer,
+    capsLock: true,
+    altGraphKey: true,
+    fnKey: true,
+    numLock: true,
+    scrollLock: true,
   });
   router.route(precise);
   router.route({ type: "wheel", deltaX: 1, deltaY: -2, deltaMode: 1, ...pointer });
   router.route({ type: "wheel", deltaX: 0.5, deltaY: -1, deltaMode: 2, ...pointer });
 
   assertEquals(calls, [
-    [7, 9, 107.5, 209.25, -2.25, 3.5, 5, 9, 2.25, -3.5, 0, 12],
+    [7, 9, 107.5, 209.25, -2.25, 3.5, 5, 505, 2.25, -3.5, 0, 12],
     [7, 9, 107.5, 209.25, -1, 2, 5, 9, 1, -2, 1, 12],
     [7, 9, 107.5, 209.25, -400, 600, 5, 9, 0.5, -1, 2, 12],
   ]);
@@ -181,9 +191,9 @@ Deno.test("canonical key adapter preserves public fields and encodes editor poli
     accelKey: true,
     capsLock: false,
     altGraphKey: false,
-    fnKey: false,
-    numLock: false,
-    scrollLock: false,
+    fnKey: true,
+    numLock: true,
+    scrollLock: true,
   });
 
   if (mapped.type !== "keydown") throw new TypeError("expected keydown");
@@ -194,7 +204,7 @@ Deno.test("canonical key adapter preserves public fields and encodes editor poli
     key: "y",
     keycode: 44,
     // Shift | Meta | runtime accelerator.
-    modifierBits: 37,
+    modifierBits: 933,
     location: 0,
     // Pressed | Repeat | Composing | PreventDefault.
     eventFlags: 15,
