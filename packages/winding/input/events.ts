@@ -176,9 +176,7 @@ export function createImeCommitEvent(
   text: string,
   sourceId?: number,
 ): ImeEvent | undefined {
-  return text.length === 0
-    ? undefined
-    : { type: "ime", kind: "commit", window, text, ...sourceKeyInputId(sourceId) };
+  return text.length === 0 ? undefined : { type: "ime", kind: "commit", window, text, ...sourceKeyInputId(sourceId) };
 }
 
 /** Invalid or empty surrounding deletions are omitted. */
