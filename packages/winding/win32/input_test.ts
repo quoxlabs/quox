@@ -1058,6 +1058,137 @@ Deno.test("prepared Win32 keys match the complete native message identity", () =
   assertEquals(matchesWin32KeyMessage(prepared, { ...prepared, lParam: prepared.lParam | (1n << 30n) }), false);
 });
 
+Deno.test("prepared Win32 BMP keys correlate only their exact posted character", () => {
+  const harness = createInputControllerHarness({ keyText: new Map([[0x41, "a"]]) });
+  harness.controller.attach(harness.window);
+  const initialLParam = makeKeyLParam(0x1e);
+  dispatchPreparedKeyDown(harness, 0x41, initialLParam);
+
+  // Unrelated window traffic may run before the posted WM_CHAR without weakening proof.
+  assertEquals(harness.controller.handleMessage(harness.window, WM.PAINT, 0n, 0n), undefined);
+  harness.controller.handleMessage(harness.window, WM.CHAR, "a".charCodeAt(0), initialLParam);
+  const firstKey = harness.events.find((event): event is KeyDownEvent => event.type === "keydown");
+  const firstCommit = harness.events.find((event) => event.type === "ime" && event.kind === "commit");
+  assert(firstKey !== undefined && Number.isInteger(firstKey.sourceKeyInputId));
+  assert(firstCommit?.type === "ime" && firstCommit.kind === "commit");
+  assertEquals(firstCommit.sourceKeyInputId, firstKey.sourceKeyInputId);
+
+  const repeatLParam = makeKeyLParam(0x1e, { previous: true });
+  dispatchPreparedKeyDown(harness, 0x41, repeatLParam);
+  harness.controller.handleMessage(harness.window, WM.CHAR, "a".charCodeAt(0), repeatLParam);
+  const keys = harness.events.filter((event): event is KeyDownEvent => event.type === "keydown");
+  const commits = harness.events.filter((event) => event.type === "ime" && event.kind === "commit");
+  assertEquals(keys.map((event) => event.repeat), [false, true]);
+  assert(keys[1].sourceKeyInputId !== keys[0].sourceKeyInputId);
+  assertEquals(commits[1].sourceKeyInputId, keys[1].sourceKeyInputId);
+});
+
+Deno.test("Win32 leaves ambiguous or mismatched character messages uncorrelated", () => {
+  const harness = createInputControllerHarness({ keyText: new Map([[0x41, "a"]]) });
+  harness.controller.attach(harness.window);
+  const packed = makeKeyLParam(0x1e, { repeatCount: 3 });
+  dispatchPreparedKeyDown(harness, 0x41, packed);
+  harness.controller.handleMessage(harness.window, WM.CHAR, "a".charCodeAt(0), packed);
+
+  const packedKeys = harness.events.filter((event): event is KeyDownEvent => event.type === "keydown");
+  assertEquals(new Set(packedKeys.map((event) => event.sourceKeyInputId)).size, 3);
+  assert(packedKeys.every((event) => Number.isInteger(event.sourceKeyInputId)));
+  const packedCommit = harness.events.find((event) => event.type === "ime" && event.kind === "commit");
+  assert(packedCommit?.type === "ime" && packedCommit.kind === "commit");
+  assertEquals(packedCommit.text, "aaa");
+  assertEquals(Object.hasOwn(packedCommit, "sourceKeyInputId"), false);
+
+  harness.events.length = 0;
+  const exact = makeKeyLParam(0x1e);
+  dispatchPreparedKeyDown(harness, 0x41, exact);
+  harness.controller.handleMessage(harness.window, WM.CHAR, "b".charCodeAt(0), exact);
+  harness.controller.handleMessage(harness.window, WM.CHAR, "a".charCodeAt(0), exact);
+  const mismatchedCommits = harness.events.filter((event) => event.type === "ime" && event.kind === "commit");
+  assertEquals(mismatchedCommits.map((event) => event.text), ["b", "a"]);
+  assert(mismatchedCommits.every((event) => !Object.hasOwn(event, "sourceKeyInputId")));
+
+  harness.events.length = 0;
+  dispatchKeyDown(harness, 0x41, exact);
+  harness.controller.handleMessage(harness.window, WM.CHAR, "a".charCodeAt(0), exact);
+  const fallbackKey = harness.events.find((event): event is KeyDownEvent => event.type === "keydown");
+  const fallbackCommit = harness.events.find((event) => event.type === "ime" && event.kind === "commit");
+  assert(fallbackKey !== undefined && fallbackCommit?.type === "ime" && fallbackCommit.kind === "commit");
+  assertEquals(Object.hasOwn(fallbackKey, "sourceKeyInputId"), false);
+  assertEquals(Object.hasOwn(fallbackCommit, "sourceKeyInputId"), false);
+});
+
+Deno.test("Win32 invalidates prepared character proof across reentrant IME work", () => {
+  const harness = createInputControllerHarness({ keyText: new Map([[0x41, "a"]]) });
+  harness.controller.attach(harness.window);
+  const lParam = makeKeyLParam(0x1e);
+  harness.controller.prepareKeyMessage(fakeNativeKeyMessageBuffer({
+    windowId: harness.window.id,
+    message: WM.KEYDOWN,
+    virtualKey: 0x41,
+    lParam,
+    timestamp: 1,
+  }));
+  // TranslateMessage may synchronously reenter the WndProc before the original
+  // key is dispatched. Even ignored IME traffic makes the old proof unusable.
+  harness.controller.handleMessage(harness.window, WM.IME_STARTCOMPOSITION, 0n, 0n);
+  harness.controller.handleMessage(harness.window, WM.KEYDOWN, 0x41, lParam);
+  harness.controller.clearPreparedKey();
+  harness.controller.handleMessage(harness.window, WM.CHAR, "a".charCodeAt(0), lParam);
+
+  const key = harness.events.find((event): event is KeyDownEvent => event.type === "keydown");
+  const commit = harness.events.find((event) => event.type === "ime" && event.kind === "commit");
+  assert(key !== undefined && commit?.type === "ime" && commit.kind === "commit");
+  assertEquals(Object.hasOwn(key, "sourceKeyInputId"), false);
+  assertEquals(Object.hasOwn(commit, "sourceKeyInputId"), false);
+
+  const characterReentry = createInputControllerHarness({ keyText: new Map([[0x41, "a"]]) });
+  characterReentry.controller.attach(characterReentry.window);
+  characterReentry.controller.prepareKeyMessage(fakeNativeKeyMessageBuffer({
+    windowId: characterReentry.window.id,
+    message: WM.KEYDOWN,
+    virtualKey: 0x41,
+    lParam,
+    timestamp: 1,
+  }));
+  characterReentry.controller.handleMessage(
+    characterReentry.window,
+    WM.CHAR,
+    "a".charCodeAt(0),
+    lParam,
+  );
+  characterReentry.controller.handleMessage(characterReentry.window, WM.KEYDOWN, 0x41, lParam);
+  characterReentry.controller.clearPreparedKey();
+  const reenteredKey = characterReentry.events.find((event): event is KeyDownEvent => event.type === "keydown");
+  const earlyCommit = characterReentry.events.find((event) => event.type === "ime" && event.kind === "commit");
+  assert(reenteredKey !== undefined && earlyCommit?.type === "ime" && earlyCommit.kind === "commit");
+  assertEquals(Object.hasOwn(reenteredKey, "sourceKeyInputId"), false);
+  assertEquals(Object.hasOwn(earlyCommit, "sourceKeyInputId"), false);
+});
+
+Deno.test("Win32 does not guess across later keys or supplementary character units", () => {
+  const boundary = createInputControllerHarness({ keyText: new Map([[0x41, "a"]]) });
+  boundary.controller.attach(boundary.window);
+  const aLParam = makeKeyLParam(0x1e);
+  dispatchPreparedKeyDown(boundary, 0x41, aLParam);
+  dispatchPreparedKeyDown(boundary, 0x42, makeKeyLParam(0x30));
+  boundary.controller.handleMessage(boundary.window, WM.CHAR, "a".charCodeAt(0), aLParam);
+  const lateCommit = boundary.events.find((event) => event.type === "ime" && event.kind === "commit");
+  assert(lateCommit?.type === "ime" && lateCommit.kind === "commit");
+  assertEquals(Object.hasOwn(lateCommit, "sourceKeyInputId"), false);
+
+  const supplementary = createInputControllerHarness({ keyText: new Map([[0x41, "🙂"]]) });
+  supplementary.controller.attach(supplementary.window);
+  dispatchPreparedKeyDown(supplementary, 0x41, aLParam);
+  supplementary.controller.handleMessage(supplementary.window, WM.CHAR, 0xd83d, aLParam);
+  supplementary.controller.handleMessage(supplementary.window, WM.CHAR, 0xde42, aLParam);
+  const key = supplementary.events.find((event): event is KeyDownEvent => event.type === "keydown");
+  const scalarCommit = supplementary.events.find((event) => event.type === "ime" && event.kind === "commit");
+  assert(key !== undefined && scalarCommit?.type === "ime" && scalarCommit.kind === "commit");
+  assertEquals(Object.hasOwn(key, "sourceKeyInputId"), false);
+  assertEquals(scalarCommit.text, "🙂");
+  assertEquals(Object.hasOwn(scalarCommit, "sourceKeyInputId"), false);
+});
+
 Deno.test("Win32 validates signed outer-window geometry before native creation", () => {
   validateWin32Geometry(-100, 20, 800, 600);
   validateWin32Geometry(-0x80000000, 0x7fffffff, 1, 0x7fffffff);
@@ -1457,7 +1588,10 @@ Deno.test("VK_PACKET surrogate transitions suppress defaults and assemble one sc
     ).length,
     0,
   );
+  assert(transitions.every((event) => !Object.hasOwn(event, "sourceKeyInputId")));
   assertEquals(textImeEvents(harness.events), [{ kind: "commit", text: "🙂" }]);
+  const commit = harness.events.find((event) => event.type === "ime" && event.kind === "commit");
+  assert(commit !== undefined && !Object.hasOwn(commit, "sourceKeyInputId"));
 });
 
 Deno.test("Win32 AltGr probe classification compares complete translation kind and text", () => {
@@ -2865,4 +2999,24 @@ function dispatchKeyDown(
   lParam: bigint,
 ): void {
   harness.controller.handleMessage(harness.window, WM.KEYDOWN, virtualKey, lParam);
+}
+
+function dispatchPreparedKeyDown(
+  harness: ReturnType<typeof createInputControllerHarness>,
+  virtualKey: number,
+  lParam: bigint,
+  message = WM.KEYDOWN,
+): void {
+  harness.controller.prepareKeyMessage(fakeNativeKeyMessageBuffer({
+    windowId: harness.window.id,
+    message,
+    virtualKey,
+    lParam: BigInt.asIntN(64, lParam),
+    timestamp: 1,
+  }));
+  try {
+    harness.controller.handleMessage(harness.window, message, virtualKey, lParam);
+  } finally {
+    harness.controller.clearPreparedKey();
+  }
 }

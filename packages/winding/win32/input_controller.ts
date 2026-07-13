@@ -10,6 +10,7 @@ import {
   createKeyUpEvent,
   ImeActivationState,
   type PreeditUpdate,
+  SourceKeyInputIdSequence,
 } from "../input/mod.ts";
 import {
   type ImeCursorArea,
@@ -115,6 +116,8 @@ interface WindowInputState {
   readonly insertCharAssembler: CsInsertCharAssembler;
   readonly insertOnType: InsertOnTypeFallbackState;
   readonly resultEcho: ResultEchoSuppressor;
+  directCharEpoch: number;
+  pendingDirectChar?: PendingDirectChar;
 }
 
 interface KeyEventResult {
@@ -124,6 +127,18 @@ interface KeyEventResult {
 
 interface PreparedKeyEvent extends KeyEventResult {
   native: NativeKeyMessage;
+  directCharEpoch: number;
+  directChar?: DirectCharIdentity;
+}
+
+interface DirectCharIdentity {
+  message: number;
+  lParam: bigint;
+  codeUnit: number;
+}
+
+interface PendingDirectChar extends DirectCharIdentity {
+  sourceKeyInputId: number;
 }
 
 interface NativeKeyMessage {
@@ -142,6 +157,7 @@ export class Win32InputController {
   readonly #states = new Map<Win32InputWindow, WindowInputState>();
   readonly #altGraphLayouts = new Map<bigint, boolean>();
   readonly #peekMessage = new ArrayBuffer(48);
+  readonly #sourceKeyInputIds = new SourceKeyInputIdSequence();
   readonly #user32: User32Library;
   readonly #imm32: Imm32Library;
   readonly #enqueue: (event: UIEvent) => void;
@@ -189,6 +205,7 @@ export class Win32InputController {
       insertCharAssembler: new CsInsertCharAssembler(),
       insertOnType: new InsertOnTypeFallbackState(),
       resultEcho: new ResultEchoSuppressor(),
+      directCharEpoch: 0,
     };
     this.#states.set(window, state);
     try {
@@ -232,6 +249,7 @@ export class Win32InputController {
     state.insertCharAssembler.reset();
     state.insertOnType.cancel();
     state.resultEcho.clear();
+    this.#invalidateDirectChar(state);
     state.logicalKeys.clear();
     state.altGraphTextKeys.clear();
     state.altGraphControlFilter.reset();
@@ -242,6 +260,7 @@ export class Win32InputController {
 
   setImeEnabled(window: Win32InputWindow, enabled: boolean): void {
     const state = this.#state(window);
+    this.#invalidateDirectChar(state);
     const errors: unknown[] = [];
     if (state.activation.desired !== enabled) {
       if (!enabled) captureError(errors, () => this.#cancelComposition(window, state));
@@ -286,6 +305,7 @@ export class Win32InputController {
   observeNativeFocus(window: Win32InputWindow, focused: boolean): void {
     const state = this.#state(window);
     if (state.activation.focused === focused) return;
+    this.#invalidateDirectChar(state);
     if (focused) {
       this.#enqueue({ type: "focus", window });
       state.activation.setFocused(true);
@@ -314,6 +334,13 @@ export class Win32InputController {
     if (window === undefined) return undefined;
     const state = this.#states.get(window);
     if (state === undefined) return undefined;
+    if (
+      message === WM.SETFOCUS || message === WM.KILLFOCUS ||
+      message === WM.IME_STARTCOMPOSITION || message === WM.IME_COMPOSITION ||
+      message === WM.IME_ENDCOMPOSITION || message === WM.IME_SETCONTEXT
+    ) {
+      this.#invalidateDirectChar(state);
+    }
 
     let result: bigint | undefined;
     switch (message) {
@@ -352,11 +379,13 @@ export class Win32InputController {
     switch (message) {
       case WM.SETFOCUS:
         if (window !== undefined && state !== undefined) {
+          this.#invalidateDirectChar(state);
           this.observeNativeFocus(window, true);
         }
         return undefined;
       case WM.KILLFOCUS:
         if (window !== undefined && state !== undefined) {
+          this.#invalidateDirectChar(state);
           this.observeNativeFocus(window, false);
         }
         return undefined;
@@ -369,39 +398,71 @@ export class Win32InputController {
           lParam,
           message === WM.SYSKEYDOWN,
         );
+        const exactlyPrepared = prepared !== undefined && "native" in prepared;
+        if (state !== undefined && !exactlyPrepared) this.#invalidateDirectChar(state);
         if (prepared !== undefined && !prepared.suppress) {
-          for (const event of expandWin32KeyRepeats(prepared.event, lParam)) this.#enqueue(event);
+          let events = expandWin32KeyRepeats(prepared.event, lParam);
+          const directChar = exactlyPrepared && state !== undefined &&
+              prepared.directCharEpoch === state.directCharEpoch
+            ? prepared.directChar
+            : undefined;
+          if (directChar !== undefined) {
+            const sourceKeyInputIds: number[] = [];
+            events = events.map((event) => {
+              const sourceKeyInputId = this.#sourceKeyInputIds.take();
+              if (sourceKeyInputId === undefined) return event;
+              sourceKeyInputIds.push(sourceKeyInputId);
+              return { ...event, sourceKeyInputId };
+            });
+            if (state !== undefined && events.length === 1 && sourceKeyInputIds.length === 1) {
+              state.pendingDirectChar = {
+                ...directChar,
+                sourceKeyInputId: sourceKeyInputIds[0],
+              };
+            }
+          }
+          for (const event of events) this.#enqueue(event);
         }
         return undefined;
       }
       case WM.KEYUP:
       case WM.SYSKEYUP: {
+        if (state !== undefined) this.#invalidateDirectChar(state);
         const prepared = this.#takePreparedKey(window, "keyup", wParam, lParam, message === WM.SYSKEYUP);
         if (prepared !== undefined && !prepared.suppress) this.#enqueue(prepared.event);
         return undefined;
       }
       case WM.CHAR:
         if (window !== undefined && state !== undefined) {
-          this.#handleChar(window, state, wParam, lParam);
+          const sourceKeyInputId = this.#takeDirectCharSource(state, message, wParam, lParam);
+          this.#handleChar(window, state, wParam, lParam, sourceKeyInputId);
           return 0n;
         }
         return undefined;
       case WM.DEADCHAR:
-        if (window !== undefined && state !== undefined) this.#flushCharDecoder(window, state);
+        if (window !== undefined && state !== undefined) {
+          this.#invalidateDirectChar(state);
+          this.#flushCharDecoder(window, state);
+        }
         return 0n;
       case WM.SYSCHAR:
-        if (window !== undefined && state !== undefined && this.#currentModifiers(true).altGraphKey) {
-          this.#handleChar(window, state, wParam, lParam);
-          return 0n;
+        if (window !== undefined && state !== undefined) {
+          const sourceKeyInputId = this.#takeDirectCharSource(state, message, wParam, lParam);
+          if (this.#currentModifiers(true).altGraphKey) {
+            this.#handleChar(window, state, wParam, lParam, sourceKeyInputId);
+            return 0n;
+          }
         }
         return undefined;
       case WM.SYSDEADCHAR:
+        if (state !== undefined) this.#invalidateDirectChar(state);
         if (window !== undefined && state !== undefined && this.#currentModifiers(true).altGraphKey) {
           this.#flushCharDecoder(window, state);
           return 0n;
         }
         return undefined;
       case WM.UNICHAR:
+        if (state !== undefined) this.#invalidateDirectChar(state);
         if (Number(wParam) === UNICODE_NOCHAR) return 1n;
         if (window !== undefined && state !== undefined) {
           this.#flushCharDecoder(window, state);
@@ -418,10 +479,13 @@ export class Win32InputController {
           inputState.insertCharAssembler.reset();
           inputState.altGraphControlFilter.reset();
           inputState.altGraphTextKeys.clear();
+          this.#invalidateDirectChar(inputState);
         }
         return undefined;
       case WM.IME_STARTCOMPOSITION:
-        if (window === undefined || state === undefined || !this.#acceptsNativeComposition(state)) return undefined;
+        if (window === undefined || state === undefined) return undefined;
+        this.#invalidateDirectChar(state);
+        if (!this.#acceptsNativeComposition(state)) return undefined;
         if (state.cancelingComposition) return 0n;
         // START names a new native session. Drop incomplete character units
         // instead of flushing stale data into the new session.
@@ -435,11 +499,15 @@ export class Win32InputController {
         this.#applyImeCursorArea(window, state);
         return 0n;
       case WM.IME_COMPOSITION:
-        if (window === undefined || state === undefined || !this.#acceptsNativeComposition(state)) return undefined;
+        if (window === undefined || state === undefined) return undefined;
+        this.#invalidateDirectChar(state);
+        if (!this.#acceptsNativeComposition(state)) return undefined;
         if (state.cancelingComposition) return 0n;
         return this.#handleImeComposition(window, state, wParam, lParam) ? 0n : undefined;
       case WM.IME_ENDCOMPOSITION: {
-        if (window === undefined || state === undefined || !this.#acceptsNativeComposition(state)) return undefined;
+        if (window === undefined || state === undefined) return undefined;
+        this.#invalidateDirectChar(state);
+        if (!this.#acceptsNativeComposition(state)) return undefined;
         state.insertCharAssembler.reset();
         if (state.cancelingComposition) {
           state.charDecoder.reset();
@@ -464,12 +532,14 @@ export class Win32InputController {
       }
       case WM.IME_CHAR:
         if (window !== undefined && state !== undefined) {
+          this.#invalidateDirectChar(state);
           this.#handleImeChar(window, state, wParam, lParam);
           return 0n;
         }
         return undefined;
       case WM.IME_SETCONTEXT:
         if (window !== undefined && state !== undefined) {
+          this.#invalidateDirectChar(state);
           const errors: unknown[] = [];
           const activating = BigInt(wParam) !== 0n;
           if (activating && state.activation.desired) {
@@ -485,6 +555,7 @@ export class Win32InputController {
         }
         return undefined;
       case WM.IME_REQUEST:
+        if (state !== undefined) this.#invalidateDirectChar(state);
         // IMR_QUERYCHARPOSITION requires geometry for its requested UTF-16
         // composition offset and the editor's actual document rectangle.
         // Winding receives only one candidate/caret anchor, so even a request
@@ -506,6 +577,7 @@ export class Win32InputController {
     if (window === undefined) return;
     const state = this.#states.get(window);
     if (state === undefined) return;
+    this.#invalidateDirectChar(state);
 
     const type = message.message === WM.KEYDOWN || message.message === WM.SYSKEYDOWN ? "keydown" : "keyup";
     const keyboardState = this.#snapshotKeyboardState();
@@ -567,21 +639,24 @@ export class Win32InputController {
       lParam: nextMessage.lParam,
       timestamp: nextMessage.timestamp,
     };
+    const event = createWin32KeyEvent(
+      type,
+      window,
+      message.virtualKey,
+      code,
+      key,
+      type === "keydown" && decodeKeyLParam(message.lParam).isRepeat,
+      state.composition.active,
+      modifiers,
+      translatedText,
+      message.message === WM.SYSKEYDOWN,
+    );
     this.#preparedKey = {
       native: message,
       suppress: layoutHasAltGraph && state.altGraphControlFilter.shouldSuppress(current, next),
-      event: createWin32KeyEvent(
-        type,
-        window,
-        message.virtualKey,
-        code,
-        key,
-        type === "keydown" && decodeKeyLParam(message.lParam).isRepeat,
-        state.composition.active,
-        modifiers,
-        translatedText,
-        message.message === WM.SYSKEYDOWN,
-      ),
+      event,
+      directCharEpoch: state.directCharEpoch,
+      directChar: directCharIdentity(message, event, translatedText),
     };
   }
 
@@ -597,6 +672,7 @@ export class Win32InputController {
       state.charDecoder.reset();
       state.insertCharAssembler.reset();
       state.resultEcho.clear();
+      this.#invalidateDirectChar(state);
       state.logicalKeys.clear();
       state.altGraphTextKeys.clear();
       state.altGraphControlFilter.reset();
@@ -732,7 +808,7 @@ export class Win32InputController {
     wParam: number | bigint,
     lParam: number | bigint,
     systemMessage: boolean,
-  ): KeyEventResult | undefined {
+  ): KeyEventResult | PreparedKeyEvent | undefined {
     const prepared = this.#preparedKey;
     const expectedMessage = type === "keydown"
       ? (systemMessage ? WM.SYSKEYDOWN : WM.KEYDOWN)
@@ -809,13 +885,18 @@ export class Win32InputController {
     if (update !== undefined) this.#enqueue(createImePreeditEvent(window, update.text, update.cursorRange));
   }
 
-  #applyImeUpdate(window: Win32InputWindow, state: WindowInputState, update: ImeCompositionUpdate): void {
+  #applyImeUpdate(
+    window: Win32InputWindow,
+    state: WindowInputState,
+    update: ImeCompositionUpdate,
+    sourceKeyInputId?: number,
+  ): void {
     if (update.result !== undefined && update.result.length > 0) {
       state.insertCharAssembler.reset();
       state.insertOnType.authoritative();
       state.composition.commit();
       this.#clearCompositionMetadata(state);
-      const commit = createImeCommitEvent(window, update.result);
+      const commit = createImeCommitEvent(window, update.result, sourceKeyInputId);
       if (commit !== undefined) this.#enqueue(commit);
     }
     if (update.preedit === undefined) return;
@@ -837,11 +918,37 @@ export class Win32InputController {
     state: WindowInputState,
     wParam: number | bigint,
     lParam: number | bigint,
+    sourceKeyInputId?: number,
   ): void {
+    if (sourceKeyInputId !== undefined) this.#flushCharDecoder(window, state);
     const repeatCount = decodeKeyLParam(lParam).repeatCount;
     for (const decoded of state.charDecoder.push(wParam, repeatCount)) {
-      this.#applyDecodedChar(window, state, decoded, false);
+      this.#applyDecodedChar(window, state, decoded, false, sourceKeyInputId);
+      sourceKeyInputId = undefined;
     }
+  }
+
+  #invalidateDirectChar(state: WindowInputState): void {
+    state.pendingDirectChar = undefined;
+    state.directCharEpoch += 1;
+  }
+
+  #takeDirectCharSource(
+    state: WindowInputState,
+    message: number,
+    wParam: number | bigint,
+    lParam: number | bigint,
+  ): number | undefined {
+    const pending = state.pendingDirectChar;
+    this.#invalidateDirectChar(state);
+    if (
+      pending === undefined || state.cancelingComposition || state.composition.active ||
+      state.insertOnType.active || pending.message !== message ||
+      pending.lParam !== BigInt.asUintN(32, BigInt(lParam)) || pending.codeUnit !== Number(wParam)
+    ) {
+      return undefined;
+    }
+    return pending.sourceKeyInputId;
   }
 
   #handleImeChar(
@@ -873,6 +980,7 @@ export class Win32InputController {
     state: WindowInputState,
     decoded: DecodedWmChar,
     conversionResult: boolean,
+    sourceKeyInputId?: number,
   ): void {
     if (state.cancelingComposition) return;
     if (state.resultEcho.consume(decoded.text, decoded.repeatCount)) return;
@@ -885,7 +993,7 @@ export class Win32InputController {
       const preedit = state.insertOnType.update(text);
       if (preedit !== undefined) this.#applyImeUpdate(window, state, { preedit });
     } else if (!state.composition.active) {
-      this.#applyImeUpdate(window, state, { result: text });
+      this.#applyImeUpdate(window, state, { result: text }, sourceKeyInputId);
     }
   }
 
@@ -1083,6 +1191,7 @@ export class Win32InputController {
   }
 
   #cancelComposition(window: Win32InputWindow, state: WindowInputState): void {
+    this.#invalidateDirectChar(state);
     const cancelNativeComposition = state.composition.active;
     state.insertOnType.cancel();
     state.insertCharAssembler.reset();
@@ -1188,6 +1297,30 @@ function createWin32KeyEvent(
       editDisposition: win32KeyEditDisposition(keycode, key, isComposing, modifiers, text, systemMessage),
     })
     : createKeyUpEvent(init);
+}
+
+function directCharIdentity(
+  native: NativeKeyMessage,
+  event: KeyEvent,
+  translatedText: string | undefined,
+): DirectCharIdentity | undefined {
+  // TranslateMessage's BOOL does not say whether it posted a character. The
+  // strongest available association is therefore one predicted BMP unit plus
+  // an exact later message tuple, invalidated by every intervening key/IME boundary.
+  if (
+    event.type !== "keydown" || event.isComposing || event.editDisposition !== "text-input" ||
+    translatedText === undefined || translatedText.length !== 1 || !isCommitText(translatedText)
+  ) {
+    return undefined;
+  }
+  const codeUnit = translatedText.charCodeAt(0);
+  if (codeUnit >= 0xd800 && codeUnit <= 0xdfff) return undefined;
+  const message = native.message === WM.KEYDOWN ? WM.CHAR : native.message === WM.SYSKEYDOWN ? WM.SYSCHAR : undefined;
+  return message === undefined ? undefined : {
+    message,
+    lParam: BigInt.asUintN(32, native.lParam),
+    codeUnit,
+  };
 }
 
 function throwCollected(errors: unknown[], message: string): void {
