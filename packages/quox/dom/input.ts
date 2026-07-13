@@ -82,6 +82,24 @@ export interface QuoxInputRoutePort {
     timeStamp: number,
     detail: number,
   ): void;
+  pointerEnter(
+    x: number,
+    y: number,
+    screenX: number | null,
+    screenY: number | null,
+    buttons: number,
+    modifierBits: number,
+    timeStamp: number,
+  ): void;
+  pointerLeave(
+    x: number,
+    y: number,
+    screenX: number | null,
+    screenY: number | null,
+    buttons: number,
+    modifierBits: number,
+    timeStamp: number,
+  ): void;
   wheel(
     x: number,
     y: number,
@@ -99,7 +117,6 @@ export interface QuoxInputRoutePort {
   key(event: QuoxKeyboardEvent): void;
   ime(event: QuoxImeEvent): void;
   appleCommand(event: QuoxAppleStandardKeybindingEvent): void;
-  clearHover(): void;
   resize(event: QuoxResizeEvent): void;
   focusChange(event: QuoxFocusChangeEvent): void;
   visibility(event: QuoxVisibilityEvent): void;
@@ -154,6 +171,28 @@ export class QuoxInputRouter {
           event.detail,
         );
         return undefined;
+      case "mouseenter":
+        this.port.pointerEnter(
+          event.x,
+          event.y,
+          event.screenX,
+          event.screenY,
+          event.buttons,
+          encodePointerModifiers(event),
+          event.timeStamp,
+        );
+        return undefined;
+      case "mouseleave":
+        this.port.pointerLeave(
+          event.x,
+          event.y,
+          event.screenX,
+          event.screenY,
+          event.buttons,
+          encodePointerModifiers(event),
+          event.timeStamp,
+        );
+        return undefined;
       case "wheel": {
         const [deltaX, deltaY] = wheelDeltaForBlitz(
           event.deltaX,
@@ -188,9 +227,6 @@ export class QuoxInputRouter {
       case "apple-standard-keybinding":
         this.port.appleCommand(event);
         return undefined;
-      case "mouseleave":
-        this.port.clearHover();
-        return undefined;
       case "resize":
         this.#viewportWidth = event.width;
         this.#viewportHeight = event.height;
@@ -205,8 +241,6 @@ export class QuoxInputRouter {
         return undefined;
       case "close":
         return "close";
-      case "mouseenter":
-        return undefined;
       default:
         return assertNever(event);
     }

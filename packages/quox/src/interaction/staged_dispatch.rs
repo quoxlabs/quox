@@ -548,6 +548,12 @@ enum PointerFlavor {
     Up,
 }
 
+#[derive(Clone, Copy)]
+enum NativePointerBoundary {
+    Enter,
+    Leave,
+}
+
 enum ResumeAction {
     Normal {
         suppress_default: bool,
@@ -584,6 +590,11 @@ enum DispatchRequest {
         flavor: PointerFlavor,
         metadata: EventMetadata,
     },
+    PointerBoundary {
+        event: BlitzPointerEvent,
+        boundary: NativePointerBoundary,
+        metadata: EventMetadata,
+    },
     Wheel {
         event: BlitzWheelEvent,
         metadata: EventMetadata,
@@ -618,6 +629,19 @@ struct PointerInput {
     time_stamp: f64,
     detail: u32,
     flavor: PointerFlavor,
+}
+
+#[derive(Clone, Copy)]
+struct PointerBoundaryInput {
+    native_x: f64,
+    native_y: f64,
+    screen: Option<(f64, f64)>,
+    x: f32,
+    y: f32,
+    buttons: blitz_traits::events::MouseEventButtons,
+    modifier_bits: u32,
+    time_stamp: f64,
+    boundary: NativePointerBoundary,
 }
 
 #[derive(Clone, Copy)]
@@ -713,6 +737,56 @@ impl<'a> ResolvedInputLayout<'a> {
                     element: ElementPoint::default(),
                 },
                 flavor: input.flavor,
+                metadata,
+            }
+        })
+    }
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "Blitz stores page coordinates as f32; native metadata retains the exact f64 boundary coordinates"
+    )]
+    fn pointer_boundary_request(self, input: PointerBoundaryInput) -> DispatchRequest {
+        let scroll = self.document.viewport_scroll();
+        let metadata = EventMetadata::pointer_with_modifiers(
+            input.time_stamp,
+            native_pointer_coordinates(
+                input.native_x,
+                input.native_y,
+                input.screen,
+                scroll.x,
+                scroll.y,
+            ),
+            0,
+            input.modifier_bits,
+        );
+        let page = match input.boundary {
+            NativePointerBoundary::Enter => super::viewport_point_to_page(
+                input.x,
+                input.y,
+                self.width,
+                self.height,
+                scroll.x,
+                scroll.y,
+            ),
+            NativePointerBoundary::Leave => Some((
+                (f64::from(input.x) + scroll.x) as f32,
+                (f64::from(input.y) + scroll.y) as f32,
+            )),
+        };
+        page.map_or(DispatchRequest::Empty, |(page_x, page_y)| {
+            DispatchRequest::PointerBoundary {
+                event: BlitzPointerEvent {
+                    id: BlitzPointerId::Mouse,
+                    is_primary: true,
+                    coords: super::pointer_coords(input.x, input.y, page_x, page_y),
+                    button: MouseEventButton::Main,
+                    buttons: input.buttons,
+                    mods: super::build_pointer_modifiers(input.modifier_bits),
+                    details: PointerDetails::default(),
+                    element: ElementPoint::default(),
+                },
+                boundary: input.boundary,
                 metadata,
             }
         })
@@ -911,10 +985,6 @@ impl Default for DispatchStack {
 }
 
 impl DispatchStack {
-    pub(crate) fn end_wheel_transaction(&mut self) {
-        self.wheel_transaction = None;
-    }
-
     fn allocate_frame_id(&mut self) -> Result<u32, DispatchError> {
         let id = self
             .next_frame_id
@@ -1221,6 +1291,10 @@ impl DispatchStack {
         redraw_requested
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "request planning keeps each native event flavor's state transition adjacent to its queued work"
+    )]
     fn plan_request(
         &mut self,
         document: &mut BaseDocument,
@@ -1260,6 +1334,25 @@ impl DispatchStack {
                 );
                 plan_pointer(document, handles, planned, &event, flavor, stream, metadata)?;
             }
+            DispatchRequest::PointerBoundary {
+                event,
+                boundary,
+                metadata,
+            } => match boundary {
+                NativePointerBoundary::Enter => {
+                    let _ = plan_hover_transitions(document, handles, planned, &event, &metadata)?;
+                }
+                NativePointerBoundary::Leave => {
+                    let previous = document.get_hover_node_id();
+                    // Match browser boundary state during listeners and avoid a delayed clear
+                    // wiping hover established by synchronously nested native input.
+                    document.clear_hover();
+                    *wheel_transaction = None;
+                    let _ = plan_hover_transition_between(
+                        document, handles, planned, &event, &metadata, previous, None,
+                    )?;
+                }
+            },
             DispatchRequest::Wheel {
                 event,
                 metadata,
@@ -2587,15 +2680,33 @@ fn plan_hover_transitions(
     metadata: &EventMetadata,
 ) -> Result<PlannedHover, DispatchError> {
     let previous = document.get_hover_node_id();
-    let changed = document.set_hover_to(event.page_x(), event.page_y());
+    document.set_hover_to(event.page_x(), event.page_y());
     let current = document.get_hover_node_id();
+    plan_hover_transition_between(
+        document, handles, planned, event, metadata, previous, current,
+    )
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "kept in the exact transition order used by pinned Blitz EventDriver"
+)]
+fn plan_hover_transition_between(
+    document: &BaseDocument,
+    handles: &mut NodeHandles,
+    planned: &mut VecDeque<PlannedWork>,
+    event: &BlitzPointerEvent,
+    metadata: &EventMetadata,
+    previous: Option<usize>,
+    current: Option<usize>,
+) -> Result<PlannedHover, DispatchError> {
     let default_target = current
         .map(|raw| guard_raw_node(document, handles, raw))
         .transpose()?
         .flatten();
     let new_chain = pointer_author_chain(document, handles, current)?;
     let author_target = new_chain.first().copied();
-    if !changed {
+    if previous == current {
         return Ok(PlannedHover {
             raw: current,
             default_target,
@@ -3377,16 +3488,14 @@ fn event_payload(data: &DomEventData, metadata: &EventMetadata) -> Option<Dispat
         DomEventData::ContextMenu(event) => Some(DispatchEventPayload::Pointer(
             click_pointer_payload(event, metadata, mouse_button_number(event.button), 0),
         )),
-        DomEventData::MouseMove(event)
-        | DomEventData::MouseEnter(event)
+        DomEventData::MouseMove(event) => Some(DispatchEventPayload::Mouse(mouse_payload(
+            event, metadata, 0, 0, true,
+        ))),
+        DomEventData::MouseEnter(event)
         | DomEventData::MouseLeave(event)
         | DomEventData::MouseOver(event)
         | DomEventData::MouseOut(event) => Some(DispatchEventPayload::Mouse(mouse_payload(
-            event,
-            metadata,
-            0,
-            0,
-            matches!(data, DomEventData::MouseMove(_)),
+            event, metadata, 0, 0, false,
         ))),
         DomEventData::MouseDown(event)
         | DomEventData::MouseUp(event)
@@ -4042,6 +4151,50 @@ fn finish_step(
     step.into_js()
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the flat WASM ABI carries browser event fields without allocating an input object"
+)]
+fn begin_pointer_boundary_request(
+    renderer: &QuoxRenderer,
+    x: f64,
+    y: f64,
+    screen_known: bool,
+    screen_x: f64,
+    screen_y: f64,
+    buttons: f64,
+    modifier_bits: f64,
+    time_stamp: f64,
+    boundary: NativePointerBoundary,
+) -> Result<JsValue, JsValue> {
+    let native_x = finite_f64(x, "x").map_err(NumericArgumentError::into_js)?;
+    let native_y = finite_f64(y, "y").map_err(NumericArgumentError::into_js)?;
+    let screen = native_screen_coordinates(screen_known, screen_x, screen_y)
+        .map_err(NumericArgumentError::into_js)?;
+    let x = finite_f32(x, "x").map_err(NumericArgumentError::into_js)?;
+    let y = finite_f32(y, "y").map_err(NumericArgumentError::into_js)?;
+    let buttons = pointer_buttons(buttons).map_err(NumericArgumentError::into_js)?;
+    let modifier_bits = known_mask(modifier_bits, POINTER_MOD_KNOWN, "modifierBits")
+        .map_err(NumericArgumentError::into_js)?;
+    let time_stamp =
+        nonnegative_f64(time_stamp, "timeStamp").map_err(NumericArgumentError::into_js)?;
+    let mut state = renderer.state.borrow_mut();
+    let request = resolve_input_layout(&mut state).pointer_boundary_request(PointerBoundaryInput {
+        native_x,
+        native_y,
+        screen,
+        x,
+        y,
+        buttons,
+        modifier_bits,
+        time_stamp,
+        boundary,
+    });
+    state.refresh_ime_cursor_area();
+    let step = begin_request(&mut state, request);
+    finish_step(&mut state, step)
+}
+
 #[wasm_bindgen]
 impl QuoxRenderer {
     #[allow(
@@ -4087,6 +4240,64 @@ impl QuoxRenderer {
         state.refresh_ime_cursor_area();
         let step = begin_request(&mut state, request);
         finish_step(&mut state, step)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the flat WASM ABI carries browser event fields without allocating an input object"
+    )]
+    pub fn begin_pointer_enter(
+        &self,
+        x: f64,
+        y: f64,
+        screen_known: bool,
+        screen_x: f64,
+        screen_y: f64,
+        buttons: f64,
+        modifier_bits: f64,
+        time_stamp: f64,
+    ) -> Result<JsValue, JsValue> {
+        begin_pointer_boundary_request(
+            self,
+            x,
+            y,
+            screen_known,
+            screen_x,
+            screen_y,
+            buttons,
+            modifier_bits,
+            time_stamp,
+            NativePointerBoundary::Enter,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the flat WASM ABI carries browser event fields without allocating an input object"
+    )]
+    pub fn begin_pointer_leave(
+        &self,
+        x: f64,
+        y: f64,
+        screen_known: bool,
+        screen_x: f64,
+        screen_y: f64,
+        buttons: f64,
+        modifier_bits: f64,
+        time_stamp: f64,
+    ) -> Result<JsValue, JsValue> {
+        begin_pointer_boundary_request(
+            self,
+            x,
+            y,
+            screen_known,
+            screen_x,
+            screen_y,
+            buttons,
+            modifier_bits,
+            time_stamp,
+            NativePointerBoundary::Leave,
+        )
     }
 
     #[allow(
@@ -4739,6 +4950,45 @@ mod tests {
             self.begin(request)
         }
 
+        #[allow(
+            clippy::too_many_arguments,
+            reason = "the test helper exposes the complete native boundary occurrence"
+        )]
+        fn begin_trusted_boundary(
+            &mut self,
+            x: f32,
+            y: f32,
+            buttons: MouseEventButtons,
+            modifier_bits: u32,
+            time_stamp: f64,
+            screen: Option<(f64, f64)>,
+            boundary: NativePointerBoundary,
+        ) -> DispatchStep {
+            let request = ResolvedInputLayout::new(
+                &mut self.document,
+                &mut self.text_controls,
+                &mut self.checked_controls,
+                &mut self.handles,
+                800,
+                600,
+                800,
+                600,
+                1.0,
+            )
+            .pointer_boundary_request(PointerBoundaryInput {
+                native_x: f64::from(x),
+                native_y: f64::from(y),
+                screen,
+                x,
+                y,
+                buttons,
+                modifier_bits,
+                time_stamp,
+                boundary,
+            });
+            self.begin(request)
+        }
+
         fn begin_trusted_wheel(&mut self, x: f32, y: f32) -> DispatchStep {
             self.begin_trusted_wheel_at(x, y, event_time_stamp())
         }
@@ -5154,6 +5404,209 @@ mod tests {
                 "mousemove",
             ]
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "native boundary metadata must retain exact host coordinates and timestamps"
+    )]
+    fn native_pointer_boundaries_use_dom_order_targets_and_metadata_without_moves() {
+        let mut context = TestContext::new(
+            "<div id='target' style='display:block;width:100px;height:40px'></div>",
+        );
+        let target = context.element("target");
+        let target_handle = context.handles.expose(target).unwrap();
+        let (x, y) = context.center(target);
+        let modifier_bits =
+            POINTER_MOD_SHIFT | POINTER_MOD_CAPS_LOCK | POINTER_MOD_FN | POINTER_MOD_NUM_LOCK;
+
+        let entered = context.begin_trusted_boundary(
+            x,
+            y,
+            MouseEventButtons::Primary,
+            modifier_bits,
+            41.25,
+            Some((1_001.125, 702.875)),
+            NativePointerBoundary::Enter,
+        );
+        assert_eq!(context.document.get_hover_node_id(), Some(target));
+        let entered = drain_steps(&mut context, entered);
+        let target_entered: Vec<_> = entered
+            .iter()
+            .filter(|step| step.target == target_handle)
+            .collect();
+        assert_eq!(
+            target_entered
+                .iter()
+                .map(|step| step.event_type.as_str())
+                .collect::<Vec<_>>(),
+            ["pointerover", "mouseover", "pointerenter", "mouseenter"]
+        );
+        assert!(
+            entered
+                .iter()
+                .all(|step| !matches!(step.event_type.as_str(), "pointermove" | "mousemove"))
+        );
+        for step in target_entered {
+            assert_eq!(step.time_stamp, 41.25);
+            let (mouse, expected_button) = match step.payload.as_deref().unwrap() {
+                DispatchEventPayload::Pointer(payload) => (&payload.mouse, -1),
+                DispatchEventPayload::Mouse(payload) => (payload, 0),
+                _ => panic!("boundary event should carry mouse fields"),
+            };
+            assert_eq!(
+                (mouse.client_x, mouse.client_y),
+                (f64::from(x), f64::from(y))
+            );
+            assert_eq!((mouse.screen_x, mouse.screen_y), (1_001.125, 702.875));
+            assert_eq!((mouse.movement_x, mouse.movement_y), (0.0, 0.0));
+            assert_eq!(
+                (mouse.button, mouse.detail, mouse.buttons),
+                (expected_button, 0, 1)
+            );
+            assert!(mouse.shift_key && mouse.caps_lock && mouse.fn_key && mouse.num_lock);
+            assert_eq!(mouse.related_target, None);
+        }
+
+        let left = context.begin_trusted_boundary(
+            -5.25,
+            y,
+            MouseEventButtons::Primary,
+            modifier_bits,
+            42.5,
+            Some((1_002.25, 704.5)),
+            NativePointerBoundary::Leave,
+        );
+        assert_eq!(context.document.get_hover_node_id(), None);
+        let left = drain_steps(&mut context, left);
+        let target_left: Vec<_> = left
+            .iter()
+            .filter(|step| step.target == target_handle)
+            .collect();
+        assert_eq!(
+            target_left
+                .iter()
+                .map(|step| step.event_type.as_str())
+                .collect::<Vec<_>>(),
+            ["pointerout", "mouseout", "pointerleave", "mouseleave"]
+        );
+        for step in target_left {
+            let (mouse, expected_button) = match step.payload.as_deref().unwrap() {
+                DispatchEventPayload::Pointer(payload) => (&payload.mouse, -1),
+                DispatchEventPayload::Mouse(payload) => (payload, 0),
+                _ => panic!("boundary event should carry mouse fields"),
+            };
+            assert_eq!(mouse.related_target, None);
+            assert_eq!((mouse.button, mouse.detail), (expected_button, 0));
+            assert_eq!(mouse.client_x, -5.25);
+        }
+    }
+
+    #[test]
+    fn native_enter_then_move_does_not_duplicate_boundaries() {
+        let mut context = TestContext::new(
+            "<div id='target' style='display:block;width:100px;height:40px'></div>",
+        );
+        let target = context.element("target");
+        let (x, y) = context.center(target);
+        let entered = context.begin_trusted_boundary(
+            x,
+            y,
+            MouseEventButtons::None,
+            0,
+            1.0,
+            None,
+            NativePointerBoundary::Enter,
+        );
+        let _ = drain(&mut context, entered);
+
+        let moved = context.begin_trusted_pointer(
+            x,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::None,
+            PointerFlavor::Move,
+        );
+        let (types, _, _) = drain(&mut context, moved);
+        assert_eq!(types, ["pointermove", "mousemove"]);
+    }
+
+    #[test]
+    fn native_leave_clears_only_hover_and_wheel_state_while_a_button_is_pressed() {
+        let mut context = TestContext::new(
+            "<div id='target' style='display:block;width:100px;height:40px'></div>",
+        );
+        let target = context.element("target");
+        let guarded = guard_node(&context.document, &mut context.handles, target)
+            .unwrap()
+            .unwrap();
+        let (x, y) = context.center(target);
+        assert!(context.document.set_hover_to(x, y));
+        let down = context.begin_trusted_pointer(
+            x,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            PointerFlavor::Down,
+        );
+        let _ = drain(&mut context, down);
+        let press_before = context.stack.mouse_button_presses[0].unwrap();
+        context.stack.wheel_transaction = Some(WheelTransaction {
+            default_target: GuardedRawNode::from_public(guarded),
+            author_target: guarded,
+            last_time_stamp: 1.0,
+        });
+
+        let left = context.begin_trusted_boundary(
+            x,
+            y,
+            MouseEventButtons::Primary,
+            0,
+            2.0,
+            None,
+            NativePointerBoundary::Leave,
+        );
+        assert_eq!(context.document.get_hover_node_id(), None);
+        assert!(context.stack.wheel_transaction.is_none());
+        let press_after = context.stack.mouse_button_presses[0].unwrap();
+        assert_eq!(press_after.author_target, press_before.author_target);
+        assert_eq!(press_after.dragged, press_before.dragged);
+        assert_eq!(
+            (press_after.page_x, press_after.page_y),
+            (press_before.page_x, press_before.page_y)
+        );
+        let (types, _, _) = drain(&mut context, left);
+        assert!(types.iter().any(|event_type| event_type == "pointerout"));
+        assert!(types.iter().any(|event_type| event_type == "mouseleave"));
+        assert!(context.stack.mouse_button_presses[0].is_some());
+    }
+
+    #[test]
+    fn native_enter_hit_tests_fresh_layout() {
+        let mut context = TestContext::new(
+            "<div id='target' style='position:absolute;left:300px;top:0;width:80px;height:40px'></div>",
+        );
+        let target = context.element("target");
+        let target_handle = context.handles.expose(target).unwrap();
+        context.set_style(
+            target,
+            "position:absolute;left:0;top:0;width:80px;height:40px",
+        );
+
+        let entered = context.begin_trusted_boundary(
+            20.0,
+            20.0,
+            MouseEventButtons::None,
+            0,
+            1.0,
+            None,
+            NativePointerBoundary::Enter,
+        );
+        let pointer_over = next_event_of_type(&mut context, entered, "pointerover");
+        assert_eq!(pointer_over.target, target_handle);
+        let remainder = context.resume(&pointer_over, false);
+        let _ = drain(&mut context, remainder);
     }
 
     #[test]

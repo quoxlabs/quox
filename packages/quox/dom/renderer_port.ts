@@ -184,6 +184,26 @@ export interface DomDispatchRendererSource {
     modifierBits: number,
     timeStamp: number,
   ): unknown;
+  begin_pointer_enter(
+    x: number,
+    y: number,
+    screenKnown: boolean,
+    screenX: number,
+    screenY: number,
+    buttons: number,
+    modifierBits: number,
+    timeStamp: number,
+  ): unknown;
+  begin_pointer_leave(
+    x: number,
+    y: number,
+    screenKnown: boolean,
+    screenX: number,
+    screenY: number,
+    buttons: number,
+    modifierBits: number,
+    timeStamp: number,
+  ): unknown;
   begin_pointer_down(
     x: number,
     y: number,
@@ -887,6 +907,54 @@ export class DomDispatchRendererPort {
   ): DomDispatchStep {
     return this.#validateInitial(
       this.#renderer.begin_pointer_move(
+        x,
+        y,
+        screenKnown,
+        screenX,
+        screenY,
+        buttons,
+        modifierBits,
+        timeStamp,
+      ),
+    );
+  }
+
+  beginPointerEnter(
+    x: number,
+    y: number,
+    screenKnown: boolean,
+    screenX: number,
+    screenY: number,
+    buttons: number,
+    modifierBits: number,
+    timeStamp: number,
+  ): DomDispatchStep {
+    return this.#validateInitial(
+      this.#renderer.begin_pointer_enter(
+        x,
+        y,
+        screenKnown,
+        screenX,
+        screenY,
+        buttons,
+        modifierBits,
+        timeStamp,
+      ),
+    );
+  }
+
+  beginPointerLeave(
+    x: number,
+    y: number,
+    screenKnown: boolean,
+    screenX: number,
+    screenY: number,
+    buttons: number,
+    modifierBits: number,
+    timeStamp: number,
+  ): DomDispatchStep {
+    return this.#validateInitial(
+      this.#renderer.begin_pointer_leave(
         x,
         y,
         screenKnown,

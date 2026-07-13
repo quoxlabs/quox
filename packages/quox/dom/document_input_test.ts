@@ -39,6 +39,14 @@ class FakeInputRenderer {
     return this.#complete(false);
   }
 
+  begin_pointer_enter(..._args: unknown[]): unknown {
+    return this.#complete(false);
+  }
+
+  begin_pointer_leave(..._args: unknown[]): unknown {
+    return this.#complete(false);
+  }
+
   begin_pointer_down(..._args: unknown[]): unknown {
     return this.#complete(false);
   }

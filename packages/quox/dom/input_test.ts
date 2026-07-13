@@ -56,7 +56,8 @@ Deno.test("pointer adapter forwards native timing and click detail", () => {
     key() {},
     ime() {},
     appleCommand() {},
-    clearHover() {},
+    pointerEnter: (...values) => calls.push(["enter", ...values]),
+    pointerLeave: (...values) => calls.push(["leave", ...values]),
     resize() {},
     focusChange() {},
     visibility() {},
@@ -65,11 +66,23 @@ Deno.test("pointer adapter forwards native timing and click detail", () => {
   router.route({ type: "mousemove", ...pointer });
   router.route({ type: "mousedown", button: 0, detail: 2, ...pointer });
   router.route({ type: "mouseup", button: 0, detail: 2, ...pointer });
+  router.route({
+    type: "mouseenter",
+    ...pointer,
+    capsLock: true,
+    altGraphKey: true,
+    fnKey: true,
+    numLock: true,
+    scrollLock: true,
+  });
+  router.route({ type: "mouseleave", ...pointer, screenX: null, screenY: null });
 
   assertEquals(calls, [
     ["move", 7, 9, 107.5, 209.25, 5, 9, 12],
     ["down", 7, 9, 107.5, 209.25, 0, 5, 9, 12, 2],
     ["up", 7, 9, 107.5, 209.25, 0, 5, 9, 12, 2],
+    ["enter", 7, 9, 107.5, 209.25, 5, 505, 12],
+    ["leave", 7, 9, null, null, 5, 9, 12],
   ]);
 });
 
@@ -84,7 +97,8 @@ Deno.test("wheel adapter preserves browser units and translates Blitz scroll dir
       key() {},
       ime() {},
       appleCommand() {},
-      clearHover() {},
+      pointerEnter() {},
+      pointerLeave() {},
       resize() {},
       focusChange() {},
       visibility() {},
@@ -139,7 +153,8 @@ Deno.test("pointer adapter preserves unavailable global coordinates", () => {
     key() {},
     ime() {},
     appleCommand() {},
-    clearHover() {},
+    pointerEnter() {},
+    pointerLeave() {},
     resize() {},
     focusChange() {},
     visibility() {},
@@ -375,7 +390,8 @@ Deno.test("native window focus dispatch precedes raw observers and isolates list
     key() {},
     ime() {},
     appleCommand() {},
-    clearHover() {},
+    pointerEnter() {},
+    pointerLeave() {},
     resize() {},
     focusChange: (event) => dispatchNativeWindowFocusEvent(target, event.type, (error) => errors.push(error)),
     visibility() {},
@@ -415,7 +431,8 @@ Deno.test("pure router preserves key listener then commit and DOM-input ordering
       if (event.kind === "commit") order.push("commit-dispatch", "dom-input");
     },
     appleCommand() {},
-    clearHover() {},
+    pointerEnter() {},
+    pointerLeave() {},
     resize() {},
     focusChange() {},
     visibility() {},

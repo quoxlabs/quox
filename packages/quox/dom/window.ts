@@ -159,6 +159,26 @@ export class QuoxWindow extends QuoxEventTarget implements Disposable {
             screenX,
             screenY,
           ),
+        pointerEnter: (x, y, screenX, screenY, buttons, modifiers, timeStamp) =>
+          this.document.dispatchPointerEnter(
+            x,
+            y,
+            buttons,
+            modifiers,
+            timeStamp,
+            screenX,
+            screenY,
+          ),
+        pointerLeave: (x, y, screenX, screenY, buttons, modifiers, timeStamp) =>
+          this.document.dispatchPointerLeave(
+            x,
+            y,
+            buttons,
+            modifiers,
+            timeStamp,
+            screenX,
+            screenY,
+          ),
         wheel: (
           x,
           y,
@@ -190,7 +210,6 @@ export class QuoxWindow extends QuoxEventTarget implements Disposable {
         key: (event) => this.document.dispatchKey(event),
         ime: (event) => this.document.dispatchIme(event),
         appleCommand: (event) => this.document.dispatchAppleStandardKeybinding(event),
-        clearHover: () => this.document.clearHover(),
         resize: (event) => {
           const width = assertUint32(event.width, "width");
           const height = assertUint32(event.height, "height");

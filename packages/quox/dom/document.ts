@@ -50,7 +50,6 @@ type SyntheticEventPathRenderer = WasmRenderer & {
   synthetic_event_path(nodeHandle: number): Uint32Array;
 };
 type InvalidatingTitleRenderer = { set_title(title: string): Uint32Array };
-type LegacyHoverRenderer = { clear_hover(): boolean };
 type ElementInterfaceRenderer = { element_interface(nodeHandle: number): number };
 type ActiveElementRenderer = { active_element(): number | undefined };
 
@@ -373,6 +372,74 @@ export class QuoxDocument extends QuoxEventTarget {
     );
   }
 
+  /** Dispatch native pointer-entry boundaries without manufacturing a move event. */
+  dispatchPointerEnter(
+    x: number,
+    y: number,
+    buttons: number,
+    modifierBits: number,
+    timeStamp = performance.now(),
+    screenX: number | null = null,
+    screenY: number | null = null,
+  ): void {
+    this.#dispatchPointerBoundary("enter", x, y, buttons, modifierBits, timeStamp, screenX, screenY);
+  }
+
+  /** Dispatch native pointer-exit boundaries without manufacturing a move event. */
+  dispatchPointerLeave(
+    x: number,
+    y: number,
+    buttons: number,
+    modifierBits: number,
+    timeStamp = performance.now(),
+    screenX: number | null = null,
+    screenY: number | null = null,
+  ): void {
+    this.#dispatchPointerBoundary("leave", x, y, buttons, modifierBits, timeStamp, screenX, screenY);
+  }
+
+  #dispatchPointerBoundary(
+    boundary: "enter" | "leave",
+    x: number,
+    y: number,
+    buttons: number,
+    modifierBits: number,
+    timeStamp: number,
+    screenX: number | null,
+    screenY: number | null,
+  ): void {
+    this.#assertActive();
+    x = assertFloat32(x, "x");
+    y = assertFloat32(y, "y");
+    buttons = assertKnownMask(buttons, POINTER_BUTTONS_MASK, "buttons");
+    modifierBits = assertKnownMask(modifierBits, POINTER_MODIFIER_MASK, "modifierBits");
+    timeStamp = assertEventTimeStamp(timeStamp);
+    const screen = assertScreenCoordinates(screenX, screenY);
+    this.#dispatchInputEvent(() =>
+      boundary === "enter"
+        ? this.#dispatchPort.beginPointerEnter(
+          x,
+          y,
+          screen.known,
+          screen.x,
+          screen.y,
+          buttons,
+          modifierBits,
+          timeStamp,
+        )
+        : this.#dispatchPort.beginPointerLeave(
+          x,
+          y,
+          screen.known,
+          screen.x,
+          screen.y,
+          buttons,
+          modifierBits,
+          timeStamp,
+        )
+    );
+  }
+
   /** Feed a wheel event into Blitz, scrolling whatever's hovered (not just the viewport). */
   dispatchWheel(
     x: number,
@@ -482,14 +549,6 @@ export class QuoxDocument extends QuoxEventTarget {
       default:
         return assertNever(event);
     }
-  }
-
-  /** Clear Blitz's hover state, e.g. when the pointer leaves the window entirely. */
-  clearHover(): void {
-    this.#assertActive();
-    runWithImeSynchronization(() => {
-      if ((this.#renderer as unknown as LegacyHoverRenderer).clear_hover()) this.#requestRender();
-    }, () => this.#syncNativeImeRequests());
   }
 
   #dispatchInputEvent(begin: () => DomDispatchStep): void {

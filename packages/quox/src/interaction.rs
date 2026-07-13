@@ -10,7 +10,6 @@ use blitz_traits::events::{
 use keyboard_types::{Code, Key, Location, Modifiers};
 use std::num::NonZeroUsize;
 use std::str::FromStr;
-use std::sync::atomic::Ordering;
 use wasm_bindgen::prelude::*;
 
 pub(super) mod staged_dispatch;
@@ -376,16 +375,6 @@ impl QuoxRenderer {
             return Ok(None);
         };
         state.expose_public_dom_node(hit.node_id)
-    }
-
-    /// Clear Blitz's hover state (and reset the cursor), e.g. when the pointer leaves the
-    /// window entirely and no further `mousemove` will arrive to naturally update hover.
-    /// Returns whether a redraw was requested.
-    pub fn clear_hover(&self) -> bool {
-        let mut state = self.state.borrow_mut();
-        state.document.clear_hover();
-        state.dispatch_stack.end_wheel_transaction();
-        state.redraw_requested.swap(false, Ordering::Relaxed)
     }
 }
 

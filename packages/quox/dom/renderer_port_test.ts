@@ -446,6 +446,52 @@ class FakeRenderer implements DomDispatchRendererSource {
     );
   }
 
+  begin_pointer_enter(
+    x: number,
+    y: number,
+    screenKnown: boolean,
+    screenX: number,
+    screenY: number,
+    buttons: number,
+    modifierBits: number,
+    timeStamp: number,
+  ): unknown {
+    return this.#call(
+      "begin_pointer_enter",
+      x,
+      y,
+      screenKnown,
+      screenX,
+      screenY,
+      buttons,
+      modifierBits,
+      timeStamp,
+    );
+  }
+
+  begin_pointer_leave(
+    x: number,
+    y: number,
+    screenKnown: boolean,
+    screenX: number,
+    screenY: number,
+    buttons: number,
+    modifierBits: number,
+    timeStamp: number,
+  ): unknown {
+    return this.#call(
+      "begin_pointer_leave",
+      x,
+      y,
+      screenKnown,
+      screenX,
+      screenY,
+      buttons,
+      modifierBits,
+      timeStamp,
+    );
+  }
+
   begin_pointer_down(
     x: number,
     y: number,
@@ -591,6 +637,8 @@ Deno.test("renderer port forwards every staged entry point and validates its res
   const port = new DomDispatchRendererPort(renderer);
 
   port.beginPointerMove(1, 2, true, 101.5, 202.25, 3, 4, 12.5);
+  port.beginPointerEnter(1, 2, true, 101.5, 202.25, 3, 4, 12.625);
+  port.beginPointerLeave(1, 2, false, 0, 0, 3, 4, 12.75);
   port.beginPointerDown(1, 2, true, 101.5, 202.25, 0, 3, 4, 13, 2);
   port.beginPointerUp(1, 2, true, 101.5, 202.25, 0, 2, 4, 14, 2);
   port.beginWheel(1, 2, false, 0, 0, 3.5, -4.5, -0.25, 0.5, 1, 0, 4, 15);
@@ -606,6 +654,8 @@ Deno.test("renderer port forwards every staged entry point and validates its res
 
   assertEquals(renderer.calls, [
     ["begin_pointer_move", 1, 2, true, 101.5, 202.25, 3, 4, 12.5],
+    ["begin_pointer_enter", 1, 2, true, 101.5, 202.25, 3, 4, 12.625],
+    ["begin_pointer_leave", 1, 2, false, 0, 0, 3, 4, 12.75],
     ["begin_pointer_down", 1, 2, true, 101.5, 202.25, 0, 3, 4, 13, 2],
     ["begin_pointer_up", 1, 2, true, 101.5, 202.25, 0, 2, 4, 14, 2],
     ["begin_wheel", 1, 2, false, 0, 0, 3.5, -4.5, -0.25, 0.5, 1, 0, 4, 15],

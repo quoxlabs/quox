@@ -237,6 +237,14 @@ class FakeDispatchRenderer {
     return this.#begin("begin_pointer_move", args);
   }
 
+  begin_pointer_enter(...args: unknown[]): unknown {
+    return this.#begin("begin_pointer_enter", args);
+  }
+
+  begin_pointer_leave(...args: unknown[]): unknown {
+    return this.#begin("begin_pointer_leave", args);
+  }
+
   begin_pointer_down(...args: unknown[]): unknown {
     return this.#begin("begin_pointer_down", args);
   }
@@ -791,6 +799,47 @@ Deno.test("trusted staged payloads create browser-style event subclasses with ex
   assert(!(scroll instanceof QuoxMouseEvent));
 });
 
+Deno.test("native boundary frames preserve DOM order, target, and null related targets", () => {
+  const { document, renderer } = createHarness();
+  const target = document.createElement("div");
+  const observed: Array<[string, unknown, unknown]> = [];
+  const types = [
+    "pointerover",
+    "mouseover",
+    "pointerenter",
+    "mouseenter",
+    "pointerout",
+    "mouseout",
+    "pointerleave",
+    "mouseleave",
+  ] as const;
+  for (const type of types) {
+    target.addEventListener(type, (event) => {
+      observed.push([type, event.target, (event as QuoxMouseEvent).relatedTarget]);
+    });
+  }
+  const boundary = (type: typeof types[number]) => ({
+    type,
+    target: target.nodeId,
+    path: [target.nodeId],
+    bubbles: !type.endsWith("enter") && !type.endsWith("leave"),
+    payload: type.startsWith("pointer")
+      ? pointerPayload({ button: -1, buttons: 1, detail: 0, relatedTarget: null })
+      : mousePayload({ button: 0, buttons: 1, detail: 0, relatedTarget: null }),
+  });
+
+  renderer.queueFrame(types.slice(0, 4).map(boundary));
+  document.dispatchPointerEnter(1, 2, 1, 0, 10);
+  renderer.queueFrame(types.slice(4).map(boundary));
+  document.dispatchPointerLeave(1, 2, 1, 0, 11);
+
+  assertEquals(observed.map(([type]) => type), [...types]);
+  for (const [, eventTarget, relatedTarget] of observed) {
+    assertStrictEquals(eventTarget, target);
+    assertStrictEquals(relatedTarget, null);
+  }
+});
+
 Deno.test("scroll events wait for rendering, coalesce targets, and use browser paths", () => {
   const { document, renderer, window, renders } = createHarness();
   const root = document.createElement("main");
@@ -978,6 +1027,8 @@ Deno.test("native pointer entry points preserve screen-coordinate availability",
   const { document, renderer } = createHarness();
 
   document.dispatchPointerMove(1, 2, 0, 0x1ff, 3, 101.5, 202.25);
+  document.dispatchPointerEnter(1, 2, 5, 0x1ff, 3.25, 101.5, 202.25);
+  document.dispatchPointerLeave(-1, 2, 5, 0x1ff, 3.5);
   document.dispatchPointerDown(1, 2, 0, 1, 0, 4, 1);
   document.dispatchWheel(1, 2, 3, 4, 0, 0, -3, -4, 0, 5, 101.5, 202.25);
 
@@ -985,6 +1036,8 @@ Deno.test("native pointer entry points preserve screen-coordinate availability",
     renderer.calls.map(([method, _frame, ...args]) => [method, ...args]),
     [
       ["begin_pointer_move", 1, 2, true, 101.5, 202.25, 0, 0x1ff, 3],
+      ["begin_pointer_enter", 1, 2, true, 101.5, 202.25, 5, 0x1ff, 3.25],
+      ["begin_pointer_leave", -1, 2, false, 0, 0, 5, 0x1ff, 3.5],
       ["begin_pointer_down", 1, 2, false, 0, 0, 0, 1, 0, 4, 1],
       ["begin_wheel", 1, 2, true, 101.5, 202.25, 3, 4, -3, -4, 0, 0, 0, 5],
     ],
@@ -996,6 +1049,14 @@ Deno.test("native pointer entry points preserve screen-coordinate availability",
   );
   assertThrows(
     () => document.dispatchPointerMove(1, 2, 0, 0, 6, Number.NaN, 202.25),
+    RangeError,
+  );
+  assertThrows(
+    () => document.dispatchPointerEnter(1, 2, 0, 0, 6, null, 202.25),
+    TypeError,
+  );
+  assertThrows(
+    () => document.dispatchPointerLeave(1, 2, 0, 0x200, 6),
     RangeError,
   );
 });
