@@ -72,6 +72,8 @@ export interface KeyDownEvent extends KeyEventBase {
   /** False for the initial press and true for an operating-system repeat. */
   repeat: boolean;
   editDisposition: KeyEditDisposition;
+  /** Fresh opaque correlation with one directly caused non-composition edit, when provable. */
+  sourceKeyInputId?: number;
 }
 
 export interface KeyUpEvent extends KeyEventBase {
@@ -108,6 +110,8 @@ export type ImeEvent =
     kind: "commit";
     /** Non-empty committed text. A commit atomically ends the current preedit. */
     text: string;
+    /** Matches the single directly causing keydown when the backend can prove that relationship. */
+    sourceKeyInputId?: number;
   })
   | (WindowEvent<"ime"> & {
     kind: "deleteSurrounding";
@@ -127,6 +131,8 @@ export type ImeEvent =
 export interface AppleStandardKeybindingEvent extends WindowEvent<"apple-standard-keybinding"> {
   /** Original AppKit action selector, for example `deleteBackward:`. */
   command: string;
+  /** Matches the single directly causing keydown when the backend can prove that relationship. */
+  sourceKeyInputId?: number;
 }
 export type MouseButton = "left" | "middle" | "right" | "back" | "forward";
 export interface PointerModifiers {

@@ -12,6 +12,7 @@ import {
   assertFloat32,
   assertIntegerRange,
   assertKnownMask,
+  assertPositiveUint32,
   assertUint32,
   assertUtf8ByteRange,
 } from "./ffi_numbers.ts";
@@ -530,6 +531,10 @@ export class QuoxDocument extends QuoxEventTarget {
   dispatchKey(event: QuoxKeyboardEvent): void {
     this.#assertActive();
     const encoded = encodeKeyEvent(event);
+    const rawSourceKeyInputId = event.type === "keydown" ? event.sourceKeyInputId : undefined;
+    const sourceKeyInputId = rawSourceKeyInputId !== undefined
+      ? assertPositiveUint32(rawSourceKeyInputId, "sourceKeyInputId")
+      : undefined;
     encoded.modifierBits = assertKnownMask(encoded.modifierBits, KEY_MODIFIER_MASK, "modifierBits");
     encoded.keycode = assertUint32(encoded.keycode, "keycode");
     encoded.location = assertIntegerRange(encoded.location, 0, 3, "location");
@@ -548,13 +553,21 @@ export class QuoxDocument extends QuoxEventTarget {
         encoded.modifierBits,
         encoded.location,
         encoded.eventFlags,
+        sourceKeyInputId,
       )
     );
   }
 
   /** Apply an AppKit editing selector through Blitz's platform-command adapter. */
   dispatchAppleStandardKeybinding(event: QuoxAppleStandardKeybindingEvent): void {
-    this.#dispatchInputEvent(() => this.#dispatchPort.beginAppleStandardKeybinding(event.command));
+    this.#assertActive();
+    const rawSourceKeyInputId = event.sourceKeyInputId;
+    const sourceKeyInputId = rawSourceKeyInputId === undefined
+      ? undefined
+      : assertPositiveUint32(rawSourceKeyInputId, "sourceKeyInputId");
+    this.#dispatchInputEvent(() =>
+      this.#dispatchPort.beginAppleStandardKeybinding(event.command, sourceKeyInputId)
+    );
   }
 
   /** Feed native IME lifecycle and edit events into Blitz. */
@@ -574,9 +587,17 @@ export class QuoxDocument extends QuoxEventTarget {
         this.#dispatchInputEvent(() => this.#dispatchPort.beginImePreedit(event.text, start, end));
         break;
       }
-      case "commit":
-        this.#dispatchInputEvent(() => this.#dispatchPort.beginImeCommit(event.text));
+      case "commit": {
+        this.#assertActive();
+        const rawSourceKeyInputId = event.sourceKeyInputId;
+        const sourceKeyInputId = rawSourceKeyInputId === undefined
+          ? undefined
+          : assertPositiveUint32(rawSourceKeyInputId, "sourceKeyInputId");
+        this.#dispatchInputEvent(() =>
+          this.#dispatchPort.beginImeCommit(event.text, sourceKeyInputId)
+        );
         break;
+      }
       case "deleteSurrounding": {
         this.#assertActive();
         const beforeBytes = assertUint32(event.beforeBytes, "beforeBytes");

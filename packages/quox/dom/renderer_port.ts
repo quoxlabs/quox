@@ -271,14 +271,15 @@ export interface DomDispatchRendererSource {
     modifierBits: number,
     location: number,
     eventFlags: number,
+    sourceKeyInputId?: number,
   ): unknown;
   begin_focus(nodeHandle: number): unknown;
   begin_blur(nodeHandle: number): unknown;
-  begin_apple_standard_keybinding(command: string): unknown;
+  begin_apple_standard_keybinding(command: string, sourceKeyInputId?: number): unknown;
   begin_ime_enabled(): unknown;
   begin_ime_disabled(): unknown;
   begin_ime_preedit(text: string, cursorStart?: number, cursorEnd?: number): unknown;
-  begin_ime_commit(text: string): unknown;
+  begin_ime_commit(text: string, sourceKeyInputId?: number): unknown;
   begin_ime_delete_surrounding(beforeBytes: number, afterBytes: number): unknown;
   resume_dom_dispatch(frameId: number, eventId: number, defaultPrevented: boolean): unknown;
   abort_dom_dispatch(frameId: number): boolean;
@@ -1133,9 +1134,21 @@ export class DomDispatchRendererPort {
     modifierBits: number,
     location: number,
     eventFlags: number,
+    sourceKeyInputId?: number,
   ): DomDispatchStep {
+    sourceKeyInputId = sourceKeyInputId === undefined
+      ? undefined
+      : assertPositiveUint32(sourceKeyInputId, "sourceKeyInputId");
     return this.#validateInitial(
-      this.#renderer.begin_key_event(code, key, keycode, modifierBits, location, eventFlags),
+      this.#renderer.begin_key_event(
+        code,
+        key,
+        keycode,
+        modifierBits,
+        location,
+        eventFlags,
+        sourceKeyInputId,
+      ),
     );
   }
 
@@ -1147,8 +1160,13 @@ export class DomDispatchRendererPort {
     return this.#validateInitial(this.#renderer.begin_blur(assertUint32(nodeHandle, "nodeHandle")));
   }
 
-  beginAppleStandardKeybinding(command: string): DomDispatchStep {
-    return this.#validateInitial(this.#renderer.begin_apple_standard_keybinding(command));
+  beginAppleStandardKeybinding(command: string, sourceKeyInputId?: number): DomDispatchStep {
+    sourceKeyInputId = sourceKeyInputId === undefined
+      ? undefined
+      : assertPositiveUint32(sourceKeyInputId, "sourceKeyInputId");
+    return this.#validateInitial(
+      this.#renderer.begin_apple_standard_keybinding(command, sourceKeyInputId),
+    );
   }
 
   beginImeEnabled(): DomDispatchStep {
@@ -1165,8 +1183,11 @@ export class DomDispatchRendererPort {
     );
   }
 
-  beginImeCommit(text: string): DomDispatchStep {
-    return this.#validateInitial(this.#renderer.begin_ime_commit(text));
+  beginImeCommit(text: string, sourceKeyInputId?: number): DomDispatchStep {
+    sourceKeyInputId = sourceKeyInputId === undefined
+      ? undefined
+      : assertPositiveUint32(sourceKeyInputId, "sourceKeyInputId");
+    return this.#validateInitial(this.#renderer.begin_ime_commit(text, sourceKeyInputId));
   }
 
   beginImeDeleteSurrounding(beforeBytes: number, afterBytes: number): DomDispatchStep {

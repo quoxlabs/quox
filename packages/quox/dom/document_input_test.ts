@@ -78,8 +78,8 @@ class FakeInputRenderer {
     return this.#complete(true);
   }
 
-  begin_apple_standard_keybinding(command: string): unknown {
-    this.calls.push({ method: "appleCommand", args: [command] });
+  begin_apple_standard_keybinding(command: string, sourceKeyInputId?: number): unknown {
+    this.calls.push({ method: "appleCommand", args: [command, sourceKeyInputId] });
     return this.#complete(false);
   }
 
@@ -98,8 +98,8 @@ class FakeInputRenderer {
     return this.#complete(false);
   }
 
-  begin_ime_commit(text: string): unknown {
-    this.calls.push({ method: "imeCommit", args: [text] });
+  begin_ime_commit(text: string, sourceKeyInputId?: number): unknown {
+    this.calls.push({ method: "imeCommit", args: [text, sourceKeyInputId] });
     return this.#inputOrComplete();
   }
 
@@ -199,13 +199,14 @@ Deno.test("keyboard dispatch forwards logical key, policy, and repeat without sy
     fnKey: true,
     numLock: true,
     scrollLock: true,
+    sourceKeyInputId: 17,
   });
 
   assertEquals(renderer.calls, [{
     method: "keyEvent",
     // modifiers = Shift | Alt | CapsLock | Fn | NumLock | ScrollLock;
     // flags = Pressed | Repeat | PreventDefault
-    args: ["KeyZ", "y", 44, 907, 0, 11],
+    args: ["KeyZ", "y", 44, 907, 0, 11, 17],
   }]);
   assertEquals(renders.count, 1);
   assertEquals(syncs.count, 1);
@@ -220,7 +221,12 @@ Deno.test("IME dispatch preserves UTF-8 preedit ranges and emits DOM input for c
   document.dispatchIme({ type: "ime", kind: "preedit", text: "éx", cursorRange: [2, 3] });
   document.dispatchIme({ type: "ime", kind: "preedit", text: "hidden", cursorRange: null });
   renderer.inputNode = 42;
-  document.dispatchIme({ type: "ime", kind: "commit", text: "é" });
+  document.dispatchIme({
+    type: "ime",
+    kind: "commit",
+    text: "é",
+    sourceKeyInputId: 18,
+  });
   document.dispatchIme({
     type: "ime",
     kind: "deleteSurrounding",
@@ -233,7 +239,7 @@ Deno.test("IME dispatch preserves UTF-8 preedit ranges and emits DOM input for c
     { method: "imeEnabled", args: [] },
     { method: "imePreedit", args: ["éx", 2, 3] },
     { method: "imePreedit", args: ["hidden", undefined, undefined] },
-    { method: "imeCommit", args: ["é"] },
+    { method: "imeCommit", args: ["é", 18] },
     { method: "imeDeleteSurrounding", args: [4, 2] },
     { method: "imeDisabled", args: [] },
   ]);
@@ -258,7 +264,7 @@ Deno.test("IME replacement dispatches surrounding deletion before commit and dra
 
   assertEquals(renderer.calls, [
     { method: "imeDeleteSurrounding", args: [3, 1] },
-    { method: "imeCommit", args: ["好"] },
+    { method: "imeCommit", args: ["好", undefined] },
   ]);
   assertEquals(inputs, 2);
   assertEquals(syncs.count, 2);
@@ -270,9 +276,10 @@ Deno.test("AppKit selectors use the dedicated renderer entry point", () => {
   document.dispatchAppleStandardKeybinding({
     type: "apple-standard-keybinding",
     command: "deleteBackward:",
+    sourceKeyInputId: 19,
   });
 
-  assertEquals(renderer.calls, [{ method: "appleCommand", args: ["deleteBackward:"] }]);
+  assertEquals(renderer.calls, [{ method: "appleCommand", args: ["deleteBackward:", 19] }]);
   assertEquals(syncs.count, 1);
 });
 
@@ -340,6 +347,50 @@ Deno.test("invalid numeric input is rejected before renderer or IME synchronizat
         kind: "deleteSurrounding",
         beforeBytes: 0x1_0000_0000,
         afterBytes: 0,
+      }),
+    RangeError,
+  );
+  assertThrows(
+    () =>
+      document.dispatchKey({
+        type: "keydown",
+        keycode: 44,
+        code: "KeyA",
+        key: "a",
+        location: 0,
+        repeat: false,
+        isComposing: false,
+        editDisposition: "text-input",
+        shiftKey: false,
+        ctrlKey: false,
+        altKey: false,
+        metaKey: false,
+        accelKey: false,
+        capsLock: false,
+        altGraphKey: false,
+        fnKey: false,
+        numLock: false,
+        scrollLock: false,
+        sourceKeyInputId: 0,
+      }),
+    RangeError,
+  );
+  assertThrows(
+    () =>
+      document.dispatchAppleStandardKeybinding({
+        type: "apple-standard-keybinding",
+        command: "deleteBackward:",
+        sourceKeyInputId: 1.5,
+      }),
+    RangeError,
+  );
+  assertThrows(
+    () =>
+      document.dispatchIme({
+        type: "ime",
+        kind: "commit",
+        text: "a",
+        sourceKeyInputId: 0x1_0000_0000,
       }),
     RangeError,
   );

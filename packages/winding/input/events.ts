@@ -23,6 +23,7 @@ export interface KeyEventInit extends KeyModifiers {
 export interface KeyDownEventInit extends KeyEventInit {
   repeat: boolean;
   editDisposition: KeyEditDisposition;
+  sourceKeyInputId?: number;
 }
 
 /**
@@ -112,6 +113,7 @@ export function createKeyDownEvent(init: KeyDownEventInit): KeyDownEvent {
     isComposing: init.isComposing,
     repeat: init.repeat,
     editDisposition: init.editDisposition,
+    ...sourceKeyInputId(init.sourceKeyInputId),
     ...modifiers(init),
   };
 }
@@ -157,8 +159,14 @@ export function createImePreeditEvent(
 }
 
 /** Empty commits carry no semantic edit and are omitted. */
-export function createImeCommitEvent(window: Window, text: string): ImeEvent | undefined {
-  return text.length === 0 ? undefined : { type: "ime", kind: "commit", window, text };
+export function createImeCommitEvent(
+  window: Window,
+  text: string,
+  sourceId?: number,
+): ImeEvent | undefined {
+  return text.length === 0
+    ? undefined
+    : { type: "ime", kind: "commit", window, text, ...sourceKeyInputId(sourceId) };
 }
 
 /** Invalid or empty surrounding deletions are omitted. */
@@ -210,4 +218,12 @@ function modifiers(value: KeyModifiers): KeyModifiers {
     numLock: value.numLock,
     scrollLock: value.scrollLock,
   };
+}
+
+function sourceKeyInputId(value: number | undefined): { sourceKeyInputId?: number } {
+  if (value === undefined) return {};
+  if (!Number.isSafeInteger(value) || value <= 0 || value > 0xffff_ffff) {
+    throw new RangeError("source key input id must be a positive uint32");
+  }
+  return { sourceKeyInputId: value };
 }

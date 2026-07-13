@@ -51,6 +51,13 @@ const POINTER_MOD_SCROLL_LOCK: u32 = super::POINTER_MOD_SCROLL_LOCK;
 const POINTER_MOD_SHIFT: u32 = super::POINTER_MOD_SHIFT;
 const WHEEL_TRANSACTION_TIMEOUT_MS: f64 = 1_500.0;
 const UI_EVENT_DETAIL_MAX: u32 = 2_147_483_647;
+const CANCELED_KEY_INPUT_CAPACITY: usize = 64;
+
+fn validate_source_key_input_id(value: Option<f64>) -> Result<Option<u32>, NumericArgumentError> {
+    value
+        .map(|value| integer_range(value, 1, u32::MAX, "sourceKeyInputId"))
+        .transpose()
+}
 
 /// One paused host dispatch. Frames form a stack because an event listener may synchronously
 /// start another trusted event before it resumes the event which invoked it.
@@ -66,6 +73,7 @@ pub(crate) struct DispatchStack {
     ignored_mouse_ups: MouseEventButtons,
     click_sequence: Option<ClickSequence>,
     space_activation_press: Option<SpaceActivationPress>,
+    canceled_key_inputs: VecDeque<u32>,
     active_composition: Option<ActiveComposition>,
     canceled_composition: Option<CanceledComposition>,
     pending_start_ime: VecDeque<DeferredImeRequest>,
@@ -347,6 +355,7 @@ struct NativeKeyMetadata {
     keycode: u32,
     modifier_bits: u32,
     location: u32,
+    source_key_input_id: Option<u32>,
 }
 
 #[allow(
@@ -968,7 +977,15 @@ enum DispatchRequest {
     },
     Ime(BlitzImeEvent),
     ImeCommit(String),
+    ImeCommitWithSource {
+        text: String,
+        source_key_input_id: u32,
+    },
     AppleStandardKeybinding(String),
+    AppleStandardKeybindingWithSource {
+        command: String,
+        source_key_input_id: u32,
+    },
     ImeDeleteSurrounding {
         before_bytes: usize,
         after_bytes: usize,
@@ -1465,6 +1482,7 @@ impl Default for DispatchStack {
             ignored_mouse_ups: MouseEventButtons::None,
             click_sequence: None,
             space_activation_press: None,
+            canceled_key_inputs: VecDeque::new(),
             active_composition: None,
             canceled_composition: None,
             pending_start_ime: VecDeque::new(),
@@ -1499,6 +1517,31 @@ impl DispatchStack {
         self.next_composition_generation = generation.checked_add(1);
         self.latest_composition_generation = Some(generation);
         Ok(generation)
+    }
+
+    fn record_canceled_key_input(&mut self, source_key_input_id: u32) {
+        if self.canceled_key_inputs.contains(&source_key_input_id) {
+            return;
+        }
+        if self.canceled_key_inputs.len() == CANCELED_KEY_INPUT_CAPACITY {
+            self.canceled_key_inputs.pop_front();
+        }
+        self.canceled_key_inputs.push_back(source_key_input_id);
+    }
+
+    fn take_canceled_key_input(&mut self, source_key_input_id: Option<u32>) -> bool {
+        let Some(source_key_input_id) = source_key_input_id else {
+            return false;
+        };
+        let Some(index) = self
+            .canceled_key_inputs
+            .iter()
+            .position(|candidate| *candidate == source_key_input_id)
+        else {
+            return false;
+        };
+        self.canceled_key_inputs.remove(index);
+        true
     }
 
     fn begin(
@@ -1597,6 +1640,16 @@ impl DispatchStack {
                 keyboard_edit,
             } => {
                 if cancelled {
+                    if matches!(&pending.guarded.event.data, DomEventData::KeyDown(_))
+                        && let Some(source_key_input_id) = pending
+                            .guarded
+                            .metadata
+                            .key
+                            .as_ref()
+                            .and_then(|key| key.source_key_input_id)
+                    {
+                        self.record_canceled_key_input(source_key_input_id);
+                    }
                     if let Some(activation) = checkable_activation.as_deref()
                         && cancel_guarded_checkable_activation(
                             document,
@@ -2419,6 +2472,30 @@ impl DispatchStack {
                 }
                 DispatchRequest::ImeCommit(text)
             }
+            DispatchRequest::ImeCommitWithSource {
+                text,
+                source_key_input_id,
+            } => {
+                if self.plan_active_ime_commit(document, handles, text.clone()) {
+                    self.take_canceled_key_input(Some(source_key_input_id));
+                    return Ok(());
+                }
+                if self.take_canceled_key_input(Some(source_key_input_id))
+                    || !is_insertable_text(&text)
+                {
+                    return Ok(());
+                }
+                DispatchRequest::ImeCommit(text)
+            }
+            DispatchRequest::AppleStandardKeybindingWithSource {
+                command,
+                source_key_input_id,
+            } => {
+                if self.take_canceled_key_input(Some(source_key_input_id)) {
+                    return Ok(());
+                }
+                DispatchRequest::AppleStandardKeybinding(command)
+            }
             DispatchRequest::Ime(BlitzImeEvent::Enabled) => {
                 self.canceled_composition = None;
                 DispatchRequest::Ime(BlitzImeEvent::Enabled)
@@ -2651,6 +2728,10 @@ impl DispatchStack {
                     data: DomEventData::AppleStandardKeybinding(command.into()),
                     metadata,
                 });
+            }
+            DispatchRequest::ImeCommitWithSource { .. }
+            | DispatchRequest::AppleStandardKeybindingWithSource { .. } => {
+                unreachable!("sourced edits are normalized before request planning")
             }
             DispatchRequest::ImeDeleteSurrounding {
                 before_bytes,
@@ -7217,6 +7298,10 @@ impl QuoxRenderer {
         finish_step(&mut state, step)
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the flat WASM ABI carries browser event fields without allocating an input object"
+    )]
     pub fn begin_key_event(
         &self,
         code: &str,
@@ -7225,11 +7310,14 @@ impl QuoxRenderer {
         modifier_bits: f64,
         location: f64,
         event_flags: f64,
+        source_key_input_id: Option<f64>,
     ) -> Result<JsValue, JsValue> {
         let (modifier_bits, location, event_flags) =
             validate_key_abi(modifier_bits, location, event_flags)
                 .map_err(NumericArgumentError::into_js)?;
         let keycode = uint32(keycode, "keycode").map_err(NumericArgumentError::into_js)?;
+        let source_key_input_id = validate_source_key_input_id(source_key_input_id)
+            .map_err(NumericArgumentError::into_js)?;
         let event = key_event(code, key, modifier_bits, location, event_flags);
         let request = DispatchRequest::Key {
             event,
@@ -7241,6 +7329,7 @@ impl QuoxRenderer {
                     keycode,
                     modifier_bits,
                     location,
+                    source_key_input_id,
                 },
             ),
             suppress_default: event_flags & KEY_EVENT_PRESSED != 0
@@ -7280,12 +7369,22 @@ impl QuoxRenderer {
         finish_step(&mut state, step)
     }
 
-    pub fn begin_apple_standard_keybinding(&self, command: &str) -> Result<JsValue, JsValue> {
+    pub fn begin_apple_standard_keybinding(
+        &self,
+        command: &str,
+        source_key_input_id: Option<f64>,
+    ) -> Result<JsValue, JsValue> {
+        let source_key_input_id = validate_source_key_input_id(source_key_input_id)
+            .map_err(NumericArgumentError::into_js)?;
         let mut state = self.state.borrow_mut();
-        let step = begin_request(
-            &mut state,
-            DispatchRequest::AppleStandardKeybinding(command.to_owned()),
+        let request = source_key_input_id.map_or_else(
+            || DispatchRequest::AppleStandardKeybinding(command.to_owned()),
+            |source_key_input_id| DispatchRequest::AppleStandardKeybindingWithSource {
+                command: command.to_owned(),
+                source_key_input_id,
+            },
         );
+        let step = begin_request(&mut state, request);
         finish_step(&mut state, step)
     }
 
@@ -7317,9 +7416,22 @@ impl QuoxRenderer {
         finish_step(&mut state, step)
     }
 
-    pub fn begin_ime_commit(&self, text: &str) -> Result<JsValue, JsValue> {
+    pub fn begin_ime_commit(
+        &self,
+        text: &str,
+        source_key_input_id: Option<f64>,
+    ) -> Result<JsValue, JsValue> {
+        let source_key_input_id = validate_source_key_input_id(source_key_input_id)
+            .map_err(NumericArgumentError::into_js)?;
         let mut state = self.state.borrow_mut();
-        let step = begin_request(&mut state, DispatchRequest::ImeCommit(text.to_owned()));
+        let request = source_key_input_id.map_or_else(
+            || DispatchRequest::ImeCommit(text.to_owned()),
+            |source_key_input_id| DispatchRequest::ImeCommitWithSource {
+                text: text.to_owned(),
+                source_key_input_id,
+            },
+        );
+        let step = begin_request(&mut state, request);
         finish_step(&mut state, step)
     }
 
@@ -8063,6 +8175,10 @@ mod tests {
     }
 
     fn host_key_metadata(key: &str) -> EventMetadata {
+        host_key_metadata_with_source(key, None)
+    }
+
+    fn host_key_metadata_with_source(key: &str, source_key_input_id: Option<u32>) -> EventMetadata {
         EventMetadata::key(
             event_time_stamp(),
             NativeKeyMetadata {
@@ -8071,8 +8187,24 @@ mod tests {
                 keycode: 0,
                 modifier_bits: 0,
                 location: 0,
+                source_key_input_id,
             },
         )
+    }
+
+    fn dispatch_sourced_keydown(
+        context: &mut TestContext,
+        source_key_input_id: u32,
+        cancelled: bool,
+    ) {
+        let keydown = event(context.begin(DispatchRequest::Key {
+            event: key(Key::Character("x".into()), Code::KeyX, KeyState::Pressed),
+            metadata: host_key_metadata_with_source("x", Some(source_key_input_id)),
+            // Direct text services own the edit, so Blitz's ordinary key default stays disabled
+            // regardless of whether author JavaScript cancels this trusted keydown.
+            suppress_default: true,
+        }));
+        complete(context.resume(&keydown, cancelled));
     }
 
     fn tab_request(
@@ -8096,6 +8228,7 @@ mod tests {
                     keycode: 9,
                     modifier_bits: if shift { KEY_MOD_SHIFT } else { 0 },
                     location: 0,
+                    source_key_input_id: None,
                 },
             ),
             suppress_default,
@@ -8122,6 +8255,7 @@ mod tests {
                     keycode: 13,
                     modifier_bits,
                     location: 0,
+                    source_key_input_id: None,
                 },
             ),
             suppress_default,
@@ -8149,6 +8283,7 @@ mod tests {
                     keycode: 32,
                     modifier_bits,
                     location: 0,
+                    source_key_input_id: None,
                 },
             ),
             suppress_default,
@@ -13795,6 +13930,144 @@ mod tests {
     }
 
     #[test]
+    fn canceled_keydown_suppresses_only_its_correlated_native_commit() {
+        let mut context = TestContext::new("<input id='editor' value=''>");
+        let input = context.element("editor");
+        assert!(context.document.set_focus_to(input));
+
+        dispatch_sourced_keydown(&mut context, 1, true);
+        complete(context.begin(DispatchRequest::ImeCommitWithSource {
+            text: "ignored".to_owned(),
+            source_key_input_id: 1,
+        }));
+        assert_eq!(context.raw_text(input), "");
+
+        dispatch_sourced_keydown(&mut context, 2, true);
+        dispatch_sourced_keydown(&mut context, 8, true);
+        complete(context.begin(DispatchRequest::ImeCommitWithSource {
+            text: "ignored".to_owned(),
+            source_key_input_id: 8,
+        }));
+        let untagged = context.begin(DispatchRequest::ImeCommit("a".to_owned()));
+        assert_eq!(drain(&mut context, untagged).0, ["beforeinput", "input"]);
+        let differently_tagged = context.begin(DispatchRequest::ImeCommitWithSource {
+            text: "b".to_owned(),
+            source_key_input_id: 3,
+        });
+        assert_eq!(
+            drain(&mut context, differently_tagged).0,
+            ["beforeinput", "input"]
+        );
+        complete(context.begin(DispatchRequest::ImeCommitWithSource {
+            text: "ignored".to_owned(),
+            source_key_input_id: 2,
+        }));
+        assert_eq!(context.raw_text(input), "ab");
+
+        // Native text services suppress Blitz's key default even when the author does not
+        // cancel keydown. That host policy must not suppress the separately reported edit.
+        dispatch_sourced_keydown(&mut context, 4, false);
+        let uncanceled = context.begin(DispatchRequest::ImeCommitWithSource {
+            text: "c".to_owned(),
+            source_key_input_id: 4,
+        });
+        assert_eq!(drain(&mut context, uncanceled).0, ["beforeinput", "input"]);
+        assert_eq!(context.raw_text(input), "abc");
+    }
+
+    #[test]
+    fn canceled_key_input_history_is_validated_deduplicated_and_bounded() {
+        assert_eq!(validate_source_key_input_id(None).unwrap(), None);
+        assert_eq!(validate_source_key_input_id(Some(1.0)).unwrap(), Some(1));
+        assert_eq!(
+            validate_source_key_input_id(Some(f64::from(u32::MAX))).unwrap(),
+            Some(u32::MAX)
+        );
+        for invalid in [
+            0.0,
+            -1.0,
+            1.5,
+            f64::NAN,
+            f64::INFINITY,
+            f64::from(u32::MAX) + 1.0,
+        ] {
+            assert!(validate_source_key_input_id(Some(invalid)).is_err());
+        }
+
+        let mut stack = DispatchStack::default();
+        stack.record_canceled_key_input(1);
+        stack.record_canceled_key_input(1);
+        assert_eq!(stack.canceled_key_inputs.len(), 1);
+        let capacity = u32::try_from(CANCELED_KEY_INPUT_CAPACITY).expect("capacity fits u32");
+        for source_key_input_id in 2..=capacity + 1 {
+            stack.record_canceled_key_input(source_key_input_id);
+        }
+        assert_eq!(stack.canceled_key_inputs.len(), CANCELED_KEY_INPUT_CAPACITY);
+        assert!(!stack.canceled_key_inputs.contains(&1));
+        assert!(stack.canceled_key_inputs.contains(&2));
+        assert!(stack.canceled_key_inputs.contains(&(capacity + 1)));
+    }
+
+    #[test]
+    fn correlated_commit_still_finishes_an_active_composition() {
+        let mut context = TestContext::new("<input id='editor' value='base'>");
+        let input = context.element("editor");
+        assert!(context.document.set_focus_to(input));
+        context
+            .document
+            .with_text_input(input, |mut driver| driver.move_to_text_end());
+
+        dispatch_sourced_keydown(&mut context, 5, true);
+        let preedit = context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "candidate".to_owned(),
+            None,
+        )));
+        let _ = drain(&mut context, preedit);
+        let commit = context.begin(DispatchRequest::ImeCommitWithSource {
+            text: "done".to_owned(),
+            source_key_input_id: 5,
+        });
+        assert_eq!(
+            drain(&mut context, commit).0,
+            [
+                "compositionupdate",
+                "beforeinput",
+                "input",
+                "compositionend"
+            ]
+        );
+        assert_eq!(context.raw_text(input), "basedone");
+        assert!(!context.stack.canceled_key_inputs.contains(&5));
+    }
+
+    #[test]
+    fn canceled_keydown_suppresses_only_its_correlated_apple_command() {
+        let mut context = TestContext::new("<input id='editor' value='ab'>");
+        let input = context.element("editor");
+        assert!(context.document.set_focus_to(input));
+        context
+            .document
+            .with_text_input(input, |mut driver| driver.move_to_text_end());
+
+        dispatch_sourced_keydown(&mut context, 6, true);
+        complete(
+            context.begin(DispatchRequest::AppleStandardKeybindingWithSource {
+                command: "deleteBackward:".to_owned(),
+                source_key_input_id: 6,
+            }),
+        );
+        assert_eq!(context.raw_text(input), "ab");
+
+        dispatch_sourced_keydown(&mut context, 7, false);
+        let command = context.begin(DispatchRequest::AppleStandardKeybindingWithSource {
+            command: "deleteBackward:".to_owned(),
+            source_key_input_id: 7,
+        });
+        assert_eq!(drain(&mut context, command).0, ["beforeinput", "input"]);
+        assert_eq!(context.raw_text(input), "a");
+    }
+
+    #[test]
     fn active_ime_commit_reconciles_final_text_through_composition_events() {
         let mut context = TestContext::new("<input id='editor' value='base'>");
         let input = context.element("editor");
@@ -15101,6 +15374,7 @@ mod tests {
                     | KEY_MOD_NUM_LOCK
                     | KEY_MOD_SCROLL_LOCK,
                 location: 2,
+                source_key_input_id: None,
             },
         );
         let pending = event(context.begin(DispatchRequest::Key {

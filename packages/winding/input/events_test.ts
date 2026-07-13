@@ -55,6 +55,7 @@ Deno.test("final key builders fill every canonical field", () => {
       ...key,
       repeat: false,
       editDisposition: "text-input",
+      sourceKeyInputId: 17,
     }),
     {
       type: "keydown",
@@ -66,6 +67,7 @@ Deno.test("final key builders fill every canonical field", () => {
       isComposing: false,
       repeat: false,
       editDisposition: "text-input",
+      sourceKeyInputId: 17,
       shiftKey: false,
       ctrlKey: false,
       altKey: false,
@@ -167,6 +169,13 @@ Deno.test("IME builders enforce canonical cursor, commit, and deletion shapes", 
     window,
     text: "日本",
   });
+  assertEquals(createImeCommitEvent(window, "paired", 17), {
+    type: "ime",
+    kind: "commit",
+    window,
+    text: "paired",
+    sourceKeyInputId: 17,
+  });
   assertEquals(createImeDeleteSurroundingEvent(window, 0, 0), undefined);
   assertEquals(createImeDeleteSurroundingEvent(window, -1, 2), undefined);
   assertEquals(createImeDeleteSurroundingEvent(window, 4, 2), {
@@ -188,10 +197,33 @@ Deno.test("IME builders enforce canonical cursor, commit, and deletion shapes", 
   assertEquals(createImeReplaceEvent(window, "A🙂B", 5, 1, "x"), undefined);
 });
 
+Deno.test("source key input ids must be positive uint32 values", () => {
+  assertRangeError(() =>
+    createKeyDownEvent({
+      ...key,
+      repeat: false,
+      editDisposition: "text-input",
+      sourceKeyInputId: 0,
+    })
+  );
+  assertRangeError(() => createImeCommitEvent(window, "x", 1.5));
+  assertRangeError(() => createImeCommitEvent(window, "x", 0x1_0000_0000));
+});
+
 function assertEquals(actual: unknown, expected: unknown): void {
   const actualJson = JSON.stringify(actual);
   const expectedJson = JSON.stringify(expected);
   if (actualJson !== expectedJson) {
     throw new Error(`Expected ${expectedJson}, got ${actualJson}`);
   }
+}
+
+function assertRangeError(callback: () => unknown): void {
+  try {
+    callback();
+  } catch (error) {
+    if (error instanceof RangeError) return;
+    throw error;
+  }
+  throw new Error("Expected RangeError");
 }
