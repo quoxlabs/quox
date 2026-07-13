@@ -1224,6 +1224,9 @@ class WaylandLibrary implements Library {
 
   #releasePointer(emitLeave: boolean): void {
     const focusedWindow = this.#pointerFocus;
+    const canceledButtons = this.#pointerButtons;
+    const interrupted = focusedWindow !== null && canceledButtons !== 0;
+    const snapshot = focusedWindow === null ? undefined : this.#pointerSnapshot();
     const cursorShapeDevice = this.#cursorShapeDevice;
     const pointer = this.#pointer;
     const listeners = this.#pointerListeners;
@@ -1235,8 +1238,18 @@ class WaylandLibrary implements Library {
     this.#pointerListeners = [];
     this.#pointerVtable = undefined;
 
-    if (emitLeave && focusedWindow) {
-      this.#events.push({ type: "mouseleave", ...this.#pointerSnapshot(), window: focusedWindow });
+    if (focusedWindow && snapshot) {
+      if (interrupted) {
+        this.#events.push({
+          type: "pointercancel",
+          ...snapshot,
+          buttons: 0,
+          canceledButtons,
+          window: focusedWindow,
+        });
+      } else if (emitLeave) {
+        this.#events.push({ type: "mouseleave", ...snapshot, window: focusedWindow });
+      }
     }
 
     const errors: unknown[] = [];

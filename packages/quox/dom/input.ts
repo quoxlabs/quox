@@ -5,6 +5,7 @@ import type {
   ImeEvent as WindingImeEvent,
   KeyEvent as WindingKeyEvent,
   MoveEvent as WindingMoveEvent,
+  PointerCancelEvent as WindingPointerCancelEvent,
   PointerModifiers as WindingPointerModifiers,
   ResizeEvent as WindingResizeEvent,
   UIEvent as WindingUIEvent,
@@ -27,6 +28,7 @@ export type QuoxImeEvent = WithoutWindow<WindingImeEvent>;
 export type QuoxAppleStandardKeybindingEvent = WithoutWindow<WindingAppleStandardKeybindingEvent>;
 
 export type QuoxMouseMoveEvent = WithoutWindow<WindingMoveEvent>;
+export type QuoxPointerCancelEvent = WithoutWindow<WindingPointerCancelEvent>;
 export type QuoxMouseButtonEvent = Omit<WithoutWindow<WindingButtonEvent>, "button"> & {
   button: number;
 };
@@ -39,6 +41,7 @@ export type QuoxVisibilityEvent = { type: "visibilitychange"; visible: boolean }
 
 export type QuoxInputEvent =
   | QuoxMouseMoveEvent
+  | QuoxPointerCancelEvent
   | QuoxMouseButtonEvent
   | QuoxMouseWheelEvent
   | QuoxKeyboardEvent
@@ -57,6 +60,15 @@ export interface QuoxInputRoutePort {
     screenX: number | null,
     screenY: number | null,
     buttons: number,
+    modifierBits: number,
+    timeStamp: number,
+  ): void;
+  pointerCancel(
+    x: number,
+    y: number,
+    screenX: number | null,
+    screenY: number | null,
+    canceledButtons: number,
     modifierBits: number,
     timeStamp: number,
   ): void;
@@ -141,6 +153,17 @@ export class QuoxInputRouter {
           event.screenX,
           event.screenY,
           event.buttons,
+          encodePointerModifiers(event),
+          event.timeStamp,
+        );
+        return undefined;
+      case "pointercancel":
+        this.port.pointerCancel(
+          event.x,
+          event.y,
+          event.screenX,
+          event.screenY,
+          event.canceledButtons,
           encodePointerModifiers(event),
           event.timeStamp,
         );
@@ -307,6 +330,13 @@ export function mapWindingEvent(event: WindingUIEvent): QuoxInputEvent {
   switch (event.type) {
     case "mousemove":
       return { type: "mousemove", ...pointerFields(event) };
+    case "pointercancel":
+      return {
+        type: "pointercancel",
+        canceledButtons: event.canceledButtons,
+        ...pointerFields(event),
+        buttons: 0,
+      };
     case "mousedown":
       return {
         type: "mousedown",

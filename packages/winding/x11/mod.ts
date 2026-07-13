@@ -23,7 +23,15 @@ import {
 } from "../input/mod.ts";
 import { domCodeFromXkbName, keyLocationHintForKeysym } from "../linux/mod.ts";
 import { utf8Bytes, utf8CString as cString } from "../text_encoding.ts";
-import { libcFunctions, NotifyInferior, NotifyNormal, x11functions, XEventMask, XEventType } from "./ffi.ts";
+import {
+  libcFunctions,
+  NotifyInferior,
+  NotifyNormal,
+  NotifyUngrab,
+  x11functions,
+  XEventMask,
+  XEventType,
+} from "./ffi.ts";
 import {
   isAutoRepeatPair,
   isTopLevelFocusTransition,
@@ -1138,6 +1146,21 @@ function importEvent(
         }
         : undefined;
     case XEventType.LeaveNotify:
+      if (view.getInt32(80, true) === NotifyUngrab) {
+        const canceledButtons = window.pointerButtons.buttons;
+        if (canceledButtons === 0) return undefined;
+        const pointer = x11PointerSnapshot(
+          view,
+          eventClock,
+          modifierMapping,
+          window.pointerButtons,
+          undefined,
+          undefined,
+          96,
+        );
+        window.pointerButtons.reset();
+        return { type: "pointercancel", ...pointer, buttons: 0, canceledButtons, window };
+      }
       return view.getInt32(80, true) === NotifyNormal && view.getInt32(84, true) !== NotifyInferior
         ? {
           type: "mouseleave",

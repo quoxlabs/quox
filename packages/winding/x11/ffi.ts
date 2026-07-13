@@ -69,6 +69,7 @@ export enum XEventMask {
 
 // Focus/crossing mode and detail values from X11/X.h.
 export const NotifyNormal = 0;
+export const NotifyUngrab = 2;
 export const NotifyWhileGrabbed = 3;
 export const NotifyInferior = 2;
 

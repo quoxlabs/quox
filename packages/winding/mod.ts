@@ -17,6 +17,7 @@ export type {
   LoadLibrary,
   MouseButton,
   MoveEvent,
+  PointerCancelEvent,
   PointerEventBase,
   PointerModifiers,
   ResizeEvent,

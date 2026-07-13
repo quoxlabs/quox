@@ -5,6 +5,7 @@ export type UIEvent =
   | AppleStandardKeybindingEvent
   | ButtonEvent
   | MoveEvent
+  | PointerCancelEvent
   | WheelEvent
   | ResizeEvent
   | CloseEvent
@@ -170,6 +171,17 @@ export interface ButtonEvent extends PointerEventBase<"mousedown" | "mouseup"> {
 }
 export interface MoveEvent extends PointerEventBase<"mousemove"> {
   type: "mousemove";
+}
+/**
+ * Fired when the native system can no longer complete a pressed pointer stream.
+ * Coordinates and modifiers describe the last known pointer state; `buttons` is
+ * zero because the application no longer owns any active native buttons.
+ */
+export interface PointerCancelEvent extends PointerEventBase<"pointercancel"> {
+  type: "pointercancel";
+  buttons: 0;
+  /** Native buttons whose pressed stream was abandoned by this cancellation. */
+  canceledButtons: number;
 }
 export interface WheelEvent extends PointerEventBase<"wheel"> {
   type: "wheel";

@@ -1142,6 +1142,37 @@ Deno.test("Win32 mouse capture state follows one owner and complete button chord
   assertEquals(capture.hasButton("right"), false);
 });
 
+Deno.test("Win32 capture distinguishes interrupted chords from a normal final release", () => {
+  const capture = new Win32MouseCaptureState();
+  const owner = 7n;
+  const buttons = [
+    ["left", 1],
+    ["right", 2],
+    ["middle", 4],
+    ["back", 8],
+    ["forward", 16],
+  ] as const;
+
+  for (const [button, mask] of buttons) {
+    capture.recordDown(owner, button);
+    assertEquals(capture.buttons & mask, mask);
+  }
+  assertEquals(capture.buttons, 31);
+
+  const canceledButtons = capture.buttons;
+  assertEquals(capture.resetOwner(owner), true);
+  assertEquals(canceledButtons, 31);
+  assertEquals(capture.buttons, 0);
+  assertEquals(capture.owner, undefined);
+
+  capture.recordDown(owner, "left");
+  assertEquals(capture.releaseWouldEnd(owner, "left"), true);
+  capture.recordUp(owner, "left");
+  assertEquals(capture.buttons, 0);
+  assertEquals(capture.owner, undefined);
+  assertEquals(capture.resetOwner(owner), false);
+});
+
 Deno.test("Win32 key locations account for remapped and NumLock-dependent keys", () => {
   assertEquals(keyLocationForKey("Enter", "NumpadEnter"), 3);
   assertEquals(keyLocationForKey("Shift", "ShiftLeft"), 1);

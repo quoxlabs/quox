@@ -393,6 +393,7 @@ class DarwinWindow implements Window, DarwinNativeResponder {
   #producedText: string | undefined;
   #producedPreedit = false;
   readonly #pressedKeys = new PressedLogicalKeyCache<number>();
+  #pointerSnapshot: DarwinPointerSnapshot | undefined;
   #ready = false;
   #closed = false;
 
@@ -572,7 +573,9 @@ class DarwinWindow implements Window, DarwinNativeResponder {
       case "mouseenter":
       case "mouseleave":
         if (event !== undefined && event !== null) {
-          this.lib.pushEvent({ type: kind, ...pointerSnapshot(event, this), window: this });
+          const pointer = pointerSnapshot(event, this);
+          this.#pointerSnapshot = pointer;
+          this.lib.pushEvent({ type: kind, ...pointer, window: this });
         }
         return;
       case "focus":
@@ -613,6 +616,10 @@ class DarwinWindow implements Window, DarwinNativeResponder {
     if (this.#closed || event === null) return;
     const translated = importPointerEvent(event, this);
     if (translated !== undefined) this.lib.pushEvent(translated);
+  }
+
+  rememberPointer(pointer: DarwinPointerSnapshot): void {
+    this.#pointerSnapshot = pointer;
   }
 
   handleNativeUpdateLayer(): void {
@@ -776,6 +783,21 @@ class DarwinWindow implements Window, DarwinNativeResponder {
 
   handleFocusLost(): void {
     if (this.#closed) return;
+    if (this.#pointerSnapshot?.buttons) {
+      const canceledButtons = this.#pointerSnapshot.buttons;
+      this.#pointerSnapshot = {
+        ...this.#pointerSnapshot,
+        buttons: 0,
+        timeStamp: performance.now(),
+      };
+      this.lib.pushEvent({
+        type: "pointercancel",
+        ...this.#pointerSnapshot,
+        buttons: 0 as const,
+        canceledButtons,
+        window: this,
+      });
+    }
     this.inputState.setNativeFocused(false);
     this.inputState.observeNativeActive(false);
     this.#flushInputState();
@@ -1534,11 +1556,13 @@ function importPointerEvent(event: Deno.PointerValue, window: DarwinWindow): UIE
         : send.i64(event, sel("buttonNumber"));
       const button = nativeMouseButton(buttonNumber);
       if (button === undefined) return undefined;
+      const pointer = pointerSnapshot(event, window, button, pressed);
+      window.rememberPointer(pointer);
       return {
         type: pressed ? "mousedown" : "mouseup",
         button,
         detail: Math.max(0, Number(send.i64(event, sel("clickCount")))),
-        ...pointerSnapshot(event, window, button, pressed),
+        ...pointer,
         window,
       };
     }
@@ -1546,7 +1570,9 @@ function importPointerEvent(event: Deno.PointerValue, window: DarwinWindow): UIE
     case NSEventType.LeftMouseDragged:
     case NSEventType.RightMouseDragged:
     case NSEventType.OtherMouseDragged: {
-      return { type: "mousemove", ...pointerSnapshot(event, window), window };
+      const pointer = pointerSnapshot(event, window);
+      window.rememberPointer(pointer);
+      return { type: "mousemove", ...pointer, window };
     }
     case NSEventType.ScrollWheel: {
       const delta = browserWheelDelta(
@@ -1554,11 +1580,22 @@ function importPointerEvent(event: Deno.PointerValue, window: DarwinWindow): UIE
         send.f64(event, sel("scrollingDeltaY")),
         send.bool(event, sel("hasPreciseScrollingDeltas")),
       );
-      return { type: "wheel", ...pointerSnapshot(event, window), ...delta, window };
+      const pointer = pointerSnapshot(event, window);
+      window.rememberPointer(pointer);
+      return { type: "wheel", ...pointer, ...delta, window };
     }
     default:
       return undefined;
   }
+}
+
+interface DarwinPointerSnapshot extends PointerModifiers {
+  x: number;
+  y: number;
+  screenX: number;
+  screenY: number;
+  buttons: number;
+  timeStamp: number;
 }
 
 function pointerSnapshot(
@@ -1566,14 +1603,7 @@ function pointerSnapshot(
   window: DarwinWindow,
   changedButton?: MouseButton,
   pressed?: boolean,
-): {
-  x: number;
-  y: number;
-  screenX: number;
-  screenY: number;
-  buttons: number;
-  timeStamp: number;
-} & PointerModifiers {
+): DarwinPointerSnapshot {
   const { getClass, sel, send } = window.lib.ffi;
   const windowPoint = send.point(event, sel("locationInWindow")) as Uint8Array;
   const nativeScreenPoint = send.point_point(

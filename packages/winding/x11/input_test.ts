@@ -289,6 +289,30 @@ Deno.test("X11 pointer snapshots remove only the released extended button", () =
   assertEquals(buttons.snapshot(0), 0);
 });
 
+Deno.test("X11 pointer reset discards retained extended buttons after an interrupted grab", () => {
+  const buttons = new X11PointerButtonState();
+  buttons.snapshot(0, "back", true);
+  buttons.snapshot(0, "forward", true);
+
+  const canceledButtons = buttons.snapshot(0);
+  buttons.reset();
+
+  assertEquals(canceledButtons, 24);
+  assertEquals(buttons.snapshot(0), 0);
+  assertEquals(buttons.snapshot(1 << 8), 1);
+});
+
+Deno.test("X11 pointer state distinguishes a normal final release from grab interruption", () => {
+  const buttons = new X11PointerButtonState();
+  assertEquals(buttons.snapshot(0, "left", true), 1);
+  assertEquals(buttons.buttons, 1);
+
+  // XButtonRelease.state describes the state before the transition. Applying
+  // the changed button must still leave the retained post-transition chord empty.
+  assertEquals(buttons.snapshot(1 << 8, "left", false), 0);
+  assertEquals(buttons.buttons, 0);
+});
+
 Deno.test("X11 pointer snapshots expose root coordinates only on the same screen", () => {
   const bytes = new ArrayBuffer(96);
   const event = new DataView(bytes);

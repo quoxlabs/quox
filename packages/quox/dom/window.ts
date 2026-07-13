@@ -38,6 +38,7 @@ export type {
   QuoxMouseEnterLeaveEvent,
   QuoxMouseMoveEvent,
   QuoxMouseWheelEvent,
+  QuoxPointerCancelEvent,
   QuoxResizeEvent,
   QuoxVisibilityEvent,
 } from "./input.ts";
@@ -135,6 +136,9 @@ export class QuoxWindow extends QuoxEventTarget implements Disposable {
             screenX,
             screenY,
           ),
+        // The native interruption remains visible to raw input observers. DOM stream
+        // cancellation is connected by the following isolated Quox change.
+        pointerCancel: () => {},
         pointerDown: (x, y, screenX, screenY, button, buttons, modifiers, timeStamp, detail) =>
           this.document.dispatchPointerDown(
             x,

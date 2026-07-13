@@ -207,6 +207,10 @@ export class Win32MouseTrackingState {
 
 export type Win32MouseButton = "left" | "middle" | "right" | "back" | "forward";
 
+function win32MouseButtonMask(button: Win32MouseButton): number {
+  return button === "left" ? 1 : button === "right" ? 2 : button === "middle" ? 4 : button === "back" ? 8 : 16;
+}
+
 /** Tracks the one thread-global Win32 capture owner and its pressed-button chord. */
 export class Win32MouseCaptureState {
   #owner: bigint | undefined;
@@ -218,6 +222,12 @@ export class Win32MouseCaptureState {
 
   get buttonCount(): number {
     return this.#buttons.size;
+  }
+
+  get buttons(): number {
+    let buttons = 0;
+    for (const button of this.#buttons) buttons |= win32MouseButtonMask(button);
+    return buttons;
   }
 
   owns(owner: bigint): boolean {

@@ -50,6 +50,7 @@ Deno.test("pointer adapter forwards native timing and click detail", () => {
   const calls: Array<[string, ...unknown[]]> = [];
   const router = new QuoxInputRouter({
     pointerMove: (...values) => calls.push(["move", ...values]),
+    pointerCancel: (...values) => calls.push(["cancel", ...values]),
     pointerDown: (...values) => calls.push(["down", ...values]),
     pointerUp: (...values) => calls.push(["up", ...values]),
     wheel() {},
@@ -64,6 +65,20 @@ Deno.test("pointer adapter forwards native timing and click detail", () => {
   });
 
   router.route({ type: "mousemove", ...pointer });
+  const canceled = mapWindingEvent({
+    type: "pointercancel",
+    window,
+    canceledButtons: 5,
+    ...pointer,
+    buttons: 0,
+  });
+  assertEquals(canceled, {
+    type: "pointercancel",
+    canceledButtons: 5,
+    ...pointer,
+    buttons: 0,
+  });
+  router.route(canceled);
   router.route({ type: "mousedown", button: 0, detail: 2, ...pointer });
   router.route({ type: "mouseup", button: 0, detail: 2, ...pointer });
   router.route({
@@ -79,6 +94,7 @@ Deno.test("pointer adapter forwards native timing and click detail", () => {
 
   assertEquals(calls, [
     ["move", 7, 9, 107.5, 209.25, 5, 9, 12],
+    ["cancel", 7, 9, 107.5, 209.25, 5, 9, 12],
     ["down", 7, 9, 107.5, 209.25, 0, 5, 9, 12, 2],
     ["up", 7, 9, 107.5, 209.25, 0, 5, 9, 12, 2],
     ["enter", 7, 9, 107.5, 209.25, 5, 505, 12],
@@ -91,6 +107,7 @@ Deno.test("wheel adapter preserves browser units and translates Blitz scroll dir
   const router = new QuoxInputRouter(
     {
       pointerMove() {},
+      pointerCancel() {},
       pointerDown() {},
       pointerUp() {},
       wheel: (...values) => calls.push(values),
@@ -147,6 +164,7 @@ Deno.test("pointer adapter preserves unavailable global coordinates", () => {
   const calls: unknown[][] = [];
   const router = new QuoxInputRouter({
     pointerMove: (...values) => calls.push(values),
+    pointerCancel() {},
     pointerDown() {},
     pointerUp() {},
     wheel() {},
@@ -384,6 +402,7 @@ Deno.test("native window focus dispatch precedes raw observers and isolates list
 
   const router = new QuoxInputRouter({
     pointerMove() {},
+    pointerCancel() {},
     pointerDown() {},
     pointerUp() {},
     wheel() {},
@@ -423,6 +442,7 @@ Deno.test("pure router preserves key listener then commit and DOM-input ordering
   const order: string[] = [];
   const router = new QuoxInputRouter({
     pointerMove() {},
+    pointerCancel() {},
     pointerDown() {},
     pointerUp() {},
     wheel() {},

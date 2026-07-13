@@ -446,7 +446,10 @@ class Win32Library implements Library {
             break;
           case WM.CAPTURECHANGED:
             if (win === undefined) return completeWin32MouseMessage(uMsg, false, defaultProcedure);
-            this.#mouseCapture.resetOwner(win.id);
+            {
+              const canceledButtons = this.#mouseCapture.buttons;
+              if (this.#mouseCapture.resetOwner(win.id)) this.#enqueuePointerCancel(win, canceledButtons);
+            }
             return completeWin32MouseMessage(uMsg, true, defaultProcedure);
           case WM.CANCELMODE:
             if (win !== undefined) this.#cancelMouseCapture(win);
@@ -781,6 +784,10 @@ class Win32Library implements Library {
       return;
     }
 
+    // Clear the local chord before ReleaseCapture synchronously delivers
+    // WM_CAPTURECHANGED, so a normal final mouseup is not reported as an
+    // interrupted stream.
+    this.#mouseCapture.recordUp(window.id, button);
     const released = this.user32.symbols.ReleaseCapture();
     const nativeOwner = this.#nativeCaptureOwner();
     if (nativeOwner !== window.id) this.#mouseCapture.resetOwner(window.id);
@@ -793,14 +800,28 @@ class Win32Library implements Library {
   #cancelMouseCapture(window: Win32Window): void {
     if (!this.#mouseCapture.owns(window.id)) return;
     if (this.#nativeCaptureOwner() !== window.id) {
-      this.#mouseCapture.resetOwner(window.id);
+      const canceledButtons = this.#mouseCapture.buttons;
+      if (this.#mouseCapture.resetOwner(window.id)) this.#enqueuePointerCancel(window, canceledButtons);
       return;
     }
+    const canceledButtons = this.#mouseCapture.buttons;
+    if (this.#mouseCapture.resetOwner(window.id)) this.#enqueuePointerCancel(window, canceledButtons);
     const released = this.user32.symbols.ReleaseCapture();
     const nativeOwner = this.#nativeCaptureOwner();
     if (nativeOwner !== window.id) this.#mouseCapture.resetOwner(window.id);
     if (released === 0) throw new Error("winding(win32): failed to cancel mouse capture");
     this.#mouseCapture.resetOwner(window.id);
+  }
+
+  #enqueuePointerCancel(window: Win32Window, canceledButtons: number): void {
+    const pointer = {
+      ...(window.pointerSnapshot ?? emptyPointerSnapshot(this.#messageTimeStamp())),
+      buttons: 0 as const,
+      timeStamp: this.#messageTimeStamp(),
+      ...this.#pointerModifiers(),
+    };
+    window.pointerSnapshot = pointer;
+    this.#events.push({ type: "pointercancel", ...pointer, canceledButtons, window });
   }
 
   publishInitialWindowState(window: Win32Window): void {

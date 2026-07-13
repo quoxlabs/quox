@@ -37,17 +37,31 @@ export function x11ScreenPosition(
  */
 export class X11PointerButtonState {
   #extendedButtons = 0;
+  #buttons = 0;
+
+  get buttons(): number {
+    return this.#buttons;
+  }
 
   snapshot(state: number, changedButton?: MouseButton, pressed?: boolean): number {
     let buttons = x11CoreButtons(state) | this.#extendedButtons;
-    if (changedButton === undefined || pressed === undefined) return buttons;
+    if (changedButton === undefined || pressed === undefined) {
+      this.#buttons = buttons;
+      return buttons;
+    }
 
     const changedMask = mouseButtonMask(changedButton);
     buttons = pressed ? buttons | changedMask : buttons & ~changedMask;
     if (changedButton === "back" || changedButton === "forward") {
       this.#extendedButtons = pressed ? this.#extendedButtons | changedMask : this.#extendedButtons & ~changedMask;
     }
+    this.#buttons = buttons;
     return buttons;
+  }
+
+  reset(): void {
+    this.#extendedButtons = 0;
+    this.#buttons = 0;
   }
 }
 
