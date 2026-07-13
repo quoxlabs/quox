@@ -5,7 +5,7 @@ mod interaction;
 mod node_handles;
 mod render;
 
-use blitz_dom::{BaseDocument, DEFAULT_CSS, DocumentConfig, FontContext};
+use blitz_dom::{BaseDocument, DEFAULT_CSS, DocumentConfig, FontContext, local_name, ns};
 use blitz_html::{HtmlDocument, HtmlProvider};
 use blitz_traits::net::DummyNetProvider;
 use blitz_traits::shell::{ClipboardError, ColorScheme, ShellProvider, Viewport};
@@ -379,6 +379,54 @@ fn focused_ime_cursor_area(document: &mut BaseDocument) -> Option<[f32; 4]> {
     Some([x, y, width, height])
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FocusedImeSurroundingText {
+    text: String,
+    selection_start_bytes: usize,
+    selection_end_bytes: usize,
+}
+
+/// Snapshot the focused Parley editor in Winding's canonical surrounding-text form.
+/// Password contents never cross the renderer boundary. During composition, Parley's rendered
+/// preedit passage is removed and represented by a collapsed selection at its insertion point.
+fn focused_ime_surrounding_text(document: &BaseDocument) -> Option<FocusedImeSurroundingText> {
+    let node_id = document.get_focussed_node_id()?;
+    let node = document
+        .get_node(node_id)
+        .filter(|node| node.is_focussed())?;
+    let element = node.element_data()?;
+    if element.name.ns == ns!(html)
+        && element.name.local.as_ref() == "input"
+        && element
+            .attr(local_name!("type"))
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("password"))
+    {
+        return None;
+    }
+
+    let editor = &element.text_input_data()?.editor;
+    let raw_text = editor.raw_text();
+    if let Some(compose) = editor.raw_compose() {
+        let before = raw_text.get(..compose.start)?;
+        let after = raw_text.get(compose.end..)?;
+        let mut text = String::with_capacity(before.len() + after.len());
+        text.push_str(before);
+        text.push_str(after);
+        return Some(FocusedImeSurroundingText {
+            text,
+            selection_start_bytes: compose.start,
+            selection_end_bytes: compose.start,
+        });
+    }
+
+    let selection = editor.raw_selection().text_range();
+    Some(FocusedImeSurroundingText {
+        text: raw_text.to_owned(),
+        selection_start_bytes: selection.start,
+        selection_end_bytes: selection.end,
+    })
+}
+
 impl QuoxRendererState {
     /// Resolve layout for the current viewport state. Shared by `render()`, `node_from_point()`,
     /// and every trusted pointer/wheel occurrence so hit tests and input defaults never see
@@ -533,6 +581,19 @@ impl QuoxRenderer {
         Ok(())
     }
 
+    /// Return `[text, selectionStartBytes, selectionEndBytes]` for the focused native editor.
+    /// `undefined` withholds surrounding text when no editor is focused or its value is private.
+    pub fn ime_surrounding_text(&self) -> Option<js_sys::Array> {
+        let snapshot = focused_ime_surrounding_text(&self.state.borrow().document)?;
+        let selection_start = u32::try_from(snapshot.selection_start_bytes).ok()?;
+        let selection_end = u32::try_from(snapshot.selection_end_bytes).ok()?;
+        let values = js_sys::Array::new();
+        values.push(&JsValue::from_str(&snapshot.text));
+        values.push(&JsValue::from_f64(f64::from(selection_start)));
+        values.push(&JsValue::from_f64(f64::from(selection_end)));
+        Some(values)
+    }
+
     /// Peek the current native IME transaction as
     /// `[revision, flags, x, y, width, height, enabled]` without acknowledging it.
     pub fn peek_ime_requests(&self) -> Result<Option<Box<[f64]>>, JsValue> {
@@ -571,10 +632,11 @@ impl QuoxRenderer {
 )]
 mod tests {
     use super::{
-        IME_REQUEST_CONTEXT_RESTART, IME_REQUEST_CURSOR_AREA, IME_REQUEST_ENABLED,
-        ImeRequestMailbox, QuoxShellProvider, focused_ime_cursor_area,
+        FocusedImeSurroundingText, IME_REQUEST_CONTEXT_RESTART, IME_REQUEST_CURSOR_AREA,
+        IME_REQUEST_ENABLED, ImeRequestMailbox, QuoxShellProvider, TextControlStates,
+        focused_ime_cursor_area, focused_ime_surrounding_text,
     };
-    use blitz_dom::{DocumentConfig, Point};
+    use blitz_dom::{DocumentConfig, Point, local_name};
     use blitz_html::HtmlDocument;
     use blitz_traits::shell::{ColorScheme, ShellProvider, Viewport};
     use std::sync::Arc;
@@ -781,5 +843,115 @@ mod tests {
         assert!((area_after[0] - area_before[0]).abs() < 0.001);
         assert!((area_after[1] - (area_before[1] - 37.0)).abs() < 0.001);
         assert_eq!(&area_after[2..], &area_before[2..]);
+    }
+
+    #[test]
+    fn focused_ime_surrounding_text_uses_raw_utf8_and_removes_active_preedit() {
+        let mut document = HtmlDocument::from_html(
+            "<!doctype html><html><body>\
+             <input id='editor' value='A🙂BC'>\
+             <input id='password' type='password' value='private'>\
+             <input id='invalid-password' type=' password ' value='public'>\
+             </body></html>",
+            DocumentConfig::default(),
+        )
+        .into_inner();
+        TextControlStates::default().reconcile_document(&mut document);
+        document.resolve(0.0);
+        let element = |id: &str| {
+            document
+                .tree()
+                .iter()
+                .find_map(|(node_id, node)| {
+                    node.element_data().and_then(|element| {
+                        (element.attr(local_name!("id")) == Some(id)).then_some(node_id)
+                    })
+                })
+                .expect("test element should exist")
+        };
+        let editor = element("editor");
+        let password = element("password");
+        let invalid_password = element("invalid-password");
+
+        assert_eq!(focused_ime_surrounding_text(&document), None);
+        assert!(document.set_focus_to(editor));
+        document.with_text_input(editor, |mut driver| driver.select_byte_range(6, 5));
+        assert_eq!(
+            focused_ime_surrounding_text(&document),
+            Some(FocusedImeSurroundingText {
+                text: "A🙂BC".to_owned(),
+                selection_start_bytes: 5,
+                selection_end_bytes: 6,
+            })
+        );
+
+        document.with_text_input(editor, |mut driver| driver.set_compose("候", Some((3, 3))));
+        assert_eq!(
+            focused_ime_surrounding_text(&document),
+            Some(FocusedImeSurroundingText {
+                text: "A🙂C".to_owned(),
+                selection_start_bytes: 5,
+                selection_end_bytes: 5,
+            })
+        );
+
+        assert!(document.set_focus_to(password));
+        assert_eq!(focused_ime_surrounding_text(&document), None);
+        assert!(document.set_focus_to(invalid_password));
+        assert_eq!(
+            focused_ime_surrounding_text(&document),
+            Some(FocusedImeSurroundingText {
+                text: "public".to_owned(),
+                selection_start_bytes: 0,
+                selection_end_bytes: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn focused_ime_surrounding_text_preserves_backend_specific_edge_values() {
+        let mut document = HtmlDocument::from_html(
+            "<!doctype html><html><body><input></body></html>",
+            DocumentConfig::default(),
+        )
+        .into_inner();
+        document.resolve(0.0);
+        let input = document
+            .tree()
+            .iter()
+            .find_map(|(node_id, node)| {
+                node.element_data()
+                    .is_some_and(|element| element.name.local.as_ref() == "input")
+                    .then_some(node_id)
+            })
+            .expect("test input should exist");
+        assert!(document.set_focus_to(input));
+
+        document.with_text_input(input, |mut driver| {
+            driver.editor.set_text("a\0b");
+            driver.select_byte_range(1, 2);
+        });
+        assert_eq!(
+            focused_ime_surrounding_text(&document),
+            Some(FocusedImeSurroundingText {
+                text: "a\0b".to_owned(),
+                selection_start_bytes: 1,
+                selection_end_bytes: 2,
+            })
+        );
+
+        let long = "x".repeat(4_001);
+        document.with_text_input(input, |mut driver| {
+            driver.editor.set_text(&long);
+            driver.select_byte_range(0, long.len());
+        });
+        assert_eq!(
+            focused_ime_surrounding_text(&document),
+            Some(FocusedImeSurroundingText {
+                text: long,
+                selection_start_bytes: 0,
+                selection_end_bytes: 4_001,
+            })
+        );
     }
 }

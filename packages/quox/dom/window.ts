@@ -6,13 +6,13 @@ import { QuoxDocument } from "./document.ts";
 import { QuoxEventTarget } from "./event_target.ts";
 import {
   mapWindingEvent,
+  NativeImeSynchronizer,
   notifyInputListeners,
   type QuoxInputEvent,
   QuoxInputRouter,
   runWithImeSynchronization,
-  synchronizeImeRequests,
 } from "./input.ts";
-import type { ImeRequestSource } from "./ime_requests.ts";
+import type { NativeImeStateSource } from "./ime_requests.ts";
 import { isVNode, mount, type QuoxRenderable } from "./mount.ts";
 import type { QuoxElement, QuoxInnerHTML } from "./node.ts";
 import { fitRgbaToFramebuffer, FramebufferState } from "./framebuffer.ts";
@@ -96,6 +96,7 @@ export class QuoxWindow extends QuoxEventTarget implements Disposable {
   #rendererFreed = false;
   #visible = true;
   readonly #inputListeners: Array<(event: QuoxInputEvent) => void> = [];
+  readonly #nativeIme = new NativeImeSynchronizer();
   readonly #inputRouter: QuoxInputRouter;
   readonly document: QuoxDocument;
 
@@ -329,8 +330,12 @@ export class QuoxWindow extends QuoxEventTarget implements Disposable {
     // Drain all pending events and forward input events to listeners.
     const listenerErrors: unknown[] = [];
     try {
-      let ev: WindingUIEvent | undefined;
-      while ((ev = this.#events.read()) !== undefined) {
+      for (;;) {
+        // Native callbacks may consult surrounding text while producing the very next record.
+        // Synchronize before every read, including between records already buffered in one poll.
+        this.#syncNativeImeRequests();
+        const ev = this.#events.read();
+        if (ev === undefined) break;
         const mapped = mapWindingEvent(ev);
 
         if (this.#inputRouter.route(mapped) === "close") {
@@ -360,7 +365,7 @@ export class QuoxWindow extends QuoxEventTarget implements Disposable {
 
   #syncNativeImeRequests(): void {
     if (this.#disposed || this.#rendererFreed) return;
-    synchronizeImeRequests(this.#renderer as unknown as ImeRequestSource, this.#win);
+    this.#nativeIme.synchronize(this.#renderer as unknown as NativeImeStateSource, this.#win);
   }
 
   #requestRender(): void {

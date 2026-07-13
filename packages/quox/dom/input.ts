@@ -17,6 +17,7 @@ import { wheelDeltaForBlitz } from "./wheel.ts";
 export {
   applyImeRequestSnapshot,
   IME_REQUEST_FLAG,
+  NativeImeSynchronizer,
   runWithImeSynchronization,
   synchronizeImeRequests,
 } from "./ime_requests.ts";
