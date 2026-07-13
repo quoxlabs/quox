@@ -204,6 +204,20 @@ Deno.test("DOM dispatch validator normalizes Uint32Array paths and accepts every
   }
 });
 
+Deno.test("DOM dispatch validator preserves text edit details and empty control input semantics", () => {
+  for (
+    const payload of [
+      { data: "候", inputType: "insertCompositionText", isComposing: true },
+      { data: null, inputType: "deleteContentBackward", isComposing: false },
+      { data: null, inputType: "", isComposing: false },
+    ]
+  ) {
+    const step = validateDomDispatchStep(eventStep({ type: "input", payload }));
+    assert(step.kind === "event");
+    assertEquals(step.payload, payload);
+  }
+});
+
 Deno.test("DOM dispatch validator accepts and freezes complete steps", () => {
   const step = validateDomDispatchStep(completeStep(9, true));
   assertEquals(step, { kind: "complete", frameId: 9, redrawRequested: true });

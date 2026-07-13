@@ -323,6 +323,10 @@ struct NativeKeyMetadata {
     location: u32,
 }
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "metadata keeps independent DOM dispatch/default flags for one native occurrence"
+)]
 #[derive(Clone, Debug, PartialEq)]
 struct EventMetadata {
     time_stamp: f64,
@@ -331,6 +335,8 @@ struct EventMetadata {
     pointer_release_click: Option<PointerReleaseClick>,
     wheel: Option<NativeWheelMetadata>,
     key: Option<NativeKeyMetadata>,
+    edit_intent: Option<EditIntent>,
+    observe_text_edit: bool,
     related_target: Option<GuardedNode>,
     click_detail: Option<u32>,
     event_type_override: Option<&'static str>,
@@ -339,6 +345,56 @@ struct EventMetadata {
     label_activation: bool,
     suppress_default: bool,
     defer_click_target: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum EditIntent {
+    InsertText { data: String, is_composing: bool },
+    InsertLineBreak,
+    InsertFromPaste,
+    DeleteByCut,
+    DeleteByComposition,
+    DeleteContentBackward,
+    DeleteContentForward,
+    DeleteWordBackward,
+    DeleteWordForward,
+    DeleteSoftLineBackward,
+    DeleteSoftLineForward,
+    DeleteHardLineBackward,
+    DeleteHardLineForward,
+}
+
+impl EditIntent {
+    fn payload(&self) -> InputPayload {
+        let (data, input_type, is_composing) = match self {
+            Self::InsertText { data, is_composing } => (
+                Some(data.clone()),
+                if *is_composing {
+                    "insertCompositionText"
+                } else {
+                    "insertText"
+                },
+                *is_composing,
+            ),
+            Self::InsertLineBreak => (None, "insertLineBreak", false),
+            Self::InsertFromPaste => (None, "insertFromPaste", false),
+            Self::DeleteByCut => (None, "deleteByCut", false),
+            Self::DeleteByComposition => (None, "deleteByComposition", false),
+            Self::DeleteContentBackward => (None, "deleteContentBackward", false),
+            Self::DeleteContentForward => (None, "deleteContentForward", false),
+            Self::DeleteWordBackward => (None, "deleteWordBackward", false),
+            Self::DeleteWordForward => (None, "deleteWordForward", false),
+            Self::DeleteSoftLineBackward => (None, "deleteSoftLineBackward", false),
+            Self::DeleteSoftLineForward => (None, "deleteSoftLineForward", false),
+            Self::DeleteHardLineBackward => (None, "deleteHardLineBackward", false),
+            Self::DeleteHardLineForward => (None, "deleteHardLineForward", false),
+        };
+        InputPayload {
+            data,
+            input_type,
+            is_composing,
+        }
+    }
 }
 
 impl EventMetadata {
@@ -350,6 +406,8 @@ impl EventMetadata {
             pointer_release_click: None,
             wheel: None,
             key: None,
+            edit_intent: None,
+            observe_text_edit: false,
             related_target: None,
             click_detail: None,
             event_type_override: None,
@@ -394,6 +452,8 @@ impl EventMetadata {
             pointer_release_click: None,
             wheel: None,
             key: None,
+            edit_intent: None,
+            observe_text_edit: false,
             related_target: None,
             click_detail: None,
             event_type_override: None,
@@ -455,6 +515,8 @@ impl EventMetadata {
                 modifier_bits,
             }),
             key: None,
+            edit_intent: None,
+            observe_text_edit: false,
             related_target: None,
             click_detail: None,
             event_type_override: None,
@@ -474,6 +536,8 @@ impl EventMetadata {
             pointer_release_click: None,
             wheel: None,
             key: Some(key),
+            edit_intent: None,
+            observe_text_edit: false,
             related_target: None,
             click_detail: None,
             event_type_override: None,
@@ -487,6 +551,17 @@ impl EventMetadata {
 
     fn with_related_target(mut self, related_target: Option<GuardedNode>) -> Self {
         self.related_target = related_target;
+        self
+    }
+
+    fn with_edit_intent(mut self, intent: Option<EditIntent>) -> Self {
+        self.observe_text_edit = intent.is_some();
+        self.edit_intent = intent;
+        self
+    }
+
+    fn with_text_edit_observation(mut self, observe: bool) -> Self {
+        self.observe_text_edit = observe;
         self
     }
 
@@ -1181,12 +1256,29 @@ struct KeyboardPayload {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+struct InputPayload {
+    data: Option<String>,
+    input_type: &'static str,
+    is_composing: bool,
+}
+
+impl InputPayload {
+    const fn empty() -> Self {
+        Self {
+            data: None,
+            input_type: "",
+            is_composing: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 enum DispatchEventPayload {
     Mouse(MousePayload),
     Pointer(PointerPayload),
     Wheel(WheelPayload),
     Keyboard(KeyboardPayload),
-    Input,
+    Input(InputPayload),
     Focus { related_target: Option<u32> },
 }
 
@@ -1706,6 +1798,11 @@ impl DispatchStack {
                 suppress_default,
             } => {
                 let target = guarded_keyboard_target(document, handles)?;
+                let intent = keyboard_edit_intent(&event);
+                let observe_text_edit = intent.is_some() || keyboard_copy_default(&event);
+                let metadata = metadata
+                    .with_edit_intent(intent)
+                    .with_text_edit_observation(observe_text_edit);
                 let space_key = is_space_key(&event).then(|| {
                     if event.state.is_pressed() {
                         SpaceKeyContinuation::Down {
@@ -1750,10 +1847,12 @@ impl DispatchStack {
             DispatchRequest::AppleStandardKeybinding(command) => {
                 let target =
                     guarded_target_or_root(document, handles, document.get_focussed_node_id())?;
+                let metadata = EventMetadata::native()
+                    .with_edit_intent(apple_standard_keybinding_edit_intent(&command));
                 planned.push_back(PlannedWork::DefaultOnly {
                     target: PlannedTarget::Guarded(target),
                     data: DomEventData::AppleStandardKeybinding(command.into()),
-                    metadata: EventMetadata::native(),
+                    metadata,
                 });
             }
             DispatchRequest::ImeDeleteSurrounding {
@@ -2493,7 +2592,9 @@ impl DispatchStack {
             element: ElementPoint::default(),
         };
         let event = DomEvent::new(target.raw, DomEventData::Click(click));
-        if let Some(event) = guard_queued_event(document, handles, event, metadata)? {
+        if let Some(event) =
+            guard_queued_event(document, handles, event, metadata.with_edit_intent(None))?
+        {
             self.frames
                 .last_mut()
                 .expect("keyboard defaults run only for an active frame")
@@ -2636,6 +2737,10 @@ impl DispatchStack {
         }
 
         let old_focus = actual_focus_node_id(document);
+        let editor_before = guarded
+            .metadata
+            .observe_text_edit
+            .then(|| editor_edit_snapshot(document, guarded.target.raw));
         let preserve_focus = default_must_preserve_focus(document, &guarded);
         let original_shell = install_ime_suppressing_shell(document, preserve_focus);
         let mut source_metadata = guarded.metadata.clone();
@@ -2703,6 +2808,12 @@ impl DispatchStack {
         // Blitz mutates Parley before returning generated events. Capture the live editor value
         // now so the first JavaScript `input` listener observes the edit which caused it.
         text_controls.sync_editor_value(document, guarded.target.raw);
+        if let Some(before) = editor_before {
+            let after = editor_edit_snapshot(document, guarded.target.raw);
+            if before == after {
+                generated.retain(|event| !matches!(&event.data, DomEventData::Input(_)));
+            }
+        }
         let new_focus = actual_focus_node_id(document);
         let (old_focus, new_focus) = if generated.iter().any(|event| is_focus_event(&event.data)) {
             let old_focus = old_focus
@@ -2834,9 +2945,9 @@ impl DispatchStack {
                         .last_mut()
                         .expect("actions run only for an active frame")
                         .redraw_requested = true;
-                    if let Some(event) =
-                        guard_queued_event(document, handles, event, EventMetadata::native())?
-                    {
+                    let metadata = EventMetadata::native()
+                        .with_edit_intent(Some(EditIntent::DeleteByComposition));
+                    if let Some(event) = guard_queued_event(document, handles, event, metadata)? {
                         self.frames
                             .last_mut()
                             .expect("actions run only for an active frame")
@@ -2875,6 +2986,23 @@ impl DispatchStack {
             }
         }
     }
+}
+
+#[derive(Debug, PartialEq)]
+struct EditorEditSnapshot {
+    value: String,
+    selection: std::ops::Range<usize>,
+}
+
+fn editor_edit_snapshot(document: &mut BaseDocument, target: usize) -> Option<EditorEditSnapshot> {
+    let mut snapshot = None;
+    document.with_text_input(target, |driver| {
+        snapshot = Some(EditorEditSnapshot {
+            value: driver.editor.raw_text().to_owned(),
+            selection: driver.editor.raw_selection().text_range(),
+        });
+    });
+    snapshot
 }
 
 #[allow(
@@ -2965,6 +3093,83 @@ fn space_key_event(data: &DomEventData) -> Option<SpaceKeyEvent<'_>> {
 
 fn is_space_key(event: &blitz_traits::events::BlitzKeyEvent) -> bool {
     matches!(&event.key, keyboard_types::Key::Character(value) if value.as_str() == " ")
+}
+
+fn keyboard_edit_intent(event: &blitz_traits::events::BlitzKeyEvent) -> Option<EditIntent> {
+    if !event.state.is_pressed() {
+        return None;
+    }
+    let action = event.modifiers.contains(keyboard_types::Modifiers::CONTROL);
+    match &event.key {
+        keyboard_types::Key::Character(value) if action && value.as_str() == "x" => {
+            Some(EditIntent::DeleteByCut)
+        }
+        keyboard_types::Key::Character(value) if action && value.as_str() == "v" => {
+            Some(EditIntent::InsertFromPaste)
+        }
+        keyboard_types::Key::Delete => Some(if action {
+            EditIntent::DeleteWordForward
+        } else {
+            EditIntent::DeleteContentForward
+        }),
+        keyboard_types::Key::Backspace => Some(if action {
+            EditIntent::DeleteWordBackward
+        } else {
+            EditIntent::DeleteContentBackward
+        }),
+        keyboard_types::Key::Enter => Some(EditIntent::InsertLineBreak),
+        keyboard_types::Key::Character(value) if value.as_str() == "\n" => {
+            Some(EditIntent::InsertLineBreak)
+        }
+        keyboard_types::Key::Character(value)
+            if !event.modifiers.intersects(
+                keyboard_types::Modifiers::CONTROL | keyboard_types::Modifiers::SUPER,
+            ) =>
+        {
+            Some(EditIntent::InsertText {
+                data: value.clone(),
+                is_composing: event.is_composing,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn keyboard_copy_default(event: &blitz_traits::events::BlitzKeyEvent) -> bool {
+    event.state.is_pressed()
+        && event.modifiers.contains(keyboard_types::Modifiers::CONTROL)
+        && matches!(&event.key, keyboard_types::Key::Character(value) if value.as_str() == "c")
+}
+
+fn apple_standard_keybinding_edit_intent(command: &str) -> Option<EditIntent> {
+    match command {
+        "insertDoubleQuoteIgnoringSubstitution:" => Some(EditIntent::InsertText {
+            data: "\"".to_owned(),
+            is_composing: false,
+        }),
+        "insertSingleQuoteIgnoringSubstitution:" => Some(EditIntent::InsertText {
+            data: "'".to_owned(),
+            is_composing: false,
+        }),
+        "insertLineBreak:"
+        | "insertNewline:"
+        | "insertNewlineIgnoringFieldEditor:"
+        | "insertParagraphSeparator:" => Some(EditIntent::InsertLineBreak),
+        "deleteBackward:" | "deleteBackwardByDecomposingPreviousCharacter:" => {
+            Some(EditIntent::DeleteContentBackward)
+        }
+        "deleteForward:" => Some(EditIntent::DeleteContentForward),
+        "deleteWordBackward:" => Some(EditIntent::DeleteWordBackward),
+        "deleteWordForward:" => Some(EditIntent::DeleteWordForward),
+        "deleteToBeginningOfLine:" => Some(EditIntent::DeleteSoftLineBackward),
+        "deleteToEndOfLine:" => Some(EditIntent::DeleteSoftLineForward),
+        "deleteToBeginningOfParagraph:" => Some(EditIntent::DeleteHardLineBackward),
+        "deleteToEndOfParagraph:" => Some(EditIntent::DeleteHardLineForward),
+        // Pinned Blitz implements Cocoa's normally insertive yank selector as copying and
+        // deleting the current selection, so describe the actual mutation as a cut.
+        "yank:" => Some(EditIntent::DeleteByCut),
+        _ => None,
+    }
 }
 
 fn is_space_activation_control(document: &BaseDocument, target: usize) -> bool {
@@ -3235,8 +3440,11 @@ fn plan_ime_commit(planned: &mut VecDeque<PlannedWork>, text: String) {
     });
     planned.push_back(PlannedWork::DefaultOnly {
         target: PlannedTarget::Focused,
-        data: DomEventData::Ime(BlitzImeEvent::Commit(text)),
-        metadata,
+        data: DomEventData::Ime(BlitzImeEvent::Commit(text.clone())),
+        metadata: metadata.with_edit_intent(Some(EditIntent::InsertText {
+            data: text,
+            is_composing: false,
+        })),
     });
 }
 
@@ -4623,7 +4831,12 @@ fn event_payload(data: &DomEventData, metadata: &EventMetadata) -> Option<Dispat
         | DomEventData::KeyUp(event) => Some(DispatchEventPayload::Keyboard(keyboard_payload(
             event, metadata,
         ))),
-        DomEventData::Input(_) => Some(DispatchEventPayload::Input),
+        DomEventData::Input(_) => Some(DispatchEventPayload::Input(
+            metadata
+                .edit_intent
+                .as_ref()
+                .map_or_else(InputPayload::empty, EditIntent::payload),
+        )),
         DomEventData::Focus(_)
         | DomEventData::Blur(_)
         | DomEventData::FocusIn(_)
@@ -5131,10 +5344,16 @@ impl DispatchEventPayload {
                 set(&object, "numLock", keyboard.num_lock.into())?;
                 set(&object, "scrollLock", keyboard.scroll_lock.into())?;
             }
-            Self::Input => {
-                set(&object, "data", JsValue::NULL)?;
-                set(&object, "inputType", JsValue::from_str(""))?;
-                set(&object, "isComposing", false.into())?;
+            Self::Input(input) => {
+                set(
+                    &object,
+                    "data",
+                    input
+                        .data
+                        .map_or(JsValue::NULL, |data| JsValue::from_str(&data)),
+                )?;
+                set(&object, "inputType", JsValue::from_str(input.input_type))?;
+                set(&object, "isComposing", input.is_composing.into())?;
             }
             Self::Focus { related_target } => {
                 set(
@@ -11988,6 +12207,14 @@ mod tests {
 
         let commit = event(context.begin(DispatchRequest::ImeCommit("é\n".to_owned())));
         assert_eq!(commit.event_type, "input");
+        assert_eq!(
+            commit.payload.as_deref(),
+            Some(&DispatchEventPayload::Input(InputPayload {
+                data: Some("é\n".to_owned()),
+                input_type: "insertText",
+                is_composing: false,
+            }))
+        );
         assert_eq!(context.raw_text(input), "é");
         assert_eq!(context.live_value(input), "é");
         complete(context.resume(&commit, false));
@@ -11996,6 +12223,14 @@ mod tests {
             "deleteBackward:".to_owned(),
         )));
         assert_eq!(apple.event_type, "input");
+        assert_eq!(
+            apple.payload.as_deref(),
+            Some(&DispatchEventPayload::Input(InputPayload {
+                data: None,
+                input_type: "deleteContentBackward",
+                is_composing: false,
+            }))
+        );
         assert_eq!(context.raw_text(input), "");
         assert_eq!(context.live_value(input), "");
         complete(context.resume(&apple, false));
@@ -12039,8 +12274,185 @@ mod tests {
         let input_event = event(context.resume(&keydown, false));
 
         assert_eq!(input_event.event_type, "input");
+        assert_eq!(
+            input_event.payload.as_deref(),
+            Some(&DispatchEventPayload::Input(InputPayload {
+                data: Some("x".to_owned()),
+                input_type: "insertText",
+                is_composing: false,
+            }))
+        );
         assert_eq!(context.live_value(input), "beforex");
         complete(context.resume(&input_event, false));
+    }
+
+    #[test]
+    fn unchanged_text_defaults_do_not_dispatch_input() {
+        let mut context = TestContext::new("<input id='editor' value='abc'>");
+        let input = context.element("editor");
+        assert!(context.document.set_focus_to(input));
+        context
+            .document
+            .with_text_input(input, |mut driver| driver.move_to_text_start());
+
+        let keydown = event(context.begin(DispatchRequest::Key {
+            event: key(Key::Backspace, Code::Backspace, KeyState::Pressed),
+            metadata: host_key_metadata("Backspace"),
+            suppress_default: false,
+        }));
+        assert_eq!(keydown.event_type, "keydown");
+        complete(context.resume(&keydown, false));
+        assert_eq!(context.raw_text(input), "abc");
+
+        complete(context.begin(DispatchRequest::AppleStandardKeybinding(
+            "deleteBackward:".to_owned(),
+        )));
+        assert_eq!(context.raw_text(input), "abc");
+
+        for (character, code) in [("c", Code::KeyC), ("v", Code::KeyV)] {
+            let mut key_event = key(Key::Character(character.into()), code, KeyState::Pressed);
+            key_event.modifiers = Modifiers::CONTROL;
+            let keydown = event(context.begin(DispatchRequest::Key {
+                event: key_event,
+                metadata: host_key_metadata(character),
+                suppress_default: false,
+            }));
+            complete(context.resume(&keydown, false));
+            assert_eq!(context.raw_text(input), "abc");
+        }
+    }
+
+    #[test]
+    fn identical_selected_text_replacement_still_dispatches_input() {
+        let mut context = TestContext::new("<input id='editor' value='a'>");
+        let input = context.element("editor");
+        assert!(context.document.set_focus_to(input));
+        context
+            .document
+            .with_text_input(input, |mut driver| driver.select_all());
+
+        let keydown = event(context.begin(DispatchRequest::Key {
+            event: key(Key::Character("a".into()), Code::KeyA, KeyState::Pressed),
+            metadata: host_key_metadata("a"),
+            suppress_default: false,
+        }));
+        let input_event = event(context.resume(&keydown, false));
+        assert_eq!(input_event.event_type, "input");
+        assert_eq!(context.raw_text(input), "a");
+        assert_eq!(
+            input_event.payload.as_deref(),
+            Some(&DispatchEventPayload::Input(InputPayload {
+                data: Some("a".to_owned()),
+                input_type: "insertText",
+                is_composing: false,
+            }))
+        );
+        complete(context.resume(&input_event, false));
+    }
+
+    #[test]
+    fn line_break_and_composing_character_inputs_expose_their_edit_details() {
+        let mut context = TestContext::new("<textarea id='editor'>a</textarea>");
+        let input = context.element("editor");
+        assert!(context.document.set_focus_to(input));
+        context
+            .document
+            .with_text_input(input, |mut driver| driver.move_to_text_end());
+
+        let enter = event(context.begin(DispatchRequest::Key {
+            event: key(Key::Enter, Code::Enter, KeyState::Pressed),
+            metadata: host_key_metadata("Enter"),
+            suppress_default: false,
+        }));
+        let line_break = event(context.resume(&enter, false));
+        assert_eq!(
+            line_break.payload.as_deref(),
+            Some(&DispatchEventPayload::Input(InputPayload {
+                data: None,
+                input_type: "insertLineBreak",
+                is_composing: false,
+            }))
+        );
+        complete(context.resume(&line_break, false));
+
+        let mut composing = key(Key::Character("候".into()), Code::KeyA, KeyState::Pressed);
+        composing.is_composing = true;
+        let keydown = event(context.begin(DispatchRequest::Key {
+            event: composing,
+            metadata: host_key_metadata("候"),
+            suppress_default: false,
+        }));
+        let input_event = event(context.resume(&keydown, false));
+        assert_eq!(
+            input_event.payload.as_deref(),
+            Some(&DispatchEventPayload::Input(InputPayload {
+                data: Some("候".to_owned()),
+                input_type: "insertCompositionText",
+                is_composing: true,
+            }))
+        );
+        complete(context.resume(&input_event, false));
+    }
+
+    #[test]
+    fn supported_native_edit_commands_map_to_browser_input_types() {
+        let mut cut = key(Key::Character("x".into()), Code::KeyX, KeyState::Pressed);
+        cut.modifiers = Modifiers::CONTROL;
+        let mut paste = key(Key::Character("v".into()), Code::KeyV, KeyState::Pressed);
+        paste.modifiers = Modifiers::CONTROL;
+        let mut word_delete = key(Key::Delete, Code::Delete, KeyState::Pressed);
+        word_delete.modifiers = Modifiers::CONTROL;
+
+        assert_eq!(keyboard_edit_intent(&cut), Some(EditIntent::DeleteByCut));
+        assert_eq!(
+            keyboard_edit_intent(&paste),
+            Some(EditIntent::InsertFromPaste)
+        );
+        assert_eq!(
+            keyboard_edit_intent(&word_delete),
+            Some(EditIntent::DeleteWordForward)
+        );
+        assert_eq!(
+            apple_standard_keybinding_edit_intent("deleteToBeginningOfParagraph:"),
+            Some(EditIntent::DeleteHardLineBackward)
+        );
+        assert_eq!(
+            apple_standard_keybinding_edit_intent("yank:"),
+            Some(EditIntent::DeleteByCut)
+        );
+        assert_eq!(apple_standard_keybinding_edit_intent("moveLeft:"), None);
+    }
+
+    #[test]
+    fn enter_activation_clears_line_break_intent_before_click_listeners() {
+        let mut context = TestContext::new("<input id='control' type='submit'>");
+        let control = context.element("control");
+        assert!(context.document.set_focus_to(control));
+
+        let keydown = event(context.begin(DispatchRequest::Key {
+            event: key(Key::Enter, Code::Enter, KeyState::Pressed),
+            metadata: host_key_metadata("Enter"),
+            suppress_default: false,
+        }));
+        let click = event(context.resume(&keydown, false));
+        assert_eq!(click.event_type, "click");
+        assert!(
+            context
+                .stack
+                .frames
+                .last()
+                .and_then(|frame| frame.pending.as_ref())
+                .is_some_and(|pending| pending.guarded.metadata.edit_intent.is_none()),
+            "the keyboard click must discard Enter's line-break intent before listeners run",
+        );
+        context.set_input_type(control, "checkbox");
+        let resumed = context.resume(&click, false);
+        let generated = drain_steps(&mut context, resumed);
+        assert!(generated.iter().all(|step| {
+            step.event_type != "input"
+                || step.payload.as_deref()
+                    == Some(&DispatchEventPayload::Input(InputPayload::empty()))
+        }));
     }
 
     #[test]
@@ -12837,7 +13249,7 @@ mod tests {
                     );
                     assert_eq!(
                         current.payload.as_deref(),
-                        Some(&DispatchEventPayload::Input)
+                        Some(&DispatchEventPayload::Input(InputPayload::empty()))
                     );
                     assert!(current.bubbles);
                     assert!(!current.cancelable);
@@ -13713,7 +14125,10 @@ mod tests {
             assert!(input.bubbles);
             assert!(!input.cancelable);
             assert!(input.composed);
-            assert_eq!(input.payload.as_deref(), Some(&DispatchEventPayload::Input));
+            assert_eq!(
+                input.payload.as_deref(),
+                Some(&DispatchEventPayload::Input(InputPayload::empty()))
+            );
             assert_eq!(
                 context
                     .text_controls
@@ -14168,6 +14583,14 @@ mod tests {
             after_bytes: 0,
         }));
         assert_eq!(input_event.event_type, "input");
+        assert_eq!(
+            input_event.payload.as_deref(),
+            Some(&DispatchEventPayload::Input(InputPayload {
+                data: None,
+                input_type: "deleteByComposition",
+                is_composing: false,
+            }))
+        );
         assert_eq!(context.raw_text(input), "bc");
         let (_, redraw_requested) = complete(context.resume(&input_event, false));
         assert!(redraw_requested);
