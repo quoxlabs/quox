@@ -390,8 +390,9 @@ Deno.test("IME adapter preserves nullable UTF-8 ranges and byte-counted edits", 
       startBytes: 1,
       endBytes: 5,
       text: "x",
+      sourceKeyInputId: 20,
     }),
-    { type: "ime", kind: "replace", startBytes: 1, endBytes: 5, text: "x" },
+    { type: "ime", kind: "replace", startBytes: 1, endBytes: 5, text: "x", sourceKeyInputId: 20 },
   );
 });
 

@@ -33,9 +33,10 @@ export const IME_REQUEST_FLAG = {
   cursorArea: 1 << 0,
   enabled: 1 << 1,
   contextRestart: 1 << 2,
+  surroundingResync: 1 << 3,
 } as const;
 
-const IME_REQUEST_FLAGS = 0x07;
+const IME_REQUEST_FLAGS = 0x0f;
 const IME_REQUEST_SNAPSHOT_LENGTH = 7;
 const WAYLAND_MAX_SURROUNDING_TEXT_BYTES = 4_000;
 const EMPTY_SURROUNDING_TEXT: ImeSurroundingText = {
@@ -62,6 +63,7 @@ export function applyImeRequestSnapshot(
   const revision = assertPositiveUint32(snapshot[0], "IME request revision");
   const flags = assertKnownMask(snapshot[1], IME_REQUEST_FLAGS, "IME request flags");
   const contextRestart = (flags & IME_REQUEST_FLAG.contextRestart) !== 0;
+  const surroundingResync = (flags & IME_REQUEST_FLAG.surroundingResync) !== 0;
   const enabledNumber = assertIntegerRange(snapshot[6], 0, 1, "IME request enabled state");
   const enabled = enabledNumber === 1;
 
@@ -81,7 +83,7 @@ export function applyImeRequestSnapshot(
     if (!enabled) throw new RangeError("an IME context restart must end enabled");
     window.setImeEnabled(false);
   }
-  prepareContext(contextRestart);
+  prepareContext(contextRestart || surroundingResync);
   if (cursorArea !== undefined) {
     window.setImeCursorArea(...cursorArea);
   }

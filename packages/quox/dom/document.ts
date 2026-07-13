@@ -606,8 +606,27 @@ export class QuoxDocument extends QuoxEventTarget {
         this.#dispatchInputEvent(() => this.#dispatchPort.beginImeDeleteSurrounding(beforeBytes, afterBytes));
         break;
       }
-      case "replace":
-        throw new Error("quox: atomic IME replacement is not connected to Blitz yet");
+      case "replace": {
+        this.#assertActive();
+        const startBytes = assertUint32(event.startBytes, "startBytes");
+        const endBytes = assertUint32(event.endBytes, "endBytes");
+        if (startBytes > endBytes) {
+          throw new RangeError("quox: IME replacement range must be ordered");
+        }
+        const rawSourceKeyInputId = event.sourceKeyInputId;
+        const sourceKeyInputId = rawSourceKeyInputId === undefined
+          ? undefined
+          : assertPositiveUint32(rawSourceKeyInputId, "sourceKeyInputId");
+        this.#dispatchInputEvent(() =>
+          this.#dispatchPort.beginImeReplace(
+            startBytes,
+            endBytes,
+            event.text,
+            sourceKeyInputId,
+          )
+        );
+        break;
+      }
       default:
         return assertNever(event);
     }

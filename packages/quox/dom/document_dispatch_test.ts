@@ -317,6 +317,10 @@ class FakeDispatchRenderer {
     return this.#begin("begin_ime_delete_surrounding", args);
   }
 
+  begin_ime_replace(...args: unknown[]): unknown {
+    return this.#begin("begin_ime_replace", args);
+  }
+
   resume_dom_dispatch(frameId: number, eventId: number, defaultPrevented: boolean): unknown {
     this.calls.push(["resume", frameId, eventId, defaultPrevented]);
     if (this.resumeError !== undefined) throw this.resumeError;

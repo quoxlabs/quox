@@ -70,6 +70,7 @@ struct QuoxRendererState {
 const IME_REQUEST_CURSOR_AREA: u8 = 1 << 0;
 const IME_REQUEST_ENABLED: u8 = 1 << 1;
 const IME_REQUEST_CONTEXT_RESTART: u8 = 1 << 2;
+const IME_REQUEST_SURROUNDING_RESYNC: u8 = 1 << 3;
 const IME_REQUEST_SNAPSHOT_LEN: usize = 7;
 
 struct ImeRequestState {
@@ -79,6 +80,8 @@ struct ImeRequestState {
     acknowledged_cursor_area: Option<[f32; 4]>,
     desired_restart_generation: u64,
     acknowledged_restart_generation: u64,
+    desired_surrounding_resync_generation: u64,
+    acknowledged_surrounding_resync_generation: u64,
     in_flight: Option<ImeRequestSnapshot>,
     next_snapshot_revision: Option<u32>,
 }
@@ -92,6 +95,8 @@ impl Default for ImeRequestState {
             acknowledged_cursor_area: None,
             desired_restart_generation: 0,
             acknowledged_restart_generation: 0,
+            desired_surrounding_resync_generation: 0,
+            acknowledged_surrounding_resync_generation: 0,
             in_flight: None,
             next_snapshot_revision: Some(1),
         }
@@ -105,6 +110,7 @@ struct ImeRequestSnapshot {
     cursor_area: Option<[f32; 4]>,
     enabled: Option<bool>,
     restart_generation: u64,
+    surrounding_resync_generation: u64,
 }
 
 impl ImeRequestSnapshot {
@@ -187,6 +193,17 @@ impl ImeRequestMailbox {
         state.desired_enabled = Some(true);
     }
 
+    fn request_surrounding_resync(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.desired_surrounding_resync_generation = state
+            .desired_surrounding_resync_generation
+            .checked_add(1)
+            .expect("IME surrounding resync generation exhausted");
+    }
+
     fn request_cursor_area(&self, mut cursor_area: [f32; 4]) {
         if !cursor_area.iter().all(|value| value.is_finite()) {
             return;
@@ -229,7 +246,13 @@ impl ImeRequestMailbox {
         let context_restart = restart_pending
             && state.desired_enabled == Some(true)
             && state.acknowledged_enabled == Some(true);
-        if !cursor_area_changed && !enabled_changed && !context_restart {
+        let surrounding_resync_pending = state.desired_surrounding_resync_generation
+            > state.acknowledged_surrounding_resync_generation;
+        if !cursor_area_changed
+            && !enabled_changed
+            && !context_restart
+            && !surrounding_resync_pending
+        {
             return Ok(None);
         }
 
@@ -242,6 +265,9 @@ impl ImeRequestMailbox {
         }
         if context_restart {
             flags |= IME_REQUEST_CONTEXT_RESTART;
+        }
+        if surrounding_resync_pending {
+            flags |= IME_REQUEST_SURROUNDING_RESYNC;
         }
 
         let revision = state
@@ -258,6 +284,7 @@ impl ImeRequestMailbox {
                 .then_some(state.desired_enabled)
                 .flatten(),
             restart_generation: state.desired_restart_generation,
+            surrounding_resync_generation: state.desired_surrounding_resync_generation,
         };
         let wire_values = snapshot.wire_values();
         state.in_flight = Some(snapshot);
@@ -299,6 +326,11 @@ impl ImeRequestMailbox {
                 // this transaction was in flight; the following enable can be ordinary.
                 state.acknowledged_restart_generation = state.desired_restart_generation;
             }
+        }
+        if snapshot.flags & IME_REQUEST_SURROUNDING_RESYNC != 0 {
+            state.acknowledged_surrounding_resync_generation = state
+                .acknowledged_surrounding_resync_generation
+                .max(snapshot.surrounding_resync_generation);
         }
         Ok(())
     }
@@ -633,8 +665,8 @@ impl QuoxRenderer {
 mod tests {
     use super::{
         FocusedImeSurroundingText, IME_REQUEST_CONTEXT_RESTART, IME_REQUEST_CURSOR_AREA,
-        IME_REQUEST_ENABLED, ImeRequestMailbox, QuoxShellProvider, TextControlStates,
-        focused_ime_cursor_area, focused_ime_surrounding_text,
+        IME_REQUEST_ENABLED, IME_REQUEST_SURROUNDING_RESYNC, ImeRequestMailbox, QuoxShellProvider,
+        TextControlStates, focused_ime_cursor_area, focused_ime_surrounding_text,
     };
     use blitz_dom::{DocumentConfig, Point, local_name};
     use blitz_html::HtmlDocument;
@@ -701,6 +733,24 @@ mod tests {
 
         let second = peek(&mailbox);
         assert_eq!(second, [2.0, 3.0, 5.0, 6.0, 7.0, 8.0, 0.0]);
+        acknowledge(&mailbox, second);
+        assert_eq!(mailbox.peek_snapshot(), Ok(None));
+    }
+
+    #[test]
+    fn surrounding_resync_requests_are_transactional_and_survive_ack() {
+        let mailbox = ImeRequestMailbox::default();
+        mailbox.request_surrounding_resync();
+        let first = peek(&mailbox);
+        assert_eq!(first[1], f64::from(IME_REQUEST_SURROUNDING_RESYNC));
+
+        mailbox.request_surrounding_resync();
+        assert_eq!(peek(&mailbox), first);
+        acknowledge(&mailbox, first);
+
+        let second = peek(&mailbox);
+        assert_eq!(second[1], f64::from(IME_REQUEST_SURROUNDING_RESYNC));
+        assert_ne!(second[0], first[0]);
         acknowledge(&mailbox, second);
         assert_eq!(mailbox.peek_snapshot(), Ok(None));
     }

@@ -146,6 +146,21 @@ Deno.test("IME restart force-resends surrounding text between disable and enable
   assertEquals(source.acknowledged, [9]);
 });
 
+Deno.test("IME surrounding resync force-resends an unchanged snapshot without restarting", () => {
+  const target = new FakeWindow();
+  const source = new FakeSource(undefined);
+  source.surrounding = ["same", 2, 2];
+  const synchronizer = new NativeImeSynchronizer();
+  synchronizer.synchronize(source, target);
+  target.calls.length = 0;
+
+  source.current = snapshot(10, 8);
+  synchronizer.synchronize(source, target);
+
+  assertEquals(target.calls, [["surrounding", "same", 2, 2]]);
+  assertEquals(source.acknowledged, [10]);
+});
+
 Deno.test("surrounding-text failures remain retryable and successful snapshots deduplicate", () => {
   const target = new FakeWindow();
   target.failSurroundingCount = 1;
@@ -321,7 +336,7 @@ Deno.test("malformed IME snapshots fail before native application or acknowledgm
     new Float64Array([1, 2]),
     snapshot(0, 2, 0, 0, 0, 0, 1),
     snapshot(1.5, 2, 0, 0, 0, 0, 1),
-    snapshot(1, 8, 0, 0, 0, 0, 1),
+    snapshot(1, 1 << 4, 0, 0, 0, 0, 1),
     snapshot(1, 4, 0, 0, 0, 0, 0),
     snapshot(1, 1, 0, 0, -1, 4, 0),
   ];

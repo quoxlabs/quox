@@ -108,6 +108,16 @@ class FakeInputRenderer {
     return this.#inputOrComplete();
   }
 
+  begin_ime_replace(
+    startBytes: number,
+    endBytes: number,
+    text: string,
+    sourceKeyInputId?: number,
+  ): unknown {
+    this.calls.push({ method: "imeReplace", args: [startBytes, endBytes, text, sourceKeyInputId] });
+    return this.#inputOrComplete();
+  }
+
   resume_dom_dispatch(frameId: number, _eventId: number, _defaultPrevented: boolean): unknown {
     const next = this.#pendingFrames.get(frameId);
     if (next === undefined) throw new Error("missing pending fake frame");
@@ -212,7 +222,7 @@ Deno.test("keyboard dispatch forwards logical key, policy, and repeat without sy
   assertEquals(syncs.count, 1);
 });
 
-Deno.test("IME dispatch preserves UTF-8 preedit ranges and emits DOM input for commit", () => {
+Deno.test("IME dispatch preserves UTF-8 ranges and forwards every native edit", () => {
   const { document, renderer, syncs } = createDocument();
   let inputs = 0;
   setElementFunctionProp(document.createElement("input"), "onInput", () => inputs++);
@@ -233,6 +243,15 @@ Deno.test("IME dispatch preserves UTF-8 preedit ranges and emits DOM input for c
     beforeBytes: 4,
     afterBytes: 2,
   });
+  renderer.inputNode = 42;
+  document.dispatchIme({
+    type: "ime",
+    kind: "replace",
+    startBytes: 1,
+    endBytes: 5,
+    text: "好",
+    sourceKeyInputId: 20,
+  });
   document.dispatchIme({ type: "ime", kind: "disabled" });
 
   assertEquals(renderer.calls, [
@@ -241,10 +260,11 @@ Deno.test("IME dispatch preserves UTF-8 preedit ranges and emits DOM input for c
     { method: "imePreedit", args: ["hidden", undefined, undefined] },
     { method: "imeCommit", args: ["é", 18] },
     { method: "imeDeleteSurrounding", args: [4, 2] },
+    { method: "imeReplace", args: [1, 5, "好", 20] },
     { method: "imeDisabled", args: [] },
   ]);
-  assertEquals(inputs, 1);
-  assertEquals(syncs.count, 6);
+  assertEquals(inputs, 2);
+  assertEquals(syncs.count, 7);
 });
 
 Deno.test("IME replacement dispatches surrounding deletion before commit and drains both inputs", () => {
@@ -391,6 +411,40 @@ Deno.test("invalid numeric input is rejected before renderer or IME synchronizat
         kind: "commit",
         text: "a",
         sourceKeyInputId: 0x1_0000_0000,
+      }),
+    RangeError,
+  );
+  assertThrows(
+    () =>
+      document.dispatchIme({
+        type: "ime",
+        kind: "replace",
+        startBytes: 0x1_0000_0000,
+        endBytes: 0x1_0000_0000,
+        text: "a",
+      }),
+    RangeError,
+  );
+  assertThrows(
+    () =>
+      document.dispatchIme({
+        type: "ime",
+        kind: "replace",
+        startBytes: 2,
+        endBytes: 1,
+        text: "a",
+      }),
+    RangeError,
+  );
+  assertThrows(
+    () =>
+      document.dispatchIme({
+        type: "ime",
+        kind: "replace",
+        startBytes: 0,
+        endBytes: 1,
+        text: "a",
+        sourceKeyInputId: 0,
       }),
     RangeError,
   );

@@ -296,6 +296,12 @@ export interface DomDispatchRendererSource {
   begin_ime_preedit(text: string, cursorStart?: number, cursorEnd?: number): unknown;
   begin_ime_commit(text: string, sourceKeyInputId?: number): unknown;
   begin_ime_delete_surrounding(beforeBytes: number, afterBytes: number): unknown;
+  begin_ime_replace(
+    startBytes: number,
+    endBytes: number,
+    text: string,
+    sourceKeyInputId?: number,
+  ): unknown;
   resume_dom_dispatch(frameId: number, eventId: number, defaultPrevented: boolean): unknown;
   abort_dom_dispatch(frameId: number): boolean;
 }
@@ -1253,6 +1259,25 @@ export class DomDispatchRendererPort {
   beginImeDeleteSurrounding(beforeBytes: number, afterBytes: number): DomDispatchStep {
     return this.#validateInitial(
       this.#renderer.begin_ime_delete_surrounding(beforeBytes, afterBytes),
+    );
+  }
+
+  beginImeReplace(
+    startBytes: number,
+    endBytes: number,
+    text: string,
+    sourceKeyInputId?: number,
+  ): DomDispatchStep {
+    startBytes = assertUint32(startBytes, "startBytes");
+    endBytes = assertUint32(endBytes, "endBytes");
+    if (startBytes > endBytes) {
+      throw new RangeError("quox: IME replacement range must be ordered");
+    }
+    sourceKeyInputId = sourceKeyInputId === undefined
+      ? undefined
+      : assertPositiveUint32(sourceKeyInputId, "sourceKeyInputId");
+    return this.#validateInitial(
+      this.#renderer.begin_ime_replace(startBytes, endBytes, text, sourceKeyInputId),
     );
   }
 

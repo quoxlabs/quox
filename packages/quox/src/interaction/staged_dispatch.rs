@@ -15,7 +15,10 @@ use crate::form_controls::{
     html_form_owner, is_html_form,
 };
 use crate::node_handles::NodeHandles;
-use crate::{QuoxRenderer, QuoxRendererState, sync_document_layout};
+use crate::{
+    FocusedImeSurroundingText, QuoxRenderer, QuoxRendererState, focused_ime_surrounding_text,
+    sync_document_layout,
+};
 use blitz_dom::node::SpecialElementData;
 use blitz_dom::{Attribute, BaseDocument, LocalName, QualName, local_name, ns};
 use blitz_traits::events::{
@@ -81,6 +84,7 @@ pub(crate) struct DispatchStack {
     canceled_composition: Option<CanceledComposition>,
     pending_start_ime: VecDeque<DeferredImeRequest>,
     pending_end_ime: VecDeque<DeferredImeRequest>,
+    surrounding_resync_requested: bool,
     // The last authoritative in-viewport mouse record is retained independently from the
     // movement baseline so layout-driven boundary refreshes never manufacture movement.
     stationary_pointer: Option<StationaryPointerSnapshot>,
@@ -93,6 +97,7 @@ struct ActiveComposition {
     generation: u32,
     target: GuardedNode,
     data: String,
+    cursor: Option<(usize, usize)>,
     pending_frame: Option<u32>,
     last_completed_frame: Option<u32>,
     start_pending: bool,
@@ -399,6 +404,7 @@ struct EventMetadata {
 #[derive(Clone, Debug, PartialEq)]
 enum EditIntent {
     InsertText { data: String, is_composing: bool },
+    InsertReplacementText { data: String },
     InsertLineBreak,
     InsertFromPaste { data: String },
     DeleteByCut,
@@ -449,6 +455,9 @@ impl EditIntent {
                 },
                 *is_composing,
             ),
+            Self::InsertReplacementText { data } => {
+                (Some(data.clone()), "insertReplacementText", false)
+            }
             Self::InsertLineBreak => (None, "insertLineBreak", false),
             Self::InsertFromPaste { data } => (Some(data.clone()), "insertFromPaste", false),
             Self::DeleteByCut => (None, "deleteByCut", false),
@@ -842,9 +851,14 @@ enum PlannedWork {
     },
     GuardedDefault(Box<GuardedDomEvent>),
     TextEdit(PendingEdit),
+    ImeReplaceCaretMove(CapturedImeReplace),
     CompositionStart(PendingCompositionEdit),
     CompositionUpdate(PendingCompositionEdit),
     CompositionEnd(PendingCompositionEnd),
+    ImeReplaceAfterComposition {
+        predecessor_generation: u32,
+        captured: CapturedImeReplace,
+    },
     ForceCompositionEnd {
         expected_generation: u32,
         metadata: EventMetadata,
@@ -966,6 +980,7 @@ enum PendingEditAction {
         before_bytes: usize,
         after_bytes: usize,
     },
+    ImeReplace(PendingImeReplace),
     Clipboard {
         action: ClipboardAction,
     },
@@ -980,6 +995,7 @@ struct PendingCompositionEdit {
     metadata: EventMetadata,
     frame_id: u32,
     end_data: Option<String>,
+    replacement_end: Option<PendingImeReplaceEnd>,
 }
 
 struct PendingCompositionEnd {
@@ -988,6 +1004,37 @@ struct PendingCompositionEnd {
     data: String,
     metadata: EventMetadata,
     frame_id: u32,
+    replacement_end: Option<PendingImeReplaceEnd>,
+}
+
+struct PendingImeReplaceEnd {
+    captured: Option<CapturedImeReplace>,
+}
+
+struct PendingImeReplace {
+    captured: CapturedImeReplace,
+}
+
+struct CapturedImeReplace {
+    target: GuardedNode,
+    expected: ImeReplaceSnapshot,
+    raw_guard: RawImeSnapshot,
+    start_bytes: usize,
+    end_bytes: usize,
+    text: String,
+}
+
+#[derive(Debug, PartialEq)]
+enum ImeReplaceSnapshot {
+    Surrounding(FocusedImeSurroundingText),
+    Private,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct RawImeSnapshot {
+    value: String,
+    selection: std::ops::Range<usize>,
+    compose: Option<std::ops::Range<usize>>,
 }
 
 enum DeferredImeRequest {
@@ -996,12 +1043,13 @@ enum DeferredImeRequest {
         cursor: Option<(usize, usize)>,
     },
     Commit(String),
+    Replace(CapturedImeReplace),
 }
 
 impl DeferredImeRequest {
     fn is_terminal(&self) -> bool {
         match self {
-            Self::Commit(_) => true,
+            Self::Commit(_) | Self::Replace(_) => true,
             Self::Preedit { data, .. } => data.is_empty(),
         }
     }
@@ -1077,6 +1125,17 @@ enum DispatchRequest {
     ImeDeleteSurrounding {
         before_bytes: usize,
         after_bytes: usize,
+    },
+    ImeReplace {
+        start_bytes: usize,
+        end_bytes: usize,
+        text: String,
+    },
+    ImeReplaceWithSource {
+        start_bytes: usize,
+        end_bytes: usize,
+        text: String,
+        source_key_input_id: u32,
     },
     Focus(usize),
     Blur(usize),
@@ -1577,6 +1636,7 @@ impl Default for DispatchStack {
             canceled_composition: None,
             pending_start_ime: VecDeque::new(),
             pending_end_ime: VecDeque::new(),
+            surrounding_resync_requested: false,
             stationary_pointer: None,
             last_mouse_move: None,
         }
@@ -1584,6 +1644,14 @@ impl Default for DispatchStack {
 }
 
 impl DispatchStack {
+    fn request_surrounding_resync(&mut self) {
+        self.surrounding_resync_requested = true;
+    }
+
+    fn take_surrounding_resync_request(&mut self) -> bool {
+        std::mem::take(&mut self.surrounding_resync_requested)
+    }
+
     fn allocate_frame_id(&mut self) -> Result<u32, DispatchError> {
         let id = self
             .next_frame_id
@@ -2115,6 +2183,7 @@ impl DispatchStack {
                 }
             }
             ResumeAction::CompositionUpdate(edit) => {
+                let mut edit = *edit;
                 if !self.composition_operation_is_current(&edit) {
                     // Superseded by a nested occurrence.
                 } else if !node_is_live(edit.target, document, handles) {
@@ -2126,6 +2195,13 @@ impl DispatchStack {
                         true,
                     )?;
                 } else if Self::composition_target_is_valid(document, handles, edit.target) {
+                    if let Some(replacement) = &mut edit.replacement_end
+                        && replacement.captured.as_ref().is_some_and(|captured| {
+                            !captured_ime_replace_is_current(document, handles, captured)
+                        })
+                    {
+                        replacement.captured = None;
+                    }
                     let intent = EditIntent::InsertText {
                         data: edit.data.clone(),
                         is_composing: true,
@@ -2135,7 +2211,7 @@ impl DispatchStack {
                         target: edit.target,
                         intent: intent.clone(),
                         metadata: edit.metadata.clone().with_edit_intent(Some(intent)),
-                        action: PendingEditAction::CompositionPreedit(edit),
+                        action: PendingEditAction::CompositionPreedit(Box::new(edit)),
                     };
                     if let Some(step) = self.stage_text_edit(document, handles, redraw, pending)? {
                         return Ok(step);
@@ -2174,6 +2250,14 @@ impl DispatchStack {
                             true,
                         )?;
                     }
+                } else if matches!(&edit.action, PendingEditAction::ImeReplace(_)) {
+                    self.finish_pending_ime_replace(
+                        document,
+                        text_controls,
+                        handles,
+                        *edit,
+                        !cancelled,
+                    )?;
                 } else if !cancelled
                     && text_edit_target_accepts(document, handles, edit.target, &edit.intent)
                 {
@@ -2521,6 +2605,7 @@ impl DispatchStack {
                 generation,
                 target,
                 data: String::new(),
+                cursor: None,
                 pending_frame: Some(frame_id),
                 last_completed_frame: None,
                 start_pending: true,
@@ -2537,6 +2622,7 @@ impl DispatchStack {
             cursor,
             metadata,
             frame_id,
+            replacement_end: None,
         };
         self.frames
             .last_mut()
@@ -2620,6 +2706,7 @@ impl DispatchStack {
                 data: text,
                 metadata,
                 frame_id,
+                replacement_end: None,
             })
         } else {
             PlannedWork::CompositionUpdate(PendingCompositionEdit {
@@ -2630,6 +2717,7 @@ impl DispatchStack {
                 metadata,
                 frame_id,
                 end_data: Some(text),
+                replacement_end: None,
             })
         };
         self.frames
@@ -2638,6 +2726,246 @@ impl DispatchStack {
             .planned
             .push_front(work);
         true
+    }
+
+    fn plan_suppressed_ime_replace(&mut self) {
+        self.canceled_composition = None;
+        self.plan_active_ime_replace_end(None);
+    }
+
+    fn plan_active_ime_replace_end(&mut self, captured: Option<CapturedImeReplace>) {
+        let Some((target, generation)) = self
+            .active_composition
+            .as_ref()
+            .map(|active| (active.target, active.generation))
+        else {
+            return;
+        };
+        let frame_id = self
+            .frames
+            .last()
+            .expect("IME replacement end requires an active frame")
+            .id;
+        let active = self
+            .active_composition
+            .as_mut()
+            .expect("the captured composition remains active");
+        active.pending_frame = Some(frame_id);
+        active.ending = true;
+        self.frames
+            .last_mut()
+            .expect("IME replacement end requires an active frame")
+            .planned
+            .push_front(PlannedWork::CompositionUpdate(PendingCompositionEdit {
+                generation,
+                target,
+                data: String::new(),
+                cursor: None,
+                metadata: EventMetadata::native(),
+                frame_id,
+                end_data: Some(String::new()),
+                replacement_end: Some(PendingImeReplaceEnd { captured }),
+            }));
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "absolute replacement validation keeps the active-composition fallback adjacent to every rejection"
+    )]
+    fn plan_ime_replace(
+        &mut self,
+        document: &mut BaseDocument,
+        handles: &mut NodeHandles,
+        start_bytes: usize,
+        end_bytes: usize,
+        text: String,
+    ) -> Result<(), DispatchError> {
+        if self.canceled_composition.is_some() {
+            if self.canceled_composition_is_current(document, handles) {
+                self.canceled_composition = None;
+                return Ok(());
+            }
+            self.canceled_composition = None;
+        }
+        let existing = self
+            .active_composition
+            .as_ref()
+            .map(|active| (active.target, active.generation));
+        if let Some((target, generation)) = existing
+            && !Self::composition_target_is_valid(document, handles, target)
+        {
+            debug_assert_eq!(
+                self.active_composition
+                    .as_ref()
+                    .map(|active| active.generation),
+                Some(generation)
+            );
+            self.plan_active_ime_replace_end(None);
+            return Ok(());
+        }
+
+        let target = if let Some((target, _)) = existing {
+            target
+        } else {
+            let Some(target_id) = actual_focus_node_id(document) else {
+                return Ok(());
+            };
+            let Some(target) = guard_node(document, handles, target_id)? else {
+                return Ok(());
+            };
+            target
+        };
+        let intent = EditIntent::InsertReplacementText { data: text.clone() };
+        if !text_edit_target_accepts(document, handles, target, &intent) {
+            if existing.is_some() {
+                self.plan_active_ime_replace_end(None);
+            }
+            return Ok(());
+        }
+        let Some(raw_guard) = raw_ime_snapshot(document, target.raw) else {
+            if existing.is_some() {
+                self.plan_active_ime_replace_end(None);
+            }
+            return Ok(());
+        };
+        let expected = if let Some(expected) = focused_ime_surrounding_text(document) {
+            if start_bytes > end_bytes
+                || end_bytes > expected.text.len()
+                || !expected.text.is_char_boundary(start_bytes)
+                || !expected.text.is_char_boundary(end_bytes)
+            {
+                if existing.is_some() {
+                    self.plan_active_ime_replace_end(None);
+                }
+                return Ok(());
+            }
+            ImeReplaceSnapshot::Surrounding(expected)
+        } else if start_bytes == 0
+            && end_bytes == 0
+            && is_password_text_control(document, target.raw)
+        {
+            ImeReplaceSnapshot::Private
+        } else {
+            if existing.is_some() {
+                self.plan_active_ime_replace_end(None);
+            }
+            return Ok(());
+        };
+        let captured = CapturedImeReplace {
+            target,
+            expected,
+            raw_guard,
+            start_bytes,
+            end_bytes,
+            text,
+        };
+        let frame_id = self
+            .frames
+            .last()
+            .expect("IME replacement planning requires an active frame")
+            .id;
+        if self
+            .active_composition
+            .as_ref()
+            .is_some_and(|active| active.start_pending && active.pending_frame != Some(frame_id))
+        {
+            defer_ime_request(
+                &mut self.pending_start_ime,
+                DeferredImeRequest::Replace(captured),
+            );
+            return Ok(());
+        }
+        if self
+            .active_composition
+            .as_ref()
+            .is_some_and(|active| active.ending)
+        {
+            defer_ime_request(
+                &mut self.pending_end_ime,
+                DeferredImeRequest::Replace(captured),
+            );
+            return Ok(());
+        }
+
+        self.plan_captured_ime_replace(document, handles, captured, false);
+        Ok(())
+    }
+
+    fn plan_captured_ime_replace(
+        &mut self,
+        document: &mut BaseDocument,
+        handles: &mut NodeHandles,
+        mut captured: CapturedImeReplace,
+        allow_start_rebase: bool,
+    ) {
+        let existing = self
+            .active_composition
+            .as_ref()
+            .map(|active| (active.target, active.generation));
+        if existing.is_some_and(|(target, _)| target != captured.target) {
+            return;
+        }
+        if allow_start_rebase
+            && let Some(active) = &self.active_composition
+            && !rebase_ime_replace_after_initial_preedit(
+                document,
+                &mut captured,
+                &active.data,
+                active.cursor,
+            )
+        {
+            return;
+        }
+        let intent = EditIntent::InsertReplacementText {
+            data: captured.text.clone(),
+        };
+        let snapshot_is_current = actual_focus_node_id(document) == Some(captured.target.raw)
+            && ime_replace_snapshot_is_current(
+                document,
+                captured.target.raw,
+                &captured.expected,
+                &captured.raw_guard,
+            )
+            && text_edit_target_accepts(document, handles, captured.target, &intent);
+        if existing.is_some() {
+            let may_replay = snapshot_is_current
+                && Self::composition_target_is_valid(document, handles, captured.target);
+            self.plan_active_ime_replace_end(may_replay.then_some(captured));
+            return;
+        }
+        if !snapshot_is_current {
+            return;
+        }
+
+        let private_noop = matches!(&captured.expected, ImeReplaceSnapshot::Private)
+            && captured.raw_guard.selection.start == captured.raw_guard.selection.end
+            && captured.text.is_empty();
+        if private_noop {
+            return;
+        }
+        let public_caret_move = matches!(&captured.expected, ImeReplaceSnapshot::Surrounding(_))
+            && captured.start_bytes == captured.end_bytes
+            && captured.text.is_empty();
+        if public_caret_move {
+            self.frames
+                .last_mut()
+                .expect("IME replacement planning requires an active frame")
+                .planned
+                .push_front(PlannedWork::ImeReplaceCaretMove(captured));
+            return;
+        }
+
+        let metadata = EventMetadata::native();
+        self.frames
+            .last_mut()
+            .expect("IME replacement planning requires an active frame")
+            .planned
+            .push_front(PlannedWork::TextEdit(PendingEdit {
+                target: captured.target,
+                intent: intent.clone(),
+                metadata: metadata.with_edit_intent(Some(intent)),
+                action: PendingEditAction::ImeReplace(PendingImeReplace { captured }),
+            }));
     }
 
     #[allow(
@@ -2685,6 +3013,27 @@ impl DispatchStack {
                     return Ok(());
                 }
                 DispatchRequest::ImeCommit(text)
+            }
+            DispatchRequest::ImeReplace {
+                start_bytes,
+                end_bytes,
+                text,
+            } => {
+                self.request_surrounding_resync();
+                return self.plan_ime_replace(document, handles, start_bytes, end_bytes, text);
+            }
+            DispatchRequest::ImeReplaceWithSource {
+                start_bytes,
+                end_bytes,
+                text,
+                source_key_input_id,
+            } => {
+                self.request_surrounding_resync();
+                if self.take_canceled_key_input(Some(source_key_input_id)) {
+                    self.plan_suppressed_ime_replace();
+                    return Ok(());
+                }
+                return self.plan_ime_replace(document, handles, start_bytes, end_bytes, text);
             }
             DispatchRequest::AppleStandardKeybindingWithSource {
                 command,
@@ -2938,8 +3287,10 @@ impl DispatchStack {
                 });
             }
             DispatchRequest::ImeCommitWithSource { .. }
-            | DispatchRequest::AppleStandardKeybindingWithSource { .. } => {
-                unreachable!("sourced edits are normalized before request planning")
+            | DispatchRequest::AppleStandardKeybindingWithSource { .. }
+            | DispatchRequest::ImeReplace { .. }
+            | DispatchRequest::ImeReplaceWithSource { .. } => {
+                unreachable!("native edits are normalized before request planning")
             }
             DispatchRequest::ImeDeleteSurrounding {
                 before_bytes,
@@ -3347,6 +3698,44 @@ impl DispatchStack {
                         return Ok(step);
                     }
                 }
+                PlannedWork::ImeReplaceCaretMove(captured) => {
+                    let intent = EditIntent::InsertReplacementText {
+                        data: captured.text.clone(),
+                    };
+                    let current = self.active_composition.is_none()
+                        && actual_focus_node_id(document) == Some(captured.target.raw)
+                        && ime_replace_snapshot_is_current(
+                            document,
+                            captured.target.raw,
+                            &captured.expected,
+                            &captured.raw_guard,
+                        )
+                        && text_edit_target_accepts(document, handles, captured.target, &intent);
+                    if !current {
+                        continue;
+                    }
+                    let before = editor_edit_snapshot(document, captured.target.raw);
+                    let applied = apply_absolute_ime_replace(
+                        document,
+                        captured.target.raw,
+                        &captured.expected,
+                        &captured.raw_guard,
+                        captured.start_bytes,
+                        captured.end_bytes,
+                        &captured.text,
+                    )
+                    .is_some();
+                    if applied {
+                        text_controls.sync_editor_value(document, captured.target.raw);
+                        let after = editor_edit_snapshot(document, captured.target.raw);
+                        if before != after {
+                            self.frames
+                                .last_mut()
+                                .expect("IME replacement caret move belongs to an active frame")
+                                .redraw_requested = true;
+                        }
+                    }
+                }
                 PlannedWork::CompositionStart(edit) => {
                     let current = self.active_composition.as_ref().is_some_and(|active| {
                         active.generation == edit.generation
@@ -3423,7 +3812,7 @@ impl DispatchStack {
                         self.discard_composition(document, handles);
                     }
                 }
-                PlannedWork::CompositionEnd(end) => {
+                PlannedWork::CompositionEnd(mut end) => {
                     if !self.composition_end_is_current(&end) {
                         continue;
                     }
@@ -3437,6 +3826,7 @@ impl DispatchStack {
                         )?;
                         continue;
                     }
+                    let mut replacement_end = end.replacement_end.take();
                     if Self::finish_guarded_composition(document, handles, end.target) {
                         self.frames
                             .last_mut()
@@ -3444,21 +3834,36 @@ impl DispatchStack {
                             .redraw_requested = true;
                     }
                     text_controls.sync_editor_value(document, end.target.raw);
+                    if let Some(replacement) = &mut replacement_end
+                        && replacement.captured.as_ref().is_some_and(|captured| {
+                            !captured_ime_replace_is_current(document, handles, captured)
+                        })
+                    {
+                        replacement.captured = None;
+                    }
                     let deferred = std::mem::take(&mut self.pending_end_ime);
                     self.active_composition = None;
-                    self.frames
+                    let frame = self
+                        .frames
                         .last_mut()
-                        .expect("composition end belongs to the active frame")
-                        .planned
-                        .extend(
-                            deferred
-                                .into_iter()
-                                .map(|request| PlannedWork::DeferredIme {
-                                    expected_generation: end.generation,
-                                    expected_completed_frame: None,
-                                    request,
-                                }),
-                        );
+                        .expect("composition end belongs to the active frame");
+                    frame.planned.extend(deferred.into_iter().map(|request| {
+                        PlannedWork::DeferredIme {
+                            expected_generation: end.generation,
+                            expected_completed_frame: None,
+                            request,
+                        }
+                    }));
+                    if let Some(captured) =
+                        replacement_end.and_then(|replacement| replacement.captured)
+                    {
+                        frame
+                            .planned
+                            .push_front(PlannedWork::ImeReplaceAfterComposition {
+                                predecessor_generation: end.generation,
+                                captured,
+                            });
+                    }
                     let target = end.target;
                     let data = end.data.clone();
                     let metadata = end.metadata.clone();
@@ -3473,6 +3878,16 @@ impl DispatchStack {
                         ResumeAction::CompositionEnd,
                     )? {
                         return Ok(step);
+                    }
+                }
+                PlannedWork::ImeReplaceAfterComposition {
+                    predecessor_generation,
+                    captured,
+                } => {
+                    if self.active_composition.is_none()
+                        && self.latest_composition_generation == Some(predecessor_generation)
+                    {
+                        self.plan_captured_ime_replace(document, handles, captured, false);
                     }
                 }
                 PlannedWork::ForceCompositionEnd {
@@ -3539,6 +3954,14 @@ impl DispatchStack {
                                     text,
                                 );
                             }
+                        }
+                        DeferredImeRequest::Replace(captured) => {
+                            self.plan_captured_ime_replace(
+                                document,
+                                handles,
+                                captured,
+                                expected_completed_frame.is_some(),
+                            );
                         }
                     }
                     if self.active_composition.as_ref().is_some_and(|active| {
@@ -4492,6 +4915,88 @@ impl DispatchStack {
         Ok(())
     }
 
+    fn finish_pending_ime_replace(
+        &mut self,
+        document: &mut BaseDocument,
+        text_controls: &mut TextControlStates,
+        handles: &mut NodeHandles,
+        edit: PendingEdit,
+        allow_default: bool,
+    ) -> Result<(), DispatchError> {
+        let PendingEdit {
+            target,
+            intent,
+            metadata,
+            action,
+        } = edit;
+        let PendingEditAction::ImeReplace(replacement) = action else {
+            unreachable!("only an atomic IME replacement uses this continuation")
+        };
+
+        let snapshot_is_current = actual_focus_node_id(document) == Some(target.raw)
+            && ime_replace_snapshot_is_current(
+                document,
+                target.raw,
+                &replacement.captured.expected,
+                &replacement.captured.raw_guard,
+            )
+            && text_edit_target_accepts(document, handles, target, &intent);
+        let applied = (allow_default && snapshot_is_current)
+            .then(|| {
+                apply_absolute_ime_replace(
+                    document,
+                    target.raw,
+                    &replacement.captured.expected,
+                    &replacement.captured.raw_guard,
+                    replacement.captured.start_bytes,
+                    replacement.captured.end_bytes,
+                    &replacement.captured.text,
+                )
+            })
+            .flatten()
+            .is_some();
+
+        if applied {
+            text_controls.sync_editor_value(document, target.raw);
+            let value = editor_edit_snapshot(document, target.raw)
+                .map_or_else(String::new, |snapshot| snapshot.value);
+            self.frames
+                .last_mut()
+                .expect("IME replacement edits run only for an active frame")
+                .redraw_requested = true;
+            let content_edit = match &replacement.captured.expected {
+                ImeReplaceSnapshot::Surrounding(_) => {
+                    replacement.captured.start_bytes != replacement.captured.end_bytes
+                        || !replacement.captured.text.is_empty()
+                }
+                ImeReplaceSnapshot::Private => {
+                    replacement.captured.raw_guard.selection.start
+                        != replacement.captured.raw_guard.selection.end
+                        || !replacement.captured.text.is_empty()
+                }
+            };
+            if content_edit {
+                let event = DomEvent::new(
+                    target.raw,
+                    DomEventData::Input(blitz_traits::events::BlitzInputEvent { value }),
+                );
+                if let Some(event) = guard_queued_event(
+                    document,
+                    handles,
+                    event,
+                    metadata.clone().with_edit_intent(Some(intent)),
+                )? {
+                    self.frames
+                        .last_mut()
+                        .expect("IME replacement edits run only for an active frame")
+                        .generated
+                        .push_back(event);
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "editing defaults keep snapshot, mutation, generated input, and composition follow-up adjacent"
@@ -4582,8 +5087,11 @@ impl DispatchStack {
                 }
                 Ok(())
             }
+            PendingEditAction::ImeReplace(_) => {
+                unreachable!("atomic IME replacements use their guarded continuation")
+            }
             PendingEditAction::CompositionPreedit(edit) => {
-                let edit = *edit;
+                let mut edit = *edit;
                 if !self.composition_operation_is_current(&edit) {
                     return Ok(());
                 }
@@ -4596,6 +5104,13 @@ impl DispatchStack {
                         true,
                     )?;
                     return Ok(());
+                }
+                if let Some(replacement) = &mut edit.replacement_end
+                    && replacement.captured.as_ref().is_some_and(|captured| {
+                        !captured_ime_replace_is_current(document, handles, captured)
+                    })
+                {
+                    replacement.captured = None;
                 }
                 let metadata =
                     edit.metadata
@@ -4630,12 +5145,20 @@ impl DispatchStack {
                 if !self.composition_operation_is_current(&edit) {
                     return Ok(());
                 }
+                if let Some(replacement) = &mut edit.replacement_end
+                    && replacement.captured.as_mut().is_some_and(|captured| {
+                        !rebase_ime_replace_after_composition_clear(document, handles, captured)
+                    })
+                {
+                    replacement.captured = None;
+                }
                 if let Some(active) = &mut self.active_composition
                     && active.generation == edit.generation
                     && active.target == edit.target
                     && active.pending_frame == Some(edit.frame_id)
                 {
                     active.data.clone_from(&edit.data);
+                    active.cursor = edit.cursor;
                 }
                 // Input Events requires every surfaced compositionupdate to be followed by the
                 // non-cancelable beforeinput/input pair, even when the native update only moves
@@ -4668,6 +5191,7 @@ impl DispatchStack {
                             data,
                             metadata: edit.metadata,
                             frame_id: edit.frame_id,
+                            replacement_end: edit.replacement_end,
                         })
                     },
                 );
@@ -4862,6 +5386,189 @@ fn editor_edit_snapshot(document: &mut BaseDocument, target: usize) -> Option<Ed
         });
     });
     snapshot
+}
+
+fn raw_ime_snapshot(document: &mut BaseDocument, target: usize) -> Option<RawImeSnapshot> {
+    let mut snapshot = None;
+    document.with_text_input(target, |driver| {
+        snapshot = Some(RawImeSnapshot {
+            value: driver.editor.raw_text().to_owned(),
+            selection: driver.editor.raw_selection().text_range(),
+            compose: driver.editor.raw_compose().clone(),
+        });
+    });
+    snapshot
+}
+
+fn is_password_text_control(document: &BaseDocument, target: usize) -> bool {
+    document
+        .get_node(target)
+        .and_then(blitz_dom::Node::element_data)
+        .is_some_and(|element| {
+            element.name.ns == ns!(html)
+                && element.name.local.as_ref() == "input"
+                && element
+                    .attr(local_name!("type"))
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case("password"))
+        })
+}
+
+fn ime_replace_snapshot_is_current(
+    document: &mut BaseDocument,
+    target: usize,
+    expected: &ImeReplaceSnapshot,
+    raw_guard: &RawImeSnapshot,
+) -> bool {
+    if raw_ime_snapshot(document, target).as_ref() != Some(raw_guard) {
+        return false;
+    }
+    match expected {
+        ImeReplaceSnapshot::Surrounding(expected) => {
+            focused_ime_surrounding_text(document).as_ref() == Some(expected)
+        }
+        ImeReplaceSnapshot::Private => is_password_text_control(document, target),
+    }
+}
+
+fn captured_ime_replace_is_current(
+    document: &mut BaseDocument,
+    handles: &NodeHandles,
+    captured: &CapturedImeReplace,
+) -> bool {
+    let intent = EditIntent::InsertReplacementText {
+        data: captured.text.clone(),
+    };
+    actual_focus_node_id(document) == Some(captured.target.raw)
+        && ime_replace_snapshot_is_current(
+            document,
+            captured.target.raw,
+            &captured.expected,
+            &captured.raw_guard,
+        )
+        && text_edit_target_accepts(document, handles, captured.target, &intent)
+}
+
+fn rebase_ime_replace_after_initial_preedit(
+    document: &mut BaseDocument,
+    captured: &mut CapturedImeReplace,
+    data: &str,
+    cursor: Option<(usize, usize)>,
+) -> bool {
+    let selection = captured.raw_guard.selection.clone();
+    if captured.raw_guard.compose.is_some()
+        || selection.start != selection.end
+        || data.is_empty()
+        || !captured.raw_guard.value.is_char_boundary(selection.start)
+    {
+        return false;
+    }
+    let cursor = cursor.unwrap_or((0, 0));
+    if cursor.0 > cursor.1
+        || cursor.1 > data.len()
+        || !data.is_char_boundary(cursor.0)
+        || !data.is_char_boundary(cursor.1)
+    {
+        return false;
+    }
+    let Some(compose_end) = selection.start.checked_add(data.len()) else {
+        return false;
+    };
+    let Some(selection_start) = selection.start.checked_add(cursor.0) else {
+        return false;
+    };
+    let Some(selection_end) = selection.start.checked_add(cursor.1) else {
+        return false;
+    };
+    let mut value = captured.raw_guard.value.clone();
+    value.insert_str(selection.start, data);
+    let expected = RawImeSnapshot {
+        value,
+        selection: selection_start..selection_end,
+        compose: Some(selection.start..compose_end),
+    };
+    if raw_ime_snapshot(document, captured.target.raw).as_ref() != Some(&expected) {
+        return false;
+    }
+    captured.raw_guard = expected;
+    true
+}
+
+fn rebase_ime_replace_after_composition_clear(
+    document: &mut BaseDocument,
+    handles: &NodeHandles,
+    captured: &mut CapturedImeReplace,
+) -> bool {
+    let expected = if let Some(compose) = captured.raw_guard.compose.clone() {
+        if compose.start > compose.end
+            || compose.end > captured.raw_guard.value.len()
+            || !captured.raw_guard.value.is_char_boundary(compose.start)
+            || !captured.raw_guard.value.is_char_boundary(compose.end)
+        {
+            return false;
+        }
+        let mut value = captured.raw_guard.value.clone();
+        value.replace_range(compose.clone(), "");
+        RawImeSnapshot {
+            value,
+            selection: compose.start..compose.start,
+            compose: None,
+        }
+    } else {
+        captured.raw_guard.clone()
+    };
+    if raw_ime_snapshot(document, captured.target.raw).as_ref() != Some(&expected) {
+        return false;
+    }
+    captured.raw_guard = expected;
+    captured_ime_replace_is_current(document, handles, captured)
+}
+
+fn apply_absolute_ime_replace(
+    document: &mut BaseDocument,
+    target: usize,
+    expected: &ImeReplaceSnapshot,
+    raw_guard: &RawImeSnapshot,
+    start_bytes: usize,
+    end_bytes: usize,
+    text: &str,
+) -> Option<String> {
+    let mut value = None;
+    document.with_text_input(target, |mut driver| {
+        let current_guard = RawImeSnapshot {
+            value: driver.editor.raw_text().to_owned(),
+            selection: driver.editor.raw_selection().text_range(),
+            compose: driver.editor.raw_compose().clone(),
+        };
+        if &current_guard != raw_guard || current_guard.compose.is_some() {
+            return;
+        }
+
+        match expected {
+            ImeReplaceSnapshot::Surrounding(expected) => {
+                let selection = driver.editor.raw_selection().text_range();
+                let current = driver.editor.raw_text();
+                if current != expected.text
+                    || selection.start != expected.selection_start_bytes
+                    || selection.end != expected.selection_end_bytes
+                    || start_bytes > end_bytes
+                    || end_bytes > current.len()
+                    || !current.is_char_boundary(start_bytes)
+                    || !current.is_char_boundary(end_bytes)
+                {
+                    return;
+                }
+                driver.select_byte_range(start_bytes, end_bytes);
+            }
+            ImeReplaceSnapshot::Private => {
+                if start_bytes != 0 || end_bytes != 0 {
+                    return;
+                }
+            }
+        }
+        driver.insert_or_replace_selection(text);
+        value = Some(driver.editor.raw_text().to_owned());
+    });
+    value
 }
 
 /// Complete the clipboard-writing half of a cut after its `cut` listeners have run. The
@@ -7655,6 +8362,9 @@ fn finish_step(
     state: &mut QuoxRendererState,
     step: Result<DispatchStep, DispatchError>,
 ) -> Result<JsValue, JsValue> {
+    if state.dispatch_stack.take_surrounding_resync_request() {
+        state.ime_requests.request_surrounding_resync();
+    }
     state.refresh_ime_cursor_area();
     let step = step.map_err(DispatchError::into_js)?;
     step.into_js()
@@ -8159,6 +8869,39 @@ impl QuoxRenderer {
         finish_step(&mut state, step)
     }
 
+    pub fn begin_ime_replace(
+        &self,
+        start_bytes: f64,
+        end_bytes: f64,
+        text: &str,
+        source_key_input_id: Option<f64>,
+    ) -> Result<JsValue, JsValue> {
+        let start_bytes =
+            wasm_usize(start_bytes, "startBytes").map_err(NumericArgumentError::into_js)?;
+        let end_bytes = wasm_usize(end_bytes, "endBytes").map_err(NumericArgumentError::into_js)?;
+        if start_bytes > end_bytes {
+            return Err(NumericArgumentError::new("IME replacement range", "be ordered").into_js());
+        }
+        let source_key_input_id = validate_source_key_input_id(source_key_input_id)
+            .map_err(NumericArgumentError::into_js)?;
+        let mut state = self.state.borrow_mut();
+        let request = source_key_input_id.map_or_else(
+            || DispatchRequest::ImeReplace {
+                start_bytes,
+                end_bytes,
+                text: text.to_owned(),
+            },
+            |source_key_input_id| DispatchRequest::ImeReplaceWithSource {
+                start_bytes,
+                end_bytes,
+                text: text.to_owned(),
+                source_key_input_id,
+            },
+        );
+        let step = begin_request(&mut state, request);
+        finish_step(&mut state, step)
+    }
+
     pub fn begin_ime_delete_surrounding(
         &self,
         before_bytes: f64,
@@ -8228,7 +8971,7 @@ fn positive_id(value: f64, name: &'static str) -> Result<u32, JsValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ImeRequestMailbox, QuoxShellProvider};
+    use crate::{IME_REQUEST_SURROUNDING_RESYNC, ImeRequestMailbox, QuoxShellProvider};
     use blitz_dom::{DocumentConfig, LocalName, NodeData, QualName, ns};
     use blitz_html::HtmlDocument;
     use blitz_traits::events::{
@@ -8365,7 +9108,8 @@ mod tests {
         }
 
         fn begin(&mut self, request: DispatchRequest) -> DispatchStep {
-            self.stack
+            let step = self
+                .stack
                 .begin(
                     &mut self.document,
                     &mut self.text_controls,
@@ -8374,11 +9118,14 @@ mod tests {
                     self.redraw.as_ref(),
                     request,
                 )
-                .expect("dispatch should begin")
+                .expect("dispatch should begin");
+            self.flush_ime_resync_request();
+            step
         }
 
         fn resume(&mut self, event: &DispatchEventStep, default_prevented: bool) -> DispatchStep {
-            self.stack
+            let step = self
+                .stack
                 .resume(
                     &mut self.document,
                     &mut self.text_controls,
@@ -8389,7 +9136,15 @@ mod tests {
                     event.event_id,
                     default_prevented,
                 )
-                .expect("dispatch should resume")
+                .expect("dispatch should resume");
+            self.flush_ime_resync_request();
+            step
+        }
+
+        fn flush_ime_resync_request(&mut self) {
+            if self.stack.take_surrounding_resync_request() {
+                self.ime_requests.request_surrounding_resync();
+            }
         }
 
         fn abort(&mut self, frame_id: u32) -> bool {
@@ -8562,6 +9317,14 @@ mod tests {
                 value = Some(driver.editor.raw_text().to_owned());
             });
             value.expect("test node should be a text input")
+        }
+
+        fn raw_selection(&mut self, node_id: usize) -> std::ops::Range<usize> {
+            let mut selection = None;
+            self.document.with_text_input(node_id, |driver| {
+                selection = Some(driver.editor.raw_selection().text_range());
+            });
+            selection.expect("test node should be a text input")
         }
 
         fn live_value(&mut self, node_id: usize) -> String {
@@ -8749,6 +9512,58 @@ mod tests {
             } => (frame_id, redraw_requested),
             DispatchStep::Event(event) => panic!("unexpected {} event", event.event_type),
         }
+    }
+
+    fn assert_surrounding_resync_requested(context: &TestContext) {
+        let snapshot = context
+            .ime_requests
+            .peek_snapshot()
+            .expect("IME request peek should succeed")
+            .expect("IME replacement should request a native transaction");
+        assert!(
+            (snapshot[1] / f64::from(IME_REQUEST_SURROUNDING_RESYNC))
+                .floor()
+                .rem_euclid(2.0)
+                > 0.5,
+            "IME replacement must force-resend even an unchanged surrounding snapshot"
+        );
+    }
+
+    fn advance_observable_composition_clear(
+        context: &mut TestContext,
+        step: DispatchStep,
+    ) -> DispatchEventStep {
+        let update = event(step);
+        assert_eq!(update.event_type, "compositionupdate");
+        assert_eq!(
+            update.payload.as_deref(),
+            Some(&DispatchEventPayload::Composition {
+                data: String::new(),
+            })
+        );
+        let before_input = event(context.resume(&update, false));
+        assert_eq!(before_input.event_type, "beforeinput");
+        assert!(!before_input.cancelable);
+        assert_eq!(
+            before_input.payload.as_deref(),
+            Some(&DispatchEventPayload::Input(InputPayload {
+                data: Some(String::new()),
+                input_type: "insertCompositionText",
+                is_composing: true,
+            }))
+        );
+        let input = event(context.resume(&before_input, false));
+        assert_eq!(input.event_type, "input");
+        assert_eq!(input.payload.as_deref(), before_input.payload.as_deref());
+        let end = event(context.resume(&input, false));
+        assert_eq!(end.event_type, "compositionend");
+        assert_eq!(
+            end.payload.as_deref(),
+            Some(&DispatchEventPayload::Composition {
+                data: String::new(),
+            })
+        );
+        end
     }
 
     fn drain(context: &mut TestContext, mut step: DispatchStep) -> (Vec<String>, u32, bool) {
@@ -15511,6 +16326,76 @@ mod tests {
     }
 
     #[test]
+    fn replacement_reentering_compositionstart_rebases_only_the_exact_initial_preedit() {
+        let mut context = TestContext::new("<input id='editor' value='base'>");
+        let input = context.element("editor");
+        assert!(context.document.set_focus_to(input));
+        context
+            .document
+            .with_text_input(input, |mut driver| driver.move_to_text_end());
+        let start = event(context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "first".to_owned(),
+            Some((5, 5)),
+        ))));
+        complete(context.begin(DispatchRequest::ImeReplace {
+            start_bytes: 0,
+            end_bytes: 4,
+            text: "done".to_owned(),
+        }));
+
+        let after_start = context.resume(&start, false);
+        let events = drain_steps(&mut context, after_start);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "compositionupdate",
+                "beforeinput",
+                "input",
+                "compositionupdate",
+                "beforeinput",
+                "input",
+                "compositionend",
+                "beforeinput",
+                "input",
+            ]
+        );
+        assert_eq!(context.raw_text(input), "done");
+        assert!(context.stack.active_composition.is_none());
+
+        let mut mutated = TestContext::new("<input id='editor' value='base'>");
+        let input = mutated.element("editor");
+        assert!(mutated.document.set_focus_to(input));
+        mutated
+            .document
+            .with_text_input(input, |mut driver| driver.move_to_text_end());
+        let start = event(mutated.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "first".to_owned(),
+            Some((5, 5)),
+        ))));
+        complete(mutated.begin(DispatchRequest::ImeReplace {
+            start_bytes: 0,
+            end_bytes: 4,
+            text: "done".to_owned(),
+        }));
+        mutated
+            .document
+            .with_text_input(input, |mut driver| driver.move_to_byte(0));
+        let after_start = mutated.resume(&start, false);
+        assert_eq!(
+            drain_steps(&mut mutated, after_start)
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            ["compositionupdate", "beforeinput", "input"]
+        );
+        assert_eq!(mutated.raw_text(input), "firstbase");
+        assert!(mutated.stack.active_composition.is_some());
+    }
+
+    #[test]
     fn start_deferred_terminal_preserves_the_following_session_boundary() {
         for cancel_start in [false, true] {
             let mut context = TestContext::new("<input id='editor' value=''>");
@@ -18602,6 +19487,588 @@ mod tests {
         }
         assert!(saw_blur);
         assert!(actual_focus_node_id(&context.document).is_none());
+    }
+
+    #[test]
+    fn atomic_ime_replacement_dispatches_cancelable_browser_input_events() {
+        let mut context = TestContext::new("<input id='editor' value='A🙂BC'>");
+        let input = context.element("editor");
+        assert!(context.document.set_focus_to(input));
+        context
+            .document
+            .with_text_input(input, |mut driver| driver.move_to_text_end());
+
+        let before_input = event(context.begin(DispatchRequest::ImeReplace {
+            start_bytes: 1,
+            end_bytes: 5,
+            text: "x".to_owned(),
+        }));
+        assert_eq!(before_input.event_type, "beforeinput");
+        assert!(before_input.bubbles && before_input.cancelable && before_input.composed);
+        assert_eq!(
+            before_input.payload.as_deref(),
+            Some(&DispatchEventPayload::Input(InputPayload {
+                data: Some("x".to_owned()),
+                input_type: "insertReplacementText",
+                is_composing: false,
+            }))
+        );
+        assert_eq!(context.raw_text(input), "A🙂BC");
+        assert_surrounding_resync_requested(&context);
+
+        let input_event = event(context.resume(&before_input, false));
+        assert_eq!(input_event.event_type, "input");
+        assert_eq!(input_event.target, before_input.target);
+        assert_eq!(
+            input_event.payload.as_deref(),
+            Some(&DispatchEventPayload::Input(InputPayload {
+                data: Some("x".to_owned()),
+                input_type: "insertReplacementText",
+                is_composing: false,
+            }))
+        );
+        assert_eq!(context.raw_text(input), "AxBC");
+        let (_, redraw_requested) = complete(context.resume(&input_event, false));
+        assert!(redraw_requested);
+        assert_eq!(context.live_value(input), "AxBC");
+    }
+
+    #[test]
+    fn canceled_identical_and_caret_only_ime_replacements_follow_browser_rules() {
+        let mut canceled = TestContext::new("<input id='editor' value='A🙂BC'>");
+        let input = canceled.element("editor");
+        assert!(canceled.document.set_focus_to(input));
+        canceled
+            .document
+            .with_text_input(input, |mut driver| driver.select_byte_range(1, 5));
+        let before_input = event(canceled.begin(DispatchRequest::ImeReplace {
+            start_bytes: 1,
+            end_bytes: 5,
+            text: "x".to_owned(),
+        }));
+        complete(canceled.resume(&before_input, true));
+        assert_eq!(canceled.raw_text(input), "A🙂BC");
+        assert_eq!(canceled.raw_selection(input), 1..5);
+        assert_surrounding_resync_requested(&canceled);
+
+        let mut noop = TestContext::new("<input id='editor' value='A🙂BC'>");
+        let input = noop.element("editor");
+        assert!(noop.document.set_focus_to(input));
+        noop.document
+            .with_text_input(input, |mut driver| driver.select_byte_range(1, 5));
+        let before_input = event(noop.begin(DispatchRequest::ImeReplace {
+            start_bytes: 1,
+            end_bytes: 5,
+            text: "🙂".to_owned(),
+        }));
+        let input_event = event(noop.resume(&before_input, false));
+        assert_eq!(input_event.event_type, "input");
+        assert_eq!(
+            input_event.payload.as_deref(),
+            before_input.payload.as_deref()
+        );
+        let (_, redraw_requested) = complete(noop.resume(&input_event, false));
+        assert!(redraw_requested);
+        assert_eq!(noop.raw_text(input), "A🙂BC");
+        assert_eq!(noop.raw_selection(input), 5..5);
+
+        let mut caret = TestContext::new("<input id='editor' value='A🙂BC'>");
+        let input = caret.element("editor");
+        assert!(caret.document.set_focus_to(input));
+        caret
+            .document
+            .with_text_input(input, |mut driver| driver.move_to_text_end());
+        let (_, redraw_requested) = complete(caret.begin(DispatchRequest::ImeReplace {
+            start_bytes: 1,
+            end_bytes: 1,
+            text: String::new(),
+        }));
+        assert!(redraw_requested);
+        assert_eq!(caret.raw_text(input), "A🙂BC");
+        assert_eq!(caret.raw_selection(input), 1..1);
+        assert_surrounding_resync_requested(&caret);
+    }
+
+    #[test]
+    fn atomic_ime_replacement_rejects_stale_ranges_targets_and_editor_snapshots() {
+        let mut malformed = TestContext::new("<input id='editor' value='A🙂BC'>");
+        let input = malformed.element("editor");
+        assert!(malformed.document.set_focus_to(input));
+        complete(malformed.begin(DispatchRequest::ImeReplace {
+            start_bytes: 2,
+            end_bytes: 5,
+            text: "x".to_owned(),
+        }));
+        assert_eq!(malformed.raw_text(input), "A🙂BC");
+        assert_surrounding_resync_requested(&malformed);
+
+        let mut mutated = TestContext::new("<input id='editor' value='A🙂BC'>");
+        let input = mutated.element("editor");
+        assert!(mutated.document.set_focus_to(input));
+        let before_input = event(mutated.begin(DispatchRequest::ImeReplace {
+            start_bytes: 1,
+            end_bytes: 5,
+            text: "x".to_owned(),
+        }));
+        mutated.document.with_text_input(input, |mut driver| {
+            driver.select_byte_range(0, 1);
+            driver.insert_or_replace_selection("listener");
+        });
+        complete(mutated.resume(&before_input, false));
+        assert_eq!(mutated.raw_text(input), "listener🙂BC");
+
+        let mut retargeted =
+            TestContext::new("<input id='first' value='A🙂BC'><input id='second' value='other'>");
+        let first = retargeted.element("first");
+        let second = retargeted.element("second");
+        assert!(retargeted.document.set_focus_to(first));
+        let before_input = event(retargeted.begin(DispatchRequest::ImeReplace {
+            start_bytes: 1,
+            end_bytes: 5,
+            text: "x".to_owned(),
+        }));
+        retargeted.document.clear_focus();
+        assert!(retargeted.document.set_focus_to(second));
+        complete(retargeted.resume(&before_input, false));
+        assert_eq!(retargeted.raw_text(first), "A🙂BC");
+        assert_eq!(retargeted.raw_text(second), "other");
+    }
+
+    #[test]
+    fn atomic_ime_replacement_ends_active_composition_without_committing_preedit() {
+        let mut context = TestContext::new("<input id='editor' value='A🙂BC'>");
+        let input = context.element("editor");
+        assert!(context.document.set_focus_to(input));
+        context
+            .document
+            .with_text_input(input, |mut driver| driver.move_to_text_end());
+        let preedit = context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "候".to_owned(),
+            None,
+        )));
+        let _ = drain_steps(&mut context, preedit);
+        assert_eq!(context.raw_text(input), "A🙂BC候");
+
+        let composition_update = event(context.begin(DispatchRequest::ImeReplace {
+            start_bytes: 1,
+            end_bytes: 5,
+            text: "x".to_owned(),
+        }));
+        assert_eq!(composition_update.event_type, "compositionupdate");
+        assert_eq!(
+            composition_update.payload.as_deref(),
+            Some(&DispatchEventPayload::Composition {
+                data: String::new(),
+            })
+        );
+        assert_eq!(context.raw_text(input), "A🙂BC候");
+
+        let composition_before_input = event(context.resume(&composition_update, false));
+        assert_eq!(composition_before_input.event_type, "beforeinput");
+        assert!(
+            composition_before_input.bubbles
+                && !composition_before_input.cancelable
+                && composition_before_input.composed
+        );
+        assert_eq!(
+            composition_before_input.payload.as_deref(),
+            Some(&DispatchEventPayload::Input(InputPayload {
+                data: Some(String::new()),
+                input_type: "insertCompositionText",
+                is_composing: true,
+            }))
+        );
+        let composition_input = event(context.resume(&composition_before_input, true));
+        assert_eq!(composition_input.event_type, "input");
+        assert_eq!(
+            composition_input.payload.as_deref(),
+            composition_before_input.payload.as_deref()
+        );
+        assert_eq!(context.raw_text(input), "A🙂BC");
+
+        let end = event(context.resume(&composition_input, false));
+        assert_eq!(end.event_type, "compositionend");
+        assert_eq!(
+            end.payload.as_deref(),
+            Some(&DispatchEventPayload::Composition {
+                data: String::new(),
+            })
+        );
+        let before_input = event(context.resume(&end, false));
+        assert_eq!(before_input.event_type, "beforeinput");
+        assert!(before_input.bubbles && before_input.cancelable && before_input.composed);
+        assert_eq!(
+            before_input.payload.as_deref(),
+            Some(&DispatchEventPayload::Input(InputPayload {
+                data: Some("x".to_owned()),
+                input_type: "insertReplacementText",
+                is_composing: false,
+            }))
+        );
+        let input_event = event(context.resume(&before_input, false));
+        assert_eq!(input_event.event_type, "input");
+        assert_eq!(
+            input_event.payload.as_deref(),
+            before_input.payload.as_deref()
+        );
+        assert_eq!(context.raw_text(input), "AxBC");
+        complete(context.resume(&input_event, false));
+        assert!(context.stack.active_composition.is_none());
+
+        let mut canceled = TestContext::new("<input id='editor' value='base'>");
+        let input = canceled.element("editor");
+        assert!(canceled.document.set_focus_to(input));
+        canceled
+            .document
+            .with_text_input(input, |mut driver| driver.move_to_text_end());
+        let preedit = canceled.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "old".to_owned(),
+            None,
+        )));
+        let _ = drain_steps(&mut canceled, preedit);
+        let replacement = canceled.begin(DispatchRequest::ImeReplace {
+            start_bytes: 0,
+            end_bytes: 4,
+            text: "new".to_owned(),
+        });
+        let end = advance_observable_composition_clear(&mut canceled, replacement);
+        let before_input = event(canceled.resume(&end, false));
+        assert_eq!(before_input.event_type, "beforeinput");
+        complete(canceled.resume(&before_input, true));
+        assert_eq!(canceled.raw_text(input), "base");
+    }
+
+    #[test]
+    fn active_replacement_rejects_listener_changes_hidden_by_canonical_preedit() {
+        let mut context = TestContext::new("<input id='editor' value='base'>");
+        let input = context.element("editor");
+        assert!(context.document.set_focus_to(input));
+        context
+            .document
+            .with_text_input(input, |mut driver| driver.move_to_text_end());
+        let preedit = context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "old".to_owned(),
+            None,
+        )));
+        let _ = drain_steps(&mut context, preedit);
+        let composition_update = event(context.begin(DispatchRequest::ImeReplace {
+            start_bytes: 0,
+            end_bytes: 4,
+            text: "replacement".to_owned(),
+        }));
+        assert_eq!(composition_update.event_type, "compositionupdate");
+        context
+            .document
+            .with_text_input(input, |mut driver| driver.set_compose("listener", None));
+        let composition_before_input = event(context.resume(&composition_update, false));
+        let composition_input = event(context.resume(&composition_before_input, false));
+        let end = event(context.resume(&composition_input, false));
+        assert_eq!(end.event_type, "compositionend");
+        complete(context.resume(&end, false));
+        assert_eq!(context.raw_text(input), "base");
+
+        let mut input_listener = TestContext::new("<input id='editor' value='base'>");
+        let input = input_listener.element("editor");
+        assert!(input_listener.document.set_focus_to(input));
+        input_listener
+            .document
+            .with_text_input(input, |mut driver| driver.move_to_text_end());
+        let preedit = input_listener.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "old".to_owned(),
+            None,
+        )));
+        let _ = drain_steps(&mut input_listener, preedit);
+        let composition_update = event(input_listener.begin(DispatchRequest::ImeReplace {
+            start_bytes: 0,
+            end_bytes: 4,
+            text: "replacement".to_owned(),
+        }));
+        let composition_before_input = event(input_listener.resume(&composition_update, false));
+        let composition_input = event(input_listener.resume(&composition_before_input, false));
+        input_listener
+            .document
+            .with_text_input(input, |mut driver| driver.set_compose("listener", None));
+        let end = event(input_listener.resume(&composition_input, false));
+        assert_eq!(end.event_type, "compositionend");
+        complete(input_listener.resume(&end, false));
+        assert_eq!(input_listener.raw_text(input), "baselistener");
+    }
+
+    #[test]
+    fn active_replacement_rechecks_mutation_focus_and_liveness_after_compositionend() {
+        let mut mutated = TestContext::new("<input id='editor' value='base'>");
+        let input = mutated.element("editor");
+        assert!(mutated.document.set_focus_to(input));
+        mutated
+            .document
+            .with_text_input(input, |mut driver| driver.move_to_text_end());
+        let preedit = mutated.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "old".to_owned(),
+            None,
+        )));
+        let _ = drain_steps(&mut mutated, preedit);
+        let replacement = mutated.begin(DispatchRequest::ImeReplace {
+            start_bytes: 0,
+            end_bytes: 4,
+            text: "replacement".to_owned(),
+        });
+        let end = advance_observable_composition_clear(&mut mutated, replacement);
+        mutated.document.with_text_input(input, |mut driver| {
+            driver.select_byte_range(0, 4);
+            driver.insert_or_replace_selection("listener");
+        });
+        complete(mutated.resume(&end, false));
+        assert_eq!(mutated.raw_text(input), "listener");
+
+        let mut retargeted =
+            TestContext::new("<input id='first' value='base'><input id='second' value='other'>");
+        let first = retargeted.element("first");
+        let second = retargeted.element("second");
+        assert!(retargeted.document.set_focus_to(first));
+        retargeted
+            .document
+            .with_text_input(first, |mut driver| driver.move_to_text_end());
+        let preedit = retargeted.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "old".to_owned(),
+            None,
+        )));
+        let _ = drain_steps(&mut retargeted, preedit);
+        let replacement = retargeted.begin(DispatchRequest::ImeReplace {
+            start_bytes: 0,
+            end_bytes: 4,
+            text: "replacement".to_owned(),
+        });
+        let end = advance_observable_composition_clear(&mut retargeted, replacement);
+        retargeted.document.clear_focus();
+        assert!(retargeted.document.set_focus_to(second));
+        complete(retargeted.resume(&end, false));
+        assert_eq!(retargeted.raw_text(first), "base");
+        assert_eq!(retargeted.raw_text(second), "other");
+
+        let mut detached = TestContext::new("<input id='editor' value='base'>");
+        let input = detached.element("editor");
+        assert!(detached.document.set_focus_to(input));
+        detached
+            .document
+            .with_text_input(input, |mut driver| driver.move_to_text_end());
+        let preedit = detached.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "old".to_owned(),
+            None,
+        )));
+        let _ = drain_steps(&mut detached, preedit);
+        let replacement = detached.begin(DispatchRequest::ImeReplace {
+            start_bytes: 0,
+            end_bytes: 4,
+            text: "replacement".to_owned(),
+        });
+        let end = advance_observable_composition_clear(&mut detached, replacement);
+        detached.document.mutate().remove_node(input);
+        complete(detached.resume(&end, false));
+        assert_eq!(detached.raw_text(input), "base");
+    }
+
+    #[test]
+    fn active_replacement_drops_after_compositionend_starts_a_new_composition() {
+        let mut context = TestContext::new("<input id='editor' value='base'>");
+        let input = context.element("editor");
+        assert!(context.document.set_focus_to(input));
+        context
+            .document
+            .with_text_input(input, |mut driver| driver.move_to_text_end());
+        let preedit = context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "old".to_owned(),
+            None,
+        )));
+        let _ = drain_steps(&mut context, preedit);
+        let replacement = context.begin(DispatchRequest::ImeReplace {
+            start_bytes: 0,
+            end_bytes: 4,
+            text: "replacement".to_owned(),
+        });
+        let end = advance_observable_composition_clear(&mut context, replacement);
+
+        let nested = context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "listener".to_owned(),
+            None,
+        )));
+        let nested_events = drain_steps(&mut context, nested);
+        assert_eq!(
+            nested_events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "compositionstart",
+                "compositionupdate",
+                "beforeinput",
+                "input"
+            ]
+        );
+        complete(context.resume(&end, false));
+        assert_eq!(context.raw_text(input), "baselistener");
+        assert!(context.stack.active_composition.is_some());
+    }
+
+    #[test]
+    fn active_replacement_replays_after_an_author_write_already_cleared_preedit() {
+        let mut context = TestContext::new("<input id='editor' value='base'>");
+        let input = context.element("editor");
+        assert!(context.document.set_focus_to(input));
+        context
+            .document
+            .with_text_input(input, |mut driver| driver.move_to_text_end());
+        let preedit = context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "old".to_owned(),
+            None,
+        )));
+        let _ = drain_steps(&mut context, preedit);
+        context
+            .document
+            .with_text_input(input, |driver| driver.editor.set_text("author"));
+        assert_eq!(context.raw_text(input), "author");
+
+        let replacement = context.begin(DispatchRequest::ImeReplace {
+            start_bytes: 0,
+            end_bytes: 6,
+            text: "done".to_owned(),
+        });
+        let end = advance_observable_composition_clear(&mut context, replacement);
+        let before_input = event(context.resume(&end, false));
+        assert_eq!(before_input.event_type, "beforeinput");
+        let input_event = event(context.resume(&before_input, false));
+        assert_eq!(input_event.event_type, "input");
+        complete(context.resume(&input_event, false));
+        assert_eq!(context.raw_text(input), "done");
+        assert!(context.stack.active_composition.is_none());
+    }
+
+    #[test]
+    fn invalid_and_source_suppressed_active_replacements_observably_clear_preedit() {
+        let mut invalid = TestContext::new("<input id='editor' value='A🙂BC'>");
+        let input = invalid.element("editor");
+        assert!(invalid.document.set_focus_to(input));
+        invalid
+            .document
+            .with_text_input(input, |mut driver| driver.move_to_text_end());
+        let preedit = invalid.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "old".to_owned(),
+            None,
+        )));
+        let _ = drain_steps(&mut invalid, preedit);
+        let replacement = invalid.begin(DispatchRequest::ImeReplace {
+            start_bytes: 2,
+            end_bytes: 5,
+            text: "replacement".to_owned(),
+        });
+        let end = advance_observable_composition_clear(&mut invalid, replacement);
+        complete(invalid.resume(&end, false));
+        assert_eq!(invalid.raw_text(input), "A🙂BC");
+        assert!(invalid.stack.active_composition.is_none());
+
+        let mut suppressed = TestContext::new("<input id='editor' value='base'>");
+        let input = suppressed.element("editor");
+        assert!(suppressed.document.set_focus_to(input));
+        dispatch_sourced_keydown(&mut suppressed, 92, true);
+        suppressed
+            .document
+            .with_text_input(input, |mut driver| driver.move_to_text_end());
+        let preedit = suppressed.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "old".to_owned(),
+            None,
+        )));
+        let _ = drain_steps(&mut suppressed, preedit);
+        let replacement = suppressed.begin(DispatchRequest::ImeReplaceWithSource {
+            start_bytes: 0,
+            end_bytes: 4,
+            text: "replacement".to_owned(),
+            source_key_input_id: 92,
+        });
+        let end = advance_observable_composition_clear(&mut suppressed, replacement);
+        complete(suppressed.resume(&end, false));
+        assert_eq!(suppressed.raw_text(input), "base");
+        assert!(suppressed.stack.active_composition.is_none());
+        assert_surrounding_resync_requested(&suppressed);
+    }
+
+    #[test]
+    fn private_empty_snapshot_replacement_inserts_at_the_password_selection() {
+        let mut context = TestContext::new("<input id='password' type='password' value='A🙂B'>");
+        let password = context.element("password");
+        assert!(context.document.set_focus_to(password));
+        context
+            .document
+            .with_text_input(password, |mut driver| driver.select_byte_range(1, 5));
+
+        let before_input = event(context.begin(DispatchRequest::ImeReplace {
+            start_bytes: 0,
+            end_bytes: 0,
+            text: "x".to_owned(),
+        }));
+        let input_event = event(context.resume(&before_input, false));
+        assert_eq!(input_event.event_type, "input");
+        assert_eq!(context.raw_text(password), "AxB");
+        complete(context.resume(&input_event, false));
+
+        complete(context.begin(DispatchRequest::ImeReplace {
+            start_bytes: 0,
+            end_bytes: 0,
+            text: String::new(),
+        }));
+        assert_eq!(context.raw_text(password), "AxB");
+
+        context
+            .document
+            .with_text_input(password, |mut driver| driver.select_byte_range(1, 2));
+        let before_delete = event(context.begin(DispatchRequest::ImeReplace {
+            start_bytes: 0,
+            end_bytes: 0,
+            text: String::new(),
+        }));
+        assert_eq!(
+            before_delete.payload.as_deref(),
+            Some(&DispatchEventPayload::Input(InputPayload {
+                data: Some(String::new()),
+                input_type: "insertReplacementText",
+                is_composing: false,
+            }))
+        );
+        let delete = event(context.resume(&before_delete, false));
+        assert_eq!(delete.event_type, "input");
+        assert_eq!(context.raw_text(password), "AB");
+        complete(context.resume(&delete, false));
+
+        complete(context.begin(DispatchRequest::ImeReplace {
+            start_bytes: 0,
+            end_bytes: 1,
+            text: "leak".to_owned(),
+        }));
+        assert_eq!(context.raw_text(password), "AB");
+    }
+
+    #[test]
+    fn sourced_atomic_replacement_is_consumed_by_a_canceled_keydown() {
+        let mut context = TestContext::new("<input id='editor' value='A🙂BC'>");
+        let input = context.element("editor");
+        assert!(context.document.set_focus_to(input));
+        dispatch_sourced_keydown(&mut context, 91, true);
+
+        complete(context.begin(DispatchRequest::ImeReplaceWithSource {
+            start_bytes: 1,
+            end_bytes: 5,
+            text: "x".to_owned(),
+            source_key_input_id: 91,
+        }));
+        assert_eq!(context.raw_text(input), "A🙂BC");
+        assert_surrounding_resync_requested(&context);
+
+        let before_input = event(context.begin(DispatchRequest::ImeReplaceWithSource {
+            start_bytes: 1,
+            end_bytes: 5,
+            text: "x".to_owned(),
+            source_key_input_id: 91,
+        }));
+        assert_eq!(before_input.event_type, "beforeinput");
+        assert!(!context.abort(before_input.frame_id));
     }
 
     #[test]

@@ -737,6 +737,15 @@ class FakeRenderer implements DomDispatchRendererSource {
     return this.#call("begin_ime_delete_surrounding", beforeBytes, afterBytes);
   }
 
+  begin_ime_replace(
+    startBytes: number,
+    endBytes: number,
+    text: string,
+    sourceKeyInputId?: number,
+  ): unknown {
+    return this.#call("begin_ime_replace", startBytes, endBytes, text, sourceKeyInputId);
+  }
+
   resume_dom_dispatch(frameId: number, eventId: number, defaultPrevented: boolean): unknown {
     return this.#call("resume_dom_dispatch", frameId, eventId, defaultPrevented);
   }
@@ -768,6 +777,7 @@ Deno.test("renderer port forwards every staged entry point and validates its res
   port.beginImePreedit("preedit", 1, 4);
   port.beginImeCommit("commit", 19);
   port.beginImeDeleteSurrounding(2, 3);
+  port.beginImeReplace(1, 5, "replacement", 20);
 
   assertEquals(renderer.calls, [
     ["begin_stationary_pointer_refresh"],
@@ -787,17 +797,21 @@ Deno.test("renderer port forwards every staged entry point and validates its res
     ["begin_ime_preedit", "preedit", 1, 4],
     ["begin_ime_commit", "commit", 19],
     ["begin_ime_delete_surrounding", 2, 3],
+    ["begin_ime_replace", 1, 5, "replacement", 20],
   ]);
 
   renderer.nextStep = { kind: "complete", frameId: 0, redrawRequested: false };
   assertThrows(() => port.beginImeEnabled(), RangeError);
   assertThrows(() => port.beginFocus(-1), RangeError);
   assertThrows(() => port.beginBlur(1.5), RangeError);
-  const callsBeforeInvalidSourceIds = renderer.calls.length;
+  const callsBeforeInvalidImeInputs = renderer.calls.length;
   assertThrows(() => port.beginKeyEvent("KeyA", "a", 44, 1, 0, 1, 0), RangeError);
   assertThrows(() => port.beginAppleStandardKeybinding("moveLeft:", 1.5), RangeError);
   assertThrows(() => port.beginImeCommit("commit", 0x1_0000_0000), RangeError);
-  assertEquals(renderer.calls.length, callsBeforeInvalidSourceIds);
+  assertThrows(() => port.beginImeReplace(-1, 5, "replacement"), RangeError);
+  assertThrows(() => port.beginImeReplace(5, 1, "replacement"), RangeError);
+  assertThrows(() => port.beginImeReplace(1, 5, "replacement", 0), RangeError);
+  assertEquals(renderer.calls.length, callsBeforeInvalidImeInputs);
 });
 
 Deno.test("renderer port validates continuation arguments and frame ownership", () => {

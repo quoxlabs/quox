@@ -436,6 +436,7 @@ export function mapWindingEvent(event: WindingUIEvent): QuoxInputEvent {
             startBytes: event.startBytes,
             endBytes: event.endBytes,
             text: event.text,
+            ...(event.sourceKeyInputId === undefined ? {} : { sourceKeyInputId: event.sourceKeyInputId }),
           };
       }
       return assertNever(event);
