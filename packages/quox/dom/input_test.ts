@@ -217,6 +217,7 @@ Deno.test("canonical key adapter preserves public fields and encodes editor poli
     repeat: true,
     isComposing: true,
     editDisposition: "text-input",
+    sourceKeyInputId: 17,
     shiftKey: true,
     ctrlKey: false,
     altKey: false,
@@ -232,6 +233,7 @@ Deno.test("canonical key adapter preserves public fields and encodes editor poli
   if (mapped.type !== "keydown") throw new TypeError("expected keydown");
   assertEquals(mapped.key, "y");
   assertEquals(mapped.editDisposition, "text-input");
+  assertEquals(mapped.sourceKeyInputId, 17);
   assertEquals(encodeKeyEvent(mapped), {
     code: "KeyZ",
     key: "y",
@@ -242,6 +244,32 @@ Deno.test("canonical key adapter preserves public fields and encodes editor poli
     // Pressed | Repeat | Composing | PreventDefault.
     eventFlags: 15,
   });
+});
+
+Deno.test("causal key sources survive commit and AppKit command mapping", () => {
+  assertEquals(
+    mapWindingEvent({
+      type: "ime",
+      kind: "commit",
+      text: "a",
+      sourceKeyInputId: 17,
+      window,
+    }),
+    { type: "ime", kind: "commit", text: "a", sourceKeyInputId: 17 },
+  );
+  assertEquals(
+    mapWindingEvent({
+      type: "apple-standard-keybinding",
+      command: "deleteBackward:",
+      sourceKeyInputId: 18,
+      window,
+    }),
+    {
+      type: "apple-standard-keybinding",
+      command: "deleteBackward:",
+      sourceKeyInputId: 18,
+    },
+  );
 });
 
 Deno.test("AltGraph preserves physical Ctrl separately from the runtime accelerator", () => {

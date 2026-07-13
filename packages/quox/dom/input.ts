@@ -369,6 +369,7 @@ export function mapWindingEvent(event: WindingUIEvent): QuoxInputEvent {
         repeat: event.repeat,
         isComposing: event.isComposing,
         editDisposition: event.editDisposition,
+        ...(event.sourceKeyInputId === undefined ? {} : { sourceKeyInputId: event.sourceKeyInputId }),
         shiftKey: event.shiftKey,
         ctrlKey: event.ctrlKey,
         altKey: event.altKey,
@@ -414,7 +415,12 @@ export function mapWindingEvent(event: WindingUIEvent): QuoxInputEvent {
             cursorRange: event.cursorRange,
           };
         case "commit":
-          return { type: "ime", kind: "commit", text: event.text };
+          return {
+            type: "ime",
+            kind: "commit",
+            text: event.text,
+            ...(event.sourceKeyInputId === undefined ? {} : { sourceKeyInputId: event.sourceKeyInputId }),
+          };
         case "deleteSurrounding":
           return {
             type: "ime",
@@ -434,7 +440,11 @@ export function mapWindingEvent(event: WindingUIEvent): QuoxInputEvent {
       return assertNever(event);
     }
     case "apple-standard-keybinding":
-      return { type: "apple-standard-keybinding", command: event.command };
+      return {
+        type: "apple-standard-keybinding",
+        command: event.command,
+        ...(event.sourceKeyInputId === undefined ? {} : { sourceKeyInputId: event.sourceKeyInputId }),
+      };
     case "resize":
       return {
         type: "resize",
