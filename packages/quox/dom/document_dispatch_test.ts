@@ -890,16 +890,17 @@ Deno.test("trusted staged payloads create browser-style event subclasses with ex
   assert(!(scroll instanceof QuoxMouseEvent));
 });
 
-Deno.test("trusted beforeinput and composition steps preserve browser payloads and flags", () => {
+Deno.test("trusted composition lifecycle preserves browser order, payloads, and flags", () => {
   const { document, renderer, window } = createHarness();
   const target = document.createElement("input");
   const events: QuoxEvent[] = [];
 
   for (
     const type of [
-      "beforeinput",
       "compositionstart",
       "compositionupdate",
+      "beforeinput",
+      "input",
       "compositionend",
     ] as const
   ) {
@@ -911,20 +912,11 @@ Deno.test("trusted beforeinput and composition steps preserve browser payloads a
 
   renderer.queueFrame([
     {
-      type: "beforeinput",
-      target: target.nodeId,
-      path: [target.nodeId],
-      bubbles: true,
-      cancelable: true,
-      composed: true,
-      payload: { data: "é", inputType: "insertCompositionText", isComposing: true },
-    },
-    {
       type: "compositionstart",
       target: target.nodeId,
       path: [target.nodeId],
       bubbles: true,
-      cancelable: false,
+      cancelable: true,
       composed: true,
       payload: { data: "" },
     },
@@ -936,6 +928,24 @@ Deno.test("trusted beforeinput and composition steps preserve browser payloads a
       cancelable: false,
       composed: true,
       payload: { data: "é" },
+    },
+    {
+      type: "beforeinput",
+      target: target.nodeId,
+      path: [target.nodeId],
+      bubbles: true,
+      cancelable: false,
+      composed: true,
+      payload: { data: "é", inputType: "insertCompositionText", isComposing: true },
+    },
+    {
+      type: "input",
+      target: target.nodeId,
+      path: [target.nodeId],
+      bubbles: true,
+      cancelable: false,
+      composed: true,
+      payload: { data: "é", inputType: "insertCompositionText", isComposing: true },
     },
     {
       type: "compositionend",
@@ -951,41 +961,47 @@ Deno.test("trusted beforeinput and composition steps preserve browser payloads a
   document.dispatchPointerMove(1, 2, 0, 0);
 
   assertEquals(events.map((event) => event.type), [
-    "beforeinput",
     "compositionstart",
     "compositionupdate",
+    "beforeinput",
+    "input",
     "compositionend",
   ]);
-  const beforeInput = events[0];
-  assert(beforeInput instanceof QuoxDOMInputEvent);
-  assertStrictEquals(beforeInput.view, window);
-  assertEquals(
-    [
-      beforeInput.data,
-      beforeInput.inputType,
-      beforeInput.isComposing,
-      beforeInput.dataTransfer,
-      beforeInput.getTargetRanges(),
-    ],
-    ["é", "insertCompositionText", true, null, []],
-  );
-  assert(beforeInput.bubbles);
-  assert(beforeInput.cancelable);
-  assert(beforeInput.composed);
-  assert(beforeInput.defaultPrevented);
-
-  for (const [event, data] of events.slice(1).map((event, index) => [event, ["", "é", "é"][index]] as const)) {
+  for (
+    const [event, data] of [events[0], events[1], events[4]].map((event, index) =>
+      [event, ["", "é", "é"][index]] as const
+    )
+  ) {
     assert(event instanceof QuoxCompositionEvent);
     assertStrictEquals(event.view, window);
     assertEquals(event.data, data);
     assert(event.bubbles);
-    assertFalse(event.cancelable);
+    assertEquals(event.cancelable, event.type === "compositionstart");
     assert(event.composed);
     assert(event.isTrusted);
   }
+
+  for (const inputEvent of events.slice(2, 4)) {
+    assert(inputEvent instanceof QuoxDOMInputEvent);
+    assertStrictEquals(inputEvent.view, window);
+    assertEquals(
+      [
+        inputEvent.data,
+        inputEvent.inputType,
+        inputEvent.isComposing,
+        inputEvent.dataTransfer,
+        inputEvent.getTargetRanges(),
+      ],
+      ["é", "insertCompositionText", true, null, []],
+    );
+    assert(inputEvent.bubbles);
+    assertFalse(inputEvent.cancelable);
+    assert(inputEvent.composed);
+    assertFalse(inputEvent.defaultPrevented);
+  }
   assertEquals(
     renderer.calls.filter(([method]) => method === "resume").map((call) => call[3]),
-    [true, false, false, false],
+    [false, false, false, false, false],
   );
 });
 

@@ -58,18 +58,38 @@ pub(crate) struct DispatchStack {
     frames: Vec<DispatchFrame>,
     next_frame_id: Option<u32>,
     next_event_id: Option<u32>,
+    next_composition_generation: Option<u32>,
+    latest_composition_generation: Option<u32>,
     wheel_transaction: Option<WheelTransaction>,
     prevent_compatibility_mouse: bool,
     mouse_button_presses: [Option<MouseButtonPress>; 5],
     ignored_mouse_ups: MouseEventButtons,
     click_sequence: Option<ClickSequence>,
     space_activation_press: Option<SpaceActivationPress>,
+    active_composition: Option<ActiveComposition>,
+    canceled_composition: Option<CanceledComposition>,
+    pending_start_ime: VecDeque<DeferredImeRequest>,
+    pending_end_ime: VecDeque<DeferredImeRequest>,
     // The last authoritative in-viewport mouse record is retained independently from the
     // movement baseline so layout-driven boundary refreshes never manufacture movement.
     stationary_pointer: Option<StationaryPointerSnapshot>,
     // UI Events defines the movement baseline at Window scope and only advances it for native
     // mouse moves, so button, wheel, and generated boundary records cannot disturb the delta.
     last_mouse_move: Option<NativePointerCoordinates>,
+}
+
+struct ActiveComposition {
+    generation: u32,
+    target: GuardedNode,
+    data: String,
+    pending_frame: Option<u32>,
+    last_completed_frame: Option<u32>,
+    start_pending: bool,
+    ending: bool,
+}
+
+struct CanceledComposition {
+    target: GuardedNode,
 }
 
 #[derive(Clone)]
@@ -341,6 +361,7 @@ struct EventMetadata {
     wheel: Option<NativeWheelMetadata>,
     key: Option<NativeKeyMetadata>,
     edit_intent: Option<EditIntent>,
+    composition_data: Option<String>,
     observe_text_edit: bool,
     related_target: Option<GuardedNode>,
     click_detail: Option<u32>,
@@ -412,6 +433,7 @@ impl EventMetadata {
             wheel: None,
             key: None,
             edit_intent: None,
+            composition_data: None,
             observe_text_edit: false,
             related_target: None,
             click_detail: None,
@@ -458,6 +480,7 @@ impl EventMetadata {
             wheel: None,
             key: None,
             edit_intent: None,
+            composition_data: None,
             observe_text_edit: false,
             related_target: None,
             click_detail: None,
@@ -521,6 +544,7 @@ impl EventMetadata {
             }),
             key: None,
             edit_intent: None,
+            composition_data: None,
             observe_text_edit: false,
             related_target: None,
             click_detail: None,
@@ -542,6 +566,7 @@ impl EventMetadata {
             wheel: None,
             key: Some(key),
             edit_intent: None,
+            composition_data: None,
             observe_text_edit: false,
             related_target: None,
             click_detail: None,
@@ -582,6 +607,16 @@ impl EventMetadata {
         self.observe_text_edit = false;
         self.event_type_override = Some("beforeinput");
         self.cancelable_override = Some(cancelable);
+        self.suppress_default = true;
+        self
+    }
+
+    fn into_composition(mut self, event_type: &'static str, data: String) -> Self {
+        self.edit_intent = None;
+        self.composition_data = Some(data);
+        self.observe_text_edit = false;
+        self.event_type_override = Some(event_type);
+        self.cancelable_override = Some(event_type == "compositionstart");
         self.suppress_default = true;
         self
     }
@@ -723,6 +758,23 @@ enum PlannedWork {
     },
     GuardedDefault(Box<GuardedDomEvent>),
     TextEdit(PendingEdit),
+    CompositionStart(PendingCompositionEdit),
+    CompositionUpdate(PendingCompositionEdit),
+    CompositionEnd(PendingCompositionEnd),
+    ForceCompositionEnd {
+        expected_generation: u32,
+        metadata: EventMetadata,
+    },
+    CompositionOccurrenceComplete {
+        generation: u32,
+        target: GuardedNode,
+        frame_id: u32,
+    },
+    DeferredIme {
+        expected_generation: u32,
+        expected_completed_frame: Option<u32>,
+        request: DeferredImeRequest,
+    },
     DoubleClick(PendingDoubleClick),
     Action(DispatchAction),
 }
@@ -793,6 +845,9 @@ enum ResumeAction {
         release_auxclick: Option<Box<DomEventData>>,
     },
     TextEdit(Box<PendingEdit>),
+    CompositionStart(Box<PendingCompositionEdit>),
+    CompositionUpdate(Box<PendingCompositionEdit>),
+    CompositionEnd,
 }
 
 struct PendingEdit {
@@ -811,6 +866,56 @@ enum PendingEditAction {
         before_bytes: usize,
         after_bytes: usize,
     },
+    CompositionPreedit(Box<PendingCompositionEdit>),
+}
+
+struct PendingCompositionEdit {
+    generation: u32,
+    target: GuardedNode,
+    data: String,
+    cursor: Option<(usize, usize)>,
+    metadata: EventMetadata,
+    frame_id: u32,
+    end_data: Option<String>,
+}
+
+struct PendingCompositionEnd {
+    generation: u32,
+    target: GuardedNode,
+    data: String,
+    metadata: EventMetadata,
+    frame_id: u32,
+}
+
+enum DeferredImeRequest {
+    Preedit {
+        data: String,
+        cursor: Option<(usize, usize)>,
+    },
+    Commit(String),
+}
+
+impl DeferredImeRequest {
+    fn is_terminal(&self) -> bool {
+        match self {
+            Self::Commit(_) => true,
+            Self::Preedit { data, .. } => data.is_empty(),
+        }
+    }
+}
+
+fn defer_ime_request(queue: &mut VecDeque<DeferredImeRequest>, request: DeferredImeRequest) {
+    let coalesces_preedit = matches!(&request, DeferredImeRequest::Preedit { data, .. } if !data.is_empty())
+        && queue.back().is_some_and(
+            |pending| matches!(pending, DeferredImeRequest::Preedit { data, .. } if !data.is_empty()),
+        );
+    if coalesces_preedit {
+        *queue
+            .back_mut()
+            .expect("a coalesced preedit has a pending predecessor") = request;
+    } else {
+        queue.push_back(request);
+    }
 }
 
 struct PendingEvent {
@@ -1317,6 +1422,7 @@ enum DispatchEventPayload {
     Wheel(WheelPayload),
     Keyboard(KeyboardPayload),
     Input(InputPayload),
+    Composition { data: String },
     Focus { related_target: Option<u32> },
 }
 
@@ -1345,12 +1451,18 @@ impl Default for DispatchStack {
             frames: Vec::new(),
             next_frame_id: Some(1),
             next_event_id: Some(1),
+            next_composition_generation: Some(1),
+            latest_composition_generation: None,
             wheel_transaction: None,
             prevent_compatibility_mouse: false,
             mouse_button_presses: [None; 5],
             ignored_mouse_ups: MouseEventButtons::None,
             click_sequence: None,
             space_activation_press: None,
+            active_composition: None,
+            canceled_composition: None,
+            pending_start_ime: VecDeque::new(),
+            pending_end_ime: VecDeque::new(),
             stationary_pointer: None,
             last_mouse_move: None,
         }
@@ -1372,6 +1484,15 @@ impl DispatchStack {
             .ok_or_else(|| DispatchError::new("quox: DOM dispatch event id space exhausted"))?;
         self.next_event_id = id.checked_add(1);
         Ok(id)
+    }
+
+    fn allocate_composition_generation(&mut self) -> Result<u32, DispatchError> {
+        let generation = self
+            .next_composition_generation
+            .ok_or_else(|| DispatchError::new("quox: composition generation space exhausted"))?;
+        self.next_composition_generation = generation.checked_add(1);
+        self.latest_composition_generation = Some(generation);
+        Ok(generation)
     }
 
     fn begin(
@@ -1404,13 +1525,13 @@ impl DispatchStack {
 
         if let Err(error) = self.plan_request(document, handles, request) {
             self.capture_redraw(redraw);
-            self.discard_failed_frame(frame_id, redraw);
+            self.discard_failed_frame(document, handles, frame_id, redraw);
             return Err(error);
         }
 
         let result = self.advance(document, text_controls, checked_controls, handles, redraw);
         if result.is_err() {
-            self.discard_failed_frame(frame_id, redraw);
+            self.discard_failed_frame(document, handles, frame_id, redraw);
         }
         result
     }
@@ -1651,8 +1772,151 @@ impl DispatchStack {
                 }
                 self.queue_generated_pointer_release(release_auxclick);
             }
+            ResumeAction::CompositionStart(edit) => {
+                if !self.composition_operation_is_current(&edit) {
+                    // A nested native occurrence owns the session now. The stale continuation
+                    // must not finish or clear that newer work.
+                } else if !node_is_live(edit.target, document, handles) {
+                    self.discard_composition(document, handles);
+                } else {
+                    self.active_composition
+                        .as_mut()
+                        .expect("compositionstart belongs to an active session")
+                        .start_pending = false;
+                    let deferred = std::mem::take(&mut self.pending_start_ime);
+                    if cancelled {
+                        let terminal_index =
+                            deferred.iter().position(DeferredImeRequest::is_terminal);
+                        self.canceled_composition =
+                            terminal_index.is_none().then_some(CanceledComposition {
+                                target: edit.target,
+                            });
+                        if let Some(terminal_index) = terminal_index {
+                            self.frames
+                                .last_mut()
+                                .expect("compositionstart belongs to the active frame")
+                                .planned
+                                .extend(deferred.into_iter().skip(terminal_index + 1).map(
+                                    |request| PlannedWork::DeferredIme {
+                                        expected_generation: edit.generation,
+                                        expected_completed_frame: None,
+                                        request,
+                                    },
+                                ));
+                        }
+                        self.close_composition(
+                            document,
+                            text_controls,
+                            handles,
+                            edit.metadata.clone(),
+                            true,
+                        )?;
+                    } else {
+                        self.canceled_composition = None;
+                        let mut after_terminal = false;
+                        let planned = &mut self
+                            .frames
+                            .last_mut()
+                            .expect("compositionstart belongs to the active frame")
+                            .planned;
+                        for request in deferred {
+                            let expected_completed_frame =
+                                (!after_terminal).then_some(edit.frame_id);
+                            after_terminal |= request.is_terminal();
+                            planned.push_back(PlannedWork::DeferredIme {
+                                expected_generation: edit.generation,
+                                expected_completed_frame,
+                                request,
+                            });
+                        }
+                        let target = edit.target;
+                        let generation = edit.generation;
+                        let frame_id = edit.frame_id;
+                        let data = edit.data.clone();
+                        let metadata = edit.metadata.clone();
+                        if let Some(step) = self.stage_composition_event(
+                            document,
+                            handles,
+                            redraw,
+                            target,
+                            metadata,
+                            "compositionupdate",
+                            data,
+                            ResumeAction::CompositionUpdate(edit),
+                        )? {
+                            return Ok(step);
+                        }
+                        if self.active_composition.as_ref().is_some_and(|active| {
+                            active.generation == generation
+                                && active.target == target
+                                && active.pending_frame == Some(frame_id)
+                        }) {
+                            self.discard_composition(document, handles);
+                        }
+                    }
+                }
+            }
+            ResumeAction::CompositionUpdate(edit) => {
+                if !self.composition_operation_is_current(&edit) {
+                    // Superseded by a nested occurrence.
+                } else if !node_is_live(edit.target, document, handles) {
+                    self.close_composition(
+                        document,
+                        text_controls,
+                        handles,
+                        edit.metadata.clone(),
+                        true,
+                    )?;
+                } else if Self::composition_target_is_valid(document, handles, edit.target) {
+                    let intent = EditIntent::InsertText {
+                        data: edit.data.clone(),
+                        is_composing: true,
+                    };
+                    let metadata = edit.metadata.clone();
+                    let pending = PendingEdit {
+                        target: edit.target,
+                        intent: intent.clone(),
+                        metadata: edit.metadata.clone().with_edit_intent(Some(intent)),
+                        action: PendingEditAction::CompositionPreedit(edit),
+                    };
+                    if let Some(step) = self.stage_text_edit(document, handles, redraw, pending)? {
+                        return Ok(step);
+                    }
+                    self.close_composition(document, text_controls, handles, metadata, true)?;
+                } else {
+                    self.close_composition(
+                        document,
+                        text_controls,
+                        handles,
+                        edit.metadata.clone(),
+                        true,
+                    )?;
+                }
+            }
+            ResumeAction::CompositionEnd => {}
             ResumeAction::TextEdit(edit) => {
-                if !cancelled
+                if let PendingEditAction::CompositionPreedit(composition) = &edit.action {
+                    if !self.composition_operation_is_current(composition) {
+                        // A nested occurrence owns the session now.
+                    } else if text_edit_target_accepts(document, handles, edit.target, &edit.intent)
+                    {
+                        self.run_pending_edit(
+                            document,
+                            text_controls,
+                            checked_controls,
+                            handles,
+                            *edit,
+                        )?;
+                    } else {
+                        self.close_composition(
+                            document,
+                            text_controls,
+                            handles,
+                            composition.metadata.clone(),
+                            true,
+                        )?;
+                    }
+                } else if !cancelled
                     && text_edit_target_accepts(document, handles, edit.target, &edit.intent)
                 {
                     self.run_pending_edit(
@@ -1682,6 +1946,15 @@ impl DispatchStack {
         };
         // As with resume, only a matching frame can claim an unattached redraw.
         self.capture_redraw(redraw);
+
+        let aborted_frame_owns_composition = self.frames[index..].iter().any(|frame| {
+            self.active_composition
+                .as_ref()
+                .is_some_and(|active| active.pending_frame == Some(frame.id))
+        });
+        if aborted_frame_owns_composition {
+            self.discard_composition(document, handles);
+        }
 
         // Nested dispatch can pre-activate the same input repeatedly. Roll back the youngest
         // transaction first so aborting an outer frame composes to the state before that frame.
@@ -1714,6 +1987,401 @@ impl DispatchStack {
         redraw_requested
     }
 
+    fn composition_target_is_valid(
+        document: &mut BaseDocument,
+        handles: &NodeHandles,
+        target: GuardedNode,
+    ) -> bool {
+        text_edit_target_accepts(
+            document,
+            handles,
+            target,
+            &EditIntent::InsertText {
+                data: String::new(),
+                is_composing: true,
+            },
+        )
+    }
+
+    fn canceled_composition_is_current(
+        &self,
+        document: &BaseDocument,
+        handles: &NodeHandles,
+    ) -> bool {
+        self.canceled_composition.as_ref().is_some_and(|canceled| {
+            node_is_live(canceled.target, document, handles)
+                && actual_focus_node_id(document) == Some(canceled.target.raw)
+        })
+    }
+
+    fn finish_guarded_composition(
+        document: &mut BaseDocument,
+        handles: &NodeHandles,
+        target: GuardedNode,
+    ) -> bool {
+        if !node_is_live(target, document, handles) {
+            return false;
+        }
+        let mut finished = false;
+        document.with_text_input(target.raw, |mut driver| {
+            driver.finish_compose();
+            finished = true;
+        });
+        finished
+    }
+
+    fn discard_composition(&mut self, document: &mut BaseDocument, handles: &NodeHandles) {
+        if let Some(active) = self.active_composition.take()
+            && Self::finish_guarded_composition(document, handles, active.target)
+            && let Some(frame) = self.frames.last_mut()
+        {
+            frame.redraw_requested = true;
+        }
+        self.pending_start_ime.clear();
+        self.pending_end_ime.clear();
+    }
+
+    fn close_composition(
+        &mut self,
+        document: &mut BaseDocument,
+        text_controls: &mut TextControlStates,
+        handles: &mut NodeHandles,
+        metadata: EventMetadata,
+        observable: bool,
+    ) -> Result<(), DispatchError> {
+        let session = self.active_composition.take();
+        self.pending_start_ime.clear();
+        let deferred = std::mem::take(&mut self.pending_end_ime);
+        let Some(ActiveComposition {
+            generation,
+            target,
+            data,
+            ..
+        }) = session
+        else {
+            return Ok(());
+        };
+
+        self.frames
+            .last_mut()
+            .expect("composition closure belongs to an active frame")
+            .planned
+            .extend(
+                deferred
+                    .into_iter()
+                    .map(|request| PlannedWork::DeferredIme {
+                        expected_generation: generation,
+                        expected_completed_frame: None,
+                        request,
+                    }),
+            );
+
+        if Self::finish_guarded_composition(document, handles, target) {
+            text_controls.sync_editor_value(document, target.raw);
+            self.frames
+                .last_mut()
+                .expect("composition closure belongs to an active frame")
+                .redraw_requested = true;
+        }
+        if !observable || !node_is_live(target, document, handles) {
+            return Ok(());
+        }
+
+        let Some(mut end) = guard_event_with_target(
+            document,
+            handles,
+            target,
+            DomEventData::Input(blitz_traits::events::BlitzInputEvent {
+                value: String::new(),
+            }),
+            metadata.into_composition("compositionend", data),
+        )?
+        else {
+            return Ok(());
+        };
+        end.event.bubbles = true;
+        self.frames
+            .last_mut()
+            .expect("composition closure belongs to an active frame")
+            .generated
+            .push_back(end);
+        Ok(())
+    }
+
+    fn composition_operation_is_current(&self, edit: &PendingCompositionEdit) -> bool {
+        self.active_composition.as_ref().is_some_and(|active| {
+            active.generation == edit.generation
+                && active.target == edit.target
+                && active.pending_frame == Some(edit.frame_id)
+        })
+    }
+
+    fn composition_end_is_current(&self, end: &PendingCompositionEnd) -> bool {
+        self.active_composition.as_ref().is_some_and(|active| {
+            active.generation == end.generation
+                && active.target == end.target
+                && active.pending_frame == Some(end.frame_id)
+        })
+    }
+
+    fn absorb_post_terminal_deferred_ime(&mut self, predecessor_generation: u32) {
+        let mut moved = Vec::new();
+        let planned = &mut self
+            .frames
+            .last_mut()
+            .expect("deferred IME replay belongs to the active frame")
+            .planned;
+        let mut index = 0;
+        while index < planned.len() {
+            let moves_to_new_start = matches!(
+                &planned[index],
+                PlannedWork::DeferredIme {
+                    expected_generation,
+                    expected_completed_frame: None,
+                    ..
+                } if *expected_generation == predecessor_generation
+            );
+            if moves_to_new_start {
+                let Some(PlannedWork::DeferredIme { request, .. }) = planned.remove(index) else {
+                    unreachable!("the matched deferred IME work remains at this index")
+                };
+                moved.push(request);
+            } else {
+                index += 1;
+            }
+        }
+        for request in moved {
+            defer_ime_request(&mut self.pending_start_ime, request);
+        }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "preedit planning keeps cancellation, target locking, and replay fencing in one transition"
+    )]
+    fn plan_ime_preedit(
+        &mut self,
+        document: &mut BaseDocument,
+        handles: &mut NodeHandles,
+        data: String,
+        cursor: Option<(usize, usize)>,
+    ) -> Result<(), DispatchError> {
+        let frame_id = self
+            .frames
+            .last()
+            .expect("IME preedit planning requires an active frame")
+            .id;
+        if self.canceled_composition.is_some() {
+            if self.canceled_composition_is_current(document, handles) {
+                if data.is_empty() {
+                    self.canceled_composition = None;
+                }
+                return Ok(());
+            }
+            self.canceled_composition = None;
+        }
+        // The disposition of compositionstart defines whether the whole session may mutate.
+        // Preserve records which re-enter from that listener, then replay them in order once its
+        // cancellation result is known.
+        if self
+            .active_composition
+            .as_ref()
+            .is_some_and(|active| active.start_pending && active.pending_frame != Some(frame_id))
+        {
+            defer_ime_request(
+                &mut self.pending_start_ime,
+                DeferredImeRequest::Preedit { data, cursor },
+            );
+            return Ok(());
+        }
+        if self
+            .active_composition
+            .as_ref()
+            .is_some_and(|active| active.ending)
+        {
+            defer_ime_request(
+                &mut self.pending_end_ime,
+                DeferredImeRequest::Preedit { data, cursor },
+            );
+            return Ok(());
+        }
+        let existing = self
+            .active_composition
+            .as_ref()
+            .map(|active| (active.target, active.generation));
+        let first = existing.is_none();
+        if first && data.is_empty() {
+            self.frames
+                .last_mut()
+                .expect("IME preedit planning requires an active frame")
+                .planned
+                .push_front(PlannedWork::DefaultOnly {
+                    target: PlannedTarget::Focused,
+                    data: DomEventData::Ime(BlitzImeEvent::Preedit(String::new(), None)),
+                    metadata: EventMetadata::native(),
+                });
+            return Ok(());
+        }
+        if let Some((target, generation)) = existing
+            && !Self::composition_target_is_valid(document, handles, target)
+        {
+            let planned = &mut self
+                .frames
+                .last_mut()
+                .expect("IME preedit planning requires an active frame")
+                .planned;
+            if !data.is_empty() {
+                planned.push_front(PlannedWork::DeferredIme {
+                    expected_generation: generation,
+                    expected_completed_frame: None,
+                    request: DeferredImeRequest::Preedit { data, cursor },
+                });
+            }
+            planned.push_front(PlannedWork::ForceCompositionEnd {
+                expected_generation: generation,
+                metadata: EventMetadata::native(),
+            });
+            return Ok(());
+        }
+
+        let (target, generation) = if let Some(active) = &mut self.active_composition {
+            active.pending_frame = Some(frame_id);
+            active.ending = data.is_empty();
+            (active.target, active.generation)
+        } else {
+            let Some(target_id) = actual_focus_node_id(document) else {
+                return Ok(());
+            };
+            let Some(target) = guard_node(document, handles, target_id)? else {
+                return Ok(());
+            };
+            if !Self::composition_target_is_valid(document, handles, target) {
+                return Ok(());
+            }
+            let generation = self.allocate_composition_generation()?;
+            self.active_composition = Some(ActiveComposition {
+                generation,
+                target,
+                data: String::new(),
+                pending_frame: Some(frame_id),
+                last_completed_frame: None,
+                start_pending: true,
+                ending: false,
+            });
+            (target, generation)
+        };
+        let metadata = EventMetadata::native();
+        let edit = PendingCompositionEdit {
+            generation,
+            target,
+            end_data: data.is_empty().then(String::new),
+            data,
+            cursor,
+            metadata,
+            frame_id,
+        };
+        self.frames
+            .last_mut()
+            .expect("IME preedit planning requires an active frame")
+            .planned
+            .push_front(if first {
+                PlannedWork::CompositionStart(edit)
+            } else {
+                PlannedWork::CompositionUpdate(edit)
+            });
+        Ok(())
+    }
+
+    fn plan_active_ime_commit(
+        &mut self,
+        document: &mut BaseDocument,
+        handles: &NodeHandles,
+        text: String,
+    ) -> bool {
+        let frame_id = self
+            .frames
+            .last()
+            .expect("IME commit planning requires an active frame")
+            .id;
+        if self.canceled_composition.is_some() {
+            if self.canceled_composition_is_current(document, handles) {
+                self.canceled_composition = None;
+                return true;
+            }
+            self.canceled_composition = None;
+        }
+        if self
+            .active_composition
+            .as_ref()
+            .is_some_and(|active| active.start_pending && active.pending_frame != Some(frame_id))
+        {
+            defer_ime_request(
+                &mut self.pending_start_ime,
+                DeferredImeRequest::Commit(text),
+            );
+            return true;
+        }
+        if self
+            .active_composition
+            .as_ref()
+            .is_some_and(|active| active.ending)
+        {
+            defer_ime_request(&mut self.pending_end_ime, DeferredImeRequest::Commit(text));
+            return true;
+        }
+        let existing = self
+            .active_composition
+            .as_ref()
+            .map(|active| (active.target, active.generation));
+        let Some((target, generation)) = existing else {
+            return false;
+        };
+        if !Self::composition_target_is_valid(document, handles, target) {
+            let planned = &mut self
+                .frames
+                .last_mut()
+                .expect("IME commit planning requires an active frame")
+                .planned;
+            planned.push_front(PlannedWork::ForceCompositionEnd {
+                expected_generation: generation,
+                metadata: EventMetadata::native(),
+            });
+            return true;
+        }
+        let metadata = EventMetadata::native();
+        let active = self
+            .active_composition
+            .as_mut()
+            .expect("an existing composition session is active");
+        active.pending_frame = Some(frame_id);
+        active.ending = true;
+        let work = if active.data == text {
+            PlannedWork::CompositionEnd(PendingCompositionEnd {
+                generation,
+                target,
+                data: text,
+                metadata,
+                frame_id,
+            })
+        } else {
+            PlannedWork::CompositionUpdate(PendingCompositionEdit {
+                generation,
+                target,
+                data: text.clone(),
+                cursor: None,
+                metadata,
+                frame_id,
+                end_data: Some(text),
+            })
+        };
+        self.frames
+            .last_mut()
+            .expect("IME commit planning requires an active frame")
+            .planned
+            .push_front(work);
+        true
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "request planning keeps each native event flavor's state transition adjacent to its queued work"
@@ -1733,6 +2401,43 @@ impl DispatchStack {
             }
         }
         request = match request {
+            DispatchRequest::Ime(BlitzImeEvent::Preedit(data, cursor)) => {
+                return self.plan_ime_preedit(document, handles, data, cursor);
+            }
+            DispatchRequest::ImeCommit(text) => {
+                if self.plan_active_ime_commit(document, handles, text.clone()) {
+                    return Ok(());
+                }
+                if !is_insertable_text(&text) {
+                    return Ok(());
+                }
+                DispatchRequest::ImeCommit(text)
+            }
+            DispatchRequest::Ime(BlitzImeEvent::Enabled) => {
+                self.canceled_composition = None;
+                DispatchRequest::Ime(BlitzImeEvent::Enabled)
+            }
+            DispatchRequest::Ime(BlitzImeEvent::Disabled) => {
+                if self.canceled_composition.take().is_some() {
+                    return Ok(());
+                }
+                if let Some(expected_generation) = self
+                    .active_composition
+                    .as_ref()
+                    .map(|active| active.generation)
+                {
+                    self.frames
+                        .last_mut()
+                        .expect("IME disable planning requires an active frame")
+                        .planned
+                        .push_front(PlannedWork::ForceCompositionEnd {
+                            expected_generation,
+                            metadata: EventMetadata::native(),
+                        });
+                    return Ok(());
+                }
+                DispatchRequest::Ime(BlitzImeEvent::Disabled)
+            }
             DispatchRequest::PointerCancel {
                 event,
                 canceled_buttons,
@@ -2347,6 +3052,206 @@ impl DispatchStack {
                         return Ok(step);
                     }
                 }
+                PlannedWork::CompositionStart(edit) => {
+                    let current = self.active_composition.as_ref().is_some_and(|active| {
+                        active.generation == edit.generation
+                            && active.target == edit.target
+                            && active.pending_frame == Some(edit.frame_id)
+                    });
+                    if !current {
+                        continue;
+                    }
+                    if !Self::composition_target_is_valid(document, handles, edit.target) {
+                        self.discard_composition(document, handles);
+                        continue;
+                    }
+                    let target = edit.target;
+                    let generation = edit.generation;
+                    let frame_id = edit.frame_id;
+                    let metadata = edit.metadata.clone();
+                    if let Some(step) = self.stage_composition_event(
+                        document,
+                        handles,
+                        redraw,
+                        target,
+                        metadata,
+                        "compositionstart",
+                        String::new(),
+                        ResumeAction::CompositionStart(Box::new(edit)),
+                    )? {
+                        return Ok(step);
+                    }
+                    if self.active_composition.as_ref().is_some_and(|active| {
+                        active.generation == generation
+                            && active.target == target
+                            && active.pending_frame == Some(frame_id)
+                    }) {
+                        self.discard_composition(document, handles);
+                    }
+                }
+                PlannedWork::CompositionUpdate(edit) => {
+                    if !self.composition_operation_is_current(&edit) {
+                        continue;
+                    }
+                    if !node_is_live(edit.target, document, handles) {
+                        self.close_composition(
+                            document,
+                            text_controls,
+                            handles,
+                            edit.metadata.clone(),
+                            true,
+                        )?;
+                        continue;
+                    }
+                    let target = edit.target;
+                    let generation = edit.generation;
+                    let frame_id = edit.frame_id;
+                    let data = edit.data.clone();
+                    let metadata = edit.metadata.clone();
+                    if let Some(step) = self.stage_composition_event(
+                        document,
+                        handles,
+                        redraw,
+                        target,
+                        metadata,
+                        "compositionupdate",
+                        data,
+                        ResumeAction::CompositionUpdate(Box::new(edit)),
+                    )? {
+                        return Ok(step);
+                    }
+                    if self.active_composition.as_ref().is_some_and(|active| {
+                        active.generation == generation
+                            && active.target == target
+                            && active.pending_frame == Some(frame_id)
+                    }) {
+                        self.discard_composition(document, handles);
+                    }
+                }
+                PlannedWork::CompositionEnd(end) => {
+                    if !self.composition_end_is_current(&end) {
+                        continue;
+                    }
+                    if !node_is_live(end.target, document, handles) {
+                        self.close_composition(
+                            document,
+                            text_controls,
+                            handles,
+                            end.metadata.clone(),
+                            true,
+                        )?;
+                        continue;
+                    }
+                    if Self::finish_guarded_composition(document, handles, end.target) {
+                        self.frames
+                            .last_mut()
+                            .expect("composition end belongs to the active frame")
+                            .redraw_requested = true;
+                    }
+                    text_controls.sync_editor_value(document, end.target.raw);
+                    let deferred = std::mem::take(&mut self.pending_end_ime);
+                    self.active_composition = None;
+                    self.frames
+                        .last_mut()
+                        .expect("composition end belongs to the active frame")
+                        .planned
+                        .extend(
+                            deferred
+                                .into_iter()
+                                .map(|request| PlannedWork::DeferredIme {
+                                    expected_generation: end.generation,
+                                    expected_completed_frame: None,
+                                    request,
+                                }),
+                        );
+                    let target = end.target;
+                    let data = end.data.clone();
+                    let metadata = end.metadata.clone();
+                    if let Some(step) = self.stage_composition_event(
+                        document,
+                        handles,
+                        redraw,
+                        target,
+                        metadata,
+                        "compositionend",
+                        data,
+                        ResumeAction::CompositionEnd,
+                    )? {
+                        return Ok(step);
+                    }
+                }
+                PlannedWork::ForceCompositionEnd {
+                    expected_generation,
+                    metadata,
+                } => {
+                    if self
+                        .active_composition
+                        .as_ref()
+                        .is_some_and(|active| active.generation == expected_generation)
+                    {
+                        self.close_composition(document, text_controls, handles, metadata, true)?;
+                    }
+                }
+                PlannedWork::CompositionOccurrenceComplete {
+                    generation,
+                    target,
+                    frame_id,
+                } => {
+                    if let Some(active) = &mut self.active_composition
+                        && active.generation == generation
+                        && active.target == target
+                        && active.pending_frame == Some(frame_id)
+                    {
+                        active.pending_frame = None;
+                        active.last_completed_frame = Some(frame_id);
+                    }
+                }
+                PlannedWork::DeferredIme {
+                    expected_generation,
+                    expected_completed_frame,
+                    request,
+                } => {
+                    let current_or_uncontested = self.active_composition.as_ref().map_or_else(
+                        || {
+                            expected_completed_frame.is_none()
+                                && self.latest_composition_generation == Some(expected_generation)
+                        },
+                        |active| {
+                            active.generation == expected_generation
+                                && expected_completed_frame.is_none_or(|frame_id| {
+                                    active.last_completed_frame == Some(frame_id)
+                                })
+                        },
+                    );
+                    if !current_or_uncontested {
+                        continue;
+                    }
+                    let predecessor_generation = expected_generation;
+                    match request {
+                        DeferredImeRequest::Preedit { data, cursor } => {
+                            self.plan_ime_preedit(document, handles, data, cursor)?;
+                        }
+                        DeferredImeRequest::Commit(text) => {
+                            if !self.plan_active_ime_commit(document, handles, text.clone())
+                                && is_insertable_text(&text)
+                            {
+                                plan_ime_commit(
+                                    &mut self
+                                        .frames
+                                        .last_mut()
+                                        .expect("deferred IME work belongs to the active frame")
+                                        .planned,
+                                    text,
+                                );
+                            }
+                        }
+                    }
+                    if self.active_composition.as_ref().is_some_and(|active| {
+                        active.generation != predecessor_generation && active.start_pending
+                    }) {
+                        self.absorb_post_terminal_deferred_ime(predecessor_generation);
+                    }
+                }
                 PlannedWork::DoubleClick(pending) => {
                     if !node_is_live(pending.target, document, handles)
                         || !document
@@ -2424,6 +3329,37 @@ impl DispatchStack {
             event,
             ResumeAction::TextEdit(Box::new(edit)),
         )?))
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "composition staging carries the guarded target, causal metadata, payload, and continuation"
+    )]
+    fn stage_composition_event(
+        &mut self,
+        document: &BaseDocument,
+        handles: &mut NodeHandles,
+        redraw: &AtomicBool,
+        target: GuardedNode,
+        metadata: EventMetadata,
+        event_type: &'static str,
+        data: String,
+        resume: ResumeAction,
+    ) -> Result<Option<DispatchStep>, DispatchError> {
+        let Some(mut event) = guard_event_with_target(
+            document,
+            handles,
+            target,
+            DomEventData::Input(blitz_traits::events::BlitzInputEvent {
+                value: String::new(),
+            }),
+            metadata.into_composition(event_type, data),
+        )?
+        else {
+            return Ok(None);
+        };
+        event.event.bubbles = true;
+        Ok(Some(self.stage(redraw, event, resume)?))
     }
 
     #[allow(
@@ -3016,6 +3952,10 @@ impl DispatchStack {
         Ok(())
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "editing defaults keep snapshot, mutation, generated input, and composition follow-up adjacent"
+    )]
     fn run_pending_edit(
         &mut self,
         document: &mut BaseDocument,
@@ -3057,9 +3997,109 @@ impl DispatchStack {
                 }
                 Ok(())
             }
+            PendingEditAction::CompositionPreedit(edit) => {
+                let edit = *edit;
+                if !self.composition_operation_is_current(&edit) {
+                    return Ok(());
+                }
+                if !Self::composition_target_is_valid(document, handles, edit.target) {
+                    self.close_composition(
+                        document,
+                        text_controls,
+                        handles,
+                        edit.metadata.clone(),
+                        true,
+                    )?;
+                    return Ok(());
+                }
+                let metadata =
+                    edit.metadata
+                        .clone()
+                        .with_edit_intent(Some(EditIntent::InsertText {
+                            data: edit.data.clone(),
+                            is_composing: true,
+                        }));
+                let Some(preedit) = guard_event_with_target(
+                    document,
+                    handles,
+                    edit.target,
+                    DomEventData::Ime(BlitzImeEvent::Preedit(edit.data.clone(), edit.cursor)),
+                    edit.metadata.clone(),
+                )?
+                else {
+                    if self.composition_operation_is_current(&edit) {
+                        self.discard_composition(document, handles);
+                    }
+                    return Ok(());
+                };
+                self.run_default(
+                    document,
+                    text_controls,
+                    checked_controls,
+                    handles,
+                    preedit,
+                    None,
+                    None,
+                )?;
+                let after = editor_edit_snapshot(document, edit.target.raw);
+                if !self.composition_operation_is_current(&edit) {
+                    return Ok(());
+                }
+                if let Some(active) = &mut self.active_composition
+                    && active.generation == edit.generation
+                    && active.target == edit.target
+                    && active.pending_frame == Some(edit.frame_id)
+                {
+                    active.data.clone_from(&edit.data);
+                }
+                // Input Events requires every surfaced compositionupdate to be followed by the
+                // non-cancelable beforeinput/input pair, even when the native update only moves
+                // the composition cursor and leaves the passage text unchanged.
+                if let Some(after) = after {
+                    let input = DomEvent::new(
+                        edit.target.raw,
+                        DomEventData::Input(blitz_traits::events::BlitzInputEvent {
+                            value: after.value,
+                        }),
+                    );
+                    if let Some(input) = guard_queued_event(document, handles, input, metadata)? {
+                        self.frames
+                            .last_mut()
+                            .expect("composition edits belong to the active frame")
+                            .generated
+                            .push_back(input);
+                    }
+                }
+                let work = edit.end_data.map_or(
+                    PlannedWork::CompositionOccurrenceComplete {
+                        generation: edit.generation,
+                        target: edit.target,
+                        frame_id: edit.frame_id,
+                    },
+                    |data| {
+                        PlannedWork::CompositionEnd(PendingCompositionEnd {
+                            generation: edit.generation,
+                            target: edit.target,
+                            data,
+                            metadata: edit.metadata,
+                            frame_id: edit.frame_id,
+                        })
+                    },
+                );
+                self.frames
+                    .last_mut()
+                    .expect("composition edits belong to the active frame")
+                    .planned
+                    .push_front(work);
+                Ok(())
+            }
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "native defaults keep each focus and pointer state transition adjacent to its guards"
+    )]
     fn run_action(
         &mut self,
         document: &mut BaseDocument,
@@ -3091,12 +4131,31 @@ impl DispatchStack {
                 related_target,
                 metadata,
             } => {
+                if self
+                    .canceled_composition
+                    .as_ref()
+                    .is_some_and(|canceled| canceled.target == target)
+                {
+                    self.canceled_composition = None;
+                }
+                if self
+                    .active_composition
+                    .as_ref()
+                    .is_some_and(|active| active.target == target)
+                {
+                    self.close_composition(
+                        document,
+                        text_controls,
+                        handles,
+                        metadata.clone(),
+                        true,
+                    )?;
+                }
                 if actual_focus_node_id(document) != Some(target.raw)
                     || !node_is_live(target, document, handles)
                 {
                     return Ok(());
                 }
-
                 text_controls.sync_editor_value(document, target.raw);
                 self.space_activation_press = None;
                 document.clear_focus();
@@ -3128,6 +4187,21 @@ impl DispatchStack {
                 {
                     return Ok(());
                 }
+                self.canceled_composition = None;
+
+                if self
+                    .active_composition
+                    .as_ref()
+                    .is_some_and(|active| active.target != target)
+                {
+                    self.close_composition(
+                        document,
+                        text_controls,
+                        handles,
+                        metadata.clone(),
+                        true,
+                    )?;
+                }
 
                 self.space_activation_press = None;
                 self.frames
@@ -3154,10 +4228,24 @@ impl DispatchStack {
         }
     }
 
-    fn discard_failed_frame(&mut self, frame_id: u32, redraw: &AtomicBool) {
+    fn discard_failed_frame(
+        &mut self,
+        document: &mut BaseDocument,
+        handles: &NodeHandles,
+        frame_id: u32,
+        redraw: &AtomicBool,
+    ) {
         let Some(index) = self.frames.iter().position(|frame| frame.id == frame_id) else {
             return;
         };
+        let discarded_frame_owns_composition = self.frames[index..].iter().any(|frame| {
+            self.active_composition
+                .as_ref()
+                .is_some_and(|active| active.pending_frame == Some(frame.id))
+        });
+        if discarded_frame_owns_composition {
+            self.discard_composition(document, handles);
+        }
         let redraw_requested = self.frames[index..]
             .iter()
             .any(|frame| frame.redraw_requested);
@@ -3680,18 +4768,20 @@ fn plan_programmatic_focus(
 
 fn plan_ime_commit(planned: &mut VecDeque<PlannedWork>, text: String) {
     let metadata = EventMetadata::native();
-    planned.push_back(PlannedWork::DefaultOnly {
-        target: PlannedTarget::Focused,
-        data: DomEventData::Ime(BlitzImeEvent::Preedit(String::new(), None)),
-        metadata: metadata.clone(),
-    });
-    planned.push_back(PlannedWork::DefaultOnly {
+    planned.push_front(PlannedWork::DefaultOnly {
         target: PlannedTarget::Focused,
         data: DomEventData::Ime(BlitzImeEvent::Commit(text.clone())),
-        metadata: metadata.with_edit_intent(Some(EditIntent::InsertText {
-            data: text,
-            is_composing: false,
-        })),
+        metadata: metadata
+            .clone()
+            .with_edit_intent(Some(EditIntent::InsertText {
+                data: text,
+                is_composing: false,
+            })),
+    });
+    planned.push_front(PlannedWork::DefaultOnly {
+        target: PlannedTarget::Focused,
+        data: DomEventData::Ime(BlitzImeEvent::Preedit(String::new(), None)),
+        metadata,
     });
 }
 
@@ -5078,12 +6168,17 @@ fn event_payload(data: &DomEventData, metadata: &EventMetadata) -> Option<Dispat
         | DomEventData::KeyUp(event) => Some(DispatchEventPayload::Keyboard(keyboard_payload(
             event, metadata,
         ))),
-        DomEventData::Input(_) => Some(DispatchEventPayload::Input(
-            metadata
-                .edit_intent
-                .as_ref()
-                .map_or_else(InputPayload::empty, EditIntent::payload),
-        )),
+        DomEventData::Input(_) => metadata.composition_data.as_ref().map_or_else(
+            || {
+                Some(DispatchEventPayload::Input(
+                    metadata
+                        .edit_intent
+                        .as_ref()
+                        .map_or_else(InputPayload::empty, EditIntent::payload),
+                ))
+            },
+            |data| Some(DispatchEventPayload::Composition { data: data.clone() }),
+        ),
         DomEventData::Focus(_)
         | DomEventData::Blur(_)
         | DomEventData::FocusIn(_)
@@ -5601,6 +6696,9 @@ impl DispatchEventPayload {
                 )?;
                 set(&object, "inputType", JsValue::from_str(input.input_type))?;
                 set(&object, "isComposing", input.is_composing.into())?;
+            }
+            Self::Composition { data } => {
+                set(&object, "data", JsValue::from_str(&data))?;
             }
             Self::Focus { related_target } => {
                 set(
@@ -6203,13 +7301,8 @@ impl QuoxRenderer {
     }
 
     pub fn begin_ime_commit(&self, text: &str) -> Result<JsValue, JsValue> {
-        let request = if is_insertable_text(text) {
-            DispatchRequest::ImeCommit(text.to_owned())
-        } else {
-            DispatchRequest::Empty
-        };
         let mut state = self.state.borrow_mut();
-        let step = begin_request(&mut state, request);
+        let step = begin_request(&mut state, DispatchRequest::ImeCommit(text.to_owned()));
         finish_step(&mut state, step)
     }
 
@@ -12685,24 +13778,96 @@ mod tests {
     }
 
     #[test]
-    fn ime_commit_clears_preedit_before_cancelable_beforeinput() {
+    fn active_ime_commit_reconciles_final_text_through_composition_events() {
         let mut context = TestContext::new("<input id='editor' value='base'>");
         let input = context.element("editor");
         assert!(context.document.set_focus_to(input));
         context
             .document
             .with_text_input(input, |mut driver| driver.move_to_text_end());
-        complete(context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+        let first_preedit = context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
             "候補".to_owned(),
             None,
-        ))));
+        )));
+        assert_eq!(
+            drain_steps(&mut context, first_preedit)
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "compositionstart",
+                "compositionupdate",
+                "beforeinput",
+                "input"
+            ]
+        );
         assert_eq!(context.raw_text(input), "base候補");
 
-        let before_input = event(context.begin(DispatchRequest::ImeCommit("確定".to_owned())));
+        let update = event(context.begin(DispatchRequest::ImeCommit("確定".to_owned())));
+        assert_eq!(update.event_type, "compositionupdate");
+        assert_eq!(
+            update.payload.as_deref(),
+            Some(&DispatchEventPayload::Composition {
+                data: "確定".to_owned(),
+            })
+        );
+        let before_input = event(context.resume(&update, false));
         assert_eq!(before_input.event_type, "beforeinput");
+        assert!(!before_input.cancelable);
+        assert_eq!(
+            before_input.payload.as_deref(),
+            Some(&DispatchEventPayload::Input(InputPayload {
+                data: Some("確定".to_owned()),
+                input_type: "insertCompositionText",
+                is_composing: true,
+            }))
+        );
+        assert_eq!(context.raw_text(input), "base候補");
+        let input_event = event(context.resume(&before_input, true));
+        assert_eq!(input_event.event_type, "input");
+        assert_eq!(context.raw_text(input), "base確定");
+        let end = event(context.resume(&input_event, false));
+        assert_eq!(end.event_type, "compositionend");
+        assert_eq!(
+            end.payload.as_deref(),
+            Some(&DispatchEventPayload::Composition {
+                data: "確定".to_owned(),
+            })
+        );
+        let (_, redraw_requested) = complete(context.resume(&end, false));
+        assert!(redraw_requested);
+        assert_eq!(context.live_value(input), "base確定");
+    }
+
+    #[test]
+    fn empty_ime_commit_cancels_an_active_composition_but_is_otherwise_silent() {
+        let mut context = TestContext::new("<input id='editor' value='base'>");
+        let input = context.element("editor");
+        assert!(context.document.set_focus_to(input));
+        context
+            .document
+            .with_text_input(input, |mut driver| driver.move_to_text_end());
+        let preedit = context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "candidate".to_owned(),
+            None,
+        )));
+        let _ = drain_steps(&mut context, preedit);
+
+        let cancel = context.begin(DispatchRequest::ImeCommit(String::new()));
+        assert_eq!(
+            drain_steps(&mut context, cancel)
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "compositionupdate",
+                "beforeinput",
+                "input",
+                "compositionend"
+            ]
+        );
         assert_eq!(context.raw_text(input), "base");
-        complete(context.resume(&before_input, true));
-        assert_eq!(context.raw_text(input), "base");
+        complete(context.begin(DispatchRequest::ImeCommit(String::new())));
     }
 
     #[test]
@@ -12736,7 +13901,7 @@ mod tests {
     }
 
     #[test]
-    fn default_only_preedit_updates_live_value_before_later_reconciliation() {
+    fn ime_preedit_dispatches_browser_lifecycle_before_mutating_text() {
         let mut context = TestContext::new("<input id='editor' value='before'>");
         let input = context.element("editor");
         assert!(context.document.set_focus_to(input));
@@ -12744,15 +13909,735 @@ mod tests {
             driver.move_to_text_end();
         });
 
-        complete(context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+        let start = event(context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
             "候補".to_owned(),
             None,
         ))));
+        assert_eq!(start.event_type, "compositionstart");
+        assert!(start.bubbles && start.cancelable && start.composed);
+        assert_eq!(
+            start.payload.as_deref(),
+            Some(&DispatchEventPayload::Composition {
+                data: String::new(),
+            })
+        );
+        assert_eq!(context.raw_text(input), "before");
+
+        let update = event(context.resume(&start, false));
+        assert_eq!(update.event_type, "compositionupdate");
+        assert!(update.bubbles && !update.cancelable && update.composed);
+        assert_eq!(update.time_stamp.to_bits(), start.time_stamp.to_bits());
+        assert_eq!(update.target, start.target);
+        assert_eq!(update.path, start.path);
+        assert_eq!(
+            update.payload.as_deref(),
+            Some(&DispatchEventPayload::Composition {
+                data: "候補".to_owned(),
+            })
+        );
+        assert_eq!(context.raw_text(input), "before");
+
+        let before_input = event(context.resume(&update, false));
+        assert_eq!(before_input.event_type, "beforeinput");
+        assert!(before_input.bubbles && !before_input.cancelable && before_input.composed);
+        assert_eq!(
+            before_input.time_stamp.to_bits(),
+            start.time_stamp.to_bits()
+        );
+        assert_eq!(before_input.target, start.target);
+        assert_eq!(
+            before_input.payload.as_deref(),
+            Some(&DispatchEventPayload::Input(InputPayload {
+                data: Some("候補".to_owned()),
+                input_type: "insertCompositionText",
+                is_composing: true,
+            }))
+        );
+        assert_eq!(context.raw_text(input), "before");
+
+        let input_event = event(context.resume(&before_input, true));
+        assert_eq!(input_event.event_type, "input");
+        assert_eq!(input_event.time_stamp.to_bits(), start.time_stamp.to_bits());
+        assert_eq!(input_event.target, start.target);
+        assert_eq!(context.raw_text(input), "before候補");
+        complete(context.resume(&input_event, false));
         assert_eq!(context.live_value(input), "before候補");
         context
             .text_controls
             .reconcile_document(&mut context.document);
         assert_eq!(context.raw_text(input), "before候補");
+    }
+
+    #[test]
+    fn cursor_only_preedit_keeps_the_composition_edit_event_triple_atomic() {
+        let mut context = TestContext::new("<input id='editor' value=''>");
+        let input = context.element("editor");
+        assert!(context.document.set_focus_to(input));
+        let first = context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "same".to_owned(),
+            None,
+        )));
+        let _ = drain_steps(&mut context, first);
+
+        let update = context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "same".to_owned(),
+            Some((2, 2)),
+        )));
+        let events = drain_steps(&mut context, update);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            ["compositionupdate", "beforeinput", "input"]
+        );
+        assert_eq!(
+            events[2].payload.as_deref(),
+            Some(&DispatchEventPayload::Input(InputPayload {
+                data: Some("same".to_owned()),
+                input_type: "insertCompositionText",
+                is_composing: true,
+            }))
+        );
+        assert_eq!(context.raw_text(input), "same");
+    }
+
+    #[test]
+    fn canceled_compositionstart_ends_without_updates_or_mutation() {
+        let mut context = TestContext::new("<input id='editor' value=''>");
+        let input = context.element("editor");
+        assert!(context.document.set_focus_to(input));
+
+        let start = event(context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "first".to_owned(),
+            None,
+        ))));
+        assert_eq!(start.event_type, "compositionstart");
+        // A native callback re-entering from compositionstart cannot outrun the listener's
+        // cancellation decision.
+        complete(context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "nested".to_owned(),
+            None,
+        ))));
+        assert_eq!(context.raw_text(input), "");
+
+        let end = event(context.resume(&start, true));
+        assert_eq!(end.event_type, "compositionend");
+        assert_eq!(
+            end.payload.as_deref(),
+            Some(&DispatchEventPayload::Composition {
+                data: String::new(),
+            })
+        );
+        complete(context.resume(&end, false));
+        assert_eq!(context.raw_text(input), "");
+
+        complete(context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "ignored".to_owned(),
+            None,
+        ))));
+        assert!(context.stack.active_composition.is_none());
+        assert!(context.stack.canceled_composition.is_some());
+        assert_eq!(context.raw_text(input), "");
+        complete(context.begin(DispatchRequest::ImeCommit("ignored".to_owned())));
+        assert!(context.stack.canceled_composition.is_none());
+
+        let later = context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "later".to_owned(),
+            None,
+        )));
+        assert_eq!(
+            drain_steps(&mut context, later)
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "compositionstart",
+                "compositionupdate",
+                "beforeinput",
+                "input"
+            ]
+        );
+        assert_eq!(context.raw_text(input), "later");
+
+        let end = event(context.begin(DispatchRequest::ImeCommit("later".to_owned())));
+        assert_eq!(end.event_type, "compositionend");
+        complete(context.resume(&end, false));
+    }
+
+    #[test]
+    fn terminal_record_deferred_during_canceled_start_avoids_a_stale_tombstone() {
+        let mut context = TestContext::new("<input id='editor' value=''>");
+        let input = context.element("editor");
+        assert!(context.document.set_focus_to(input));
+        let start = event(context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "first".to_owned(),
+            None,
+        ))));
+        complete(context.begin(DispatchRequest::ImeCommit("terminal".to_owned())));
+        let end = event(context.resume(&start, true));
+        assert_eq!(end.event_type, "compositionend");
+        complete(context.resume(&end, false));
+        assert!(context.stack.canceled_composition.is_none());
+
+        let next = event(context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "next".to_owned(),
+            None,
+        ))));
+        assert_eq!(next.event_type, "compositionstart");
+        assert!(context.abort(next.frame_id));
+    }
+
+    #[test]
+    fn terminal_ime_records_reentering_compositionstart_are_replayed_after_acceptance() {
+        for (nested, expected_value) in [
+            (DispatchRequest::ImeCommit("done".to_owned()), "basedone"),
+            (DispatchRequest::ImeCommit(String::new()), "base"),
+            (
+                DispatchRequest::Ime(BlitzImeEvent::Preedit(String::new(), None)),
+                "base",
+            ),
+        ] {
+            let mut context = TestContext::new("<input id='editor' value='base'>");
+            let input = context.element("editor");
+            assert!(context.document.set_focus_to(input));
+            context
+                .document
+                .with_text_input(input, |mut driver| driver.move_to_text_end());
+            let start = event(context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+                "first".to_owned(),
+                None,
+            ))));
+            complete(context.begin(nested));
+
+            let after_start = context.resume(&start, false);
+            assert_eq!(
+                drain_steps(&mut context, after_start)
+                    .iter()
+                    .map(|event| event.event_type.as_str())
+                    .collect::<Vec<_>>(),
+                [
+                    "compositionupdate",
+                    "beforeinput",
+                    "input",
+                    "compositionupdate",
+                    "beforeinput",
+                    "input",
+                    "compositionend",
+                ]
+            );
+            assert_eq!(context.raw_text(input), expected_value);
+        }
+    }
+
+    #[test]
+    fn start_deferred_terminal_preserves_the_following_session_boundary() {
+        for cancel_start in [false, true] {
+            let mut context = TestContext::new("<input id='editor' value=''>");
+            let input = context.element("editor");
+            assert!(context.document.set_focus_to(input));
+            let start = event(context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+                "initial".to_owned(),
+                None,
+            ))));
+            complete(context.begin(DispatchRequest::ImeCommit("terminal".to_owned())));
+            complete(context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+                "next".to_owned(),
+                None,
+            ))));
+
+            let after_start = context.resume(&start, cancel_start);
+            let events = drain_steps(&mut context, after_start);
+            let types = events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>();
+            let end = types
+                .iter()
+                .position(|event_type| *event_type == "compositionend")
+                .expect("the terminal record must end the old session");
+            let next_start = types
+                .iter()
+                .position(|event_type| *event_type == "compositionstart")
+                .expect("the post-terminal preedit must begin a new session");
+            assert!(end < next_start, "{types:?}");
+            assert_eq!(
+                context
+                    .stack
+                    .active_composition
+                    .as_ref()
+                    .map(|active| active.data.as_str()),
+                Some("next")
+            );
+            assert!(context.stack.canceled_composition.is_none());
+        }
+    }
+
+    #[test]
+    fn newer_nested_update_supersedes_a_start_deferred_record() {
+        let mut context = TestContext::new("<input id='editor' value=''>");
+        let input = context.element("editor");
+        assert!(context.document.set_focus_to(input));
+        let start = event(context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "initial".to_owned(),
+            None,
+        ))));
+        complete(context.begin(DispatchRequest::ImeCommit("deferred".to_owned())));
+
+        let outer_update = event(context.resume(&start, false));
+        assert_eq!(outer_update.event_type, "compositionupdate");
+        let newer = context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "newer".to_owned(),
+            None,
+        )));
+        let _ = drain_steps(&mut context, newer);
+        complete(context.resume(&outer_update, false));
+
+        assert_eq!(context.raw_text(input), "newer");
+        assert_eq!(
+            context
+                .stack
+                .active_composition
+                .as_ref()
+                .map(|active| active.data.as_str()),
+            Some("newer")
+        );
+    }
+
+    #[test]
+    fn nested_preedit_supersedes_each_stale_outer_continuation_without_ending_session() {
+        for stale_event_index in 0..3 {
+            let mut context = TestContext::new("<input id='editor' value=''>");
+            let input = context.element("editor");
+            assert!(context.document.set_focus_to(input));
+            let initial = context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+                "initial".to_owned(),
+                None,
+            )));
+            let _ = drain_steps(&mut context, initial);
+
+            let mut stale = event(context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+                "outer".to_owned(),
+                None,
+            ))));
+            for _ in 0..stale_event_index {
+                stale = event(context.resume(&stale, false));
+            }
+            assert_eq!(
+                stale.event_type,
+                ["compositionupdate", "beforeinput", "input"][stale_event_index]
+            );
+
+            let nested = context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+                "nested".to_owned(),
+                None,
+            )));
+            assert_eq!(
+                drain_steps(&mut context, nested)
+                    .iter()
+                    .map(|event| event.event_type.as_str())
+                    .collect::<Vec<_>>(),
+                ["compositionupdate", "beforeinput", "input"]
+            );
+            complete(context.resume(&stale, false));
+            assert_eq!(context.raw_text(input), "nested");
+
+            let end = event(context.begin(DispatchRequest::ImeCommit("nested".to_owned())));
+            assert_eq!(end.event_type, "compositionend");
+            complete(context.resume(&end, false));
+        }
+    }
+
+    #[test]
+    fn aborting_any_pending_composition_phase_discards_only_its_owned_session() {
+        for pending_event_index in 0..4 {
+            let mut context = TestContext::new("<input id='editor' value=''>");
+            let input = context.element("editor");
+            assert!(context.document.set_focus_to(input));
+            let mut pending = event(context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+                "aborted".to_owned(),
+                None,
+            ))));
+            for _ in 0..pending_event_index {
+                pending = event(context.resume(&pending, false));
+            }
+            assert_eq!(
+                pending.event_type,
+                [
+                    "compositionstart",
+                    "compositionupdate",
+                    "beforeinput",
+                    "input"
+                ][pending_event_index]
+            );
+            assert!(context.abort(pending.frame_id));
+
+            let restarted = event(context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+                "restarted".to_owned(),
+                None,
+            ))));
+            assert_eq!(restarted.event_type, "compositionstart");
+            assert!(context.abort(restarted.frame_id));
+        }
+
+        let mut deferred = TestContext::new("<input id='editor' value=''>");
+        let input = deferred.element("editor");
+        assert!(deferred.document.set_focus_to(input));
+        let start = event(deferred.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "outer".to_owned(),
+            None,
+        ))));
+        complete(deferred.begin(DispatchRequest::ImeCommit("nested".to_owned())));
+        assert!(!deferred.stack.pending_start_ime.is_empty());
+        assert!(deferred.abort(start.frame_id));
+        assert!(deferred.stack.pending_start_ime.is_empty());
+        let restarted = event(deferred.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "restarted".to_owned(),
+            None,
+        ))));
+        assert_eq!(restarted.event_type, "compositionstart");
+        assert!(deferred.abort(restarted.frame_id));
+    }
+
+    #[test]
+    fn disabled_closes_only_the_composition_it_observed() {
+        let mut disabled = TestContext::new("<input id='editor' value=''>");
+        let input = disabled.element("editor");
+        assert!(disabled.document.set_focus_to(input));
+        let preedit = disabled.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "active".to_owned(),
+            None,
+        )));
+        let _ = drain_steps(&mut disabled, preedit);
+        let end = event(disabled.begin(DispatchRequest::Ime(BlitzImeEvent::Disabled)));
+        assert_eq!(end.event_type, "compositionend");
+        assert_eq!(
+            end.payload.as_deref(),
+            Some(&DispatchEventPayload::Composition {
+                data: "active".to_owned(),
+            })
+        );
+        let nested = disabled.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "new".to_owned(),
+            None,
+        )));
+        assert_eq!(
+            drain_steps(&mut disabled, nested)
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "compositionstart",
+                "compositionupdate",
+                "beforeinput",
+                "input"
+            ]
+        );
+        let (_, redraw_requested) = complete(disabled.resume(&end, false));
+        assert!(redraw_requested);
+        assert_eq!(disabled.raw_text(input), "newactive");
+        assert_eq!(
+            disabled
+                .stack
+                .active_composition
+                .as_ref()
+                .map(|active| active.data.as_str()),
+            Some("new")
+        );
+        let nested_end = event(disabled.begin(DispatchRequest::ImeCommit("new".to_owned())));
+        assert_eq!(nested_end.event_type, "compositionend");
+        complete(disabled.resume(&nested_end, false));
+    }
+
+    #[test]
+    fn focus_loss_closes_composition_before_followup_work() {
+        let mut blurred = TestContext::new("<input id='editor' value=''>");
+        let input = blurred.element("editor");
+        assert!(blurred.document.set_focus_to(input));
+        let preedit = blurred.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "active".to_owned(),
+            None,
+        )));
+        let _ = drain_steps(&mut blurred, preedit);
+        let blur = blurred.begin_programmatic_blur(input);
+        let events = drain_steps(&mut blurred, blur);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            ["compositionend", "blur", "focusout"]
+        );
+        assert_eq!(events[0].target, events[1].target);
+
+        let mut reentrant =
+            TestContext::new("<input id='first' value=''><input id='second' value=''>");
+        let first = reentrant.element("first");
+        let second = reentrant.element("second");
+        assert!(reentrant.document.set_focus_to(first));
+        let preedit = reentrant.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "active".to_owned(),
+            None,
+        )));
+        let _ = drain_steps(&mut reentrant, preedit);
+        let first_guard = guard_node(&reentrant.document, &mut reentrant.handles, first)
+            .expect("focus target handle should fit")
+            .expect("focus target should remain live");
+        let second_guard = guard_node(&reentrant.document, &mut reentrant.handles, second)
+            .expect("related target handle should fit")
+            .expect("related target should remain live");
+        reentrant.document.clear_focus();
+        assert!(reentrant.document.set_focus_to(second));
+        let frame_id = reentrant
+            .stack
+            .allocate_frame_id()
+            .expect("frame id should fit");
+        reentrant.stack.frames.push(DispatchFrame {
+            id: frame_id,
+            planned: VecDeque::new(),
+            generated: VecDeque::new(),
+            pending: None,
+            redraw_requested: false,
+        });
+        reentrant
+            .stack
+            .run_action(
+                &mut reentrant.document,
+                &mut reentrant.text_controls,
+                &mut reentrant.handles,
+                DispatchAction::LoseFocus {
+                    target: first_guard,
+                    related_target: Some(second_guard),
+                    metadata: EventMetadata::native(),
+                },
+            )
+            .expect("stale focus action should still close composition");
+        let end = event(
+            reentrant
+                .stack
+                .advance(
+                    &mut reentrant.document,
+                    &mut reentrant.text_controls,
+                    &mut reentrant.checked_controls,
+                    &mut reentrant.handles,
+                    reentrant.redraw.as_ref(),
+                )
+                .expect("composition end should stage"),
+        );
+        assert_eq!(end.event_type, "compositionend");
+        assert_eq!(end.target, first_guard.handle);
+        complete(reentrant.resume(&end, false));
+        assert_eq!(actual_focus_node_id(&reentrant.document), Some(second));
+    }
+
+    #[test]
+    fn new_target_preedit_replay_cannot_overwrite_a_session_started_from_old_end() {
+        let mut context =
+            TestContext::new("<input id='first' value=''><input id='second' value=''>");
+        let first = context.element("first");
+        let second = context.element("second");
+        assert!(context.document.set_focus_to(first));
+        let preedit = context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "old".to_owned(),
+            None,
+        )));
+        let _ = drain_steps(&mut context, preedit);
+        context.document.clear_focus();
+        assert!(context.document.set_focus_to(second));
+
+        let old_end = event(context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "outer".to_owned(),
+            None,
+        ))));
+        assert_eq!(old_end.event_type, "compositionend");
+        let nested = context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "nested".to_owned(),
+            None,
+        )));
+        let _ = drain_steps(&mut context, nested);
+        complete(context.resume(&old_end, false));
+
+        assert_eq!(context.raw_text(first), "old");
+        assert_eq!(context.raw_text(second), "nested");
+        assert_eq!(
+            context
+                .stack
+                .active_composition
+                .as_ref()
+                .map(|active| (active.target.raw, active.data.as_str())),
+            Some((second, "nested"))
+        );
+    }
+
+    #[test]
+    fn gaining_focus_clears_a_detached_composition_before_new_target_input() {
+        let mut context =
+            TestContext::new("<input id='first' value=''><input id='second' value=''>");
+        let first = context.element("first");
+        let second = context.element("second");
+        assert!(context.document.set_focus_to(first));
+        let preedit = context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "old".to_owned(),
+            None,
+        )));
+        let _ = drain_steps(&mut context, preedit);
+        context.document.mutate().remove_node(first);
+
+        let focus = context.begin_programmatic_focus(second);
+        assert_eq!(
+            drain_steps(&mut context, focus)
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            ["compositionend", "focus", "focusin"]
+        );
+        assert!(context.stack.active_composition.is_none());
+
+        let new_preedit = context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "new".to_owned(),
+            None,
+        )));
+        assert_eq!(
+            drain_steps(&mut context, new_preedit)
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "compositionstart",
+                "compositionupdate",
+                "beforeinput",
+                "input"
+            ]
+        );
+        assert_eq!(context.raw_text(second), "new");
+    }
+
+    #[test]
+    fn composition_end_uses_locked_live_target_after_editability_changes() {
+        let mut context = TestContext::new("<input id='editor' value=''>");
+        let input = context.element("editor");
+        assert!(context.document.set_focus_to(input));
+        let preedit = context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "active".to_owned(),
+            None,
+        )));
+        let _ = drain_steps(&mut context, preedit);
+
+        let update = event(context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "blocked".to_owned(),
+            None,
+        ))));
+        context.document.mutate().set_attribute(
+            input,
+            QualName {
+                prefix: None,
+                ns: ns!(),
+                local: local_name!("readonly"),
+            },
+            "",
+        );
+        let end = event(context.resume(&update, false));
+        assert_eq!(end.event_type, "compositionend");
+        assert_eq!(end.target, update.target);
+        assert_eq!(
+            end.payload.as_deref(),
+            Some(&DispatchEventPayload::Composition {
+                data: "active".to_owned(),
+            })
+        );
+        complete(context.resume(&end, false));
+        assert_eq!(context.raw_text(input), "active");
+    }
+
+    #[test]
+    fn matching_commit_ends_without_duplicate_input_and_end_reentrancy_survives() {
+        let mut context = TestContext::new("<input id='editor' value=''>");
+        let input = context.element("editor");
+        assert!(context.document.set_focus_to(input));
+        let preedit = context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "same".to_owned(),
+            None,
+        )));
+        let _ = drain_steps(&mut context, preedit);
+
+        let end = event(context.begin(DispatchRequest::ImeCommit("same".to_owned())));
+        assert_eq!(end.event_type, "compositionend");
+        let nested_start = event(context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+            "new".to_owned(),
+            None,
+        ))));
+        assert_eq!(nested_start.event_type, "compositionstart");
+        let nested_events = drain_steps(&mut context, DispatchStep::Event(nested_start));
+        assert_eq!(
+            nested_events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "compositionstart",
+                "compositionupdate",
+                "beforeinput",
+                "input"
+            ]
+        );
+        complete(context.resume(&end, false));
+
+        let nested_end = event(context.begin(DispatchRequest::ImeCommit("new".to_owned())));
+        assert_eq!(nested_end.event_type, "compositionend");
+        let (_, redraw_requested) = complete(context.resume(&nested_end, false));
+        assert!(redraw_requested);
+    }
+
+    #[test]
+    fn terminal_commit_defers_nested_preedit_until_after_compositionend() {
+        for pending_event_index in 0..3 {
+            let mut context = TestContext::new("<input id='editor' value=''>");
+            let input = context.element("editor");
+            assert!(context.document.set_focus_to(input));
+            let preedit = context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+                "old".to_owned(),
+                None,
+            )));
+            let _ = drain_steps(&mut context, preedit);
+
+            let mut pending =
+                event(context.begin(DispatchRequest::ImeCommit("terminal".to_owned())));
+            for _ in 0..pending_event_index {
+                pending = event(context.resume(&pending, false));
+            }
+            assert_eq!(
+                pending.event_type,
+                ["compositionupdate", "beforeinput", "input"][pending_event_index]
+            );
+            complete(context.begin(DispatchRequest::Ime(BlitzImeEvent::Preedit(
+                "next".to_owned(),
+                None,
+            ))));
+
+            let after_pending = context.resume(&pending, false);
+            let events = drain_steps(&mut context, after_pending);
+            let types = events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>();
+            let end = types
+                .iter()
+                .position(|event_type| *event_type == "compositionend")
+                .expect("the native terminal commit must dispatch compositionend");
+            let next_start = types
+                .iter()
+                .position(|event_type| *event_type == "compositionstart")
+                .expect("the nested preedit must begin the following session");
+            assert!(end < next_start, "{types:?}");
+            assert_eq!(
+                context
+                    .stack
+                    .active_composition
+                    .as_ref()
+                    .map(|active| active.data.as_str()),
+                Some("next")
+            );
+        }
     }
 
     #[test]
