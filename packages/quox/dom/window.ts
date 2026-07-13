@@ -401,26 +401,30 @@ export class QuoxWindow extends QuoxEventTarget implements Disposable {
       this.document.flushPendingScrollEvents();
       if (!this.#stopped && !this.#disposed && !this.#rendererFreed) {
         this.document.syncNativeTitle();
+        this.document.refreshStationaryPointer();
 
-        // Render the retained Blitz document via WebGPU in WASM.
-        const rgba = fitRgbaToFramebuffer(
-          await this.#renderer.render(),
-          renderWidth,
-          renderHeight,
-          framebuffer.width,
-          framebuffer.height,
-        );
-
-        if (
-          !this.#stopped && !this.#disposed && this.#framebuffer.drawable && this.#framebuffer.isCurrent(framebuffer)
-        ) {
-          // Blit RGBA buffer to the window (conversion to native pixel format is handled by winding).
-          this.#win.blit(
-            rgba,
+        // A boundary listener may synchronously stop or dispose the window.
+        if (!this.#stopped && !this.#disposed && !this.#rendererFreed) {
+          // Render the retained Blitz document via WebGPU in WASM.
+          const rgba = fitRgbaToFramebuffer(
+            await this.#renderer.render(),
+            renderWidth,
+            renderHeight,
             framebuffer.width,
             framebuffer.height,
-            renderFrameToken,
           );
+
+          if (
+            !this.#stopped && !this.#disposed && this.#framebuffer.drawable && this.#framebuffer.isCurrent(framebuffer)
+          ) {
+            // Blit RGBA buffer to the window (conversion to native pixel format is handled by winding).
+            this.#win.blit(
+              rgba,
+              framebuffer.width,
+              framebuffer.height,
+              renderFrameToken,
+            );
+          }
         }
       }
     } catch (error) {

@@ -64,9 +64,18 @@ pub(crate) struct DispatchStack {
     ignored_mouse_ups: MouseEventButtons,
     click_sequence: Option<ClickSequence>,
     space_activation_press: Option<SpaceActivationPress>,
+    // The last authoritative in-viewport mouse record is retained independently from the
+    // movement baseline so layout-driven boundary refreshes never manufacture movement.
+    stationary_pointer: Option<StationaryPointerSnapshot>,
     // UI Events defines the movement baseline at Window scope and only advances it for native
     // mouse moves, so button, wheel, and generated boundary records cannot disturb the delta.
     last_mouse_move: Option<NativePointerCoordinates>,
+}
+
+#[derive(Clone)]
+struct StationaryPointerSnapshot {
+    event: BlitzPointerEvent,
+    metadata: EventMetadata,
 }
 
 #[derive(Clone, Copy)]
@@ -699,6 +708,10 @@ struct PendingEvent {
 
 enum DispatchRequest {
     Empty,
+    StationaryPointerRefresh {
+        event: BlitzPointerEvent,
+        metadata: EventMetadata,
+    },
     Pointer {
         event: BlitzPointerEvent,
         flavor: PointerFlavor,
@@ -895,6 +908,38 @@ impl<'a> ResolvedInputLayout<'a> {
             }
         } else {
             DispatchRequest::Empty
+        }
+    }
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "Blitz stores rebased page coordinates as f32 while native metadata remains f64"
+    )]
+    fn stationary_pointer_request(
+        self,
+        mut snapshot: StationaryPointerSnapshot,
+    ) -> DispatchRequest {
+        let scroll = self.document.viewport_scroll();
+        let client_x = snapshot.event.coords.client_x;
+        let client_y = snapshot.event.coords.client_y;
+        snapshot.event.coords = super::pointer_coords(
+            client_x,
+            client_y,
+            (f64::from(client_x) + scroll.x) as f32,
+            (f64::from(client_y) + scroll.y) as f32,
+        );
+        snapshot.metadata.time_stamp = event_time_stamp();
+        if let Some(pointer) = &mut snapshot.metadata.pointer {
+            pointer.coords.page_x = pointer.coords.client_x + scroll.x;
+            pointer.coords.page_y = pointer.coords.client_y + scroll.y;
+            pointer.coords.offset_x = 0.0;
+            pointer.coords.offset_y = 0.0;
+            pointer.movement_x = 0.0;
+            pointer.movement_y = 0.0;
+        }
+        DispatchRequest::StationaryPointerRefresh {
+            event: snapshot.event,
+            metadata: snapshot.metadata,
         }
     }
 
@@ -1176,6 +1221,7 @@ impl Default for DispatchStack {
             ignored_mouse_ups: MouseEventButtons::None,
             click_sequence: None,
             space_activation_press: None,
+            stationary_pointer: None,
             last_mouse_move: None,
         }
     }
@@ -1514,6 +1560,7 @@ impl DispatchStack {
                 canceled_buttons,
                 metadata,
             } => {
+                self.stationary_pointer = None;
                 self.plan_pointer_cancel(document, handles, &event, canceled_buttons, &metadata)?;
                 return Ok(());
             }
@@ -1537,11 +1584,18 @@ impl DispatchStack {
 
         match request {
             DispatchRequest::Empty => {}
+            DispatchRequest::StationaryPointerRefresh { event, metadata } => {
+                let _ = plan_hover_transitions(document, handles, planned, &event, &metadata)?;
+            }
             DispatchRequest::Pointer {
                 event,
                 flavor,
                 mut metadata,
             } => {
+                self.stationary_pointer = Some(StationaryPointerSnapshot {
+                    event: event.clone(),
+                    metadata: metadata.clone(),
+                });
                 end_wheel_transaction_for_pointer_down(wheel_transaction, flavor);
                 if event.is_mouse()
                     && matches!(flavor, PointerFlavor::Move)
@@ -1563,6 +1617,7 @@ impl DispatchStack {
                 flavor,
                 metadata,
             } => {
+                self.stationary_pointer = None;
                 // Native backends retain an ordinary mouse stream while a button is held. The
                 // pointer may therefore leave the viewport before its move/release records. Keep
                 // the stream bookkeeping authoritative without inventing an outside DOM target.
@@ -1589,9 +1644,14 @@ impl DispatchStack {
                 metadata,
             } => match boundary {
                 NativePointerBoundary::Enter => {
+                    self.stationary_pointer = Some(StationaryPointerSnapshot {
+                        event: event.clone(),
+                        metadata: metadata.clone(),
+                    });
                     let _ = plan_hover_transitions(document, handles, planned, &event, &metadata)?;
                 }
                 NativePointerBoundary::Leave => {
+                    self.stationary_pointer = None;
                     let previous = document.get_hover_node_id();
                     // Match browser boundary state during listeners and avoid a delayed clear
                     // wiping hover established by synchronously nested native input.
@@ -1610,6 +1670,26 @@ impl DispatchStack {
                 metadata,
                 occurrence_target,
             } => {
+                if let Some(wheel) = metadata.wheel {
+                    self.stationary_pointer = Some(StationaryPointerSnapshot {
+                        event: BlitzPointerEvent {
+                            id: BlitzPointerId::Mouse,
+                            is_primary: true,
+                            coords: event.coords,
+                            button: MouseEventButton::Main,
+                            buttons: event.buttons,
+                            mods: event.mods,
+                            details: PointerDetails::default(),
+                            element: ElementPoint::default(),
+                        },
+                        metadata: EventMetadata::pointer_metadata(
+                            metadata.time_stamp,
+                            wheel.coords,
+                            0,
+                            wheel.modifier_bits,
+                        ),
+                    });
+                }
                 plan_wheel(
                     document,
                     handles,
@@ -5240,6 +5320,18 @@ fn begin_pointer_boundary_request(
 
 #[wasm_bindgen]
 impl QuoxRenderer {
+    /// Resolve pending layout and emit browser boundary events for a mouse which has not moved.
+    pub fn begin_stationary_pointer_refresh(&self) -> Result<JsValue, JsValue> {
+        let mut state = self.state.borrow_mut();
+        let snapshot = state.dispatch_stack.stationary_pointer.clone();
+        let request = snapshot.map_or(DispatchRequest::Empty, |snapshot| {
+            resolve_input_layout(&mut state).stationary_pointer_request(snapshot)
+        });
+        state.refresh_ime_cursor_area();
+        let step = begin_request(&mut state, request);
+        finish_step(&mut state, step)
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "the flat WASM ABI carries browser event fields without allocating an input object"
@@ -6121,6 +6213,25 @@ mod tests {
                 buttons: MouseEventButtons::None,
                 modifier_bits: 0,
                 time_stamp,
+            });
+            self.begin(request)
+        }
+
+        fn begin_stationary_pointer_refresh(&mut self) -> DispatchStep {
+            let snapshot = self.stack.stationary_pointer.clone();
+            let request = snapshot.map_or(DispatchRequest::Empty, |snapshot| {
+                ResolvedInputLayout::new(
+                    &mut self.document,
+                    &mut self.text_controls,
+                    &mut self.checked_controls,
+                    &mut self.handles,
+                    800,
+                    600,
+                    800,
+                    600,
+                    1.0,
+                )
+                .stationary_pointer_request(snapshot)
             });
             self.begin(request)
         }
@@ -9409,6 +9520,130 @@ mod tests {
         assert_eq!(context.handles.resolve(next.target), Some(right));
         let resumed = context.resume(&next, true);
         let _ = drain(&mut context, resumed);
+    }
+
+    #[test]
+    fn stationary_pointer_refresh_emits_layout_boundaries_without_moving_the_baseline() {
+        let mut context = TestContext::new(
+            "<div id='b' style='position:absolute;left:0;top:0;width:100px;height:40px'></div>\
+             <div id='a' style='position:absolute;left:0;top:0;width:100px;height:40px'></div>",
+        );
+        let a = context.element("a");
+        let b = context.element("b");
+        let point = context
+            .point_hitting(a)
+            .expect("the front element should be hittable");
+
+        let first = context.begin_trusted_pointer(
+            point.0,
+            point.1,
+            MouseEventButton::Main,
+            MouseEventButtons::None,
+            PointerFlavor::Move,
+        );
+        let _ = drain(&mut context, first);
+        assert_eq!(context.document.get_hover_node_id(), Some(a));
+        let baseline = context.stack.last_mouse_move;
+        assert!(context.stack.stationary_pointer.is_some());
+
+        context.set_style(
+            a,
+            "position:absolute;left:200px;top:0;width:100px;height:40px",
+        );
+        let refresh = context.begin_stationary_pointer_refresh();
+        let boundaries = drain_steps(&mut context, refresh);
+        let types = boundaries
+            .iter()
+            .map(|step| step.event_type.as_str())
+            .collect::<Vec<_>>();
+        assert!(types.contains(&"pointerout"));
+        assert!(types.contains(&"pointerleave"));
+        assert!(types.contains(&"pointerover"));
+        assert!(types.contains(&"pointerenter"));
+        assert!(types.contains(&"mouseout"));
+        assert!(types.contains(&"mouseover"));
+        assert!(!types.contains(&"pointermove"));
+        assert!(!types.contains(&"mousemove"));
+        assert_eq!(context.document.get_hover_node_id(), Some(b));
+        assert_eq!(context.stack.last_mouse_move, baseline);
+
+        let moved = context.begin_trusted_pointer(
+            point.0 + 5.0,
+            point.1,
+            MouseEventButton::Main,
+            MouseEventButtons::None,
+            PointerFlavor::Move,
+        );
+        let pointer_move = next_event_of_type(&mut context, moved, "pointermove");
+        let Some(DispatchEventPayload::Pointer(payload)) = pointer_move.payload.as_deref() else {
+            panic!("pointermove should carry a pointer payload");
+        };
+        assert_eq!(
+            (payload.mouse.movement_x, payload.mouse.movement_y),
+            (5.0, 0.0)
+        );
+        let resumed = context.resume(&pointer_move, false);
+        let _ = drain(&mut context, resumed);
+    }
+
+    #[test]
+    fn native_pointer_presence_records_update_and_clear_the_stationary_snapshot() {
+        let mut context = TestContext::new(
+            "<div id='target' style='display:block;width:100px;height:40px'></div>",
+        );
+        let target = context.element("target");
+        let point = context.center(target);
+
+        let moved = context.begin_trusted_pointer(
+            point.0,
+            point.1,
+            MouseEventButton::Main,
+            MouseEventButtons::None,
+            PointerFlavor::Move,
+        );
+        let _ = drain(&mut context, moved);
+        assert!(context.stack.stationary_pointer.is_some());
+
+        let left = context.begin_trusted_boundary(
+            point.0,
+            point.1,
+            MouseEventButtons::None,
+            0,
+            2.0,
+            None,
+            NativePointerBoundary::Leave,
+        );
+        let _ = drain(&mut context, left);
+        assert!(context.stack.stationary_pointer.is_none());
+
+        let entered = context.begin_trusted_boundary(
+            point.0,
+            point.1,
+            MouseEventButtons::None,
+            0,
+            3.0,
+            None,
+            NativePointerBoundary::Enter,
+        );
+        let _ = drain(&mut context, entered);
+        assert!(context.stack.stationary_pointer.is_some());
+
+        let canceled = context.begin(pointer_cancel_request_at(
+            point.0,
+            point.1,
+            MouseEventButtons::Primary,
+            EventMetadata::pointer(
+                4.0,
+                native_pointer_coordinates(f64::from(point.0), f64::from(point.1), None, 0.0, 0.0),
+                0,
+            ),
+        ));
+        complete(canceled);
+        assert!(context.stack.stationary_pointer.is_none());
+
+        let wheel = context.begin_trusted_wheel(point.0, point.1);
+        let _ = drain(&mut context, wheel);
+        assert!(context.stack.stationary_pointer.is_some());
     }
 
     #[test]

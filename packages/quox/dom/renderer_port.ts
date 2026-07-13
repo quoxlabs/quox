@@ -185,6 +185,7 @@ export class DomDispatchInitialStepError extends Error {
  * interface once at the boundary. Return values deliberately remain `unknown` until validated.
  */
 export interface DomDispatchRendererSource {
+  begin_stationary_pointer_refresh(): unknown;
   begin_pointer_move(
     x: number,
     y: number,
@@ -935,6 +936,10 @@ export class DomDispatchRendererPort {
       if (frameId === undefined) throw error;
       throw new DomDispatchInitialStepError(frameId, error);
     }
+  }
+
+  beginStationaryPointerRefresh(): DomDispatchStep {
+    return this.#validateInitial(this.#renderer.begin_stationary_pointer_refresh());
   }
 
   beginPointerMove(

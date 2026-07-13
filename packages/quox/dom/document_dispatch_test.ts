@@ -244,6 +244,10 @@ class FakeDispatchRenderer {
     return this.#begin("begin_pointer_move", args);
   }
 
+  begin_stationary_pointer_refresh(...args: unknown[]): unknown {
+    return this.#begin("begin_stationary_pointer_refresh", args);
+  }
+
   begin_pointer_cancel(...args: unknown[]): unknown {
     return this.#begin("begin_pointer_cancel", args);
   }
@@ -385,6 +389,54 @@ function createHarness(onDispatchIdle: () => void = () => undefined): {
   );
   return { document, renderer, window, renders, syncs };
 }
+
+Deno.test("stationary pointer refresh pumps boundary listeners without scheduling itself forever", () => {
+  const { document, renderer, renders, syncs } = createHarness();
+  const oldTarget = document.createElement("div");
+  const newTarget = document.createElement("button");
+  const calls: string[] = [];
+
+  oldTarget.addEventListener("pointerout", () => {
+    calls.push("out");
+    newTarget.innerHTML = "listener mutation";
+  });
+  newTarget.addEventListener("pointerover", () => calls.push("over"));
+  renderer.queueFrame([
+    {
+      type: "pointerout",
+      target: oldTarget.nodeId,
+      path: [oldTarget.nodeId],
+      payload: pointerPayload({ relatedTarget: newTarget.nodeId }),
+    },
+    {
+      type: "pointerover",
+      target: newTarget.nodeId,
+      path: [newTarget.nodeId],
+      payload: pointerPayload({ relatedTarget: oldTarget.nodeId }),
+    },
+  ], true);
+
+  document.refreshStationaryPointer();
+  assertEquals(calls, ["out", "over"]);
+  assertEquals(
+    renderer.calls.filter(([method]) => method === "begin_stationary_pointer_refresh").length,
+    1,
+  );
+  // The listener mutation schedules a follow-up layout refresh. The renderer's own hover redraw
+  // is consumed by the render already in progress and does not add a second request.
+  assertEquals(renders, ["render"]);
+  assertEquals(syncs, ["sync"]);
+
+  // The next pre-render refresh has no transition and requests no redraw. In particular, the
+  // refresh completion does not recursively begin another frame.
+  document.refreshStationaryPointer();
+  assertEquals(
+    renderer.calls.filter(([method]) => method === "begin_stationary_pointer_refresh").length,
+    2,
+  );
+  assertEquals(renders, ["render"]);
+  assertEquals(syncs, ["sync", "sync"]);
+});
 
 Deno.test("element focus and blur pump browser focus events through staged dispatch", () => {
   const { document, renderer, renders, syncs } = createHarness();

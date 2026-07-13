@@ -437,6 +437,10 @@ class FakeRenderer implements DomDispatchRendererSource {
     return this.nextStep;
   }
 
+  begin_stationary_pointer_refresh(): unknown {
+    return this.#call("begin_stationary_pointer_refresh");
+  }
+
   begin_pointer_move(
     x: number,
     y: number,
@@ -673,6 +677,7 @@ Deno.test("renderer port forwards every staged entry point and validates its res
   const renderer = new FakeRenderer();
   const port = new DomDispatchRendererPort(renderer);
 
+  port.beginStationaryPointerRefresh();
   port.beginPointerMove(1, 2, true, 101.5, 202.25, 3, 4, 12.5);
   port.beginPointerCancel(1, 2, true, 101.5, 202.25, 5, 4, 12.55);
   port.beginPointerEnter(1, 2, true, 101.5, 202.25, 3, 4, 12.625);
@@ -691,6 +696,7 @@ Deno.test("renderer port forwards every staged entry point and validates its res
   port.beginImeDeleteSurrounding(2, 3);
 
   assertEquals(renderer.calls, [
+    ["begin_stationary_pointer_refresh"],
     ["begin_pointer_move", 1, 2, true, 101.5, 202.25, 3, 4, 12.5],
     ["begin_pointer_cancel", 1, 2, true, 101.5, 202.25, 5, 4, 12.55],
     ["begin_pointer_enter", 1, 2, true, 101.5, 202.25, 3, 4, 12.625],

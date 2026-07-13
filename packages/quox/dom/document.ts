@@ -300,6 +300,13 @@ export class QuoxDocument extends QuoxEventTarget {
     );
   }
 
+  /** Reconcile hover boundaries after layout changes while the native mouse is stationary. */
+  refreshStationaryPointer(): void {
+    // The render which requested this preflight already satisfies Blitz's hover redraw. Author
+    // mutations still call #requestRender normally and retain a following refresh opportunity.
+    this.#dispatchInputEvent(() => this.#dispatchPort.beginStationaryPointerRefresh(), false);
+  }
+
   /** Cancel a native pointer stream that the platform can no longer complete. */
   dispatchPointerCancel(
     x: number,
@@ -584,7 +591,7 @@ export class QuoxDocument extends QuoxEventTarget {
     }
   }
 
-  #dispatchInputEvent(begin: () => DomDispatchStep): void {
+  #dispatchInputEvent(begin: () => DomDispatchStep, scheduleCompletionRedraw = true): void {
     this.#assertActive();
     this.#dispatchDepth += 1;
     let failed = false;
@@ -593,7 +600,7 @@ export class QuoxDocument extends QuoxEventTarget {
     let idleFailure: unknown;
     try {
       runWithImeSynchronization(
-        () => this.#beginAndPumpDispatchFrame(begin),
+        () => this.#beginAndPumpDispatchFrame(begin, scheduleCompletionRedraw),
         () => this.#syncNativeImeRequests(),
       );
     } catch (error) {
@@ -620,16 +627,16 @@ export class QuoxDocument extends QuoxEventTarget {
     if (idleFailed) throw idleFailure;
   }
 
-  #beginAndPumpDispatchFrame(begin: () => DomDispatchStep): void {
+  #beginAndPumpDispatchFrame(begin: () => DomDispatchStep, scheduleCompletionRedraw: boolean): void {
     try {
-      this.#pumpDispatchFrame(begin());
+      this.#pumpDispatchFrame(begin(), scheduleCompletionRedraw);
     } catch (error) {
       if (!(error instanceof DomDispatchInitialStepError)) throw error;
       this.#abortDispatchFrame(error.frameId, error.validationError);
     }
   }
 
-  #pumpDispatchFrame(initialStep: DomDispatchStep): void {
+  #pumpDispatchFrame(initialStep: DomDispatchStep, scheduleCompletionRedraw: boolean): void {
     const frameId = initialStep.frameId;
     let step = initialStep;
 
@@ -639,7 +646,7 @@ export class QuoxDocument extends QuoxEventTarget {
       }
 
       if (step.kind === "complete") {
-        if (step.redrawRequested) this.#requestRender();
+        if (scheduleCompletionRedraw && step.redrawRequested) this.#requestRender();
         return;
       }
 
