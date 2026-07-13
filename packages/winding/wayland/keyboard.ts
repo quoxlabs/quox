@@ -105,7 +105,16 @@ export class WaylandEnterKeyBatch {
   }
 }
 
-type ProvisionalModifier = "shiftKey" | "ctrlKey" | "altKey" | "metaKey" | "capsLock" | "altGraphKey";
+type ProvisionalModifier =
+  | "shiftKey"
+  | "ctrlKey"
+  | "altKey"
+  | "metaKey"
+  | "capsLock"
+  | "altGraphKey"
+  | "fnKey"
+  | "numLock"
+  | "scrollLock";
 
 export interface WaylandResolvedKeyTransition {
   readonly key: string;
@@ -129,6 +138,9 @@ export class WaylandKeyTransitionState {
     const metaKey = this.#value("metaKey");
     const capsLock = this.#value("capsLock");
     const altGraphKey = this.#value("altGraphKey");
+    const fnKey = this.#value("fnKey");
+    const numLock = this.#value("numLock");
+    const scrollLock = this.#value("scrollLock");
     return {
       shiftKey,
       ctrlKey,
@@ -137,6 +149,9 @@ export class WaylandKeyTransitionState {
       accelKey: ctrlKey && !altGraphKey,
       capsLock,
       altGraphKey,
+      fnKey,
+      numLock,
+      scrollLock,
     };
   }
 
@@ -185,7 +200,7 @@ export class WaylandKeyTransitionState {
     if (phase === "press") {
       const initialPress = retainedModifier === undefined;
       this.#heldModifiers.set(rawKeycode, modifier);
-      if (modifier === "capsLock") {
+      if (isLockModifier(modifier)) {
         if (initialPress) this.#provisional.set(modifier, !this.#value(modifier));
       } else {
         this.#provisional.set(modifier, this.#hasHeldModifier(modifier));
@@ -194,8 +209,8 @@ export class WaylandKeyTransitionState {
     }
 
     this.#heldModifiers.delete(rawKeycode);
-    // CapsLock describes the lock, not whether its physical key remains down.
-    if (modifier !== "capsLock") {
+    // Lock modifiers describe the toggle, not whether their physical keys remain down.
+    if (!isLockModifier(modifier)) {
       this.#provisional.set(modifier, this.#hasHeldModifier(modifier));
     }
   }
@@ -226,9 +241,19 @@ function provisionalModifierForKey(key: string): ProvisionalModifier | undefined
       return "capsLock";
     case "AltGraph":
       return "altGraphKey";
+    case "Fn":
+      return "fnKey";
+    case "NumLock":
+      return "numLock";
+    case "ScrollLock":
+      return "scrollLock";
     default:
       return undefined;
   }
+}
+
+function isLockModifier(modifier: ProvisionalModifier): boolean {
+  return modifier === "capsLock" || modifier === "numLock" || modifier === "scrollLock";
 }
 
 function emptyModifiers(): KeyModifiers {
@@ -240,6 +265,9 @@ function emptyModifiers(): KeyModifiers {
     accelKey: false,
     capsLock: false,
     altGraphKey: false,
+    fnKey: false,
+    numLock: false,
+    scrollLock: false,
   };
 }
 

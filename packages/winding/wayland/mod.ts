@@ -1,4 +1,4 @@
-import type { Library, LoadLibrary, MouseButton, PointerModifiers, UIEvent } from "../types.ts";
+import type { KeyModifiers, Library, LoadLibrary, MouseButton, PointerModifiers, UIEvent } from "../types.ts";
 import { ClickCounter, DeferredNativeError, EventQueue, guardNativeCallback, NativeEventClock } from "../input/mod.ts";
 import { utf8CString as cStr } from "../text_encoding.ts";
 import { buildXdgIfaces, libdlSymbols, waylandSymbols, WlCursorShape, WlOp, WlSeatCap, xkbSymbols } from "./ffi.ts";
@@ -1282,11 +1282,7 @@ class WaylandLibrary implements Library {
     screenY: null;
     buttons: number;
     timeStamp: number;
-    shiftKey: boolean;
-    ctrlKey: boolean;
-    altKey: boolean;
-    metaKey: boolean;
-  } {
+  } & PointerModifiers {
     return {
       x: this.#pointerPosition.x,
       y: this.#pointerPosition.y,
@@ -1602,17 +1598,17 @@ class WaylandLibrary implements Library {
   }
 }
 
-function pointerModifiers(modifiers: {
-  shiftKey: boolean;
-  ctrlKey: boolean;
-  altKey: boolean;
-  metaKey: boolean;
-}): PointerModifiers {
+function pointerModifiers(modifiers: KeyModifiers): PointerModifiers {
   return {
     shiftKey: modifiers.shiftKey,
     ctrlKey: modifiers.ctrlKey,
     altKey: modifiers.altKey,
     metaKey: modifiers.metaKey,
+    capsLock: modifiers.capsLock,
+    altGraphKey: modifiers.altGraphKey,
+    fnKey: modifiers.fnKey,
+    numLock: modifiers.numLock,
+    scrollLock: modifiers.scrollLock,
   };
 }
 

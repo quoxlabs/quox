@@ -332,6 +332,9 @@ function keyEvent(overrides: Partial<KeyDownEvent> = {}): KeyDownEvent {
     accelKey: false,
     capsLock: false,
     altGraphKey: false,
+    fnKey: false,
+    numLock: false,
+    scrollLock: false,
     window: TEST_WINDOW,
     ...overrides,
   };

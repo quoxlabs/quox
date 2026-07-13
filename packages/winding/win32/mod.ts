@@ -38,6 +38,7 @@ import {
   type Win32MouseButton,
   Win32MouseCaptureState,
   Win32MouseTrackingState,
+  win32PointerModifiers,
   win32QuitExitCode,
 } from "./input.ts";
 import { Win32InputController } from "./input_controller.ts";
@@ -702,12 +703,11 @@ class Win32Library implements Library {
   }
 
   #pointerModifiers(keyState?: number): PointerModifiers {
-    return {
-      shiftKey: keyState === undefined ? this.user32.symbols.GetKeyState(0x10) < 0 : (keyState & 0x0004) !== 0,
-      ctrlKey: keyState === undefined ? this.user32.symbols.GetKeyState(0x11) < 0 : (keyState & 0x0008) !== 0,
-      altKey: this.user32.symbols.GetKeyState(0x12) < 0,
-      metaKey: this.user32.symbols.GetKeyState(0x5b) < 0 || this.user32.symbols.GetKeyState(0x5c) < 0,
-    };
+    return win32PointerModifiers(
+      keyState,
+      (virtualKey) => this.user32.symbols.GetKeyState(virtualKey),
+      () => this.input.layoutHasAltGraph(),
+    );
   }
 
   #pointerSnapshot(
@@ -1069,6 +1069,11 @@ function emptyPointerSnapshot(timeStamp: number): Win32PointerSnapshot {
     ctrlKey: false,
     altKey: false,
     metaKey: false,
+    capsLock: false,
+    altGraphKey: false,
+    fnKey: false,
+    numLock: false,
+    scrollLock: false,
   };
 }
 

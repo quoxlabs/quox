@@ -692,6 +692,7 @@ export const xkbSymbols = {
   xkb_state_key_get_utf8: { parameters: ["pointer", "u32", "pointer", "usize"], result: "i32" },
   xkb_state_key_get_one_sym: { parameters: ["pointer", "u32"], result: "u32" },
   xkb_state_mod_name_is_active: { parameters: ["pointer", "buffer", "i32"], result: "i32" },
+  xkb_state_led_name_is_active: { parameters: ["pointer", "buffer"], result: "i32" },
   xkb_compose_table_new_from_locale: {
     parameters: ["pointer", "buffer", "i32"],
     result: "pointer",

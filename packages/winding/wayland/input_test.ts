@@ -1915,6 +1915,37 @@ Deno.test("CapsLock toggles on keydown only and AltGraph disables the accelerato
   assertEquals(transition.accelKey, false);
 });
 
+Deno.test("Fn and lock modifiers remain current between Wayland modifier snapshots", () => {
+  const state = new WaylandKeyTransitionState();
+  state.confirmModifiers(keyModifiers());
+
+  assertEquals(state.resolve(70, "press", "NumLock").modifiers.numLock, true);
+  assertEquals(state.resolve(70, "release", "NumLock").modifiers.numLock, true);
+  assertEquals(state.resolve(71, "press", "ScrollLock").modifiers.scrollLock, true);
+  assertEquals(state.resolve(72, "press", "Fn").modifiers.fnKey, true);
+  assertEquals(state.resolve(72, "release", "Fn").modifiers.fnKey, false);
+
+  state.confirmModifiers(keyModifiers({ numLock: true, scrollLock: true }));
+  assertEquals(state.modifiers.numLock, true);
+  assertEquals(state.modifiers.scrollLock, true);
+});
+
+Deno.test("XF86 Fn translation updates provisional Wayland modifier state", () => {
+  const translated = translateWlKeyboardKey(
+    464,
+    "press",
+    translatorFor({ keysym: 0x100811d0, keyText: "", text: "" }),
+  );
+  const state = new WaylandKeyTransitionState();
+  state.confirmModifiers(keyModifiers());
+  const pressed = state.resolve(translated.rawKeycode, "press", translated.key);
+
+  assertEquals(translated.key, "Fn");
+  assertEquals(pressed.key, "Fn");
+  assertEquals(pressed.modifiers.fnKey, true);
+  assertEquals(state.resolve(translated.rawKeycode, "release", translated.key).modifiers.fnKey, false);
+});
+
 Deno.test("Wayland pointer capability transitions are symmetric", () => {
   assertEquals(pointerCapabilityAction(true, false), "acquire");
   assertEquals(pointerCapabilityAction(false, true), "release");
@@ -2296,6 +2327,9 @@ Deno.test("Wayland edit ownership leaves delivered shortcuts to key defaults", (
     accelKey: false,
     capsLock: false,
     altGraphKey: false,
+    fnKey: false,
+    numLock: false,
+    scrollLock: false,
   };
   assertEquals(waylandKeyEditDisposition("a", "a", false, plain), "text-input");
   assertEquals(waylandKeyEditDisposition("ArrowLeft", undefined, false, plain), "key-default");
@@ -2728,6 +2762,9 @@ function keyModifiers(overrides: Partial<KeyModifiers> = {}): KeyModifiers {
     accelKey: ctrlKey && !altGraphKey,
     capsLock: false,
     altGraphKey,
+    fnKey: false,
+    numLock: false,
+    scrollLock: false,
     ...overrides,
   };
 }

@@ -96,6 +96,9 @@ Deno.test("X11 shortcut modifiers do not turn lookup text into edits", () => {
     accelKey: false,
     capsLock: false,
     altGraphKey: false,
+    fnKey: false,
+    numLock: false,
+    scrollLock: false,
   };
   assertEquals(x11CommittedText("a", plain, false, false, false), "a");
   assertEquals(x11CommittedText("a", { ...plain, altKey: true }, false, false, false), undefined);
@@ -247,13 +250,21 @@ Deno.test("X11 modifier snapshots apply the reported transition", () => {
     metaMask: 64,
     capsLockMask: 2,
     altGraphMask: 128,
-    maskByKeycode: new Map([[50, 1], [66, 2]]),
-    toggleKeycodes: new Set([66]),
+    fnMask: 16,
+    numLockMask: 32,
+    scrollLockMask: 64,
+    maskByKeycode: new Map([[50, 1], [66, 2], [77, 32], [78, 64], [79, 16]]),
+    toggleKeycodes: new Set([66, 77, 78]),
   };
   assertEquals(x11ModifierSnapshot(0, 50, true, mapping).shiftKey, true);
   assertEquals(x11ModifierSnapshot(1, 50, false, mapping).shiftKey, false);
   assertEquals(x11ModifierSnapshot(0, 66, true, mapping).capsLock, true);
   assertEquals(x11ModifierSnapshot(2, 66, false, mapping).capsLock, true);
+  assertEquals(x11ModifierSnapshot(0, 77, true, mapping).numLock, true);
+  assertEquals(x11ModifierSnapshot(32, 77, false, mapping).numLock, true);
+  assertEquals(x11ModifierSnapshot(0, 78, true, mapping).scrollLock, true);
+  assertEquals(x11ModifierSnapshot(0, 79, true, mapping).fnKey, true);
+  assertEquals(x11ModifierSnapshot(16, 79, false, mapping).fnKey, false);
 });
 
 Deno.test("X11 pointer snapshots retain extended-button chords", () => {

@@ -67,6 +67,8 @@ const APPLICATION_X_EVENT_MASKS = BigInt(
 const X_SHIFT_MASK = 1 << 0;
 const X_CONTROL_MASK = 1 << 2;
 const XK_CAPS_LOCK = 0xffe5n;
+const XK_SCROLL_LOCK = 0xff14n;
+const XK_NUM_LOCK = 0xff7fn;
 const XK_ALT_L = 0xffe9n;
 const XK_ALT_R = 0xffean;
 const XK_META_L = 0xffe7n;
@@ -76,6 +78,7 @@ const XK_SUPER_R = 0xffecn;
 const XK_MODE_SWITCH = 0xff7en;
 const XK_ISO_LEVEL3_SHIFT = 0xfe03n;
 const XK_ISO_LEVEL5_SHIFT = 0xfe11n;
+const XF86XK_FN = 0x100811d0n;
 const XKB_USE_CORE_KBD = 0x0100;
 const XKB_KEY_NAMES_MASK = 1 << 9;
 const XKB_ALL_COMPONENTS_MASK = 0x7f;
@@ -430,6 +433,9 @@ class X11Library implements Library {
     metaMask: 0,
     capsLockMask: 0,
     altGraphMask: 0,
+    fnMask: 0,
+    numLockMask: 0,
+    scrollLockMask: 0,
     maskByKeycode: new Map(),
     toggleKeycodes: new Set(),
   };
@@ -922,6 +928,9 @@ class X11Library implements Library {
       let metaMask = 0;
       let capsLockMask = 0;
       let altGraphMask = 0;
+      let fnMask = 0;
+      let numLockMask = 0;
+      let scrollLockMask = 0;
       const maskByKeycode = new Map<number, number>();
       const toggleKeycodes = new Set<number>();
       for (let modifier = 0; modifier < 8; modifier++) {
@@ -941,6 +950,15 @@ class X11Library implements Library {
               capsLockMask |= mask;
               toggleKeycodes.add(keycode);
             }
+            if (keysym === XK_NUM_LOCK) {
+              numLockMask |= mask;
+              toggleKeycodes.add(keycode);
+            }
+            if (keysym === XK_SCROLL_LOCK) {
+              scrollLockMask |= mask;
+              toggleKeycodes.add(keycode);
+            }
+            if (keysym === XF86XK_FN) fnMask |= mask;
             if (
               keysym === XK_MODE_SWITCH || keysym === XK_ISO_LEVEL3_SHIFT ||
               keysym === XK_ISO_LEVEL5_SHIFT
@@ -955,6 +973,9 @@ class X11Library implements Library {
         metaMask,
         capsLockMask,
         altGraphMask,
+        fnMask,
+        numLockMask,
+        scrollLockMask,
         maskByKeycode,
         toggleKeycodes,
       };
@@ -1148,11 +1169,7 @@ function x11PointerSnapshot(
   screenY: number | null;
   buttons: number;
   timeStamp: number;
-  shiftKey: boolean;
-  ctrlKey: boolean;
-  altKey: boolean;
-  metaKey: boolean;
-} {
+} & PointerModifiers {
   const state = view.getUint32(stateOffset, true);
   const buttons = buttonState.snapshot(state, changedButton, pressed);
   return {
@@ -1188,6 +1205,11 @@ function pointerModifiers(modifiers: ReturnType<typeof x11ModifierSnapshot>): Po
     ctrlKey: modifiers.ctrlKey,
     altKey: modifiers.altKey,
     metaKey: modifiers.metaKey,
+    capsLock: modifiers.capsLock,
+    altGraphKey: modifiers.altGraphKey,
+    fnKey: modifiers.fnKey,
+    numLock: modifiers.numLock,
+    scrollLock: modifiers.scrollLock,
   };
 }
 

@@ -317,7 +317,11 @@ function primaryScreenFrame(ffi: DarwinFfi): ScreenFrame {
 
 function getModifiers(event: Deno.PointerValue, ffi: DarwinFfi): KeyModifiers {
   const { sel, send } = ffi;
-  const flags = send.u64(event, sel("modifierFlags"));
+  return darwinModifierSnapshot(send.u64(event, sel("modifierFlags")));
+}
+
+/** Convert an AppKit modifierFlags value to Winding's browser-style snapshot. */
+export function darwinModifierSnapshot(flags: bigint): KeyModifiers {
   const metaKey = (flags & NS_EVENT_MODIFIER_FLAG_COMMAND) !== 0n;
   return {
     shiftKey: (flags & NS_EVENT_MODIFIER_FLAG_SHIFT) !== 0n,
@@ -327,6 +331,10 @@ function getModifiers(event: Deno.PointerValue, ffi: DarwinFfi): KeyModifiers {
     accelKey: metaKey,
     capsLock: (flags & NS_EVENT_MODIFIER_FLAG_CAPS_LOCK) !== 0n,
     altGraphKey: false,
+    fnKey: (flags & NS_EVENT_MODIFIER_FLAG_FUNCTION) !== 0n,
+    // AppKit's event modifier flags do not expose the other lock LEDs.
+    numLock: false,
+    scrollLock: false,
   };
 }
 
@@ -1565,11 +1573,7 @@ function pointerSnapshot(
   screenY: number;
   buttons: number;
   timeStamp: number;
-  shiftKey: boolean;
-  ctrlKey: boolean;
-  altKey: boolean;
-  metaKey: boolean;
-} {
+} & PointerModifiers {
   const { getClass, sel, send } = window.lib.ffi;
   const windowPoint = send.point(event, sel("locationInWindow")) as Uint8Array;
   const nativeScreenPoint = send.point_point(
@@ -1611,6 +1615,11 @@ function pointerModifiers(modifiers: KeyModifiers): PointerModifiers {
     ctrlKey: modifiers.ctrlKey,
     altKey: modifiers.altKey,
     metaKey: modifiers.metaKey,
+    capsLock: modifiers.capsLock,
+    altGraphKey: modifiers.altGraphKey,
+    fnKey: modifiers.fnKey,
+    numLock: modifiers.numLock,
+    scrollLock: modifiers.scrollLock,
   };
 }
 

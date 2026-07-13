@@ -21,19 +21,37 @@ export {
 } from "./ime_requests.ts";
 
 type WithoutWindow<Event> = Event extends { window: unknown } ? Omit<Event, "window"> : never;
+type WithoutWindowOr<Event, Field extends PropertyKey> = Event extends { window: unknown }
+  ? Omit<Event, "window" | Field>
+  : never;
 
-export type QuoxKeyboardEvent = WithoutWindow<WindingKeyEvent>;
+// Winding transports these browser-visible states now, while Quox projects
+// them in a follow-up ABI change. Keep the intermediate event shape explicit
+// rather than making unrelated adapters manufacture false values.
+type DeferredKeyModifier = "fnKey" | "numLock" | "scrollLock";
+type DeferredPointerModifier = "capsLock" | "altGraphKey" | DeferredKeyModifier;
+type DirectPointerModifiers = Pick<
+  WindingPointerModifiers,
+  "shiftKey" | "ctrlKey" | "altKey" | "metaKey"
+>;
+
+export type QuoxKeyboardEvent = WithoutWindowOr<WindingKeyEvent, DeferredKeyModifier>;
 export type QuoxImeEvent = WithoutWindow<WindingImeEvent>;
 export type QuoxAppleStandardKeybindingEvent = WithoutWindow<WindingAppleStandardKeybindingEvent>;
 
-export type QuoxMouseMoveEvent = WithoutWindow<WindingMoveEvent>;
-export type QuoxMouseButtonEvent = Omit<WithoutWindow<WindingButtonEvent>, "button"> & {
-  button: number;
-};
-export type QuoxMouseWheelEvent = WithoutWindow<WindingWheelEvent>;
+export type QuoxMouseMoveEvent = WithoutWindowOr<WindingMoveEvent, DeferredPointerModifier>;
+export type QuoxMouseButtonEvent =
+  & Omit<
+    WithoutWindowOr<WindingButtonEvent, DeferredPointerModifier>,
+    "button"
+  >
+  & {
+    button: number;
+  };
+export type QuoxMouseWheelEvent = WithoutWindowOr<WindingWheelEvent, DeferredPointerModifier>;
 export type QuoxResizeEvent = WithoutWindow<WindingResizeEvent>;
 export type QuoxCloseEvent = { type: "close" };
-export type QuoxMouseEnterLeaveEvent = WithoutWindow<WindingEnterLeaveEvent>;
+export type QuoxMouseEnterLeaveEvent = WithoutWindowOr<WindingEnterLeaveEvent, DeferredPointerModifier>;
 export type QuoxFocusChangeEvent = { type: "focus" | "blur" };
 export type QuoxVisibilityEvent = { type: "visibilitychange"; visible: boolean };
 
@@ -222,7 +240,7 @@ const BUTTON_INDEX: Record<WindingButtonEvent["button"], number> = {
 };
 
 function pointerFields(
-  event: WindingPointerModifiers & {
+  event: DirectPointerModifiers & {
     x: number;
     y: number;
     screenX: number | null;
@@ -245,7 +263,7 @@ function pointerFields(
   };
 }
 
-export function encodePointerModifiers(event: WindingPointerModifiers): number {
+export function encodePointerModifiers(event: DirectPointerModifiers): number {
   let bits = 0;
   if (event.shiftKey) bits |= PointerModifierMask.Shift;
   if (event.ctrlKey) bits |= PointerModifierMask.Control;

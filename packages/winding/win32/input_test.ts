@@ -35,6 +35,7 @@ import {
   Win32MessageQueueGate,
   Win32MouseCaptureState,
   Win32MouseTrackingState,
+  win32PointerModifiers,
   win32ProbeLevelShowsAltGraph,
   win32QuitExitCode,
   WmCharDecoder,
@@ -1637,6 +1638,9 @@ Deno.test("injected ToUnicode translation follows the active layout and uses the
       accelKey: false,
       capsLock: false,
       altGraphKey: false,
+      fnKey: false,
+      numLock: false,
+      scrollLock: false,
     },
   });
 });
@@ -1678,6 +1682,57 @@ Deno.test("ordinary Ctrl shortcuts translate without Ctrl while retaining event 
   assertEquals(translated.modifiers.ctrlKey, true);
   assertEquals(translated.modifiers.accelKey, true);
   assertEquals(translated.modifiers.altGraphKey, false);
+});
+
+Deno.test("keyboard modifier snapshots expose Win32 lock toggles", () => {
+  const modifiers = keyboardModifiers(keyboardState([
+    [VK.CAPITAL, 0x01],
+    [VK.NUMLOCK, 0x01],
+    [VK.SCROLL, 0x01],
+  ]));
+  assertEquals(modifiers.capsLock, true);
+  assertEquals(modifiers.numLock, true);
+  assertEquals(modifiers.scrollLock, true);
+  assertEquals(modifiers.fnKey, false);
+});
+
+Deno.test("Win32 pointer AltGraph requires Control, right Alt, and an AltGraph layout", () => {
+  const native = new Map<number, number>([
+    [VK.MENU, -0x8000],
+    [VK.RMENU, -0x8000],
+    [VK.CAPITAL, 0x0001],
+    [VK.NUMLOCK, 0x0001],
+    [VK.SCROLL, 0x0001],
+  ]);
+  const snapshot = (layoutHasAltGraph: boolean, mouseKeyState = 0x0008) =>
+    win32PointerModifiers(mouseKeyState, (virtualKey) => native.get(virtualKey) ?? 0, () => layoutHasAltGraph);
+
+  assertEquals(snapshot(false).altGraphKey, false);
+  assertEquals(snapshot(true).altGraphKey, true);
+  assertEquals(snapshot(true, 0).altGraphKey, false);
+  assertEquals(snapshot(true).capsLock, true);
+  assertEquals(snapshot(true).numLock, true);
+  assertEquals(snapshot(true).scrollLock, true);
+
+  let layoutProbes = 0;
+  win32PointerModifiers(0, (virtualKey) => native.get(virtualKey) ?? 0, () => {
+    layoutProbes++;
+    return true;
+  });
+  assertEquals(layoutProbes, 0);
+});
+
+Deno.test("Win32 keyboard-state fallback preserves Num Lock and Scroll Lock", () => {
+  const harness = createInputControllerHarness({
+    getKeyboardStateResult: 0,
+    keyboardState: [[VK.NUMLOCK, 0x01], [VK.SCROLL, 0x01]],
+  });
+  harness.controller.attach(harness.window);
+  harness.controller.handleMessage(harness.window, WM.KEYDOWN, VK.F1, makeKeyLParam(0x3b));
+
+  const keydown = harness.events.find((event): event is KeyDownEvent => event.type === "keydown");
+  assertEquals(keydown?.numLock, true);
+  assertEquals(keydown?.scrollLock, true);
 });
 
 Deno.test("AltGr preserves Control and right Alt for layout translation without becoming an accelerator", () => {
@@ -1810,6 +1865,9 @@ Deno.test("Win32 edit ownership follows WM_SYSKEYDOWN rather than inferred Alt s
     accelKey: false,
     capsLock: false,
     altGraphKey: false,
+    fnKey: false,
+    numLock: false,
+    scrollLock: false,
   };
   assertEquals(win32KeyEditDisposition(VK.F1 + 9, "F10", false, ordinary, undefined, true), "platform");
   assertEquals(win32KeyEditDisposition(VK.LEFT, "ArrowLeft", false, ordinary, undefined, false), "key-default");
@@ -2583,6 +2641,7 @@ interface FakeImmBehavior {
     layout: Deno.PointerValue,
   ) => { result: number; text: string };
   keyboardState?: ReadonlyArray<readonly [virtualKey: number, state: number]>;
+  getKeyboardStateResult?: number;
   compositionData?: ReadonlyMap<number, Uint8Array | number>;
   onNotifyIme?: () => void;
   devicePixelRatio?: number;
@@ -2615,13 +2674,16 @@ function createInputControllerHarness(behavior: FakeImmBehavior = {}) {
       GetKeyboardState(target: Uint8Array) {
         target.fill(0);
         for (const [virtualKey, state] of behavior.keyboardState ?? []) target[virtualKey] = state;
-        return 1;
+        return behavior.getKeyboardStateResult ?? 1;
       },
       GetKeyboardLayout: () => behavior.keyboardLayout === undefined ? null : keyboardLayout,
       MapVirtualKeyExW(virtualKey: number, mapType: number, layout: Deno.PointerValue) {
         return behavior.mapVirtualKey?.(virtualKey, mapType, layout) ?? 0;
       },
-      GetKeyState: () => 0,
+      GetKeyState(virtualKey: number) {
+        const state = behavior.keyboardState?.find(([candidate]) => candidate === virtualKey)?.[1] ?? 0;
+        return (state & 0x80 ? -0x8000 : 0) | (state & 0x01);
+      },
       PeekMessageW: () => 0,
       ToUnicodeEx(
         virtualKey: number,

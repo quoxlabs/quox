@@ -206,5 +206,8 @@ function modifiers(value: KeyModifiers): KeyModifiers {
     accelKey: value.accelKey,
     capsLock: value.capsLock,
     altGraphKey: value.altGraphKey,
+    fnKey: value.fnKey,
+    numLock: value.numLock,
+    scrollLock: value.scrollLock,
   };
 }

@@ -113,6 +113,7 @@ const NAMED_KEYSYMS = new Map<number, string>([
   [0x1008ff29, "BrowserRefresh"],
   [0x1008ff30, "BrowserFavorites"],
   [0x1008ff31, "MediaPause"],
+  [0x100811d0, "Fn"],
 ]);
 
 const KEYPAD_PRINTABLE_KEYSYMS = new Set([

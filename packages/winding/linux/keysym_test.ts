@@ -23,6 +23,7 @@ Deno.test("Linux logical keys use keysyms for controls, named, keypad, and media
   assertEquals(logicalKeyFromKeysym(0xffca), "F13");
   assertEquals(logicalKeyFromKeysym(0x1008ff14), "MediaPlay");
   assertEquals(logicalKeyFromKeysym(0x1008ff12), "AudioVolumeMute");
+  assertEquals(logicalKeyFromKeysym(0x100811d0), "Fn");
 });
 
 Deno.test("effective Linux modifier keysyms retain their native side", () => {

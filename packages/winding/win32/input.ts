@@ -1,6 +1,6 @@
 /** Pure Win32 keyboard, AltGr, and WM_CHAR helpers. This module performs no FFI. */
 
-import type { KeyEditDisposition, KeyEvent } from "../types.ts";
+import type { KeyEditDisposition, KeyEvent, PointerModifiers } from "../types.ts";
 import { normalizeKeyboardText } from "../input/keyboard.ts";
 import { WM } from "./ffi.ts";
 
@@ -524,6 +524,9 @@ export interface Win32KeyboardModifiers {
   accelKey: boolean;
   capsLock: boolean;
   altGraphKey: boolean;
+  fnKey: boolean;
+  numLock: boolean;
+  scrollLock: boolean;
 }
 
 /** Match browser AltGraph exposure without treating every Ctrl+Alt shortcut as text. */
@@ -574,6 +577,30 @@ export function keyboardModifiers(state: Uint8Array): Win32KeyboardModifiers {
     accelKey: ctrlKey && !altGraphKey,
     capsLock: keyIsToggled(state, VK.CAPITAL),
     altGraphKey,
+    // Windows has no virtual-key state for the hardware Function modifier.
+    fnKey: false,
+    numLock: keyIsToggled(state, VK.NUMLOCK),
+    scrollLock: keyIsToggled(state, VK.SCROLL),
+  };
+}
+
+/** Build a browser-style pointer modifier snapshot from Win32 key state. */
+export function win32PointerModifiers(
+  mouseKeyState: number | undefined,
+  getKeyState: (virtualKey: number) => number,
+  layoutHasAltGraph: () => boolean,
+): PointerModifiers {
+  const ctrlKey = mouseKeyState === undefined ? getKeyState(VK.CONTROL) < 0 : (mouseKeyState & 0x0008) !== 0;
+  return {
+    shiftKey: mouseKeyState === undefined ? getKeyState(VK.SHIFT) < 0 : (mouseKeyState & 0x0004) !== 0,
+    ctrlKey,
+    altKey: getKeyState(VK.MENU) < 0,
+    metaKey: getKeyState(VK.LWIN) < 0 || getKeyState(VK.RWIN) < 0,
+    capsLock: (getKeyState(VK.CAPITAL) & 1) !== 0,
+    altGraphKey: ctrlKey && getKeyState(VK.RMENU) < 0 && layoutHasAltGraph(),
+    fnKey: false,
+    numLock: (getKeyState(VK.NUMLOCK) & 1) !== 0,
+    scrollLock: (getKeyState(VK.SCROLL) & 1) !== 0,
   };
 }
 

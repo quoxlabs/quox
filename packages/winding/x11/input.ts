@@ -9,6 +9,9 @@ export interface X11ModifierMapping {
   readonly metaMask: number;
   readonly capsLockMask: number;
   readonly altGraphMask: number;
+  readonly fnMask: number;
+  readonly numLockMask: number;
+  readonly scrollLockMask: number;
   readonly maskByKeycode: ReadonlyMap<number, number>;
   readonly toggleKeycodes: ReadonlySet<number>;
 }
@@ -83,6 +86,9 @@ export function x11ModifierSnapshot(
     accelKey: ctrlKey && !altGraphKey,
     capsLock: (state & mapping.capsLockMask) !== 0,
     altGraphKey,
+    fnKey: (state & mapping.fnMask) !== 0,
+    numLock: (state & mapping.numLockMask) !== 0,
+    scrollLock: (state & mapping.scrollLockMask) !== 0,
   };
 }
 

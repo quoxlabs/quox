@@ -511,7 +511,7 @@ export class Win32InputController {
     const keyboardState = this.#snapshotKeyboardState();
     const layout = this.#user32.symbols.GetKeyboardLayout(0);
     const languageId = this.#keyboardLayoutLanguageId(layout);
-    const layoutHasAltGraph = this.#layoutHasAltGraph(layout);
+    const layoutHasAltGraph = this.layoutHasAltGraph(layout);
     const modifiers = keyboardModifiers(keyboardState);
     modifiers.altGraphKey = shouldExposeAltGraph(modifiers, layoutHasAltGraph, false);
 
@@ -638,6 +638,8 @@ export class Win32InputController {
         VK.CONTROL,
         VK.MENU,
         VK.CAPITAL,
+        VK.NUMLOCK,
+        VK.SCROLL,
         VK.LSHIFT,
         VK.RSHIFT,
         VK.LCONTROL,
@@ -657,7 +659,7 @@ export class Win32InputController {
 
   #currentModifiers(characterMessage = false) {
     const modifiers = keyboardModifiers(this.#snapshotKeyboardState());
-    const layoutHasAltGraph = this.#layoutHasAltGraph(this.#user32.symbols.GetKeyboardLayout(0));
+    const layoutHasAltGraph = this.layoutHasAltGraph();
     modifiers.altGraphKey = shouldExposeAltGraph(modifiers, layoutHasAltGraph, characterMessage);
     modifiers.accelKey = modifiers.ctrlKey && !modifiers.altGraphKey;
     return modifiers;
@@ -688,7 +690,8 @@ export class Win32InputController {
     return win32LanguageIdFromKeyboardLayout(this.#keyboardLayoutAddress(layout));
   }
 
-  #layoutHasAltGraph(layout: Deno.PointerValue): boolean {
+  /** Whether the active layout has a real AltGraph level rather than an ordinary Ctrl+Alt chord. */
+  layoutHasAltGraph(layout: Deno.PointerValue = this.#user32.symbols.GetKeyboardLayout(0)): boolean {
     const layoutId = this.#keyboardLayoutAddress(layout);
     if (layoutId === undefined) return false;
     const cached = this.#altGraphLayouts.get(layoutId);
@@ -753,7 +756,7 @@ export class Win32InputController {
     const keyboardState = this.#snapshotKeyboardState();
     const layout = this.#user32.symbols.GetKeyboardLayout(0);
     const languageId = this.#keyboardLayoutLanguageId(layout);
-    const layoutHasAltGraph = this.#layoutHasAltGraph(layout);
+    const layoutHasAltGraph = this.layoutHasAltGraph(layout);
     const modifiers = keyboardModifiers(keyboardState);
     modifiers.altGraphKey = shouldExposeAltGraph(modifiers, layoutHasAltGraph, false);
     const code = getDomCode(lParam);

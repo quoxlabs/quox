@@ -95,6 +95,11 @@ Deno.test("wheel adapter preserves browser units and translates Blitz scroll dir
     deltaY: -3.5,
     deltaMode: 0,
     ...pointer,
+    capsLock: false,
+    altGraphKey: false,
+    fnKey: false,
+    numLock: false,
+    scrollLock: false,
   });
   assertEquals(precise, {
     type: "wheel",
@@ -176,6 +181,9 @@ Deno.test("canonical key adapter preserves public fields and encodes editor poli
     accelKey: true,
     capsLock: false,
     altGraphKey: false,
+    fnKey: false,
+    numLock: false,
+    scrollLock: false,
   });
 
   if (mapped.type !== "keydown") throw new TypeError("expected keydown");
@@ -211,6 +219,9 @@ Deno.test("AltGraph preserves physical Ctrl separately from the runtime accelera
     accelKey: false,
     capsLock: false,
     altGraphKey: true,
+    fnKey: false,
+    numLock: false,
+    scrollLock: false,
   });
 
   if (mapped.type !== "keydown") throw new TypeError("expected keydown");
@@ -238,6 +249,9 @@ Deno.test("only key-default disposition keeps the Blitz editor default", () => {
     accelKey: false,
     capsLock: false,
     altGraphKey: false,
+    fnKey: false,
+    numLock: false,
+    scrollLock: false,
   };
 
   const keyDefault = mapWindingEvent({ ...base, editDisposition: "key-default" });
@@ -266,6 +280,9 @@ Deno.test("keyup has no text or default-cancellation policy", () => {
     accelKey: false,
     capsLock: false,
     altGraphKey: false,
+    fnKey: false,
+    numLock: false,
+    scrollLock: false,
   });
 
   if (mapped.type !== "keyup") throw new TypeError("expected keyup");
@@ -410,6 +427,9 @@ Deno.test("pure router preserves key listener then commit and DOM-input ordering
     accelKey: false,
     capsLock: false,
     altGraphKey: false,
+    fnKey: false,
+    numLock: false,
+    scrollLock: false,
   });
   const commit = mapWindingEvent({ type: "ime", kind: "commit", text: "a", window });
 

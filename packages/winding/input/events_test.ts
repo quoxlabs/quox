@@ -44,6 +44,9 @@ const key: KeyEventInit = {
   accelKey: false,
   capsLock: false,
   altGraphKey: false,
+  fnKey: false,
+  numLock: false,
+  scrollLock: false,
 };
 
 Deno.test("final key builders fill every canonical field", () => {
@@ -70,6 +73,9 @@ Deno.test("final key builders fill every canonical field", () => {
       accelKey: false,
       capsLock: false,
       altGraphKey: false,
+      fnKey: false,
+      numLock: false,
+      scrollLock: false,
     },
   );
 
@@ -99,6 +105,9 @@ Deno.test("final key builders fill every canonical field", () => {
     accelKey: false,
     capsLock: false,
     altGraphKey: false,
+    fnKey: false,
+    numLock: false,
+    scrollLock: false,
   });
 });
 

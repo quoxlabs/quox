@@ -29,6 +29,12 @@ export interface KeyModifiers {
   capsLock: boolean;
   /** Whether the active keyboard level is AltGraph/AltGr. */
   altGraphKey: boolean;
+  /** Active Function modifier state, when exposed by the platform. */
+  fnKey: boolean;
+  /** Active Num Lock state, when exposed by the platform. */
+  numLock: boolean;
+  /** Active Scroll Lock state, when exposed by the platform. */
+  scrollLock: boolean;
 }
 /** DOM KeyboardEvent.location-compatible key location. */
 export type KeyLocation = 0 | 1 | 2 | 3;
@@ -127,6 +133,12 @@ export interface PointerModifiers {
   ctrlKey: boolean;
   altKey: boolean;
   metaKey: boolean;
+  /** Browser-visible modifier states exposed through MouseEvent.getModifierState(). */
+  capsLock: boolean;
+  altGraphKey: boolean;
+  fnKey: boolean;
+  numLock: boolean;
+  scrollLock: boolean;
 }
 export interface PointerEventBase<Type extends string> extends WindowEvent<Type>, PointerModifiers {
   /** DOM MouseEvent.x/clientX-compatible logical client coordinate. */

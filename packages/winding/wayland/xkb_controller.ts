@@ -41,6 +41,10 @@ const XKB_MOD_META = cStr("Mod4");
 const XKB_MOD_LEVEL_THREE = cStr("LevelThree");
 const XKB_MOD5 = cStr("Mod5");
 const XKB_MOD_LOCK = cStr("Lock");
+const XKB_MOD_FN = cStr("Fn");
+const XKB_LED_CAPS = cStr("Caps Lock");
+const XKB_LED_NUM = cStr("Num Lock");
+const XKB_LED_SCROLL = cStr("Scroll Lock");
 
 type XkbLibrary = Deno.DynamicLibrary<typeof xkbSymbols>;
 export type WaylandKeyPhase = "press" | "release" | "repeat";
@@ -189,6 +193,8 @@ export class WaylandXkbController {
         name,
         XKB_STATE_MODS_EFFECTIVE,
       ) > 0;
+    const activeLed = (name: Uint8Array): boolean =>
+      this.xkb.symbols.xkb_state_led_name_is_active(this.#state!, name) > 0;
     const ctrlKey = active(XKB_MOD_CONTROL);
     const altGraphKey = active(XKB_MOD_LEVEL_THREE) || active(XKB_MOD5);
     this.#keys.confirmModifiers({
@@ -197,8 +203,11 @@ export class WaylandXkbController {
       altKey: active(XKB_MOD_ALT),
       metaKey: active(XKB_MOD_META),
       accelKey: ctrlKey && !altGraphKey,
-      capsLock: active(XKB_MOD_LOCK),
+      capsLock: activeLed(XKB_LED_CAPS) || active(XKB_MOD_LOCK),
       altGraphKey,
+      fnKey: active(XKB_MOD_FN),
+      numLock: activeLed(XKB_LED_NUM),
+      scrollLock: activeLed(XKB_LED_SCROLL),
     });
   }
 
@@ -311,5 +320,8 @@ function modifiersFromMask(mask: number): KeyModifiers {
     accelKey: ctrlKey,
     capsLock: (mask & XKB_LOCK_MASK) !== 0,
     altGraphKey: false,
+    fnKey: false,
+    numLock: false,
+    scrollLock: false,
   };
 }
