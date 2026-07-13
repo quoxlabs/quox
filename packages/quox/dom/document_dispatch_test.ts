@@ -8,6 +8,7 @@ import { setElementFunctionProp } from "./handlers.ts";
 import { documentHasActiveDispatch, releaseStoppedRenderer } from "./internals.ts";
 import type { QuoxElement } from "./node.ts";
 import {
+  QuoxCompositionEvent,
   QuoxDOMInputEvent,
   QuoxDOMKeyboardEvent,
   QuoxFocusEvent,
@@ -143,8 +144,13 @@ function payloadForType(type: DomDispatchEventType): Record<string, unknown> | u
     case "keydown":
     case "keyup":
       return keyboardPayload();
+    case "beforeinput":
     case "input":
       return { data: null, inputType: "", isComposing: false };
+    case "compositionstart":
+    case "compositionupdate":
+    case "compositionend":
+      return { data: "" };
     case "focus":
     case "blur":
     case "focusin":
@@ -815,6 +821,105 @@ Deno.test("trusted staged payloads create browser-style event subclasses with ex
   assert(scroll instanceof QuoxEvent);
   assert(!(scroll instanceof QuoxFocusEvent));
   assert(!(scroll instanceof QuoxMouseEvent));
+});
+
+Deno.test("trusted beforeinput and composition steps preserve browser payloads and flags", () => {
+  const { document, renderer, window } = createHarness();
+  const target = document.createElement("input");
+  const events: QuoxEvent[] = [];
+
+  for (
+    const type of [
+      "beforeinput",
+      "compositionstart",
+      "compositionupdate",
+      "compositionend",
+    ] as const
+  ) {
+    target.addEventListener(type, (event) => {
+      events.push(event);
+      if (type === "beforeinput") event.preventDefault();
+    });
+  }
+
+  renderer.queueFrame([
+    {
+      type: "beforeinput",
+      target: target.nodeId,
+      path: [target.nodeId],
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      payload: { data: "é", inputType: "insertCompositionText", isComposing: true },
+    },
+    {
+      type: "compositionstart",
+      target: target.nodeId,
+      path: [target.nodeId],
+      bubbles: true,
+      cancelable: false,
+      composed: true,
+      payload: { data: "" },
+    },
+    {
+      type: "compositionupdate",
+      target: target.nodeId,
+      path: [target.nodeId],
+      bubbles: true,
+      cancelable: false,
+      composed: true,
+      payload: { data: "é" },
+    },
+    {
+      type: "compositionend",
+      target: target.nodeId,
+      path: [target.nodeId],
+      bubbles: true,
+      cancelable: false,
+      composed: true,
+      payload: { data: "é" },
+    },
+  ]);
+
+  document.dispatchPointerMove(1, 2, 0, 0);
+
+  assertEquals(events.map((event) => event.type), [
+    "beforeinput",
+    "compositionstart",
+    "compositionupdate",
+    "compositionend",
+  ]);
+  const beforeInput = events[0];
+  assert(beforeInput instanceof QuoxDOMInputEvent);
+  assertStrictEquals(beforeInput.view, window);
+  assertEquals(
+    [
+      beforeInput.data,
+      beforeInput.inputType,
+      beforeInput.isComposing,
+      beforeInput.dataTransfer,
+      beforeInput.getTargetRanges(),
+    ],
+    ["é", "insertCompositionText", true, null, []],
+  );
+  assert(beforeInput.bubbles);
+  assert(beforeInput.cancelable);
+  assert(beforeInput.composed);
+  assert(beforeInput.defaultPrevented);
+
+  for (const [event, data] of events.slice(1).map((event, index) => [event, ["", "é", "é"][index]] as const)) {
+    assert(event instanceof QuoxCompositionEvent);
+    assertStrictEquals(event.view, window);
+    assertEquals(event.data, data);
+    assert(event.bubbles);
+    assertFalse(event.cancelable);
+    assert(event.composed);
+    assert(event.isTrusted);
+  }
+  assertEquals(
+    renderer.calls.filter(([method]) => method === "resume").map((call) => call[3]),
+    [true, false, false, false],
+  );
 });
 
 Deno.test("native boundary frames preserve DOM order, target, and null related targets", () => {

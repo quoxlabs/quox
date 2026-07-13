@@ -5,6 +5,7 @@ import {
   isQuoxVNode,
   type QuoxComponent,
   type QuoxEventProps,
+  type QuoxJsxCompositionEvent,
   type QuoxJsxEvent,
   type QuoxJsxFocusEvent,
   type QuoxJsxInputEvent,
@@ -15,6 +16,7 @@ import {
 } from "./jsx-runtime.ts";
 import type { QuoxEvent } from "../quox/dom/event.ts";
 import type {
+  QuoxCompositionEvent,
   QuoxDOMInputEvent,
   QuoxDOMKeyboardEvent,
   QuoxFocusEvent,
@@ -51,7 +53,11 @@ type ExpectedBaseEventProp =
   | "onKeyPress"
   | "onKeyDown"
   | "onKeyUp"
+  | "onBeforeInput"
   | "onInput"
+  | "onCompositionStart"
+  | "onCompositionUpdate"
+  | "onCompositionEnd"
   | "onFocus"
   | "onBlur"
   | "onFocusIn"
@@ -71,8 +77,9 @@ const runtimeEventCompatibility: [
   QuoxWheelEvent extends QuoxJsxWheelEvent ? true : false,
   QuoxDOMKeyboardEvent extends QuoxJsxKeyboardEvent ? true : false,
   QuoxDOMInputEvent extends QuoxJsxInputEvent ? true : false,
+  QuoxCompositionEvent extends QuoxJsxCompositionEvent ? true : false,
   QuoxFocusEvent extends QuoxJsxFocusEvent ? true : false,
-] = [true, true, true, true, true, true, true, true];
+] = [true, true, true, true, true, true, true, true, true];
 
 const supportedEvents = (
   <input
@@ -89,7 +96,11 @@ const supportedEvents = (
     onWheelCapture={(event) => expectType<QuoxJsxWheelEvent>(event)}
     onAuxClick={(event) => expectType<QuoxJsxPointerEvent>(event)}
     onKeyDown={(event) => expectType<QuoxJsxKeyboardEvent>(event)}
+    onBeforeInputCapture={(event) => expectType<QuoxJsxInputEvent>(event)}
     onInput={(event) => expectType<QuoxJsxInputEvent>(event)}
+    onCompositionStart={(event) => expectType<QuoxJsxCompositionEvent>(event)}
+    onCompositionUpdateCapture={(event) => expectType<QuoxJsxCompositionEvent>(event)}
+    onCompositionEnd={(event) => expectType<QuoxJsxCompositionEvent>(event)}
     onFocusOutCapture={(event) => expectType<QuoxJsxFocusEvent>(event)}
     onDoubleClick={(event) => expectType<QuoxJsxMouseEvent>(event)}
     onDblClickCapture={(event) => expectType<QuoxJsxMouseEvent>(event)}

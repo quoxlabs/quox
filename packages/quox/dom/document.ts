@@ -20,6 +20,7 @@ import { type AssertActive, attachDocumentInternals, type RequestRender } from "
 import { ELEMENT_NODE, GENERIC_ELEMENT_INTERFACE, QuoxNodeCache, TEXT_NODE } from "./node_cache.ts";
 import { QuoxElement, type QuoxInputElement, type QuoxNode, type QuoxText, type QuoxTextAreaElement } from "./node.ts";
 import {
+  type DomDispatchCompositionPayload,
   type DomDispatchEventStep,
   type DomDispatchFocusPayload,
   DomDispatchInitialStepError,
@@ -33,6 +34,7 @@ import {
 } from "./renderer_port.ts";
 import {
   createTrustedMouseEventInit,
+  QuoxCompositionEvent,
   QuoxDOMInputEvent,
   QuoxDOMKeyboardEvent,
   QuoxFocusEvent,
@@ -803,6 +805,7 @@ export class QuoxDocument extends QuoxEventTarget {
           modifierScrollLock: payload.scrollLock,
         });
       }
+      case "beforeinput":
       case "input": {
         const payload = step.payload as DomDispatchInputPayload;
         return new QuoxDOMInputEvent(step.type, {
@@ -811,6 +814,16 @@ export class QuoxDocument extends QuoxEventTarget {
           data: payload.data,
           inputType: payload.inputType,
           isComposing: payload.isComposing,
+        });
+      }
+      case "compositionstart":
+      case "compositionupdate":
+      case "compositionend": {
+        const payload = step.payload as DomDispatchCompositionPayload;
+        return new QuoxCompositionEvent(step.type, {
+          ...eventInit,
+          view: this.#defaultView,
+          data: payload.data,
         });
       }
       case "focus":

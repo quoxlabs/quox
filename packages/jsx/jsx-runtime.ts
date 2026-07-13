@@ -138,6 +138,10 @@ export interface QuoxJsxInputEvent extends QuoxJsxUIEvent {
   getTargetRanges(): unknown[];
 }
 
+export interface QuoxJsxCompositionEvent extends QuoxJsxUIEvent {
+  readonly data: string;
+}
+
 export interface QuoxJsxFocusEvent extends QuoxJsxUIEvent {
   readonly relatedTarget: object | null;
 }
@@ -175,7 +179,11 @@ type QuoxBaseEventProps = {
   onKeyPress?: QuoxEventProp<QuoxJsxKeyboardEvent>;
   onKeyDown?: QuoxEventProp<QuoxJsxKeyboardEvent>;
   onKeyUp?: QuoxEventProp<QuoxJsxKeyboardEvent>;
+  onBeforeInput?: QuoxEventProp<QuoxJsxInputEvent>;
   onInput?: QuoxEventProp<QuoxJsxInputEvent>;
+  onCompositionStart?: QuoxEventProp<QuoxJsxCompositionEvent>;
+  onCompositionUpdate?: QuoxEventProp<QuoxJsxCompositionEvent>;
+  onCompositionEnd?: QuoxEventProp<QuoxJsxCompositionEvent>;
   onFocus?: QuoxEventProp<QuoxJsxFocusEvent>;
   onBlur?: QuoxEventProp<QuoxJsxFocusEvent>;
   onFocusIn?: QuoxEventProp<QuoxJsxFocusEvent>;

@@ -33,7 +33,11 @@ export const DOM_DISPATCH_EVENT_TYPES = Object.freeze(
     "keypress",
     "keydown",
     "keyup",
+    "beforeinput",
     "input",
+    "compositionstart",
+    "compositionupdate",
+    "compositionend",
     "focus",
     "blur",
     "focusin",
@@ -116,6 +120,10 @@ export interface DomDispatchInputPayload {
   readonly isComposing: boolean;
 }
 
+export interface DomDispatchCompositionPayload {
+  readonly data: string;
+}
+
 export interface DomDispatchFocusPayload {
   readonly relatedTarget: number | null;
 }
@@ -126,6 +134,7 @@ export type DomDispatchEventPayload =
   | DomDispatchWheelPayload
   | DomDispatchKeyboardPayload
   | DomDispatchInputPayload
+  | DomDispatchCompositionPayload
   | DomDispatchFocusPayload;
 
 export interface DomDispatchEventStep<Payload = DomDispatchEventPayload> {
@@ -468,6 +477,7 @@ const KEYBOARD_PAYLOAD_PROPERTIES = Object.freeze(
 );
 
 const INPUT_PAYLOAD_PROPERTIES = Object.freeze(["data", "inputType", "isComposing"] as const);
+const COMPOSITION_PAYLOAD_PROPERTIES = Object.freeze(["data"] as const);
 const FOCUS_PAYLOAD_PROPERTIES = Object.freeze(["relatedTarget"] as const);
 const COMPLETE_STEP_PROPERTIES = Object.freeze(["kind", "frameId", "redrawRequested"] as const);
 const EVENT_STEP_PROPERTIES = Object.freeze(
@@ -648,6 +658,20 @@ function validateInputPayload(value: unknown): DomDispatchInputPayload {
   });
 }
 
+function validateCompositionPayload(value: unknown): DomDispatchCompositionPayload {
+  const descriptors = inspectExactPlainRecord(
+    value,
+    "DOM dispatch payload",
+    COMPOSITION_PAYLOAD_PROPERTIES,
+  );
+  return Object.freeze({
+    data: assertString(
+      requiredValue(descriptors, "data", "DOM dispatch payload"),
+      "DOM dispatch payload.data",
+    ),
+  });
+}
+
 function validateFocusPayload(value: unknown): DomDispatchFocusPayload {
   const descriptors = inspectExactPlainRecord(
     value,
@@ -701,8 +725,13 @@ function validateEventPayload(
     case "keydown":
     case "keyup":
       return validateKeyboardPayload(value);
+    case "beforeinput":
     case "input":
       return validateInputPayload(value);
+    case "compositionstart":
+    case "compositionupdate":
+    case "compositionend":
+      return validateCompositionPayload(value);
     case "focus":
     case "blur":
     case "focusin":

@@ -118,8 +118,13 @@ function payloadForType(type: DomDispatchEventType): Record<string, unknown> | u
     case "keydown":
     case "keyup":
       return keyboardPayload();
+    case "beforeinput":
     case "input":
       return { data: null, inputType: "", isComposing: false };
+    case "compositionstart":
+    case "compositionupdate":
+    case "compositionend":
+      return { data: "" };
     case "focus":
     case "blur":
     case "focusin":
@@ -267,7 +272,9 @@ Deno.test("DOM dispatch validator requires the exact payload family and rejects 
     eventStep({ type: "dblclick", payload: pointerPayload() }),
     eventStep({ type: "wheel", payload: mousePayload() }),
     eventStep({ type: "keydown", payload: { ...keyboardPayload(), data: null } }),
+    eventStep({ type: "beforeinput", payload: { data: null, inputType: "" } }),
     eventStep({ type: "input", payload: { data: null, inputType: "" } }),
+    eventStep({ type: "compositionupdate", payload: { data: "x", isComposing: true } }),
     eventStep({ type: "focus", payload: { relatedTarget: null, detail: 0 } }),
     eventStep({ type: "scroll", payload: undefined }),
     eventStep({ type: "scroll", payload: {} }),
@@ -310,6 +317,8 @@ Deno.test("DOM dispatch validator enforces payload types, finite values, ranges,
     eventStep({ type: "keydown", payload: keyboardPayload({ keyCode: 1.5 }) }),
     eventStep({ type: "keydown", payload: keyboardPayload({ numLock: 1 }) }),
     eventStep({ type: "input", payload: { data: 1, inputType: "", isComposing: false } }),
+    eventStep({ type: "beforeinput", payload: { data: null, inputType: 1, isComposing: false } }),
+    eventStep({ type: "compositionstart", payload: { data: null } }),
     eventStep({ type: "focus", payload: { relatedTarget: 1.5 } }),
   ];
 
