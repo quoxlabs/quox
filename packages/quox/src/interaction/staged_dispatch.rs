@@ -6047,8 +6047,8 @@ fn reconcile_generated_checkable_defaults(
 ) -> bool {
     // Blitz mutates checkbox/radio render data before queuing `input`. A staged click already
     // performed that activation before JavaScript, whose listener writes are authoritative;
-    // never import Blitz's second toggle for that same stable target. Other generated input
-    // targets still use the legacy import path until label activation is staged separately.
+    // never import Blitz's second toggle for that same stable target. Generated input targets
+    // use the legacy import path only when no staged checkable transaction protects them.
     let activated_inputs = generated
         .iter()
         .filter_map(|event| matches!(&event.data, DomEventData::Input(_)).then_some(event.target));
