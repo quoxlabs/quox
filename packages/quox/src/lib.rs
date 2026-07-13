@@ -363,9 +363,9 @@ fn focused_ime_cursor_area(document: &mut BaseDocument) -> Option<[f32; 4]> {
 impl QuoxRendererState {
     /// Resolve layout for the current viewport state. Shared by `render()`, `node_from_point()`,
     /// and every trusted pointer/wheel occurrence so hit tests and input defaults never see
-    /// arbitrarily stale geometry. A layout change alone does not yet synthesize boundary events
-    /// for a stationary pointer. Blitz's own `set_viewport` already re-clamps scroll on every
-    /// call, so scroll position is owned entirely by `BaseDocument`
+    /// arbitrarily stale geometry. Rendering follows layout with a stationary-pointer refresh,
+    /// so layout-only target changes stage their boundary events before paint. Blitz's own
+    /// `set_viewport` already re-clamps scroll on every call, so scroll position is owned entirely by `BaseDocument`
     /// (via `viewport_scroll()`/`scroll_by`) — quox keeps no mirror of it, which would otherwise
     /// clobber Blitz's own wheel-driven scroll updates.
     fn sync_layout(&mut self) {
