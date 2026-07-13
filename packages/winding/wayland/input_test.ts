@@ -17,6 +17,7 @@ import { createWaylandSurroundingTextState, TextInputV3Batch, TextInputV3SerialG
 import { CompositionState, keyLocationForKey, normalizeImeCursorArea, validateImeCursorRange } from "../input/mod.ts";
 import { keyLocationHintForKeysym, logicalKeyFromKeysym } from "../linux/mod.ts";
 import { emitWaylandTextInputEdits } from "./text_input_controller.ts";
+import { isDirectWaylandKeyCommit } from "./keyboard_controller.ts";
 import type { WaylandWindow } from "./window.ts";
 import {
   BUFFER_EVENT_SIGNATURES,
@@ -99,7 +100,7 @@ import {
   WaylandOutputScaleState,
   WaylandSurfaceOutputScaleState,
 } from "./output.ts";
-import type { KeyModifiers } from "../types.ts";
+import type { KeyModifiers, UIEvent } from "../types.ts";
 import {
   WAYLAND_WINDOW_CLOSED_MESSAGE,
   WAYLAND_WINDOW_MUTATION_NAMES,
@@ -2353,6 +2354,15 @@ Deno.test("Wayland edit ownership leaves delivered shortcuts to key defaults", (
   assertEquals(waylandKeyEditDisposition("Dead", undefined, false, plain), "text-input");
 });
 
+Deno.test("only direct local key text receives causal correlation", () => {
+  assertEquals(isDirectWaylandKeyCommit("a", "text-input", false, false), true);
+  assertEquals(isDirectWaylandKeyCommit(undefined, "text-input", false, false), false);
+  assertEquals(isDirectWaylandKeyCommit("", "text-input", false, false), false);
+  assertEquals(isDirectWaylandKeyCommit("a", "key-default", false, false), false);
+  assertEquals(isDirectWaylandKeyCommit("é", "text-input", true, false), false);
+  assertEquals(isDirectWaylandKeyCommit("Dead", "text-input", false, true), false);
+});
+
 Deno.test("logical keysym mapping covers printable, named, dead, function, and keypad keys", () => {
   assertEquals(logicalKeyFromKeysym(0x010020ac, "€"), "€");
   assertEquals(logicalKeyFromKeysym(0x0101f642), "🙂");
@@ -2529,17 +2539,22 @@ Deno.test("text-input preserves exact nonempty native commit strings", () => {
 
 Deno.test("native text-input edits reset pending local Compose before emission", () => {
   const order: string[] = [];
+  const emitted: UIEvent[] = [];
   const window = { composition: new CompositionState() } as unknown as WaylandWindow;
 
   emitWaylandTextInputEdits(
     {
       resetLocalCompose: () => order.push("reset-compose"),
-      pushEvent: (event) => order.push(`${event.type}/${event.type === "ime" ? event.kind : ""}`),
+      pushEvent: (event) => {
+        emitted.push(event);
+        order.push(`${event.type}/${event.type === "ime" ? event.kind : ""}`);
+      },
     },
     window,
     [{ type: "commit", text: "native" }],
   );
   assertEquals(order, ["reset-compose", "ime/commit"]);
+  assertEquals(Object.hasOwn(emitted[0], "sourceKeyInputId"), false);
 
   emitWaylandTextInputEdits(
     {

@@ -1,7 +1,13 @@
 /** wl_keyboard proxy, focus, repeat, and canonical semantic event routing. */
 
-import type { KeyModifiers, UIEvent } from "../types.ts";
-import { createImeCommitEvent, createImePreeditEvent, createKeyDownEvent, createKeyUpEvent } from "../input/mod.ts";
+import type { KeyEditDisposition, KeyModifiers, UIEvent } from "../types.ts";
+import {
+  createImeCommitEvent,
+  createImePreeditEvent,
+  createKeyDownEvent,
+  createKeyUpEvent,
+  SourceKeyInputIdSequence,
+} from "../input/mod.ts";
 import { domCodeFromEvdev, keyLocationHintForKeysym } from "../linux/mod.ts";
 import { WlOp, type xkbSymbols } from "./ffi.ts";
 import { WaylandEnterKeyBatch, waylandKeyEditDisposition } from "./keyboard.ts";
@@ -35,6 +41,16 @@ export interface WaylandKeyboardHost {
   syncTextInput(window: WaylandWindow): void;
 }
 
+export function isDirectWaylandKeyCommit(
+  text: string | undefined,
+  disposition: KeyEditDisposition,
+  wasComposing: boolean,
+  isComposing: boolean,
+): boolean {
+  return text !== undefined && text.length > 0 && disposition === "text-input" &&
+    !wasComposing && !isComposing;
+}
+
 export class WaylandKeyboardController {
   readonly #input: WaylandXkbController;
   #keyboard: Deno.PointerObject | null = null;
@@ -42,6 +58,7 @@ export class WaylandKeyboardController {
   #listeners: AnyCallback[] = [];
   #vtable: BigUint64Array<ArrayBuffer> | undefined;
   readonly #enterKeys = new WaylandEnterKeyBatch();
+  readonly #sourceKeyInputIds = new SourceKeyInputIdSequence();
   #closed = false;
 
   constructor(readonly host: WaylandKeyboardHost) {
@@ -296,6 +313,14 @@ export class WaylandKeyboardController {
       wasComposing || translated.isComposing,
       modifiers,
     );
+    const sourceKeyInputId = isDirectWaylandKeyCommit(
+        translated.text,
+        disposition,
+        wasComposing,
+        translated.isComposing,
+      )
+      ? this.#sourceKeyInputIds.take()
+      : undefined;
     this.host.pushEvent(createKeyDownEvent({
       window,
       keycode: rawKeycode,
@@ -305,6 +330,7 @@ export class WaylandKeyboardController {
       isComposing: wasComposing,
       repeat: phase === "repeat",
       editDisposition: disposition,
+      sourceKeyInputId,
       ...modifiers,
     }));
 
@@ -314,7 +340,7 @@ export class WaylandKeyboardController {
     }
     if (translated.text !== undefined && disposition === "text-input") {
       window.composition.commit();
-      const commit = createImeCommitEvent(window, translated.text);
+      const commit = createImeCommitEvent(window, translated.text, sourceKeyInputId);
       if (commit !== undefined) this.host.pushEvent(commit);
       return;
     }
