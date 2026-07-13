@@ -114,7 +114,6 @@ function payloadForType(type: DomDispatchEventType): Record<string, unknown> | u
       return mousePayload();
     case "wheel":
       return wheelPayload();
-    case "keypress":
     case "keydown":
     case "keyup":
       return keyboardPayload();
@@ -258,6 +257,7 @@ Deno.test("DOM dispatch validator rejects malformed IDs, metadata, and paths", (
     eventStep({ type: "load" }),
     eventStep({ type: "composition" }),
     eventStep({ type: "applekeybinding" }),
+    eventStep({ type: "keypress" }),
     eventStep({ path: [] }),
     eventStep({ path: [0] }),
     eventStep({ path: [8, 7] }),

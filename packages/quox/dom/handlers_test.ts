@@ -1,4 +1,4 @@
-import { assertEquals, assertStrictEquals } from "@std/assert";
+import { assertEquals, assertStrictEquals, assertThrows } from "@std/assert";
 import type { QuoxRenderer as WasmRenderer } from "../lib/quox.js";
 import type { QuoxDocument } from "./document.ts";
 import { QuoxEvent } from "./event.ts";
@@ -29,7 +29,6 @@ const EVENT_TYPE_TO_PROP = {
   auxclick: "onAuxClick",
   contextmenu: "onContextMenu",
   dblclick: "onDoubleClick",
-  keypress: "onKeyPress",
   keydown: "onKeyDown",
   keyup: "onKeyUp",
   beforeinput: "onBeforeInput",
@@ -88,6 +87,22 @@ Deno.test("every staged DOM event has live JSX bubble and capture props", () => 
       assertEquals(handlerArgs, [event], prop);
     }
   }
+});
+
+Deno.test("unsupported keypress JSX props fail while synthetic keypress stays available", () => {
+  const element = createElement();
+  for (const prop of ["onKeyPress", "onKeyPressCapture"]) {
+    assertThrows(
+      () => setElementFunctionProp(element, prop, () => undefined),
+      TypeError,
+      `quox: JSX event prop "${prop}" is not supported`,
+    );
+  }
+
+  let calls = 0;
+  element.addEventListener("keypress", () => calls += 1);
+  element.dispatchEvent(new QuoxEvent("keypress"));
+  assertEquals(calls, 1);
 });
 
 Deno.test("capture JSX props run in the capture listener group", () => {

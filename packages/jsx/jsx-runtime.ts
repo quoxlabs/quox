@@ -176,7 +176,6 @@ type QuoxBaseEventProps = {
   onContextMenu?: QuoxEventProp<QuoxJsxPointerEvent>;
   onDoubleClick?: QuoxEventProp<QuoxJsxMouseEvent>;
   onDblClick?: QuoxEventProp<QuoxJsxMouseEvent>;
-  onKeyPress?: QuoxEventProp<QuoxJsxKeyboardEvent>;
   onKeyDown?: QuoxEventProp<QuoxJsxKeyboardEvent>;
   onKeyUp?: QuoxEventProp<QuoxJsxKeyboardEvent>;
   onBeforeInput?: QuoxEventProp<QuoxJsxInputEvent>;

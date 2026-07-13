@@ -290,12 +290,8 @@ Deno.test("mount rejects function-valued event props Quox cannot dispatch", asyn
 
   for (
     const prop of [
-      "onAuxClick",
-      "onBeforeInput",
-      "onChange",
-      "onCompositionStart",
-      "onCompositionUpdate",
-      "onCompositionEndCapture",
+      "onKeyPress",
+      "onKeyPressCapture",
     ]
   ) {
     await assertRejects(

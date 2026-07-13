@@ -788,7 +788,6 @@ export class QuoxDocument extends QuoxEventTarget {
           }),
         );
       }
-      case "keypress":
       case "keydown":
       case "keyup": {
         const payload = step.payload as DomDispatchKeyboardPayload;

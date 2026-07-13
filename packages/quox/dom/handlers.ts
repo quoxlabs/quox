@@ -46,7 +46,6 @@ const EVENT_TYPE_TO_PROP = Object.freeze(
     auxclick: "onAuxClick",
     contextmenu: "onContextMenu",
     dblclick: "onDoubleClick",
-    keypress: "onKeyPress",
     keydown: "onKeyDown",
     keyup: "onKeyUp",
     beforeinput: "onBeforeInput",

@@ -30,7 +30,6 @@ export const DOM_DISPATCH_EVENT_TYPES = Object.freeze(
     "auxclick",
     "contextmenu",
     "dblclick",
-    "keypress",
     "keydown",
     "keyup",
     "beforeinput",
@@ -723,7 +722,6 @@ function validateEventPayload(
       return validateMousePayload(value);
     case "wheel":
       return validateWheelPayload(value);
-    case "keypress":
     case "keydown":
     case "keyup":
       return validateKeyboardPayload(value);

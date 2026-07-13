@@ -140,7 +140,6 @@ function payloadForType(type: DomDispatchEventType): Record<string, unknown> | u
       return mousePayload();
     case "wheel":
       return wheelPayload();
-    case "keypress":
     case "keydown":
     case "keyup":
       return keyboardPayload();

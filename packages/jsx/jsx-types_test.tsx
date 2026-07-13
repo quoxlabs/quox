@@ -50,7 +50,6 @@ type ExpectedBaseEventProp =
   | "onContextMenu"
   | "onDoubleClick"
   | "onDblClick"
-  | "onKeyPress"
   | "onKeyDown"
   | "onKeyUp"
   | "onBeforeInput"
