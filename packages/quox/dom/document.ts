@@ -21,6 +21,7 @@ import { type AssertActive, attachDocumentInternals, type RequestRender } from "
 import { ELEMENT_NODE, GENERIC_ELEMENT_INTERFACE, QuoxNodeCache, TEXT_NODE } from "./node_cache.ts";
 import { QuoxElement, type QuoxInputElement, type QuoxNode, type QuoxText, type QuoxTextAreaElement } from "./node.ts";
 import {
+  type DomDispatchClipboardPayload,
   type DomDispatchCompositionPayload,
   type DomDispatchEventStep,
   type DomDispatchFocusPayload,
@@ -35,7 +36,9 @@ import {
 } from "./renderer_port.ts";
 import {
   createTrustedMouseEventInit,
+  QuoxClipboardEvent,
   QuoxCompositionEvent,
+  QuoxDataTransfer,
   QuoxDOMInputEvent,
   QuoxDOMKeyboardEvent,
   QuoxFocusEvent,
@@ -826,6 +829,15 @@ export class QuoxDocument extends QuoxEventTarget {
           modifierFn: payload.fnKey,
           modifierNumLock: payload.numLock,
           modifierScrollLock: payload.scrollLock,
+        });
+      }
+      case "copy":
+      case "cut":
+      case "paste": {
+        const payload = step.payload as DomDispatchClipboardPayload;
+        return new QuoxClipboardEvent(step.type, {
+          ...eventInit,
+          clipboardData: new QuoxDataTransfer(payload.text),
         });
       }
       case "beforeinput":

@@ -158,8 +158,9 @@ enum SpaceKeyContinuation {
     },
 }
 
-struct KeyboardEditContinuation {
-    intent: EditIntent,
+struct KeyboardDefaultContinuation {
+    intent: Option<EditIntent>,
+    clipboard: Option<ClipboardAction>,
     source_was_editor: bool,
 }
 
@@ -371,6 +372,7 @@ struct EventMetadata {
     wheel: Option<NativeWheelMetadata>,
     key: Option<NativeKeyMetadata>,
     edit_intent: Option<EditIntent>,
+    clipboard_action: Option<ClipboardAction>,
     composition_data: Option<String>,
     observe_text_edit: bool,
     related_target: Option<GuardedNode>,
@@ -387,7 +389,7 @@ struct EventMetadata {
 enum EditIntent {
     InsertText { data: String, is_composing: bool },
     InsertLineBreak,
-    InsertFromPaste,
+    InsertFromPaste { data: String },
     DeleteByCut,
     DeleteByComposition,
     DeleteContentBackward,
@@ -398,6 +400,30 @@ enum EditIntent {
     DeleteSoftLineForward,
     DeleteHardLineBackward,
     DeleteHardLineForward,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ClipboardAction {
+    Copy,
+    Cut,
+    Paste { data: String },
+}
+
+impl ClipboardAction {
+    const fn event_type(&self) -> &'static str {
+        match self {
+            Self::Copy => "copy",
+            Self::Cut => "cut",
+            Self::Paste { .. } => "paste",
+        }
+    }
+
+    fn data(&self) -> Option<String> {
+        match self {
+            Self::Copy | Self::Cut => None,
+            Self::Paste { data } => Some(data.clone()),
+        }
+    }
 }
 
 impl EditIntent {
@@ -413,7 +439,7 @@ impl EditIntent {
                 *is_composing,
             ),
             Self::InsertLineBreak => (None, "insertLineBreak", false),
-            Self::InsertFromPaste => (None, "insertFromPaste", false),
+            Self::InsertFromPaste { data } => (Some(data.clone()), "insertFromPaste", false),
             Self::DeleteByCut => (None, "deleteByCut", false),
             Self::DeleteByComposition => (None, "deleteByComposition", false),
             Self::DeleteContentBackward => (None, "deleteContentBackward", false),
@@ -443,6 +469,7 @@ impl EventMetadata {
             wheel: None,
             key: None,
             edit_intent: None,
+            clipboard_action: None,
             composition_data: None,
             observe_text_edit: false,
             related_target: None,
@@ -490,6 +517,7 @@ impl EventMetadata {
             wheel: None,
             key: None,
             edit_intent: None,
+            clipboard_action: None,
             composition_data: None,
             observe_text_edit: false,
             related_target: None,
@@ -554,6 +582,7 @@ impl EventMetadata {
             }),
             key: None,
             edit_intent: None,
+            clipboard_action: None,
             composition_data: None,
             observe_text_edit: false,
             related_target: None,
@@ -576,6 +605,7 @@ impl EventMetadata {
             wheel: None,
             key: Some(key),
             edit_intent: None,
+            clipboard_action: None,
             composition_data: None,
             observe_text_edit: false,
             related_target: None,
@@ -600,6 +630,11 @@ impl EventMetadata {
         self
     }
 
+    fn with_clipboard_action(mut self, action: Option<ClipboardAction>) -> Self {
+        self.clipboard_action = action;
+        self
+    }
+
     fn with_text_edit_observation(mut self, observe: bool) -> Self {
         self.observe_text_edit = observe;
         self
@@ -614,9 +649,20 @@ impl EventMetadata {
             }
         );
         self.edit_intent = Some(intent);
+        self.clipboard_action = None;
         self.observe_text_edit = false;
         self.event_type_override = Some("beforeinput");
         self.cancelable_override = Some(cancelable);
+        self.suppress_default = true;
+        self
+    }
+
+    fn into_clipboard(mut self, action: &ClipboardAction) -> Self {
+        self.edit_intent = None;
+        self.clipboard_action = Some(action.clone());
+        self.observe_text_edit = false;
+        self.event_type_override = Some(action.event_type());
+        self.cancelable_override = Some(true);
         self.suppress_default = true;
         self
     }
@@ -842,7 +888,7 @@ enum ResumeAction {
         double_click: Option<Box<PendingDoubleClick>>,
         checkable_activation: Option<Box<GuardedCheckableActivation>>,
         space_key: Option<SpaceKeyContinuation>,
-        keyboard_edit: Option<KeyboardEditContinuation>,
+        keyboard_default: Option<KeyboardDefaultContinuation>,
     },
     PointerLead {
         pointer_default: Box<GuardedDomEvent>,
@@ -859,10 +905,20 @@ enum ResumeAction {
         pointer_default_prevented: bool,
         release_auxclick: Option<Box<DomEventData>>,
     },
+    Clipboard(Box<PendingClipboardDefault>),
     TextEdit(Box<PendingEdit>),
     CompositionStart(Box<PendingCompositionEdit>),
     CompositionUpdate(Box<PendingCompositionEdit>),
     CompositionEnd,
+}
+
+struct PendingClipboardDefault {
+    target: GuardedNode,
+    action: ClipboardAction,
+    intent: Option<EditIntent>,
+    source_was_editor: bool,
+    guarded: Box<GuardedDomEvent>,
+    space_key: Option<SpaceKeyContinuation>,
 }
 
 struct PendingEdit {
@@ -880,6 +936,9 @@ enum PendingEditAction {
     ImeDeleteSurrounding {
         before_bytes: usize,
         after_bytes: usize,
+    },
+    Clipboard {
+        action: ClipboardAction,
     },
     CompositionPreedit(Box<PendingCompositionEdit>),
 }
@@ -1445,6 +1504,7 @@ enum DispatchEventPayload {
     Wheel(WheelPayload),
     Keyboard(KeyboardPayload),
     Input(InputPayload),
+    Clipboard { text: Option<String> },
     Composition { data: String },
     Focus { related_target: Option<u32> },
 }
@@ -1637,7 +1697,7 @@ impl DispatchStack {
                 double_click,
                 checkable_activation,
                 space_key,
-                keyboard_edit,
+                keyboard_default,
             } => {
                 if cancelled {
                     if matches!(&pending.guarded.event.data, DomEventData::KeyDown(_))
@@ -1663,14 +1723,37 @@ impl DispatchStack {
                             .expect("canceled activation belongs to the active frame")
                             .redraw_requested = true;
                     }
-                } else if !suppress_default {
-                    if let Some(keyboard_edit) = keyboard_edit {
+                } else if !suppress_default
+                    || keyboard_default
+                        .as_ref()
+                        .is_some_and(|pending| pending.clipboard.is_some())
+                {
+                    if let Some(keyboard_default) = keyboard_default {
                         debug_assert!(double_click.is_none());
                         debug_assert!(checkable_activation.is_none());
-                        if keyboard_edit.source_was_editor {
+                        if let Some(action) = keyboard_default.clipboard {
+                            let clipboard = PendingClipboardDefault {
+                                target: pending.guarded.target,
+                                action,
+                                intent: keyboard_default.intent,
+                                source_was_editor: keyboard_default.source_was_editor,
+                                guarded: Box::new(pending.guarded),
+                                space_key,
+                            };
+                            if let Some(step) =
+                                self.stage_clipboard_event(document, handles, redraw, clipboard)?
+                            {
+                                return Ok(step);
+                            }
+                        } else if keyboard_default.source_was_editor {
+                            let Some(intent) = keyboard_default.intent else {
+                                unreachable!(
+                                    "a non-clipboard keyboard default must have an edit intent"
+                                )
+                            };
                             let edit = PendingEdit {
                                 target: pending.guarded.target,
-                                intent: keyboard_edit.intent,
+                                intent,
                                 metadata: pending.guarded.metadata.clone(),
                                 action: PendingEditAction::Default {
                                     guarded: Box::new(pending.guarded.clone()),
@@ -1714,6 +1797,54 @@ impl DispatchStack {
                         .expect("double-click follow-up belongs to the active frame")
                         .planned
                         .push_front(PlannedWork::DoubleClick(*double_click));
+                }
+            }
+            ResumeAction::Clipboard(clipboard) => {
+                if !cancelled && node_is_live(clipboard.target, document, handles) {
+                    if clipboard.source_was_editor {
+                        if let Some(intent) = clipboard.intent {
+                            let can_edit = !matches!(&clipboard.action, ClipboardAction::Cut)
+                                || copy_editor_selection_to_clipboard(
+                                    document,
+                                    clipboard.target.raw,
+                                );
+                            if can_edit {
+                                let edit = PendingEdit {
+                                    target: clipboard.target,
+                                    intent,
+                                    metadata: clipboard.guarded.metadata.clone(),
+                                    action: PendingEditAction::Clipboard {
+                                        action: clipboard.action,
+                                    },
+                                };
+                                if let Some(step) =
+                                    self.stage_text_edit(document, handles, redraw, edit)?
+                                {
+                                    return Ok(step);
+                                }
+                            }
+                        } else {
+                            self.run_default(
+                                document,
+                                text_controls,
+                                checked_controls,
+                                handles,
+                                *clipboard.guarded,
+                                None,
+                                clipboard.space_key,
+                            )?;
+                        }
+                    } else if !text_edit_element(document, clipboard.target.raw) {
+                        self.run_default(
+                            document,
+                            text_controls,
+                            checked_controls,
+                            handles,
+                            *clipboard.guarded,
+                            None,
+                            clipboard.space_key,
+                        )?;
+                    }
                 }
             }
             ResumeAction::PointerLead {
@@ -2672,10 +2803,19 @@ impl DispatchStack {
                 suppress_default,
             } => {
                 let target = guarded_keyboard_target(document, handles)?;
-                let intent = keyboard_edit_intent(&event);
-                let observe_text_edit = intent.is_some() || keyboard_copy_default(&event);
+                let clipboard = keyboard_clipboard_action(document, &event);
+                let intent = match &clipboard {
+                    Some(ClipboardAction::Cut) => Some(EditIntent::DeleteByCut),
+                    Some(ClipboardAction::Paste { data }) => {
+                        Some(EditIntent::InsertFromPaste { data: data.clone() })
+                    }
+                    Some(ClipboardAction::Copy) => None,
+                    None => keyboard_edit_intent(&event),
+                };
+                let observe_text_edit = intent.is_some() || clipboard.is_some();
                 let metadata = metadata
                     .with_edit_intent(intent)
+                    .with_clipboard_action(clipboard)
                     .with_text_edit_observation(observe_text_edit);
                 let space_key = is_space_key(&event).then(|| {
                     if event.state.is_pressed() {
@@ -3418,6 +3558,41 @@ impl DispatchStack {
         )?))
     }
 
+    fn stage_clipboard_event(
+        &mut self,
+        document: &BaseDocument,
+        handles: &mut NodeHandles,
+        redraw: &AtomicBool,
+        pending: PendingClipboardDefault,
+    ) -> Result<Option<DispatchStep>, DispatchError> {
+        if !node_is_live(pending.target, document, handles) {
+            return Ok(None);
+        }
+        let metadata = pending
+            .guarded
+            .metadata
+            .clone()
+            .into_clipboard(&pending.action);
+        let Some(mut event) = guard_event_with_target(
+            document,
+            handles,
+            pending.target,
+            DomEventData::Input(blitz_traits::events::BlitzInputEvent {
+                value: String::new(),
+            }),
+            metadata,
+        )?
+        else {
+            return Ok(None);
+        };
+        event.event.bubbles = true;
+        Ok(Some(self.stage(
+            redraw,
+            event,
+            ResumeAction::Clipboard(Box::new(pending)),
+        )?))
+    }
+
     #[allow(
         clippy::too_many_arguments,
         reason = "composition staging carries the guarded target, causal metadata, payload, and continuation"
@@ -3516,19 +3691,23 @@ impl DispatchStack {
         } else {
             None
         };
-        let keyboard_edit = matches!(&event.event.data, DomEventData::KeyDown(_))
-            .then(|| event.metadata.edit_intent.clone())
-            .flatten()
-            .map(|intent| KeyboardEditContinuation {
-                intent,
-                source_was_editor: editor_edit_snapshot(document, event.target.raw).is_some(),
-            });
+        let keyboard_default = matches!(&event.event.data, DomEventData::KeyDown(_))
+            .then(|| {
+                let intent = event.metadata.edit_intent.clone();
+                let clipboard = event.metadata.clipboard_action.clone();
+                (intent.is_some() || clipboard.is_some()).then(|| KeyboardDefaultContinuation {
+                    intent,
+                    clipboard,
+                    source_was_editor: editor_edit_snapshot(document, event.target.raw).is_some(),
+                })
+            })
+            .flatten();
         let resume = ResumeAction::Normal {
             suppress_default,
             double_click,
             checkable_activation,
             space_key,
-            keyboard_edit,
+            keyboard_default,
         };
         Ok(self.finish_stage(redraw, event_id, event, resume))
     }
@@ -4062,6 +4241,51 @@ impl DispatchStack {
                 None,
                 space_key,
             ),
+            PendingEditAction::Clipboard { action } => {
+                let before = editor_edit_snapshot(document, edit.target.raw);
+                match action {
+                    ClipboardAction::Copy => {
+                        unreachable!("copy has no beforeinput edit default")
+                    }
+                    ClipboardAction::Cut => {
+                        document.with_text_input(edit.target.raw, |mut driver| {
+                            if driver.editor.selected_text().is_some() {
+                                driver.delete_selection();
+                            }
+                        });
+                    }
+                    ClipboardAction::Paste { data } => {
+                        document.with_text_input(edit.target.raw, |mut driver| {
+                            driver.insert_or_replace_selection(&data);
+                        });
+                    }
+                }
+                let after = editor_edit_snapshot(document, edit.target.raw);
+                if before != after {
+                    text_controls.sync_editor_value(document, edit.target.raw);
+                    self.frames
+                        .last_mut()
+                        .expect("clipboard edits run only for an active frame")
+                        .redraw_requested = true;
+                    let value = after.map_or_else(String::new, |snapshot| snapshot.value);
+                    let metadata = edit
+                        .metadata
+                        .with_clipboard_action(None)
+                        .with_edit_intent(Some(edit.intent));
+                    let event = DomEvent::new(
+                        edit.target.raw,
+                        DomEventData::Input(blitz_traits::events::BlitzInputEvent { value }),
+                    );
+                    if let Some(event) = guard_queued_event(document, handles, event, metadata)? {
+                        self.frames
+                            .last_mut()
+                            .expect("clipboard edits run only for an active frame")
+                            .generated
+                            .push_back(event);
+                    }
+                }
+                Ok(())
+            }
             PendingEditAction::ImeDeleteSurrounding {
                 before_bytes,
                 after_bytes,
@@ -4367,6 +4591,17 @@ fn editor_edit_snapshot(document: &mut BaseDocument, target: usize) -> Option<Ed
     snapshot
 }
 
+/// Complete the clipboard-writing half of a cut after its `cut` listeners have run. The
+/// subsequent `beforeinput` controls only whether the document selection is deleted; canceling
+/// that edit must not roll back the already accepted clipboard action.
+fn copy_editor_selection_to_clipboard(document: &mut BaseDocument, target: usize) -> bool {
+    let mut selected = None;
+    document.with_text_input(target, |driver| {
+        selected = driver.editor.selected_text().map(str::to_owned);
+    });
+    selected.is_some_and(|text| document.shell_provider.set_clipboard_text(text).is_ok())
+}
+
 fn text_edit_target_accepts(
     document: &mut BaseDocument,
     handles: &NodeHandles,
@@ -4524,12 +4759,6 @@ fn keyboard_edit_intent(event: &blitz_traits::events::BlitzKeyEvent) -> Option<E
     }
     let action = event.modifiers.contains(keyboard_types::Modifiers::CONTROL);
     match &event.key {
-        keyboard_types::Key::Character(value) if action && value.as_str() == "x" => {
-            Some(EditIntent::DeleteByCut)
-        }
-        keyboard_types::Key::Character(value) if action && value.as_str() == "v" => {
-            Some(EditIntent::InsertFromPaste)
-        }
         keyboard_types::Key::Delete => Some(if action {
             EditIntent::DeleteWordForward
         } else {
@@ -4558,10 +4787,30 @@ fn keyboard_edit_intent(event: &blitz_traits::events::BlitzKeyEvent) -> Option<E
     }
 }
 
-fn keyboard_copy_default(event: &blitz_traits::events::BlitzKeyEvent) -> bool {
-    event.state.is_pressed()
-        && event.modifiers.contains(keyboard_types::Modifiers::CONTROL)
-        && matches!(&event.key, keyboard_types::Key::Character(value) if value.as_str() == "c")
+fn keyboard_clipboard_action(
+    document: &BaseDocument,
+    event: &blitz_traits::events::BlitzKeyEvent,
+) -> Option<ClipboardAction> {
+    if !event.state.is_pressed() || !event.modifiers.contains(keyboard_types::Modifiers::CONTROL) {
+        return None;
+    }
+    match &event.key {
+        keyboard_types::Key::Character(value) if value.as_str() == "c" => {
+            Some(ClipboardAction::Copy)
+        }
+        keyboard_types::Key::Character(value) if value.as_str() == "x" => {
+            Some(ClipboardAction::Cut)
+        }
+        keyboard_types::Key::Character(value) if value.as_str() == "v" => {
+            Some(ClipboardAction::Paste {
+                data: document
+                    .shell_provider
+                    .get_clipboard_text()
+                    .unwrap_or_default(),
+            })
+        }
+        _ => None,
+    }
 }
 
 fn apple_standard_keybinding_edit_intent(command: &str) -> Option<EditIntent> {
@@ -6266,17 +6515,7 @@ fn event_payload(data: &DomEventData, metadata: &EventMetadata) -> Option<Dispat
         | DomEventData::KeyUp(event) => Some(DispatchEventPayload::Keyboard(keyboard_payload(
             event, metadata,
         ))),
-        DomEventData::Input(_) => metadata.composition_data.as_ref().map_or_else(
-            || {
-                Some(DispatchEventPayload::Input(
-                    metadata
-                        .edit_intent
-                        .as_ref()
-                        .map_or_else(InputPayload::empty, EditIntent::payload),
-                ))
-            },
-            |data| Some(DispatchEventPayload::Composition { data: data.clone() }),
-        ),
+        DomEventData::Input(_) => Some(input_carrier_payload(metadata)),
         DomEventData::Focus(_)
         | DomEventData::Blur(_)
         | DomEventData::FocusIn(_)
@@ -6286,6 +6525,23 @@ fn event_payload(data: &DomEventData, metadata: &EventMetadata) -> Option<Dispat
         DomEventData::Scroll(_)
         | DomEventData::Ime(_)
         | DomEventData::AppleStandardKeybinding(_) => None,
+    }
+}
+
+fn input_carrier_payload(metadata: &EventMetadata) -> DispatchEventPayload {
+    if let Some(action) = &metadata.clipboard_action {
+        DispatchEventPayload::Clipboard {
+            text: action.data(),
+        }
+    } else if let Some(data) = &metadata.composition_data {
+        DispatchEventPayload::Composition { data: data.clone() }
+    } else {
+        DispatchEventPayload::Input(
+            metadata
+                .edit_intent
+                .as_ref()
+                .map_or_else(InputPayload::empty, EditIntent::payload),
+        )
     }
 }
 
@@ -6794,6 +7050,13 @@ impl DispatchEventPayload {
                 )?;
                 set(&object, "inputType", JsValue::from_str(input.input_type))?;
                 set(&object, "isComposing", input.is_composing.into())?;
+            }
+            Self::Clipboard { text } => {
+                set(
+                    &object,
+                    "text",
+                    text.map_or(JsValue::NULL, |text| JsValue::from_str(&text)),
+                )?;
             }
             Self::Composition { data } => {
                 set(&object, "data", JsValue::from_str(&data))?;
@@ -7513,7 +7776,45 @@ mod tests {
     };
     use blitz_traits::shell::{ColorScheme, ShellProvider, Viewport};
     use keyboard_types::{Code, Key, Location, Modifiers};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct MemoryClipboardShell {
+        text: Mutex<String>,
+    }
+
+    impl MemoryClipboardShell {
+        fn with_text(text: &str) -> Self {
+            Self {
+                text: Mutex::new(text.to_owned()),
+            }
+        }
+
+        fn text(&self) -> String {
+            self.text
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl ShellProvider for MemoryClipboardShell {
+        fn get_clipboard_text(&self) -> Result<String, ClipboardError> {
+            Ok(self
+                .text
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone())
+        }
+
+        fn set_clipboard_text(&self, text: String) -> Result<(), ClipboardError> {
+            *self
+                .text
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = text;
+            Ok(())
+        }
+    }
 
     struct TestContext {
         document: BaseDocument,
@@ -14173,7 +14474,9 @@ mod tests {
             metadata: host_key_metadata("c"),
             suppress_default: false,
         }));
-        complete(context.resume(&keydown, false));
+        let copy_event = event(context.resume(&keydown, false));
+        assert_eq!(copy_event.event_type, "copy");
+        complete(context.resume(&copy_event, false));
 
         complete(context.begin(DispatchRequest::AppleStandardKeybinding(
             "moveLeft:".to_owned(),
@@ -14978,7 +15281,8 @@ mod tests {
 
     #[test]
     fn unchanged_text_defaults_do_not_dispatch_input() {
-        let mut context = TestContext::new("<input id='editor' value='abc'>");
+        let shell = Arc::new(MemoryClipboardShell::default());
+        let mut context = TestContext::with_shell("<input id='editor' value='abc'>", shell);
         let input = context.element("editor");
         assert!(context.document.set_focus_to(input));
         context
@@ -15020,7 +15324,12 @@ mod tests {
                 metadata: host_key_metadata(character),
                 suppress_default: false,
             }));
-            let resumed = context.resume(&keydown, false);
+            let clipboard = event(context.resume(&keydown, false));
+            assert_eq!(
+                clipboard.event_type,
+                if character == "v" { "paste" } else { "copy" }
+            );
+            let resumed = context.resume(&clipboard, false);
             if character == "v" {
                 let before_input = event(resumed);
                 assert_eq!(before_input.event_type, "beforeinput");
@@ -15123,6 +15432,212 @@ mod tests {
     }
 
     #[test]
+    fn paste_dispatches_clipboard_and_edit_events_with_one_stable_snapshot() {
+        let shell = Arc::new(MemoryClipboardShell::with_text("pasted"));
+        let mut context = TestContext::with_shell(
+            "<div id='outer'><input id='editor' value='before'></div>",
+            shell.clone(),
+        );
+        let input = context.element("editor");
+        assert!(context.document.set_focus_to(input));
+        context
+            .document
+            .with_text_input(input, |mut driver| driver.move_to_text_end());
+
+        let mut key_event = key(Key::Character("v".into()), Code::KeyV, KeyState::Pressed);
+        key_event.modifiers = Modifiers::CONTROL;
+        let keydown = event(context.begin(DispatchRequest::Key {
+            event: key_event,
+            metadata: host_key_metadata("v"),
+            // Darwin reports an accompanying native text command. The browser clipboard
+            // transaction still belongs to this keydown rather than that private command.
+            suppress_default: true,
+        }));
+        assert_eq!(keydown.event_type, "keydown");
+
+        let paste = event(context.resume(&keydown, false));
+        assert_eq!(paste.event_type, "paste");
+        assert!(paste.bubbles && paste.cancelable && paste.composed);
+        assert_eq!(paste.target, keydown.target);
+        assert_eq!(paste.path, keydown.path);
+        assert_eq!(
+            paste.payload.as_deref(),
+            Some(&DispatchEventPayload::Clipboard {
+                text: Some("pasted".to_owned()),
+            })
+        );
+
+        assert!(shell.set_clipboard_text("newer".to_owned()).is_ok());
+        let before_input = event(context.resume(&paste, false));
+        assert_eq!(before_input.event_type, "beforeinput");
+        assert_eq!(context.live_value(input), "before");
+        assert_eq!(
+            before_input.payload.as_deref(),
+            Some(&DispatchEventPayload::Input(InputPayload {
+                data: Some("pasted".to_owned()),
+                input_type: "insertFromPaste",
+                is_composing: false,
+            }))
+        );
+
+        let input_event = event(context.resume(&before_input, false));
+        assert_eq!(input_event.event_type, "input");
+        assert_eq!(context.live_value(input), "beforepasted");
+        assert_eq!(input_event.payload, before_input.payload);
+        complete(context.resume(&input_event, false));
+        assert_eq!(shell.text(), "newer");
+    }
+
+    #[test]
+    fn clipboard_and_beforeinput_cancellation_stop_paste_at_their_own_boundaries() {
+        let shell = Arc::new(MemoryClipboardShell::with_text("pasted"));
+        let mut canceled_paste =
+            TestContext::with_shell("<input id='editor' value='before'>", shell.clone());
+        let input = canceled_paste.element("editor");
+        assert!(canceled_paste.document.set_focus_to(input));
+        canceled_paste
+            .document
+            .with_text_input(input, |mut driver| driver.move_to_text_end());
+        let mut key_event = key(Key::Character("v".into()), Code::KeyV, KeyState::Pressed);
+        key_event.modifiers = Modifiers::CONTROL;
+        let keydown = event(canceled_paste.begin(DispatchRequest::Key {
+            event: key_event,
+            metadata: host_key_metadata("v"),
+            suppress_default: false,
+        }));
+        let paste = event(canceled_paste.resume(&keydown, false));
+        complete(canceled_paste.resume(&paste, true));
+        assert_eq!(canceled_paste.live_value(input), "before");
+
+        let mut canceled_edit =
+            TestContext::with_shell("<input id='editor' value='before'>", shell);
+        let input = canceled_edit.element("editor");
+        assert!(canceled_edit.document.set_focus_to(input));
+        canceled_edit
+            .document
+            .with_text_input(input, |mut driver| driver.move_to_text_end());
+        let mut key_event = key(Key::Character("v".into()), Code::KeyV, KeyState::Pressed);
+        key_event.modifiers = Modifiers::CONTROL;
+        let keydown = event(canceled_edit.begin(DispatchRequest::Key {
+            event: key_event,
+            metadata: host_key_metadata("v"),
+            suppress_default: false,
+        }));
+        let paste = event(canceled_edit.resume(&keydown, false));
+        let before_input = event(canceled_edit.resume(&paste, false));
+        complete(canceled_edit.resume(&before_input, true));
+        assert_eq!(canceled_edit.live_value(input), "before");
+    }
+
+    #[test]
+    fn copy_and_cut_update_the_application_clipboard_at_browser_boundaries() {
+        let copy_shell = Arc::new(MemoryClipboardShell::with_text("old"));
+        let mut copy = TestContext::with_shell(
+            "<div id='outer'><input id='editor' value='selected'></div>",
+            copy_shell.clone(),
+        );
+        let input = copy.element("editor");
+        assert!(copy.document.set_focus_to(input));
+        copy.document
+            .with_text_input(input, |mut driver| driver.select_all());
+        let mut key_event = key(Key::Character("c".into()), Code::KeyC, KeyState::Pressed);
+        key_event.modifiers = Modifiers::CONTROL;
+        let keydown = event(copy.begin(DispatchRequest::Key {
+            event: key_event,
+            metadata: host_key_metadata("c"),
+            suppress_default: true,
+        }));
+        let copy_event = event(copy.resume(&keydown, false));
+        assert_eq!(copy_event.event_type, "copy");
+        assert!(copy_event.bubbles && copy_event.cancelable && copy_event.composed);
+        assert_eq!(
+            copy_event.payload.as_deref(),
+            Some(&DispatchEventPayload::Clipboard { text: None })
+        );
+        complete(copy.resume(&copy_event, false));
+        assert_eq!(copy_shell.text(), "selected");
+        assert_eq!(copy.live_value(input), "selected");
+
+        let cut_shell = Arc::new(MemoryClipboardShell::with_text("old"));
+        let mut cut = TestContext::with_shell(
+            "<div id='outer'><input id='editor' value='selected'></div>",
+            cut_shell.clone(),
+        );
+        let input = cut.element("editor");
+        assert!(cut.document.set_focus_to(input));
+        cut.document
+            .with_text_input(input, |mut driver| driver.select_all());
+        let mut key_event = key(Key::Character("x".into()), Code::KeyX, KeyState::Pressed);
+        key_event.modifiers = Modifiers::CONTROL;
+        let keydown = event(cut.begin(DispatchRequest::Key {
+            event: key_event,
+            metadata: host_key_metadata("x"),
+            suppress_default: true,
+        }));
+        let cut_event = event(cut.resume(&keydown, false));
+        assert_eq!(cut_event.event_type, "cut");
+        assert_eq!(
+            cut_event.payload.as_deref(),
+            Some(&DispatchEventPayload::Clipboard { text: None })
+        );
+        let before_input = event(cut.resume(&cut_event, false));
+        assert_eq!(before_input.event_type, "beforeinput");
+        assert_eq!(cut_shell.text(), "selected");
+        assert_eq!(cut.live_value(input), "selected");
+        assert_eq!(
+            before_input.payload.as_deref(),
+            Some(&DispatchEventPayload::Input(InputPayload {
+                data: None,
+                input_type: "deleteByCut",
+                is_composing: false,
+            }))
+        );
+
+        // Canceling the edit preserves the document but not the already completed cut-to-
+        // clipboard step, matching the Input Events browser test.
+        complete(cut.resume(&before_input, true));
+        assert_eq!(cut_shell.text(), "selected");
+        assert_eq!(cut.live_value(input), "selected");
+
+        let mut key_event = key(Key::Character("x".into()), Code::KeyX, KeyState::Pressed);
+        key_event.modifiers = Modifiers::CONTROL;
+        let keydown = event(cut.begin(DispatchRequest::Key {
+            event: key_event,
+            metadata: host_key_metadata("x"),
+            suppress_default: false,
+        }));
+        let cut_event = event(cut.resume(&keydown, false));
+        let before_input = event(cut.resume(&cut_event, false));
+        let input_event = event(cut.resume(&before_input, false));
+        assert_eq!(input_event.event_type, "input");
+        assert_eq!(input_event.payload, before_input.payload);
+        assert_eq!(cut.live_value(input), "");
+        complete(cut.resume(&input_event, false));
+
+        let canceled_shell = Arc::new(MemoryClipboardShell::with_text("old"));
+        let mut canceled = TestContext::with_shell(
+            "<input id='editor' value='selected'>",
+            canceled_shell.clone(),
+        );
+        let input = canceled.element("editor");
+        assert!(canceled.document.set_focus_to(input));
+        canceled
+            .document
+            .with_text_input(input, |mut driver| driver.select_all());
+        let mut key_event = key(Key::Character("x".into()), Code::KeyX, KeyState::Pressed);
+        key_event.modifiers = Modifiers::CONTROL;
+        let keydown = event(canceled.begin(DispatchRequest::Key {
+            event: key_event,
+            metadata: host_key_metadata("x"),
+            suppress_default: false,
+        }));
+        let cut_event = event(canceled.resume(&keydown, false));
+        complete(canceled.resume(&cut_event, true));
+        assert_eq!(canceled_shell.text(), "old");
+        assert_eq!(canceled.live_value(input), "selected");
+    }
+
+    #[test]
     fn supported_native_edit_commands_map_to_browser_input_types() {
         let mut cut = key(Key::Character("x".into()), Code::KeyX, KeyState::Pressed);
         cut.modifiers = Modifiers::CONTROL;
@@ -15131,10 +15646,19 @@ mod tests {
         let mut word_delete = key(Key::Delete, Code::Delete, KeyState::Pressed);
         word_delete.modifiers = Modifiers::CONTROL;
 
-        assert_eq!(keyboard_edit_intent(&cut), Some(EditIntent::DeleteByCut));
+        let shell = Arc::new(MemoryClipboardShell::with_text("pasted"));
+        let context = TestContext::with_shell("", shell);
+        assert_eq!(keyboard_edit_intent(&cut), None);
+        assert_eq!(keyboard_edit_intent(&paste), None);
         assert_eq!(
-            keyboard_edit_intent(&paste),
-            Some(EditIntent::InsertFromPaste)
+            keyboard_clipboard_action(&context.document, &cut),
+            Some(ClipboardAction::Cut)
+        );
+        assert_eq!(
+            keyboard_clipboard_action(&context.document, &paste),
+            Some(ClipboardAction::Paste {
+                data: "pasted".to_owned(),
+            })
         );
         assert_eq!(
             keyboard_edit_intent(&word_delete),

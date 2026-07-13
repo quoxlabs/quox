@@ -8,7 +8,7 @@ mod render;
 use blitz_dom::{BaseDocument, DEFAULT_CSS, DocumentConfig, FontContext};
 use blitz_html::{HtmlDocument, HtmlProvider};
 use blitz_traits::net::DummyNetProvider;
-use blitz_traits::shell::{ColorScheme, ShellProvider, Viewport};
+use blitz_traits::shell::{ClipboardError, ColorScheme, ShellProvider, Viewport};
 use ffi_numbers::{NumericArgumentError, positive_f32, uint32};
 use form_controls::{CheckedControlStates, TextControlStates};
 use interaction::staged_dispatch::DispatchStack;
@@ -312,6 +312,11 @@ struct QuoxShellProvider {
     ime_requests: Arc<ImeRequestMailbox>,
 }
 
+// Clipboard ownership belongs to the application rather than an individual window. Winding
+// does not yet expose a system-clipboard bridge, so keep the supported plain-text format shared
+// by every renderer in this WASM application instance.
+static APPLICATION_CLIPBOARD: Mutex<String> = Mutex::new(String::new());
+
 impl ShellProvider for QuoxShellProvider {
     fn request_redraw(&self) {
         self.redraw_requested.store(true, Ordering::Relaxed);
@@ -323,6 +328,20 @@ impl ShellProvider for QuoxShellProvider {
 
     fn set_ime_cursor_area(&self, x: f32, y: f32, width: f32, height: f32) {
         self.ime_requests.request_cursor_area([x, y, width, height]);
+    }
+
+    fn get_clipboard_text(&self) -> Result<String, ClipboardError> {
+        Ok(APPLICATION_CLIPBOARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone())
+    }
+
+    fn set_clipboard_text(&self, text: String) -> Result<(), ClipboardError> {
+        *APPLICATION_CLIPBOARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = text;
+        Ok(())
     }
 }
 
@@ -553,11 +572,13 @@ impl QuoxRenderer {
 mod tests {
     use super::{
         IME_REQUEST_CONTEXT_RESTART, IME_REQUEST_CURSOR_AREA, IME_REQUEST_ENABLED,
-        ImeRequestMailbox, focused_ime_cursor_area,
+        ImeRequestMailbox, QuoxShellProvider, focused_ime_cursor_area,
     };
     use blitz_dom::{DocumentConfig, Point};
     use blitz_html::HtmlDocument;
-    use blitz_traits::shell::{ColorScheme, Viewport};
+    use blitz_traits::shell::{ColorScheme, ShellProvider, Viewport};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
     fn peek(mailbox: &ImeRequestMailbox) -> [f64; 7] {
         mailbox
@@ -570,6 +591,22 @@ mod tests {
         mailbox
             .acknowledge_snapshot(snapshot[0] as u32)
             .expect("acknowledgment should succeed");
+    }
+
+    #[test]
+    fn clipboard_text_is_shared_across_application_renderers() {
+        let provider = || QuoxShellProvider {
+            redraw_requested: Arc::new(AtomicBool::new(false)),
+            ime_requests: Arc::new(ImeRequestMailbox::default()),
+        };
+        let first = provider();
+        let second = provider();
+
+        assert!(first.set_clipboard_text("shared text".to_owned()).is_ok());
+        let Ok(text) = second.get_clipboard_text() else {
+            panic!("the application clipboard should be readable");
+        };
+        assert_eq!(text, "shared text");
     }
 
     #[test]

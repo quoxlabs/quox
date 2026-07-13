@@ -5,7 +5,9 @@ import {
   isQuoxVNode,
   type QuoxComponent,
   type QuoxEventProps,
+  type QuoxJsxClipboardEvent,
   type QuoxJsxCompositionEvent,
+  type QuoxJsxDataTransfer,
   type QuoxJsxEvent,
   type QuoxJsxFocusEvent,
   type QuoxJsxInputEvent,
@@ -16,7 +18,9 @@ import {
 } from "./jsx-runtime.ts";
 import type { QuoxEvent } from "../quox/dom/event.ts";
 import type {
+  QuoxClipboardEvent,
   QuoxCompositionEvent,
+  QuoxDataTransfer,
   QuoxDOMInputEvent,
   QuoxDOMKeyboardEvent,
   QuoxFocusEvent,
@@ -52,6 +56,9 @@ type ExpectedBaseEventProp =
   | "onDblClick"
   | "onKeyDown"
   | "onKeyUp"
+  | "onCopy"
+  | "onCut"
+  | "onPaste"
   | "onBeforeInput"
   | "onInput"
   | "onChange"
@@ -76,10 +83,12 @@ const runtimeEventCompatibility: [
   QuoxPointerEvent extends QuoxJsxPointerEvent ? true : false,
   QuoxWheelEvent extends QuoxJsxWheelEvent ? true : false,
   QuoxDOMKeyboardEvent extends QuoxJsxKeyboardEvent ? true : false,
+  QuoxClipboardEvent extends QuoxJsxClipboardEvent ? true : false,
+  QuoxDataTransfer extends QuoxJsxDataTransfer ? true : false,
   QuoxDOMInputEvent extends QuoxJsxInputEvent ? true : false,
   QuoxCompositionEvent extends QuoxJsxCompositionEvent ? true : false,
   QuoxFocusEvent extends QuoxJsxFocusEvent ? true : false,
-] = [true, true, true, true, true, true, true, true, true];
+] = [true, true, true, true, true, true, true, true, true, true, true];
 
 const supportedEvents = (
   <input
@@ -96,6 +105,12 @@ const supportedEvents = (
     onWheelCapture={(event) => expectType<QuoxJsxWheelEvent>(event)}
     onAuxClick={(event) => expectType<QuoxJsxPointerEvent>(event)}
     onKeyDown={(event) => expectType<QuoxJsxKeyboardEvent>(event)}
+    onCopy={(event) => expectType<QuoxJsxClipboardEvent>(event)}
+    onCutCapture={(event) => expectType<QuoxJsxClipboardEvent>(event)}
+    onPaste={(event) => {
+      expectType<QuoxJsxClipboardEvent>(event);
+      expectType<QuoxJsxDataTransfer | null>(event.clipboardData);
+    }}
     onBeforeInputCapture={(event) => expectType<QuoxJsxInputEvent>(event)}
     onInput={(event) => expectType<QuoxJsxInputEvent>(event)}
     onChange={(event) => expectType<QuoxJsxEvent>(event)}

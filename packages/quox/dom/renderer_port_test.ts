@@ -117,6 +117,11 @@ function payloadForType(type: DomDispatchEventType): Record<string, unknown> | u
     case "keydown":
     case "keyup":
       return keyboardPayload();
+    case "copy":
+    case "cut":
+      return { text: null };
+    case "paste":
+      return { text: "clipboard text" };
     case "beforeinput":
     case "input":
       return { data: null, inputType: "", isComposing: false };
@@ -223,6 +228,24 @@ Deno.test("DOM dispatch validator preserves text edit details and empty control 
   assertEquals(step.payload, undefined);
 });
 
+Deno.test("DOM dispatch validator preserves exact clipboard payloads", () => {
+  for (
+    const [type, text] of [
+      ["copy", null],
+      ["cut", null],
+      ["paste", ""],
+      ["paste", "clipboard text"],
+    ] as const
+  ) {
+    const rawPayload = { text };
+    const step = validateDomDispatchStep(eventStep({ type, payload: rawPayload }));
+    assert(step.kind === "event");
+    assertEquals(step.payload, rawPayload);
+    assert(Object.isFrozen(step.payload));
+    assert(!Object.is(step.payload, rawPayload));
+  }
+});
+
 Deno.test("DOM dispatch validator accepts and freezes complete steps", () => {
   const step = validateDomDispatchStep(completeStep(9, true));
   assertEquals(step, { kind: "complete", frameId: 9, redrawRequested: true });
@@ -294,6 +317,7 @@ Deno.test("DOM dispatch validator requires exact payload families and rejects pl
     eventStep({ type: "dblclick", payload: pointerPayload() }),
     eventStep({ type: "wheel", payload: mousePayload() }),
     eventStep({ type: "keydown", payload: { ...keyboardPayload(), data: null } }),
+    eventStep({ type: "copy", payload: { text: null, future: true } }),
     eventStep({ type: "beforeinput", payload: { data: null, inputType: "" } }),
     eventStep({ type: "input", payload: { data: null, inputType: "" } }),
     eventStep({ type: "compositionupdate", payload: { data: "x", isComposing: true } }),
@@ -340,6 +364,10 @@ Deno.test("DOM dispatch validator enforces payload types, finite values, ranges,
     eventStep({ type: "keydown", payload: keyboardPayload({ location: 4 }) }),
     eventStep({ type: "keydown", payload: keyboardPayload({ keyCode: 1.5 }) }),
     eventStep({ type: "keydown", payload: keyboardPayload({ numLock: 1 }) }),
+    eventStep({ type: "copy", payload: { text: "not initially exposed" } }),
+    eventStep({ type: "cut", payload: { text: "not initially exposed" } }),
+    eventStep({ type: "paste", payload: { text: null } }),
+    eventStep({ type: "paste", payload: { text: 1 } }),
     eventStep({ type: "input", payload: { data: 1, inputType: "", isComposing: false } }),
     eventStep({ type: "beforeinput", payload: { data: null, inputType: 1, isComposing: false } }),
     eventStep({ type: "compositionstart", payload: { data: null } }),

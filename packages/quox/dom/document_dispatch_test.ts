@@ -8,7 +8,9 @@ import { setElementFunctionProp } from "./handlers.ts";
 import { documentHasActiveDispatch, releaseStoppedRenderer } from "./internals.ts";
 import type { QuoxElement } from "./node.ts";
 import {
+  QuoxClipboardEvent,
   QuoxCompositionEvent,
+  QuoxDataTransfer,
   QuoxDOMInputEvent,
   QuoxDOMKeyboardEvent,
   QuoxFocusEvent,
@@ -143,6 +145,11 @@ function payloadForType(type: DomDispatchEventType): Record<string, unknown> | u
     case "keydown":
     case "keyup":
       return keyboardPayload();
+    case "copy":
+    case "cut":
+      return { text: null };
+    case "paste":
+      return { text: "clipboard text" };
     case "beforeinput":
     case "input":
       return { data: null, inputType: "", isComposing: false };
@@ -911,6 +918,108 @@ Deno.test("payloadless trusted input uses HTML's plain Event shape", () => {
   assertFalse(received.cancelable);
   assert(received.composed);
   assert(received.isTrusted);
+});
+
+Deno.test("trusted clipboard events expose read-only plaintext transfers and metadata", () => {
+  const { document, renderer } = createHarness();
+  const parent = document.createElement("section");
+  const target = document.createElement("input");
+  const observed: Array<{
+    type: string;
+    types: readonly string[];
+    text: string;
+    bubbles: boolean;
+    cancelable: boolean;
+    composed: boolean;
+  }> = [];
+  const bubbled: string[] = [];
+
+  for (const type of ["copy", "cut", "paste"] as const) {
+    target.addEventListener(type, (event) => {
+      assert(event instanceof QuoxClipboardEvent);
+      assert(event.clipboardData instanceof QuoxDataTransfer);
+      assert(event.isTrusted);
+      observed.push({
+        type: event.type,
+        types: event.clipboardData.types,
+        text: event.clipboardData.getData("text/plain"),
+        bubbles: event.bubbles,
+        cancelable: event.cancelable,
+        composed: event.composed,
+      });
+      if (type === "copy") event.preventDefault();
+    });
+    parent.addEventListener(type, () => bubbled.push(type));
+  }
+
+  renderer.queueFrame([
+    {
+      type: "copy",
+      target: target.nodeId,
+      path: [target.nodeId, parent.nodeId],
+      payload: { text: null },
+    },
+    {
+      type: "cut",
+      target: target.nodeId,
+      path: [target.nodeId, parent.nodeId],
+      payload: { text: null },
+    },
+    {
+      type: "paste",
+      target: target.nodeId,
+      path: [target.nodeId, parent.nodeId],
+      payload: { text: "clipboard text" },
+    },
+    {
+      type: "paste",
+      target: target.nodeId,
+      path: [target.nodeId, parent.nodeId],
+      payload: { text: "" },
+    },
+  ]);
+
+  document.dispatchPointerMove(1, 2, 0, 0);
+
+  assertEquals(observed, [
+    {
+      type: "copy",
+      types: [],
+      text: "",
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+    },
+    {
+      type: "cut",
+      types: [],
+      text: "",
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+    },
+    {
+      type: "paste",
+      types: ["text/plain"],
+      text: "clipboard text",
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+    },
+    {
+      type: "paste",
+      types: ["text/plain"],
+      text: "",
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+    },
+  ]);
+  assertEquals(bubbled, ["copy", "cut", "paste", "paste"]);
+  assertEquals(
+    renderer.calls.filter(([method]) => method === "resume").map((call) => call[3]),
+    [true, false, false, false],
+  );
 });
 
 Deno.test("trusted composition lifecycle preserves browser order, payloads, and flags", () => {

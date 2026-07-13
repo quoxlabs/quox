@@ -32,6 +32,9 @@ export const DOM_DISPATCH_EVENT_TYPES = Object.freeze(
     "dblclick",
     "keydown",
     "keyup",
+    "copy",
+    "cut",
+    "paste",
     "beforeinput",
     "input",
     "change",
@@ -114,6 +117,11 @@ export interface DomDispatchKeyboardPayload {
   readonly scrollLock: boolean;
 }
 
+export interface DomDispatchClipboardPayload {
+  /** Plaintext clipboard contents. Copy and cut expose an empty transfer as `null`. */
+  readonly text: string | null;
+}
+
 export interface DomDispatchInputPayload {
   readonly data: string | null;
   readonly inputType: string;
@@ -133,6 +141,7 @@ export type DomDispatchEventPayload =
   | DomDispatchPointerPayload
   | DomDispatchWheelPayload
   | DomDispatchKeyboardPayload
+  | DomDispatchClipboardPayload
   | DomDispatchInputPayload
   | DomDispatchCompositionPayload
   | DomDispatchFocusPayload;
@@ -478,6 +487,7 @@ const KEYBOARD_PAYLOAD_PROPERTIES = Object.freeze(
   ] as const,
 );
 
+const CLIPBOARD_PAYLOAD_PROPERTIES = Object.freeze(["text"] as const);
 const INPUT_PAYLOAD_PROPERTIES = Object.freeze(["data", "inputType", "isComposing"] as const);
 const COMPOSITION_PAYLOAD_PROPERTIES = Object.freeze(["data"] as const);
 const FOCUS_PAYLOAD_PROPERTIES = Object.freeze(["relatedTarget"] as const);
@@ -642,6 +652,28 @@ function validateKeyboardPayload(value: unknown): DomDispatchKeyboardPayload {
   });
 }
 
+function validateClipboardPayload(
+  value: unknown,
+  type: "copy" | "cut" | "paste",
+): DomDispatchClipboardPayload {
+  const descriptors = inspectExactPlainRecord(
+    value,
+    "DOM dispatch payload",
+    CLIPBOARD_PAYLOAD_PROPERTIES,
+  );
+  const text = requiredValue(descriptors, "text", "DOM dispatch payload");
+  if (text !== null && typeof text !== "string") {
+    throw new TypeError("quox: DOM dispatch payload.text must be a string or null");
+  }
+  if (type === "paste" && text === null) {
+    throw new TypeError("quox: paste events require DOM dispatch payload.text to be a string");
+  }
+  if (type !== "paste" && text !== null) {
+    throw new TypeError(`quox: ${type} events require DOM dispatch payload.text to be null`);
+  }
+  return Object.freeze({ text });
+}
+
 function validateInputPayload(value: unknown): DomDispatchInputPayload {
   const descriptors = inspectExactPlainRecord(
     value,
@@ -726,6 +758,10 @@ function validateEventPayload(
     case "keydown":
     case "keyup":
       return validateKeyboardPayload(value);
+    case "copy":
+    case "cut":
+    case "paste":
+      return validateClipboardPayload(value, type);
     case "beforeinput":
     case "input":
       return validateInputPayload(value);

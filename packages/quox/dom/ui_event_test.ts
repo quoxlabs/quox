@@ -3,7 +3,9 @@ import { QuoxEvent } from "./event.ts";
 import { QuoxEventTarget } from "./event_target.ts";
 import {
   createTrustedMouseEventInit,
+  QuoxClipboardEvent,
   QuoxCompositionEvent,
+  QuoxDataTransfer,
   QuoxDOMInputEvent,
   QuoxDOMKeyboardEvent,
   QuoxFocusEvent,
@@ -221,6 +223,44 @@ Deno.test("keyboard events separate physical modifiers from key identity", () =>
     () => new QuoxDOMKeyboardEvent("keydown", { key: Symbol("key") } as unknown as { key: string }),
     TypeError,
   );
+});
+
+Deno.test("clipboard events expose a read-only plaintext DataTransfer facade", () => {
+  const transfer = new QuoxDataTransfer("clip\ud800board");
+  const event = new QuoxClipboardEvent("paste", {
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    clipboardData: transfer,
+  });
+
+  assert(event instanceof QuoxEvent);
+  assertStrictEquals(event.clipboardData, transfer);
+  assertEquals(transfer.types, ["text/plain"]);
+  assert(Object.isFrozen(transfer.types));
+  assertEquals(transfer.getData("text/plain"), "clip\ufffdboard");
+  assertEquals(transfer.getData("TEXT"), "clip\ufffdboard");
+  assertEquals(transfer.getData("text/html"), "");
+
+  for (
+    const mutate of [
+      () => transfer.clearData(),
+      () => transfer.clearData("text/plain"),
+      () => transfer.setData("text/plain", "replacement"),
+    ]
+  ) {
+    const error = assertThrows(mutate, DOMException, "clipboard data is read-only");
+    assertEquals(error.name, "NotSupportedError");
+  }
+
+  const emptyPaste = new QuoxDataTransfer("");
+  assertEquals(emptyPaste.types, ["text/plain"]);
+  assertEquals(emptyPaste.getData("text"), "");
+
+  const emptyCopy = new QuoxDataTransfer(null);
+  assertEquals(emptyCopy.types, []);
+  assertEquals(emptyCopy.getData("text/plain"), "");
+  assertStrictEquals(new QuoxClipboardEvent("copy").clipboardData, null);
 });
 
 Deno.test("input and composition event data is not confused with a control value", () => {

@@ -72,6 +72,10 @@ export interface QuoxKeyboardEventInit extends QuoxEventModifierInit {
   keyCode?: number;
 }
 
+export interface QuoxClipboardEventInit extends QuoxEventInit {
+  clipboardData?: QuoxDataTransfer | null;
+}
+
 export interface QuoxInputEventInit extends QuoxUIEventInit {
   data?: string | null;
   isComposing?: boolean;
@@ -305,6 +309,55 @@ export function createTrustedMouseEventInit<Init extends QuoxMouseEventInit>(
   coordinates: TrustedMouseCoordinates,
 ): Init {
   return Object.assign({}, eventInit, { [trustedMouseCoordinates]: { ...coordinates } });
+}
+
+/**
+ * The read-only plaintext subset of `DataTransfer` exposed by native clipboard events.
+ *
+ * Quox does not yet feed handler-authored clipboard contents back into the native default action,
+ * so mutation fails explicitly instead of appearing to work and then being ignored.
+ */
+export class QuoxDataTransfer {
+  readonly #text: string | null;
+  readonly #types: readonly string[];
+
+  constructor(text: string | null = null) {
+    this.#text = text === null ? null : toUSVString(text);
+    this.#types = Object.freeze(this.#text === null ? [] : ["text/plain"]);
+  }
+
+  get types(): readonly string[] {
+    return this.#types;
+  }
+
+  getData(format: string): string {
+    const normalized = domString(format, "").toLowerCase();
+    if (normalized !== "text" && normalized !== "text/plain") return "";
+    return this.#text ?? "";
+  }
+
+  clearData(_format?: string): void {
+    throw new DOMException("quox: clipboard data is read-only", "NotSupportedError");
+  }
+
+  setData(_format: string, _data: string): void {
+    throw new DOMException("quox: clipboard data is read-only", "NotSupportedError");
+  }
+}
+
+/** Browser-shaped clipboard event backed by Quox's plaintext transfer facade. */
+export class QuoxClipboardEvent extends QuoxEvent {
+  readonly #clipboardData: QuoxDataTransfer | null;
+
+  constructor(type: string, eventInit: QuoxClipboardEventInit = {}) {
+    eventInit = eventInit ?? {};
+    super(type, eventInit);
+    this.#clipboardData = eventInit.clipboardData ?? null;
+  }
+
+  get clipboardData(): QuoxDataTransfer | null {
+    return this.#clipboardData;
+  }
 }
 
 export class QuoxUIEvent extends QuoxEvent {

@@ -3,8 +3,11 @@ import { openWindow } from "./dom/window.ts";
 export * from "./dom/document.ts";
 export { QuoxEvent, type QuoxEventInit, type QuoxEventPhase } from "./dom/event.ts";
 export {
+  QuoxClipboardEvent,
+  type QuoxClipboardEventInit,
   QuoxCompositionEvent,
   type QuoxCompositionEventInit,
+  QuoxDataTransfer,
   QuoxDOMInputEvent,
   QuoxDOMKeyboardEvent,
   type QuoxEventModifierInit,

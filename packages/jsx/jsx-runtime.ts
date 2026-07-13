@@ -130,6 +130,17 @@ export interface QuoxJsxKeyboardEvent extends QuoxJsxUIEvent {
   getModifierState(keyArg: string): boolean;
 }
 
+export interface QuoxJsxDataTransfer {
+  readonly types: readonly string[];
+  getData(format: string): string;
+  clearData(format?: string): void;
+  setData(format: string, data: string): void;
+}
+
+export interface QuoxJsxClipboardEvent extends QuoxJsxEvent {
+  readonly clipboardData: QuoxJsxDataTransfer | null;
+}
+
 export interface QuoxJsxInputEvent extends QuoxJsxUIEvent {
   readonly data: string | null;
   readonly isComposing: boolean;
@@ -178,6 +189,9 @@ type QuoxBaseEventProps = {
   onDblClick?: QuoxEventProp<QuoxJsxMouseEvent>;
   onKeyDown?: QuoxEventProp<QuoxJsxKeyboardEvent>;
   onKeyUp?: QuoxEventProp<QuoxJsxKeyboardEvent>;
+  onCopy?: QuoxEventProp<QuoxJsxClipboardEvent>;
+  onCut?: QuoxEventProp<QuoxJsxClipboardEvent>;
+  onPaste?: QuoxEventProp<QuoxJsxClipboardEvent>;
   onBeforeInput?: QuoxEventProp<QuoxJsxInputEvent>;
   onInput?: QuoxEventProp<QuoxJsxInputEvent>;
   onChange?: QuoxEventProp<QuoxJsxEvent>;
