@@ -181,6 +181,7 @@ type QuoxBaseEventProps = {
   onKeyUp?: QuoxEventProp<QuoxJsxKeyboardEvent>;
   onBeforeInput?: QuoxEventProp<QuoxJsxInputEvent>;
   onInput?: QuoxEventProp<QuoxJsxInputEvent>;
+  onChange?: QuoxEventProp<QuoxJsxEvent>;
   onCompositionStart?: QuoxEventProp<QuoxJsxCompositionEvent>;
   onCompositionUpdate?: QuoxEventProp<QuoxJsxCompositionEvent>;
   onCompositionEnd?: QuoxEventProp<QuoxJsxCompositionEvent>;

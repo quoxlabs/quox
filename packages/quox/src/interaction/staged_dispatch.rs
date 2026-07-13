@@ -209,6 +209,17 @@ enum LabelClickDefault {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EventShapeOverride {
+    PlainChange,
+}
+
+#[derive(Clone, Copy)]
+struct ProtectedCheckableDefault {
+    target: GuardedNode,
+    checkedness_change: Option<bool>,
+}
+
 impl GuardedRawNode {
     fn from_public(public: GuardedNode) -> Self {
         Self {
@@ -268,6 +279,7 @@ struct EventMetadata {
     click_detail: Option<u32>,
     event_type_override: Option<&'static str>,
     cancelable_override: Option<bool>,
+    shape_override: Option<EventShapeOverride>,
     label_activation: bool,
     suppress_default: bool,
     defer_click_target: bool,
@@ -286,6 +298,7 @@ impl EventMetadata {
             click_detail: None,
             event_type_override: None,
             cancelable_override: None,
+            shape_override: None,
             label_activation: false,
             suppress_default: false,
             defer_click_target: false,
@@ -329,6 +342,7 @@ impl EventMetadata {
             click_detail: None,
             event_type_override: None,
             cancelable_override: None,
+            shape_override: None,
             label_activation: false,
             suppress_default: false,
             defer_click_target: false,
@@ -389,6 +403,7 @@ impl EventMetadata {
             click_detail: None,
             event_type_override: None,
             cancelable_override: None,
+            shape_override: None,
             label_activation: false,
             suppress_default: false,
             defer_click_target: false,
@@ -407,6 +422,7 @@ impl EventMetadata {
             click_detail: None,
             event_type_override: None,
             cancelable_override: None,
+            shape_override: None,
             label_activation: false,
             suppress_default: false,
             defer_click_target: false,
@@ -463,9 +479,18 @@ impl EventMetadata {
         self.pointer_release_click = None;
         self.event_type_override = None;
         self.cancelable_override = None;
+        self.shape_override = None;
         self.label_activation = true;
         self.suppress_default = false;
         self.defer_click_target = false;
+        self
+    }
+
+    fn into_change(mut self) -> Self {
+        self.event_type_override = Some("change");
+        self.cancelable_override = Some(false);
+        self.shape_override = Some(EventShapeOverride::PlainChange);
+        self.suppress_default = true;
         self
     }
 
@@ -1237,9 +1262,7 @@ impl DispatchStack {
                         checked_controls,
                         handles,
                         pending.guarded,
-                        checkable_activation
-                            .as_deref()
-                            .map(|activation| activation.target),
+                        checkable_activation.as_deref(),
                     )?;
                 }
                 if let Some(double_click) = double_click {
@@ -2010,12 +2033,10 @@ impl DispatchStack {
             let prepared = checked_controls.prepare_legacy_activation(document, event.target.raw);
             if let Some(state) = prepared {
                 debug_assert_eq!(state.target(), event.target.raw);
-                if event.metadata.pointer.is_some()
-                    && is_html_actually_disabled(document, event.target.raw)
-                {
-                    // Queue-front native release clicks are filtered before staging. Retain this
-                    // default guard for any future internal pointer-originated click path which is
-                    // not tied to a matched native release.
+                if is_html_actually_disabled(document, event.target.raw) {
+                    // Native queued clicks are filtered before staging, while internally
+                    // generated clicks can remain observable. Neither path may activate a
+                    // disabled form control.
                     suppress_default = true;
                     None
                 } else {
@@ -2080,9 +2101,15 @@ impl DispatchStack {
             path: event.path.iter().map(|node| node.handle).collect(),
             bubbles: event.event.bubbles,
             cancelable: event.event.cancelable,
-            composed: event_is_composed(&event.event.data),
+            composed: match event.metadata.shape_override {
+                Some(EventShapeOverride::PlainChange) => false,
+                None => event_is_composed(&event.event.data),
+            },
             time_stamp: event.metadata.time_stamp,
-            payload: event_payload(&event.event.data, &event.metadata).map(Box::new),
+            payload: match event.metadata.shape_override {
+                Some(EventShapeOverride::PlainChange) => None,
+                None => event_payload(&event.event.data, &event.metadata).map(Box::new),
+            },
         };
         frame.pending = Some(PendingEvent {
             id: event_id,
@@ -2267,7 +2294,7 @@ impl DispatchStack {
         checked_controls: &mut CheckedControlStates,
         handles: &mut NodeHandles,
         mut guarded: GuardedDomEvent,
-        protected_checked_target: Option<GuardedNode>,
+        protected_checked_activation: Option<&GuardedCheckableActivation>,
     ) -> Result<(), DispatchError> {
         if !node_is_live(guarded.target, document, handles) {
             return Ok(());
@@ -2296,6 +2323,8 @@ impl DispatchStack {
         let viewport_scroll_before_default = document.viewport_scroll();
         let preserved_file_value = file_value_preserved_during_click(document, &guarded);
         let mut generated = Vec::new();
+        let protected_checked_target =
+            protected_checked_activation.map(|activation| activation.target);
         let temporary_radio_name = install_temporary_radio_name(document, protected_checked_target);
         run_engine_or_label_default(
             document,
@@ -2321,6 +2350,12 @@ impl DispatchStack {
             &generated,
             protected_checked_target,
         );
+        let protected_checkable_default = protected_checkable_default(
+            document,
+            checked_controls,
+            handles,
+            protected_checked_activation,
+        );
         if checkedness_changed {
             self.frames
                 .last_mut()
@@ -2344,14 +2379,14 @@ impl DispatchStack {
         } else {
             (None, None)
         };
-        let mut guarded_generated = VecDeque::with_capacity(generated.len());
-        for event in generated.into_iter().filter(not_blitz_double_click) {
-            let metadata =
-                generated_event_metadata(&source_metadata, &event.data, old_focus, new_focus);
-            if let Some(event) = guard_queued_event(document, handles, event, metadata)? {
-                guarded_generated.push_back(event);
-            }
-        }
+        let guarded_generated = guard_generated_default_events(
+            document,
+            handles,
+            generated,
+            &source_metadata,
+            (old_focus, new_focus),
+            protected_checkable_default,
+        )?;
         self.frames
             .last_mut()
             .expect("defaults run only for an active frame")
@@ -2856,6 +2891,68 @@ fn generated_event_metadata(
         _ => source.related_target,
     };
     source.clone().with_related_target(related_target)
+}
+
+fn guard_generated_default_events(
+    document: &BaseDocument,
+    handles: &mut NodeHandles,
+    mut generated: Vec<DomEvent>,
+    source_metadata: &EventMetadata,
+    focus: (Option<GuardedNode>, Option<GuardedNode>),
+    protected: Option<ProtectedCheckableDefault>,
+) -> Result<VecDeque<GuardedDomEvent>, DispatchError> {
+    let protected_input_present = protected.is_some_and(|protected| {
+        generated.iter().any(|event| {
+            event.target == protected.target.raw && matches!(&event.data, DomEventData::Input(_))
+        })
+    });
+    if let Some(ProtectedCheckableDefault {
+        target,
+        checkedness_change: Some(checked),
+    }) = protected
+        && !protected_input_present
+    {
+        generated.insert(
+            0,
+            DomEvent::new(
+                target.raw,
+                DomEventData::Input(blitz_traits::events::BlitzInputEvent {
+                    value: checked.to_string(),
+                }),
+            ),
+        );
+    }
+
+    let (old_focus, new_focus) = focus;
+    let mut protected_input_emitted = false;
+    let mut guarded = VecDeque::with_capacity(generated.len() + 1);
+    for event in generated.into_iter().filter(not_blitz_double_click) {
+        let metadata = generated_event_metadata(source_metadata, &event.data, old_focus, new_focus);
+        let protected_input = protected.is_some_and(|protected| {
+            event.target == protected.target.raw && matches!(&event.data, DomEventData::Input(_))
+        });
+        if protected_input {
+            let accepted = protected.is_some_and(|protected| {
+                protected.checkedness_change.is_some() && !protected_input_emitted
+            });
+            if !accepted {
+                continue;
+            }
+            protected_input_emitted = true;
+            let change_event = DomEvent::new(event.target, event.data.clone());
+            if let Some(event) = guard_queued_event(document, handles, event, metadata.clone())? {
+                guarded.push_back(event);
+            }
+            if let Some(event) =
+                guard_queued_event(document, handles, change_event, metadata.into_change())?
+            {
+                guarded.push_back(event);
+            }
+        } else if let Some(event) = guard_queued_event(document, handles, event, metadata)? {
+            guarded.push_back(event);
+        }
+    }
+    Ok(guarded)
 }
 
 /// Blitz's `DoubleClick` uses one document-global counter which ignores button and target.
@@ -3377,6 +3474,9 @@ fn guard_queued_event(
     mut event: DomEvent,
     metadata: EventMetadata,
 ) -> Result<Option<GuardedDomEvent>, DispatchError> {
+    if let Some(cancelable) = metadata.cancelable_override {
+        event.cancelable = cancelable;
+    }
     let Some(default_target) = guard_raw_node(document, handles, event.target)? else {
         return Ok(None);
     };
@@ -3744,6 +3844,23 @@ fn cancel_guarded_checkable_activation(
         .filter(|previous| node_is_live(*previous, document, handles))
         .map(|previous| previous.raw);
     checked_controls.cancel_legacy_activation(document, &activation.state, previous_radio)
+}
+
+fn protected_checkable_default(
+    document: &BaseDocument,
+    checked_controls: &CheckedControlStates,
+    handles: &NodeHandles,
+    activation: Option<&GuardedCheckableActivation>,
+) -> Option<ProtectedCheckableDefault> {
+    let activation = activation?;
+    checked_controls
+        .legacy_activation_is_checkable_relevant(&activation.state)
+        .then(|| ProtectedCheckableDefault {
+            target: activation.target,
+            checkedness_change: node_is_live(activation.target, document, handles)
+                .then(|| checked_controls.legacy_activation_checkedness_change(&activation.state))
+                .flatten(),
+        })
 }
 
 fn reconcile_generated_checkable_defaults(
@@ -9489,7 +9606,7 @@ mod tests {
 
         let step = context.resume(&click, false);
         let (types, _, _) = drain(&mut context, step);
-        assert_eq!(types, ["input"]);
+        assert_eq!(types, ["input", "change"]);
         assert_eq!(actual_focus_node_id(&context.document), Some(editor));
         assert!(
             context.ime_requests.peek_snapshot().unwrap().is_none(),
@@ -9697,7 +9814,7 @@ mod tests {
             metadata: EventMetadata::native(),
         });
         let (types, _, _) = drain(&mut context, up);
-        assert_eq!(types, ["pointerup", "mouseup", "click", "input"]);
+        assert_eq!(types, ["pointerup", "mouseup", "click", "input", "change"]);
     }
 
     #[test]
@@ -11126,6 +11243,7 @@ mod tests {
         let mut saw_pointer_up = false;
         let mut saw_mouse_up = false;
         let mut saw_input = false;
+        let mut activation_events = Vec::new();
         while let DispatchStep::Event(current) = step {
             assert_eq!(current.time_stamp, 777.0);
             match current.event_type.as_str() {
@@ -11155,6 +11273,7 @@ mod tests {
                 }
                 "input" => {
                     saw_input = true;
+                    activation_events.push("input");
                     assert!(
                         context
                             .checked_controls
@@ -11166,12 +11285,23 @@ mod tests {
                         current.payload.as_deref(),
                         Some(&DispatchEventPayload::Input)
                     );
+                    assert!(current.bubbles);
+                    assert!(!current.cancelable);
+                    assert!(current.composed);
+                }
+                "change" => {
+                    activation_events.push("change");
+                    assert!(current.bubbles);
+                    assert!(!current.cancelable);
+                    assert!(!current.composed);
+                    assert_eq!(current.payload, None);
                 }
                 _ => {}
             }
             step = context.resume(&current, false);
         }
         assert!(saw_pointer_up && saw_mouse_up && saw_click && saw_input);
+        assert_eq!(activation_events, ["input", "change"]);
     }
 
     #[test]
@@ -11212,7 +11342,72 @@ mod tests {
     }
 
     #[test]
-    fn checkbox_pre_activation_is_visible_and_uncanceled_listener_writes_survive() {
+    fn already_checked_radio_emits_no_input_or_change() {
+        let mut context = TestContext::new("<input id='target' type='radio' name='group' checked>");
+        let target = context.element("target");
+        let click = stage_generated_with_metadata(
+            &mut context,
+            target,
+            DomEventData::Click(pointer(
+                1.0,
+                1.0,
+                MouseEventButton::Main,
+                MouseEventButtons::None,
+            )),
+            EventMetadata::pointer(
+                91.0,
+                native_pointer_coordinates(1.0, 1.0, None, 0.0, 0.0),
+                1,
+            ),
+        );
+
+        let step = context.resume(&click, false);
+        let (types, _, _) = drain(&mut context, step);
+        assert!(
+            !types
+                .iter()
+                .any(|event_type| matches!(event_type.as_str(), "input" | "change"))
+        );
+        assert!(
+            context
+                .checked_controls
+                .checked(&mut context.document, target)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn canceled_checkable_click_emits_no_input_or_change() {
+        let mut context = TestContext::new("<input id='target' type='checkbox'>");
+        let target = context.element("target");
+        let click = stage_generated(
+            &mut context,
+            target,
+            DomEventData::Click(pointer(
+                1.0,
+                1.0,
+                MouseEventButton::Main,
+                MouseEventButtons::None,
+            )),
+        );
+
+        let step = context.resume(&click, true);
+        let (types, _, _) = drain(&mut context, step);
+        assert!(
+            !types
+                .iter()
+                .any(|event_type| matches!(event_type.as_str(), "input" | "change"))
+        );
+        assert!(
+            !context
+                .checked_controls
+                .checked(&mut context.document, target)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn checkbox_listener_restoring_checkedness_suppresses_activation_events() {
         let mut context = TestContext::new("<input id='box' type='checkbox'>");
         let checkbox = context.element("box");
         context
@@ -11257,7 +11452,11 @@ mod tests {
             .unwrap();
         let step = context.resume(&click, false);
         let (types, _, _) = drain(&mut context, step);
-        assert!(types.iter().any(|event_type| event_type == "input"));
+        assert!(
+            !types
+                .iter()
+                .any(|event_type| matches!(event_type.as_str(), "input" | "change"))
+        );
         assert!(
             !context
                 .checked_controls
@@ -11639,7 +11838,7 @@ mod tests {
     }
 
     #[test]
-    fn uncanceled_noncheckable_to_checkable_listener_writes_survive_blitz_default() {
+    fn uncanceled_noncheckable_to_checkable_listener_writes_survive_without_activation_events() {
         for input_type in ["checkbox", "radio"] {
             let mut context = TestContext::new("<input id='target' type='text'>");
             let target = context.element("target");
@@ -11665,7 +11864,11 @@ mod tests {
 
             let step = context.resume(&click, false);
             let (types, _, _) = drain(&mut context, step);
-            assert!(types.iter().any(|event_type| event_type == "input"));
+            assert!(
+                !types
+                    .iter()
+                    .any(|event_type| matches!(event_type.as_str(), "input" | "change"))
+            );
             assert!(
                 !context
                     .checked_controls
@@ -11873,7 +12076,7 @@ mod tests {
     }
 
     #[test]
-    fn nonpointer_disabled_click_keeps_the_synthetic_activation_path() {
+    fn nonpointer_disabled_click_does_not_run_checkable_activation() {
         let mut context = TestContext::new("<input id='target' type='checkbox' disabled>");
         let target = context.element("target");
         let click = stage_generated(
@@ -11887,18 +12090,17 @@ mod tests {
             )),
         );
         assert!(
-            context
-                .checked_controls
-                .checked(&mut context.document, target)
-                .unwrap(),
-            "actual-disabled gating is specific to trusted native pointer activation",
-        );
-        complete(context.resume(&click, false));
-        assert!(
-            context
+            !context
                 .checked_controls
                 .checked(&mut context.document, target)
                 .unwrap()
+        );
+        let step = context.resume(&click, false);
+        let (types, _, _) = drain(&mut context, step);
+        assert!(
+            !types
+                .iter()
+                .any(|event_type| matches!(event_type.as_str(), "input" | "change"))
         );
     }
 

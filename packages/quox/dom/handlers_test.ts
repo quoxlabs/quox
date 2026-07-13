@@ -34,6 +34,7 @@ const EVENT_TYPE_TO_PROP = {
   keyup: "onKeyUp",
   beforeinput: "onBeforeInput",
   input: "onInput",
+  change: "onChange",
   compositionstart: "onCompositionStart",
   compositionupdate: "onCompositionUpdate",
   compositionend: "onCompositionEnd",

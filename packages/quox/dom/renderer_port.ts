@@ -35,6 +35,7 @@ export const DOM_DISPATCH_EVENT_TYPES = Object.freeze(
     "keyup",
     "beforeinput",
     "input",
+    "change",
     "compositionstart",
     "compositionupdate",
     "compositionend",
@@ -691,8 +692,8 @@ function validateEventPayload(
   present: boolean,
   value: unknown,
 ): DomDispatchEventPayload | undefined {
-  if (type === "scroll") {
-    if (present) throw new TypeError("quox: scroll events must not carry a payload");
+  if (type === "scroll" || type === "change") {
+    if (present) throw new TypeError(`quox: ${type} events must not carry a payload`);
     return undefined;
   }
   if (!present) throw new TypeError(`quox: ${type} events must carry a payload`);
@@ -863,7 +864,7 @@ export function validateDomDispatchStep(value: unknown): DomDispatchStep {
   assertExactProperties(
     descriptors,
     "DOM dispatch step",
-    type === "scroll" ? EVENT_STEP_PROPERTIES : PAYLOAD_EVENT_STEP_PROPERTIES,
+    type === "scroll" || type === "change" ? EVENT_STEP_PROPERTIES : PAYLOAD_EVENT_STEP_PROPERTIES,
   );
 
   const target = assertPositiveUint32(

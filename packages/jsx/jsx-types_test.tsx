@@ -55,6 +55,7 @@ type ExpectedBaseEventProp =
   | "onKeyUp"
   | "onBeforeInput"
   | "onInput"
+  | "onChange"
   | "onCompositionStart"
   | "onCompositionUpdate"
   | "onCompositionEnd"
@@ -98,6 +99,7 @@ const supportedEvents = (
     onKeyDown={(event) => expectType<QuoxJsxKeyboardEvent>(event)}
     onBeforeInputCapture={(event) => expectType<QuoxJsxInputEvent>(event)}
     onInput={(event) => expectType<QuoxJsxInputEvent>(event)}
+    onChange={(event) => expectType<QuoxJsxEvent>(event)}
     onCompositionStart={(event) => expectType<QuoxJsxCompositionEvent>(event)}
     onCompositionUpdateCapture={(event) => expectType<QuoxJsxCompositionEvent>(event)}
     onCompositionEnd={(event) => expectType<QuoxJsxCompositionEvent>(event)}

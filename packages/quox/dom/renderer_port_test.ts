@@ -121,6 +121,8 @@ function payloadForType(type: DomDispatchEventType): Record<string, unknown> | u
     case "beforeinput":
     case "input":
       return { data: null, inputType: "", isComposing: false };
+    case "change":
+      return undefined;
     case "compositionstart":
     case "compositionupdate":
     case "compositionend":
@@ -258,7 +260,7 @@ Deno.test("DOM dispatch validator rejects malformed IDs, metadata, and paths", (
   assertThrows(() => validateDomDispatchStep(eventStep({ path: sparsePath })), TypeError);
 });
 
-Deno.test("DOM dispatch validator requires the exact payload family and rejects payloads on scroll", () => {
+Deno.test("DOM dispatch validator requires exact payload families and rejects plain-event payloads", () => {
   const missingPayload = eventStep();
   delete missingPayload.payload;
 
@@ -278,6 +280,8 @@ Deno.test("DOM dispatch validator requires the exact payload family and rejects 
     eventStep({ type: "focus", payload: { relatedTarget: null, detail: 0 } }),
     eventStep({ type: "scroll", payload: undefined }),
     eventStep({ type: "scroll", payload: {} }),
+    eventStep({ type: "change", payload: undefined }),
+    eventStep({ type: "change", payload: {} }),
     eventStep({ type: "click", payload: extraPointerField }),
   ];
 

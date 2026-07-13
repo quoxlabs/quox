@@ -613,6 +613,7 @@ Deno.test("trusted staged payloads create browser-style event subclasses with ex
     "wheel",
     "keydown",
     "input",
+    "change",
     "focus",
     "blur",
     "scroll",
@@ -700,6 +701,13 @@ Deno.test("trusted staged payloads create browser-style event subclasses with ex
       target: target.nodeId,
       path: [target.nodeId],
       payload: { data: "é", inputType: "insertText", isComposing: true },
+    },
+    {
+      type: "change",
+      target: target.nodeId,
+      path: [target.nodeId],
+      cancelable: false,
+      composed: false,
     },
     {
       type: "focus",
@@ -809,6 +817,13 @@ Deno.test("trusted staged payloads create browser-style event subclasses with ex
   const input = events.get("input");
   assert(input instanceof QuoxDOMInputEvent);
   assertEquals([input.data, input.inputType, input.isComposing], ["é", "insertText", true]);
+
+  const change = events.get("change");
+  assert(change instanceof QuoxEvent);
+  assert(!(change instanceof QuoxDOMInputEvent));
+  assert(change.bubbles);
+  assertFalse(change.cancelable);
+  assertFalse(change.composed);
 
   const focus = events.get("focus");
   assert(focus instanceof QuoxFocusEvent);

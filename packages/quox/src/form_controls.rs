@@ -394,6 +394,42 @@ impl CheckedControlStates {
         self.project_document(document) || !logically_changed.is_empty()
     }
 
+    /// Report whether an uncanceled legacy activation left its live target in a different
+    /// checked state. The dispatcher calls this only after reconciling listener mutations and
+    /// reprojecting Blitz's default, so type changes and detachment suppress activation events.
+    pub(crate) fn legacy_activation_checkedness_change(
+        &self,
+        activation: &LegacyCheckableActivation,
+    ) -> Option<bool> {
+        self.controls.get(&activation.target).and_then(|state| {
+            (state.descriptor.connected
+                && matches!(
+                    state.descriptor.kind,
+                    CheckedInputKind::Checkbox | CheckedInputKind::Radio
+                )
+                && state.checked != activation.previous_checked)
+                .then_some(state.checked)
+        })
+    }
+
+    /// Whether either side of a click-listener type transition uses checkable activation.
+    /// Other input defaults can also emit `input`, so the dispatcher must not treat every
+    /// snapshot captured by `prepare_legacy_activation` as a protected checkbox/radio default.
+    pub(crate) fn legacy_activation_is_checkable_relevant(
+        &self,
+        activation: &LegacyCheckableActivation,
+    ) -> bool {
+        matches!(
+            activation.initial_kind,
+            CheckedInputKind::Checkbox | CheckedInputKind::Radio
+        ) || self.controls.get(&activation.target).is_some_and(|state| {
+            matches!(
+                state.descriptor.kind,
+                CheckedInputKind::Checkbox | CheckedInputKind::Radio
+            )
+        })
+    }
+
     /// Purge before Blitz destroys nodes because its slab may immediately reuse their ids.
     pub(crate) fn invalidate_nodes(&mut self, node_ids: impl IntoIterator<Item = usize>) {
         for node_id in node_ids {
@@ -3052,6 +3088,39 @@ mod tests {
         controls.reconcile_document(&mut document);
         assert!(!controls.state(dirty).unwrap().default_checked);
         assert!(!controls.state(dirty).unwrap().checked);
+    }
+
+    #[test]
+    fn legacy_activation_relevance_excludes_other_input_defaults_but_spans_type_changes() {
+        let mut document = document(
+            "<input id='text'><input id='file' type='file'>\
+             <input id='box' type='checkbox'>",
+        );
+        let text = element(&document, "text");
+        let file = element(&document, "file");
+        let checkbox = element(&document, "box");
+        let mut controls = CheckedControlStates::default();
+        controls.reconcile_document(&mut document);
+
+        let text_activation = controls
+            .prepare_legacy_activation(&mut document, text)
+            .unwrap();
+        let file_activation = controls
+            .prepare_legacy_activation(&mut document, file)
+            .unwrap();
+        let checkbox_activation = controls
+            .prepare_legacy_activation(&mut document, checkbox)
+            .unwrap();
+        assert!(!controls.legacy_activation_is_checkable_relevant(&text_activation));
+        assert!(!controls.legacy_activation_is_checkable_relevant(&file_activation));
+        assert!(controls.legacy_activation_is_checkable_relevant(&checkbox_activation));
+
+        set_input_type(&mut document, text, "radio");
+        set_input_type(&mut document, checkbox, "text");
+        controls.reconcile_document(&mut document);
+        assert!(controls.legacy_activation_is_checkable_relevant(&text_activation));
+        assert!(controls.legacy_activation_is_checkable_relevant(&checkbox_activation));
+        assert!(!controls.legacy_activation_is_checkable_relevant(&file_activation));
     }
 
     #[test]

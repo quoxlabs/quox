@@ -816,6 +816,8 @@ export class QuoxDocument extends QuoxEventTarget {
           isComposing: payload.isComposing,
         });
       }
+      case "change":
+        return new QuoxEvent(step.type, eventInit);
       case "compositionstart":
       case "compositionupdate":
       case "compositionend": {
