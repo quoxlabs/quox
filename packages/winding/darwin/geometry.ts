@@ -126,6 +126,18 @@ export function appKitWindowFrame(
   ]);
 }
 
+/** Convert an AppKit global point to Winding's primary-screen top-left space. */
+export function appKitScreenPoint(
+  x: number,
+  y: number,
+  primaryScreen: ScreenFrame,
+): { screenX: number; screenY: number } {
+  return {
+    screenX: x - primaryScreen.x,
+    screenY: primaryScreen.y + primaryScreen.height - y,
+  };
+}
+
 /** Translate AppKit scroll values into DOM direction and unit conventions. */
 export function browserWheelDelta(
   scrollingDeltaX: number,

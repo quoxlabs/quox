@@ -25,6 +25,11 @@ export function waylandFixedToNumber(value: number): number {
   return value / 256;
 }
 
+/** Core Wayland intentionally exposes no compositor-global pointer coordinates. */
+export function waylandPointerScreenPosition(): { screenX: null; screenY: null } {
+  return { screenX: null, screenY: null };
+}
+
 /** Retains the enter location used by button and wheel events before the first motion. */
 export class WaylandPointerPosition {
   #x = 0;

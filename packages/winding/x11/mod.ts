@@ -33,6 +33,7 @@ import {
   type X11ModifierMapping,
   x11ModifierSnapshot,
   X11PointerButtonState,
+  x11ScreenPosition,
 } from "./input.ts";
 import { NativeXImage } from "./native_image.ts";
 import { XimContext, XimManager } from "./xim.ts";
@@ -1145,6 +1146,8 @@ function x11PointerSnapshot(
 ): {
   x: number;
   y: number;
+  screenX: number | null;
+  screenY: number | null;
   buttons: number;
   timeStamp: number;
   shiftKey: boolean;
@@ -1157,6 +1160,7 @@ function x11PointerSnapshot(
   return {
     x: view.getInt32(64, true),
     y: view.getInt32(68, true),
+    ...x11ScreenPosition(view),
     buttons,
     timeStamp: eventClock.timeStamp(view.getUint32(56, true)),
     ...pointerModifiers(x11ModifierSnapshot(state, 0, false, modifierMapping)),

@@ -73,7 +73,13 @@ import {
   WM,
 } from "./ffi.ts";
 import { Win32InputController, type Win32InputWindow } from "./input_controller.ts";
-import { decodeWin32DpiChange, scaleWin32OuterGeometry, Win32DpiAwareness, Win32DpiState } from "./dpi.ts";
+import {
+  decodeWin32DpiChange,
+  logicalWin32ScreenPosition,
+  scaleWin32OuterGeometry,
+  Win32DpiAwareness,
+  Win32DpiState,
+} from "./dpi.ts";
 import { describeWin32Error, WIN32_SYSTEM_MESSAGE_FLAGS } from "./error.ts";
 import { prepareWin32Frame, Win32RetainedFrame } from "./frame.ts";
 import {
@@ -512,6 +518,17 @@ Deno.test("native client and screen-wheel points convert to public logical coord
     { x: 300, y: 150 },
   );
   assertEquals(dpi.logicalToNative(12.5), 25);
+
+  // Desktop positions retain the primary/system scale even when this HWND is
+  // on a differently scaled monitor and uses another scale for client input.
+  assertEquals(logicalWin32ScreenPosition(-300, 150, 144), {
+    screenX: -200,
+    screenY: 100,
+  });
+  assertEquals(logicalWin32ScreenPosition(600, 300, 96), {
+    screenX: 600,
+    screenY: 300,
+  });
 });
 
 Deno.test("Win32 HIMC association remains independent across SETCONTEXT and focus orders", () => {

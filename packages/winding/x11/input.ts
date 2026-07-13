@@ -13,6 +13,17 @@ export interface X11ModifierMapping {
   readonly toggleKeycodes: ReadonlySet<number>;
 }
 
+/** Read Xlib's root-relative occurrence point, which is undefined across screens. */
+export function x11ScreenPosition(
+  event: DataView<ArrayBuffer>,
+  sameScreenOffset = 88,
+): { screenX: number | null; screenY: number | null } {
+  return event.getInt32(sameScreenOffset, true) === 0 ? { screenX: null, screenY: null } : {
+    screenX: event.getInt32(72, true),
+    screenY: event.getInt32(76, true),
+  };
+}
+
 /**
  * Retain the buttons which core X11 cannot represent in an event's state mask.
  *

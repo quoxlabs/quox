@@ -133,6 +133,18 @@ export interface PointerEventBase<Type extends string> extends WindowEvent<Type>
   x: number;
   /** DOM MouseEvent.y/clientY-compatible logical client coordinate. */
   y: number;
+  /**
+   * DOM MouseEvent.screenX-compatible logical desktop coordinate, relative to
+   * the same top-left origin used by public window geometry. `null` means the
+   * native protocol does not expose global pointer positions.
+   */
+  screenX: number | null;
+  /**
+   * DOM MouseEvent.screenY-compatible logical desktop coordinate, relative to
+   * the same top-left origin used by public window geometry. `null` means the
+   * native protocol does not expose global pointer positions.
+   */
+  screenY: number | null;
   /** DOM MouseEvent.buttons-compatible currently pressed button bitmask. */
   buttons: number;
   /** DOM Event.timeStamp-compatible milliseconds relative to the runtime time origin. */

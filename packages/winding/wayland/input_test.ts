@@ -80,6 +80,7 @@ import {
   WaylandPointerAxisSource,
   WaylandPointerFrameAccumulator,
   WaylandPointerPosition,
+  waylandPointerScreenPosition,
 } from "./pointer.ts";
 import { openRequiredWaylandDependency, type RequiredWaylandDependency, validateWaylandNativeLayout } from "./mod.ts";
 import {
@@ -2064,6 +2065,7 @@ Deno.test("enter coordinates seed snapshots before the first motion", () => {
   position.updateFixed(384, -128);
 
   assertEquals({ x: position.x, y: position.y }, { x: 1.5, y: -0.5 });
+  assertEquals(waylandPointerScreenPosition(), { screenX: null, screenY: null });
 });
 
 Deno.test("Wayland configurations latch role state and serial as one generation", () => {

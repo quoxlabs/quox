@@ -20,6 +20,7 @@ import {
 } from "../input/mod.ts";
 import { getDomCode } from "./dom_code.ts";
 import {
+  appKitScreenPoint,
   appKitWindowFrame,
   browserWheelDelta,
   type ScreenFrame,
@@ -163,6 +164,7 @@ function openMsgSendSymbols(libraries: Closeable[]) {
     void_f64: openMsgSend(libraries, ["pointer", "pointer", "f64"], "void"),
     bool_i64: openMsgSend(libraries, ["pointer", "pointer", "i64"], "bool"),
     point: openMsgSend(libraries, ["pointer", "pointer"], NSPOINT),
+    point_point: openMsgSend(libraries, ["pointer", "pointer", NSPOINT], NSPOINT),
     point_pointId: openMsgSend(
       libraries,
       ["pointer", "pointer", NSPOINT, "pointer"],
@@ -1553,6 +1555,8 @@ function pointerSnapshot(
 ): {
   x: number;
   y: number;
+  screenX: number;
+  screenY: number;
   buttons: number;
   timeStamp: number;
   shiftKey: boolean;
@@ -1562,6 +1566,11 @@ function pointerSnapshot(
 } {
   const { getClass, sel, send } = window.lib.ffi;
   const windowPoint = send.point(event, sel("locationInWindow")) as Uint8Array;
+  const nativeScreenPoint = send.point_point(
+    window.nsWindow,
+    sel("convertPointToScreen:"),
+    windowPoint,
+  ) as Uint8Array;
   const point = send.point_pointId(
     window.contentView,
     sel("convertPoint:fromView:"),
@@ -1573,9 +1582,17 @@ function pointerSnapshot(
     const mask = mouseButtonMask(changedButton);
     buttons = pressed ? buttons | mask : buttons & ~mask;
   }
+  const primaryScreen = primaryScreenFrame(window.lib.ffi);
+  validateDarwinScreenFrame(primaryScreen);
+  const screen = appKitScreenPoint(
+    readStructF64(nativeScreenPoint, 0),
+    readStructF64(nativeScreenPoint, 8),
+    primaryScreen,
+  );
   return {
     x: readStructF64(point, 0),
     y: window.height - readStructF64(point, 8),
+    ...screen,
     buttons,
     timeStamp: window.lib.pointerTimeStamp(send.f64(event, sel("timestamp"))),
     ...pointerModifiers(getModifiers(event, window.lib.ffi)),

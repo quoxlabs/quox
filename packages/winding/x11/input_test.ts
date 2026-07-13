@@ -9,6 +9,7 @@ import {
   x11KeyEditDisposition,
   x11ModifierSnapshot,
   X11PointerButtonState,
+  x11ScreenPosition,
 } from "./input.ts";
 import { decodeXimTextLayout } from "./xim_abi.ts";
 import {
@@ -266,6 +267,18 @@ Deno.test("X11 pointer snapshots remove only the released extended button", () =
   assertEquals(buttons.snapshot(1 << 10), 18);
   assertEquals(buttons.snapshot(1 << 10, "forward", false), 2);
   assertEquals(buttons.snapshot(0), 0);
+});
+
+Deno.test("X11 pointer snapshots expose root coordinates only on the same screen", () => {
+  const bytes = new ArrayBuffer(96);
+  const event = new DataView(bytes);
+  event.setInt32(72, -320, true);
+  event.setInt32(76, 1440, true);
+  event.setInt32(88, 1, true);
+  assertDeepEquals(x11ScreenPosition(event), { screenX: -320, screenY: 1440 });
+
+  event.setInt32(88, 0, true);
+  assertDeepEquals(x11ScreenPosition(event), { screenX: null, screenY: null });
 });
 
 Deno.test("X11 pixels follow the server visual masks and byte order", () => {

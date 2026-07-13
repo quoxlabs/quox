@@ -4,6 +4,7 @@ import { EventQueue } from "../input/event_queue.ts";
 import { ClickCounter, NativeEventClock } from "../input/events.ts";
 import {
   decodeWin32DpiChange,
+  logicalWin32ScreenPosition,
   scaleWin32OuterGeometry,
   USER_DEFAULT_SCREEN_DPI,
   Win32DpiAwareness,
@@ -72,6 +73,8 @@ const UP_BUTTON: Partial<Record<WM, Win32MouseButton>> = {
 interface Win32PointerSnapshot extends PointerModifiers {
   x: number;
   y: number;
+  screenX: number;
+  screenY: number;
   buttons: number;
   timeStamp: number;
 }
@@ -716,6 +719,8 @@ class Win32Library implements Library {
     pressed?: boolean,
   ): Win32PointerSnapshot {
     const point = decodeMouseLParam(lParam);
+    let nativeScreenX = point.x;
+    let nativeScreenY = point.y;
     if (message === WM.MOUSEWHEEL || message === WM.MOUSEHWHEEL) {
       const clientPoint = new Int32Array([point.x, point.y]);
       if (this.user32.symbols.ScreenToClient(window.hwnd, clientPoint) === 0) {
@@ -723,11 +728,19 @@ class Win32Library implements Library {
       }
       point.x = clientPoint[0];
       point.y = clientPoint[1];
+    } else {
+      const screenPoint = new Int32Array([point.x, point.y]);
+      if (this.user32.symbols.ClientToScreen(window.hwnd, screenPoint) === 0) {
+        throw new Error(this.getLastError());
+      }
+      nativeScreenX = screenPoint[0];
+      nativeScreenY = screenPoint[1];
     }
     // Mouse messages and ScreenToClient use the HWND's native coordinate
     // space. Public pointer coordinates share the resize event's logical units.
     point.x = window.nativeToLogical(point.x);
     point.y = window.nativeToLogical(point.y);
+    const screen = logicalWin32ScreenPosition(nativeScreenX, nativeScreenY, this.systemDpi());
     const keyState = Number(BigInt(wParam) & 0xffffn);
     let buttons = win32Buttons(keyState);
     if (changedButton !== undefined && pressed !== undefined) {
@@ -737,6 +750,7 @@ class Win32Library implements Library {
     const snapshot: Win32PointerSnapshot = {
       x: point.x,
       y: point.y,
+      ...screen,
       buttons,
       timeStamp: this.#messageTimeStamp(),
       ...this.#pointerModifiers(keyState),
@@ -1047,6 +1061,8 @@ function emptyPointerSnapshot(timeStamp: number): Win32PointerSnapshot {
   return {
     x: 0,
     y: 0,
+    screenX: 0,
+    screenY: 0,
     buttons: 0,
     timeStamp,
     shiftKey: false,

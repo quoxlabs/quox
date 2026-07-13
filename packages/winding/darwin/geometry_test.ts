@@ -1,4 +1,5 @@
 import {
+  appKitScreenPoint,
   appKitWindowFrame,
   browserWheelDelta,
   DARWIN_WINDOW_DIMENSION_LIMIT,
@@ -36,6 +37,20 @@ Deno.test("Darwin window coordinates cover displays on every side of the primary
     [...appKitWindowFrame(80, 1080, 320, 200, primary)],
     [80, -200, 320, 200],
   );
+});
+
+Deno.test("Darwin maps global pointer points to primary-screen top-left coordinates", () => {
+  assertEquals(appKitScreenPoint(100, 1000, primary), { screenX: 100, screenY: 80 });
+
+  const shiftedPrimary: ScreenFrame = { x: 250, y: -100, width: 1920, height: 1080 };
+  assertEquals(appKitScreenPoint(100, 1100, shiftedPrimary), {
+    screenX: -150,
+    screenY: -120,
+  });
+  assertEquals(appKitScreenPoint(2300, -300, shiftedPrimary), {
+    screenX: 2050,
+    screenY: 1280,
+  });
 });
 
 Deno.test("Darwin rejects invalid primary-screen data before coordinate conversion", () => {

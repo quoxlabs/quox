@@ -52,7 +52,7 @@ import {
   type WaylandGlobalOffer,
   WaylandGlobalRegistry,
 } from "./global_registry.ts";
-import { WaylandPointerFrameAccumulator, WaylandPointerPosition } from "./pointer.ts";
+import { WaylandPointerFrameAccumulator, WaylandPointerPosition, waylandPointerScreenPosition } from "./pointer.ts";
 import { type WaylandDecorationManagerBinding, WaylandDecorationManagerState } from "./decoration.ts";
 import { type WaylandFractionalScaleManagerPair, WaylandFractionalScaleManagerState } from "./fractional_scale.ts";
 import { WaylandPostDispatchQueue } from "./frame_pacing.ts";
@@ -1278,6 +1278,8 @@ class WaylandLibrary implements Library {
   #pointerSnapshot(time?: number): {
     x: number;
     y: number;
+    screenX: null;
+    screenY: null;
     buttons: number;
     timeStamp: number;
     shiftKey: boolean;
@@ -1288,6 +1290,7 @@ class WaylandLibrary implements Library {
     return {
       x: this.#pointerPosition.x,
       y: this.#pointerPosition.y,
+      ...waylandPointerScreenPosition(),
       buttons: this.#pointerButtons,
       timeStamp: time === undefined ? performance.now() : this.#pointerClock.timeStamp(time),
       ...pointerModifiers(this.#keyboardController.modifiers),

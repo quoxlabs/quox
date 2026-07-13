@@ -20,6 +20,11 @@ export interface Win32OuterGeometry {
   height: number;
 }
 
+export interface Win32ScreenPosition {
+  screenX: number;
+  screenY: number;
+}
+
 export interface Win32DpiChange extends Win32OuterGeometry {
   dpi: number;
 }
@@ -100,6 +105,16 @@ export function scaleWin32OuterGeometry(
     width: nativeDimension(width * sizeScale),
     height: nativeDimension(height * sizeScale),
   };
+}
+
+/** Convert native desktop pixels to the primary-origin logical units used by public positions. */
+export function logicalWin32ScreenPosition(
+  x: number,
+  y: number,
+  systemDpi: number,
+): Win32ScreenPosition {
+  const scale = validateDpi(systemDpi) / USER_DEFAULT_SCREEN_DPI;
+  return { screenX: x / scale, screenY: y / scale };
 }
 
 /** Decode WM_DPICHANGED's equal-axis DPI and suggested physical outer rectangle. */
