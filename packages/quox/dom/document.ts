@@ -814,6 +814,10 @@ export class QuoxDocument extends QuoxEventTarget {
       }
       case "beforeinput":
       case "input": {
+        // HTML checkable and file activation use a plain Event, unlike text edits.
+        if (step.type === "input" && step.payload === undefined) {
+          return new QuoxEvent(step.type, eventInit);
+        }
         const payload = step.payload as DomDispatchInputPayload;
         return new QuoxDOMInputEvent(step.type, {
           ...eventInit,

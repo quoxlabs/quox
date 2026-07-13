@@ -292,6 +292,7 @@ enum SpaceKeyEvent<'a> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EventShapeOverride {
+    PlainInput,
     PlainChange,
 }
 
@@ -678,6 +679,11 @@ impl EventMetadata {
         self.cancelable_override = Some(false);
         self.shape_override = Some(EventShapeOverride::PlainChange);
         self.suppress_default = true;
+        self
+    }
+
+    fn into_plain_input(mut self) -> Self {
+        self.shape_override = Some(EventShapeOverride::PlainInput);
         self
     }
 
@@ -3471,11 +3477,12 @@ impl DispatchStack {
             cancelable: event.event.cancelable,
             composed: match event.metadata.shape_override {
                 Some(EventShapeOverride::PlainChange) => false,
+                Some(EventShapeOverride::PlainInput) => true,
                 None => event_is_composed(&event.event.data),
             },
             time_stamp: event.metadata.time_stamp,
             payload: match event.metadata.shape_override {
-                Some(EventShapeOverride::PlainChange) => None,
+                Some(EventShapeOverride::PlainInput | EventShapeOverride::PlainChange) => None,
                 None => event_payload(&event.event.data, &event.metadata).map(Box::new),
             },
         };
@@ -4968,7 +4975,12 @@ fn guard_generated_default_events(
             }
             protected_input_emitted = true;
             let change_event = DomEvent::new(event.target, event.data.clone());
-            if let Some(event) = guard_queued_event(document, handles, event, metadata.clone())? {
+            if let Some(event) = guard_queued_event(
+                document,
+                handles,
+                event,
+                metadata.clone().into_plain_input(),
+            )? {
                 guarded.push_back(event);
             }
             if let Some(event) =
@@ -4980,7 +4992,12 @@ fn guard_generated_default_events(
             let file_input = changed_file_input == Some(event.target)
                 && matches!(&event.data, DomEventData::Input(_));
             let change_event = file_input.then(|| DomEvent::new(event.target, event.data.clone()));
-            if let Some(event) = guard_queued_event(document, handles, event, metadata.clone())? {
+            let input_metadata = if file_input {
+                metadata.clone().into_plain_input()
+            } else {
+                metadata.clone()
+            };
+            if let Some(event) = guard_queued_event(document, handles, event, input_metadata)? {
                 guarded.push_back(event);
             }
             if let Some(change_event) = change_event
@@ -14886,11 +14903,11 @@ mod tests {
         context.set_input_type(control, "checkbox");
         let resumed = context.resume(&click, false);
         let generated = drain_steps(&mut context, resumed);
-        assert!(generated.iter().all(|step| {
-            step.event_type != "input"
-                || step.payload.as_deref()
-                    == Some(&DispatchEventPayload::Input(InputPayload::empty()))
-        }));
+        assert!(
+            generated
+                .iter()
+                .all(|step| { step.event_type != "input" || step.payload.is_none() })
+        );
     }
 
     #[test]
@@ -15685,10 +15702,7 @@ mod tests {
                             .unwrap(),
                         "live checkedness must be synchronized before input is staged",
                     );
-                    assert_eq!(
-                        current.payload.as_deref(),
-                        Some(&DispatchEventPayload::Input(InputPayload::empty()))
-                    );
+                    assert_eq!(current.payload, None);
                     assert!(current.bubbles);
                     assert!(!current.cancelable);
                     assert!(current.composed);
@@ -16563,10 +16577,7 @@ mod tests {
             assert!(input.bubbles);
             assert!(!input.cancelable);
             assert!(input.composed);
-            assert_eq!(
-                input.payload.as_deref(),
-                Some(&DispatchEventPayload::Input(InputPayload::empty()))
-            );
+            assert_eq!(input.payload, None);
             assert_eq!(
                 context
                     .text_controls

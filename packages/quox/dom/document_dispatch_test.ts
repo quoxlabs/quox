@@ -890,6 +890,30 @@ Deno.test("trusted staged payloads create browser-style event subclasses with ex
   assert(!(scroll instanceof QuoxMouseEvent));
 });
 
+Deno.test("payloadless trusted input uses HTML's plain Event shape", () => {
+  const { document, renderer } = createHarness();
+  const target = document.createElement("input");
+  let received: QuoxEvent | undefined;
+  target.addEventListener("input", (event) => received = event);
+  renderer.queueFrame([{
+    type: "input",
+    target: target.nodeId,
+    path: [target.nodeId],
+    bubbles: true,
+    cancelable: false,
+    composed: true,
+  }]);
+
+  document.dispatchPointerMove(1, 2, 0, 0);
+
+  assert(received instanceof QuoxEvent);
+  assert(!(received instanceof QuoxDOMInputEvent));
+  assert(received.bubbles);
+  assertFalse(received.cancelable);
+  assert(received.composed);
+  assert(received.isTrusted);
+});
+
 Deno.test("trusted composition lifecycle preserves browser order, payloads, and flags", () => {
   const { document, renderer, window } = createHarness();
   const target = document.createElement("input");

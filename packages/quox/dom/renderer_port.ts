@@ -693,7 +693,7 @@ function validateEventPayload(
   present: boolean,
   value: unknown,
 ): DomDispatchEventPayload | undefined {
-  if (type === "scroll" || type === "change") {
+  if (type === "scroll" || type === "change" || (type === "input" && !present)) {
     if (present) throw new TypeError(`quox: ${type} events must not carry a payload`);
     return undefined;
   }

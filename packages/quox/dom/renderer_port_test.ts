@@ -216,6 +216,12 @@ Deno.test("DOM dispatch validator preserves text edit details and empty control 
     assert(step.kind === "event");
     assertEquals(step.payload, payload);
   }
+
+  const plainInput = eventStep({ type: "input" });
+  delete plainInput.payload;
+  const step = validateDomDispatchStep(plainInput);
+  assert(step.kind === "event");
+  assertEquals(step.payload, undefined);
 });
 
 Deno.test("DOM dispatch validator accepts and freezes complete steps", () => {
