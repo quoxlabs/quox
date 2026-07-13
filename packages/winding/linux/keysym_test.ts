@@ -1,4 +1,4 @@
-import { isDeadKeysym, logicalKeyFromKeysym, unicodeTextFromKeysym } from "./keysym.ts";
+import { isDeadKeysym, keyLocationHintForKeysym, logicalKeyFromKeysym, unicodeTextFromKeysym } from "./keysym.ts";
 
 Deno.test("Linux logical keys prefer layout-aware printable lookup text", () => {
   assertEquals(logicalKeyFromKeysym(0x7a, "z"), "z");
@@ -23,6 +23,17 @@ Deno.test("Linux logical keys use keysyms for controls, named, keypad, and media
   assertEquals(logicalKeyFromKeysym(0xffca), "F13");
   assertEquals(logicalKeyFromKeysym(0x1008ff14), "MediaPlay");
   assertEquals(logicalKeyFromKeysym(0x1008ff12), "AudioVolumeMute");
+});
+
+Deno.test("effective Linux modifier keysyms retain their native side", () => {
+  for (const keysym of [0xffe1, 0xffe3, 0xffe7, 0xffe9, 0xffeb]) {
+    assertEquals(keyLocationHintForKeysym(keysym), 1);
+  }
+  for (const keysym of [0xffe2, 0xffe4, 0xffe8, 0xffea, 0xffec]) {
+    assertEquals(keyLocationHintForKeysym(keysym), 2);
+  }
+  assertEquals(keyLocationHintForKeysym(0xfe03), undefined);
+  assertEquals(keyLocationHintForKeysym(0x61), undefined);
 });
 
 Deno.test("Linux dead and invalid keysyms have canonical fallbacks", () => {

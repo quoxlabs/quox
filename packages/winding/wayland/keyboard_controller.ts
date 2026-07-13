@@ -2,7 +2,7 @@
 
 import type { KeyModifiers, UIEvent } from "../types.ts";
 import { createImeCommitEvent, createImePreeditEvent, createKeyDownEvent, createKeyUpEvent } from "../input/mod.ts";
-import { domCodeFromEvdev } from "../linux/mod.ts";
+import { domCodeFromEvdev, keyLocationHintForKeysym } from "../linux/mod.ts";
 import { WlOp, type xkbSymbols } from "./ffi.ts";
 import { WaylandEnterKeyBatch, waylandKeyEditDisposition } from "./keyboard.ts";
 import {
@@ -282,6 +282,7 @@ export class WaylandKeyboardController {
         keycode: rawKeycode,
         code,
         key: resolved.key,
+        location: keyLocationHintForKeysym(translated.keysym),
         isComposing: wasComposing,
         ...modifiers,
       }));
@@ -300,6 +301,7 @@ export class WaylandKeyboardController {
       keycode: rawKeycode,
       code,
       key,
+      location: keyLocationHintForKeysym(translated.keysym),
       isComposing: wasComposing,
       repeat: phase === "repeat",
       editDisposition: disposition,

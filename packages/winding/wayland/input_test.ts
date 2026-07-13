@@ -14,8 +14,8 @@ import {
 } from "./keyboard.ts";
 import { CURSOR_SHAPE_MANAGER_V1_REQUESTS, WlOp, WlShmFormat, XDG_DECORATION_PROTOCOL_METADATA } from "./ffi.ts";
 import { createWaylandSurroundingTextState, TextInputV3Batch, TextInputV3SerialGate } from "./text_input.ts";
-import { CompositionState, keyLocationForCode, normalizeImeCursorArea, validateImeCursorRange } from "../input/mod.ts";
-import { logicalKeyFromKeysym } from "../linux/mod.ts";
+import { CompositionState, keyLocationForKey, normalizeImeCursorArea, validateImeCursorRange } from "../input/mod.ts";
+import { keyLocationHintForKeysym, logicalKeyFromKeysym } from "../linux/mod.ts";
 import { emitWaylandTextInputEdits } from "./text_input_controller.ts";
 import type { WaylandWindow } from "./window.ts";
 import {
@@ -2181,14 +2181,15 @@ Deno.test("Wayland raw keycodes remain separate from xkb keycodes", () => {
   });
 });
 
-Deno.test("key locations distinguish modifiers and numpad keys from arrows", () => {
-  assertEquals(keyLocationForCode("ShiftLeft"), 1);
-  assertEquals(keyLocationForCode("AltRight"), 2);
-  assertEquals(keyLocationForCode("Numpad1"), 3);
-  assertEquals(keyLocationForCode("NumpadParenLeft"), 3);
-  assertEquals(keyLocationForCode("ArrowLeft"), 0);
-  assertEquals(keyLocationForCode("ArrowRight"), 0);
-  assertEquals(keyLocationForCode("KeyA"), 0);
+Deno.test("Wayland key locations account for XKB remapping and keypad meanings", () => {
+  assertEquals(keyLocationForKey("Shift", "ShiftLeft"), 1);
+  assertEquals(keyLocationForKey("Alt", "AltRight"), 2);
+  assertEquals(keyLocationForKey("1", "Numpad1"), 3);
+  assertEquals(keyLocationForKey("End", "Numpad1"), 3);
+  assertEquals(keyLocationForKey("(", "NumpadParenLeft"), 0);
+  assertEquals(keyLocationForKey("a", "ShiftLeft"), 0);
+  assertEquals(keyLocationForKey("Shift", "KeyA", keyLocationHintForKeysym(0xffe1)), 1);
+  assertEquals(keyLocationForKey("Control", "KeyA", keyLocationHintForKeysym(0xffe4)), 2);
 });
 
 Deno.test("key release resolves a logical key without generating text or feeding Compose", () => {

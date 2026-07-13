@@ -17,12 +17,11 @@ import {
   createKeyDownEvent,
   createKeyUpEvent,
   EventQueue,
-  keyLocationForCode,
   NativeEventClock,
   normalizeKeyboardText,
   PressedLogicalKeyCache,
 } from "../input/mod.ts";
-import { domCodeFromXkbName } from "../linux/mod.ts";
+import { domCodeFromXkbName, keyLocationHintForKeysym } from "../linux/mod.ts";
 import { utf8Bytes, utf8CString as cString } from "../text_encoding.ts";
 import { libcFunctions, NotifyInferior, NotifyNormal, x11functions, XEventMask, XEventType } from "./ffi.ts";
 import {
@@ -641,7 +640,6 @@ class X11Library implements Library {
                 keycode,
                 code,
                 key,
-                location: keyLocationForCode(code),
                 repeat,
                 isComposing: wasComposing,
                 editDisposition: "text-input",
@@ -653,7 +651,6 @@ class X11Library implements Library {
                 keycode,
                 code,
                 key: window.pressedKeys.release(keycode),
-                location: keyLocationForCode(code),
                 isComposing: wasComposing,
                 ...modifiers,
                 window,
@@ -689,12 +686,13 @@ class X11Library implements Library {
 
           if (type === XEventType.KeyRelease) {
             if (this.#isAutoRepeatRelease(view)) continue;
-            const key = window.pressedKeys.release(keycode, this.input.lookupLogicalKey(eventPointer));
+            const lookup = this.input.lookupKey(eventPointer);
+            const key = window.pressedKeys.release(keycode, lookup.key);
             const event: KeyUpEvent = createKeyUpEvent({
               keycode,
               code,
               key,
-              location: keyLocationForCode(code),
+              location: keyLocationHintForKeysym(lookup.keysym),
               isComposing: window.input.composing,
               ...modifiers,
               window,
@@ -717,7 +715,7 @@ class X11Library implements Library {
             keycode,
             code,
             key,
-            location: keyLocationForCode(code),
+            location: keyLocationHintForKeysym(lookup.keysym),
             repeat,
             isComposing: wasComposing,
             editDisposition: x11KeyEditDisposition(

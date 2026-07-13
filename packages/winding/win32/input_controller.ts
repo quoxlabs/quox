@@ -54,6 +54,7 @@ import {
   InsertOnTypeFallbackState,
   isCommitText,
   keyboardModifiers,
+  keyLocationHintForVirtualKey,
   matchesWin32KeyMessage,
   probeWin32AltGraphLayout,
   repeatedWmCharText,
@@ -1168,7 +1169,15 @@ function createWin32KeyEvent(
   text: string | undefined,
   systemMessage: boolean,
 ): KeyEvent {
-  const init = { window, keycode, code, key, isComposing, ...modifiers };
+  const init = {
+    window,
+    keycode,
+    code,
+    key,
+    location: keyLocationHintForVirtualKey(keycode),
+    isComposing,
+    ...modifiers,
+  };
   return type === "keydown"
     ? createKeyDownEvent({
       ...init,

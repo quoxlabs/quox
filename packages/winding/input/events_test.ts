@@ -102,6 +102,23 @@ Deno.test("final key builders fill every canonical field", () => {
   });
 });
 
+Deno.test("final key builders sanitize native location hints after logical remapping", () => {
+  assertEquals(
+    createKeyDownEvent({
+      ...key,
+      code: "ShiftLeft",
+      key: "a",
+      location: 1,
+      repeat: false,
+      editDisposition: "text-input",
+    }).location,
+    0,
+  );
+  assertEquals(createKeyUpEvent({ ...key, code: "KeyA", key: "Control", location: 1 }).location, 1);
+  assertEquals(createKeyUpEvent({ ...key, code: "NumLock", key: "NumLock", location: 3 }).location, 0);
+  assertEquals(createKeyUpEvent({ ...key, code: "Numpad1", key: "End", location: 3 }).location, 3);
+});
+
 Deno.test("IME builders enforce canonical cursor, commit, and deletion shapes", () => {
   assertEquals(createImePreeditEvent(window, "éx", [2, 3]), {
     type: "ime",

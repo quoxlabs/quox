@@ -1,5 +1,13 @@
 import type { KeyDownEvent, Window } from "../types.ts";
+import { keyLocationForKey } from "../input/mod.ts";
 import { DarwinInputState, NS_NOT_FOUND, utf16RangeToUtf8 } from "./input_state.ts";
+
+Deno.test("Darwin key locations normalize keypad Clear and effective AppKit key codes", () => {
+  assertEquals(keyLocationForKey("Clear", "NumLock", 3), 0);
+  assertEquals(keyLocationForKey("NumLock", "NumLock", 3), 0);
+  assertEquals(keyLocationForKey("a", "ShiftLeft"), 0);
+  assertEquals(keyLocationForKey("Control", "ControlRight"), 2);
+});
 
 Deno.test("Darwin UTF-16 ranges become UTF-8 selections", () => {
   assertEquals(utf16RangeToUtf8("A🙂é", 1, 2), [1, 5]);

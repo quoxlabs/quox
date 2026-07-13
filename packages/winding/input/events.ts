@@ -9,7 +9,7 @@ import type {
   Window,
 } from "../types.ts";
 import { validateImeCursorRange } from "./ime.ts";
-import { keyLocationForCode, normalizeLogicalKey } from "./keyboard.ts";
+import { keyLocationForKey, normalizeLogicalKey } from "./keyboard.ts";
 
 export interface KeyEventInit extends KeyModifiers {
   window: Window;
@@ -101,13 +101,14 @@ export class ClickCounter<Button> {
 /** Build a fully normalized public keydown event. */
 export function createKeyDownEvent(init: KeyDownEventInit): KeyDownEvent {
   const code = normalizeLogicalKey(init.code);
+  const key = normalizeLogicalKey(init.key);
   return {
     type: "keydown",
     window: init.window,
     keycode: init.keycode,
     code,
-    key: normalizeLogicalKey(init.key),
-    location: init.location ?? keyLocationForCode(code),
+    key,
+    location: keyLocationForKey(key, code, init.location),
     isComposing: init.isComposing,
     repeat: init.repeat,
     editDisposition: init.editDisposition,
@@ -118,13 +119,14 @@ export function createKeyDownEvent(init: KeyDownEventInit): KeyDownEvent {
 /** Build a fully normalized public keyup event. */
 export function createKeyUpEvent(init: KeyEventInit): KeyUpEvent {
   const code = normalizeLogicalKey(init.code);
+  const key = normalizeLogicalKey(init.key);
   return {
     type: "keyup",
     window: init.window,
     keycode: init.keycode,
     code,
-    key: normalizeLogicalKey(init.key),
-    location: init.location ?? keyLocationForCode(code),
+    key,
+    location: keyLocationForKey(key, code, init.location),
     isComposing: init.isComposing,
     repeat: false,
     ...modifiers(init),

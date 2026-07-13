@@ -436,6 +436,26 @@ export const VK = {
   OEM_CLEAR: 0xfe,
 } as const;
 
+/** Return a side only when the effective Win32 virtual-key identity supplies one. */
+export function keyLocationHintForVirtualKey(virtualKey: number): 1 | 2 | undefined {
+  switch (virtualKey) {
+    case VK.LSHIFT:
+    case VK.LCONTROL:
+    case VK.LMENU:
+    case VK.LWIN:
+      return 1;
+    case VK.RSHIFT:
+    case VK.RCONTROL:
+    case VK.RMENU:
+    case VK.RWIN:
+      return 2;
+    default:
+      // Ordinary WM_KEY messages use generic modifier VKs. Their DOM code is
+      // the only reliable side evidence, including after common scan remaps.
+      return undefined;
+  }
+}
+
 /** Windows 10 1607+ flag that makes ToUnicodeEx leave the keyboard buffer unchanged. */
 export const TO_UNICODE_NO_STATE_CHANGE = 0x04;
 

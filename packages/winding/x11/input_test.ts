@@ -1,5 +1,5 @@
-import { normalizeKeyboardText } from "../input/mod.ts";
-import { logicalKeyFromKeysym } from "../linux/mod.ts";
+import { keyLocationForKey, normalizeKeyboardText } from "../input/mod.ts";
+import { keyLocationHintForKeysym, logicalKeyFromKeysym } from "../linux/mod.ts";
 import { XEventType } from "./ffi.ts";
 import {
   fallbackLookupText,
@@ -22,6 +22,15 @@ import {
 import { packRgbaPixels } from "./native_image.ts";
 import { supportsX11Abi, validateX11Geometry } from "./mod.ts";
 import { selectXimStyles } from "./xim.ts";
+
+Deno.test("X11 key locations follow remapped KeySyms instead of evdev positions alone", () => {
+  assertEquals(keyLocationForKey("Control", "ControlLeft"), 1);
+  assertEquals(keyLocationForKey("a", "ControlLeft"), 0);
+  assertEquals(keyLocationForKey("ArrowUp", "Numpad8"), 3);
+  assertEquals(keyLocationForKey("Insert", "Numpad0"), 0);
+  assertEquals(keyLocationForKey("Control", "KeyA", keyLocationHintForKeysym(0xffe3)), 1);
+  assertEquals(keyLocationForKey("Meta", "KeyA", keyLocationHintForKeysym(0xffec)), 2);
+});
 
 Deno.test("X11 logical keys prefer layout-aware printable text", () => {
   assertEquals(logicalKeyFromKeysym(0x7a, "z"), "z");

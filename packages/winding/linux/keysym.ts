@@ -2,6 +2,9 @@ import { normalizeKeyboardText } from "../input/keyboard.ts";
 
 export type LinuxKeysym = number | bigint;
 
+const LEFT_MODIFIER_KEYSYMS = new Set([0xffe1, 0xffe3, 0xffe7, 0xffe9, 0xffeb]);
+const RIGHT_MODIFIER_KEYSYMS = new Set([0xffe2, 0xffe4, 0xffe8, 0xffea, 0xffec]);
+
 const NAMED_KEYSYMS = new Map<number, string>([
   [0xff08, "Backspace"],
   [0xff09, "Tab"],
@@ -150,6 +153,15 @@ export function logicalKeyFromKeysym(keysym: LinuxKeysym, lookupText = ""): stri
   return normalizeKeyboardText(lookupText) ??
     normalizeKeyboardText(unicodeTextFromKeysym(value)) ??
     "Unidentified";
+}
+
+/** Return a sided location carried by an effective XKB/X11 modifier keysym. */
+export function keyLocationHintForKeysym(keysym: LinuxKeysym): 1 | 2 | undefined {
+  const value = numericKeysym(keysym);
+  if (value === undefined) return undefined;
+  if (LEFT_MODIFIER_KEYSYMS.has(value)) return 1;
+  if (RIGHT_MODIFIER_KEYSYMS.has(value)) return 2;
+  return undefined;
 }
 
 export function isDeadKeysym(keysym: LinuxKeysym): boolean {

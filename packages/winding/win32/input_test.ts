@@ -13,6 +13,7 @@ import {
   isCommitText,
   keyboardModifiers,
   keyboardStateForTranslation,
+  keyLocationHintForVirtualKey,
   logicalKeyFromVirtualKey,
   matchesWin32KeyMessage,
   normalizeWin32PrintableLogicalKey,
@@ -84,7 +85,7 @@ import { describeWin32Error, WIN32_SYSTEM_MESSAGE_FLAGS } from "./error.ts";
 import { prepareWin32Frame, Win32RetainedFrame } from "./frame.ts";
 import {
   ImeActivationState,
-  keyLocationForCode,
+  keyLocationForKey,
   normalizeImeCursorArea,
   PressedLogicalKeyCache,
   utf16IndexToUtf8Offset,
@@ -1140,11 +1141,16 @@ Deno.test("Win32 mouse capture state follows one owner and complete button chord
   assertEquals(capture.hasButton("right"), false);
 });
 
-Deno.test("physical codes determine DOM key locations", () => {
-  assertEquals(keyLocationForCode("NumpadEnter"), 3);
-  assertEquals(keyLocationForCode("ShiftLeft"), 1);
-  assertEquals(keyLocationForCode("AltRight"), 2);
-  assertEquals(keyLocationForCode("KeyA"), 0);
+Deno.test("Win32 key locations account for remapped and NumLock-dependent keys", () => {
+  assertEquals(keyLocationForKey("Enter", "NumpadEnter"), 3);
+  assertEquals(keyLocationForKey("Shift", "ShiftLeft"), 1);
+  assertEquals(keyLocationForKey("Alt", "AltRight"), 2);
+  assertEquals(keyLocationForKey("a", "ShiftLeft"), 0);
+  assertEquals(keyLocationForKey("ArrowLeft", "Numpad4"), 3);
+  assertEquals(keyLocationForKey("NumLock", "NumLock", 3), 0);
+  assertEquals(keyLocationForKey("Shift", "KeyA", keyLocationHintForVirtualKey(VK.LSHIFT)), 1);
+  assertEquals(keyLocationForKey("Meta", "KeyA", keyLocationHintForVirtualKey(VK.RWIN)), 2);
+  assertEquals(keyLocationHintForVirtualKey(VK.CONTROL), undefined);
 });
 
 Deno.test("logical virtual-key mapping covers named, function, translated, and unknown keys", () => {

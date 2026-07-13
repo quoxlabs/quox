@@ -14,7 +14,7 @@ import {
   createKeyDownEvent,
   createKeyUpEvent,
   EventQueue,
-  keyLocationForCode,
+  keyLocationForKey,
   NativeEventClock,
   PressedLogicalKeyCache,
 } from "../input/mod.ts";
@@ -817,6 +817,7 @@ class DarwinWindow implements Window, DarwinNativeResponder {
         // UI Events resolves `key` for every native repeat using the current
         // modifier/layout state rather than freezing the initial press value.
         completedKey.key = resolvedKey;
+        completedKey.location = keyLocationForKey(resolvedKey, completedKey.code);
       }
       this.#keyDispatchActive = false;
       this.#producedText = undefined;
@@ -1069,16 +1070,21 @@ class DarwinWindow implements Window, DarwinNativeResponder {
     const { sel, send } = this.lib.ffi;
     const keycode = send.u16(event, sel("keyCode"));
     const code = getDomCode(keycode, this.lib.ffi.isIsoKeyboard());
+    const key = logicalKey ?? logicalKeyForEvent({
+      keycode,
+      code,
+      characters: "",
+      charactersIgnoringModifiers: "",
+    });
+    // AppKit exposes modifier side through keyCode only; modifierFlags are
+    // aggregate and characters are invalid on flagsChanged. If an external
+    // remapper preserves a standard keyCode while manufacturing modifier
+    // semantics, there is no reliable inverse-remap side hint to add here.
     return {
       keycode,
       code,
-      key: logicalKey ?? logicalKeyForEvent({
-        keycode,
-        code,
-        characters: "",
-        charactersIgnoringModifiers: "",
-      }),
-      location: keycode === 0x47 ? 3 : keyLocationForCode(code),
+      key,
+      location: keyLocationForKey(key, code),
       isComposing: this.inputState.composing,
       ...getModifiers(event, this.lib.ffi),
       window: this,
