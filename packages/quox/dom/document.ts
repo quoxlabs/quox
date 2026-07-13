@@ -565,9 +565,7 @@ export class QuoxDocument extends QuoxEventTarget {
     const sourceKeyInputId = rawSourceKeyInputId === undefined
       ? undefined
       : assertPositiveUint32(rawSourceKeyInputId, "sourceKeyInputId");
-    this.#dispatchInputEvent(() =>
-      this.#dispatchPort.beginAppleStandardKeybinding(event.command, sourceKeyInputId)
-    );
+    this.#dispatchInputEvent(() => this.#dispatchPort.beginAppleStandardKeybinding(event.command, sourceKeyInputId));
   }
 
   /** Feed native IME lifecycle and edit events into Blitz. */
@@ -593,9 +591,7 @@ export class QuoxDocument extends QuoxEventTarget {
         const sourceKeyInputId = rawSourceKeyInputId === undefined
           ? undefined
           : assertPositiveUint32(rawSourceKeyInputId, "sourceKeyInputId");
-        this.#dispatchInputEvent(() =>
-          this.#dispatchPort.beginImeCommit(event.text, sourceKeyInputId)
-        );
+        this.#dispatchInputEvent(() => this.#dispatchPort.beginImeCommit(event.text, sourceKeyInputId));
         break;
       }
       case "deleteSurrounding": {
