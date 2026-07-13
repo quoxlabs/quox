@@ -376,7 +376,7 @@ export class QuoxDocument extends QuoxEventTarget {
     );
   }
 
-  /** Feed a pointer-up event into Blitz. Synthesizes `click`/`dblclick`/`contextmenu`. */
+  /** Feed a pointer-up event into Blitz. Synthesizes `click`/`auxclick`/`dblclick`/`contextmenu`. */
   dispatchPointerUp(
     x: number,
     y: number,
