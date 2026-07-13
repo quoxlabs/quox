@@ -2,15 +2,18 @@ use super::{
     apply_ime_delete_surrounding, is_insertable_text, key_event, mouse_button, pointer_buttons,
     preedit_cursor, validate_key_abi,
 };
-use crate::dom::{actual_focus_node_id, is_programmatically_focusable, public_dom_node_id};
+use crate::dom::{
+    actual_focus_node_id, is_html_actually_disabled, is_programmatically_focusable,
+    public_dom_node_id,
+};
 use crate::ffi_numbers::{
     NumericArgumentError, finite_f32, finite_f64, integer_range, known_mask, nonnegative_f64,
     uint32, wasm_usize,
 };
-use crate::form_controls::{CheckedControlStates, TextControlStates};
+use crate::form_controls::{CheckedControlStates, LegacyCheckableActivation, TextControlStates};
 use crate::node_handles::NodeHandles;
 use crate::{QuoxRenderer, QuoxRendererState, sync_document_layout};
-use blitz_dom::{BaseDocument, LocalName, QualName, local_name, ns};
+use blitz_dom::{Attribute, BaseDocument, LocalName, QualName, local_name, ns};
 use blitz_traits::events::{
     BlitzImeEvent, BlitzPointerEvent, BlitzPointerId, BlitzScrollEvent, BlitzWheelDelta,
     BlitzWheelEvent, DomEvent, DomEventData, MouseEventButton, MouseEventButtons,
@@ -168,6 +171,17 @@ struct GuardedNode {
 struct GuardedRawNode {
     raw: usize,
     public: GuardedNode,
+}
+
+struct GuardedCheckableActivation {
+    state: LegacyCheckableActivation,
+    target: GuardedNode,
+    previous_radio: Option<GuardedNode>,
+}
+
+struct TemporaryRadioNameFacade {
+    target: usize,
+    value: String,
 }
 
 impl GuardedRawNode {
@@ -454,6 +468,7 @@ enum ResumeAction {
     Normal {
         suppress_default: bool,
         double_click: Option<Box<PendingDoubleClick>>,
+        checkable_activation: Option<Box<GuardedCheckableActivation>>,
     },
     PointerLead {
         pointer_default: Box<GuardedDomEvent>,
@@ -894,14 +909,32 @@ impl DispatchStack {
             ResumeAction::Normal {
                 suppress_default,
                 double_click,
+                checkable_activation,
             } => {
-                if !cancelled && !suppress_default {
+                if cancelled {
+                    if let Some(activation) = checkable_activation.as_deref()
+                        && cancel_guarded_checkable_activation(
+                            document,
+                            checked_controls,
+                            handles,
+                            activation,
+                        )
+                    {
+                        self.frames
+                            .last_mut()
+                            .expect("canceled activation belongs to the active frame")
+                            .redraw_requested = true;
+                    }
+                } else if !suppress_default {
                     self.run_default(
                         document,
                         text_controls,
                         checked_controls,
                         handles,
                         pending.guarded,
+                        checkable_activation
+                            .as_deref()
+                            .map(|activation| activation.target),
                     )?;
                 }
                 if let Some(double_click) = double_click {
@@ -986,6 +1019,7 @@ impl DispatchStack {
                         checked_controls,
                         handles,
                         pointer_default,
+                        None,
                     )?;
                 }
                 self.queue_generated_pointer_release(suppressed_release_activation);
@@ -1018,6 +1052,7 @@ impl DispatchStack {
                             checked_controls,
                             handles,
                             *pointer_default,
+                            None,
                         )?;
                     }
                 }
@@ -1028,12 +1063,40 @@ impl DispatchStack {
         self.advance(document, text_controls, checked_controls, handles, redraw)
     }
 
-    fn abort(&mut self, redraw: &AtomicBool, frame_id: u32) -> bool {
+    fn abort(
+        &mut self,
+        document: &mut BaseDocument,
+        checked_controls: &mut CheckedControlStates,
+        handles: &NodeHandles,
+        redraw: &AtomicBool,
+        frame_id: u32,
+    ) -> bool {
         let Some(index) = self.frames.iter().position(|frame| frame.id == frame_id) else {
             return false;
         };
         // As with resume, only a matching frame can claim an unattached redraw.
         self.capture_redraw(redraw);
+
+        // Nested dispatch can pre-activate the same input repeatedly. Roll back the youngest
+        // transaction first so aborting an outer frame composes to the state before that frame.
+        for frame in self.frames[index..].iter_mut().rev() {
+            let activation = frame.pending.as_ref().and_then(|pending| {
+                if let ResumeAction::Normal {
+                    checkable_activation: Some(activation),
+                    ..
+                } = &pending.resume
+                {
+                    Some(activation.as_ref())
+                } else {
+                    None
+                }
+            });
+            if activation.is_some_and(|activation| {
+                cancel_guarded_checkable_activation(document, checked_controls, handles, activation)
+            }) {
+                frame.redraw_requested = true;
+            }
+        }
 
         let redraw_requested = self.frames[index..]
             .iter()
@@ -1196,13 +1259,14 @@ impl DispatchStack {
                 if let Some(mut event) = freeze_event_path(document, handles, event)? {
                     let suppress_default = event.metadata.suppress_default;
                     let double_click = self.observe_completed_click(&mut event);
-                    return self.stage(
+                    return self.stage_normal(
+                        document,
+                        checked_controls,
+                        handles,
                         redraw,
                         event,
-                        ResumeAction::Normal {
-                            suppress_default,
-                            double_click,
-                        },
+                        suppress_default,
+                        double_click,
                     );
                 }
                 continue;
@@ -1230,13 +1294,14 @@ impl DispatchStack {
                     if let Some(event) =
                         guard_planned_event(document, handles, target, data, metadata)?
                     {
-                        return self.stage(
+                        return self.stage_normal(
+                            document,
+                            checked_controls,
+                            handles,
                             redraw,
                             event,
-                            ResumeAction::Normal {
-                                suppress_default,
-                                double_click: None,
-                            },
+                            suppress_default,
+                            None,
                         );
                     }
                 }
@@ -1357,13 +1422,14 @@ impl DispatchStack {
                     else {
                         continue;
                     };
-                    return self.stage(
+                    return self.stage_normal(
+                        document,
+                        checked_controls,
+                        handles,
                         redraw,
                         event,
-                        ResumeAction::Normal {
-                            suppress_default: false,
-                            double_click: None,
-                        },
+                        false,
+                        None,
                     );
                 }
                 PlannedWork::DefaultOnly {
@@ -1380,6 +1446,7 @@ impl DispatchStack {
                             checked_controls,
                             handles,
                             event,
+                            None,
                         )?;
                     }
                 }
@@ -1396,7 +1463,14 @@ impl DispatchStack {
                             continue;
                         }
                     }
-                    self.run_default(document, text_controls, checked_controls, handles, *guarded)?;
+                    self.run_default(
+                        document,
+                        text_controls,
+                        checked_controls,
+                        handles,
+                        *guarded,
+                        None,
+                    )?;
                 }
                 PlannedWork::DoubleClick(pending) => {
                     if !node_is_live(pending.target, document, handles)
@@ -1416,13 +1490,14 @@ impl DispatchStack {
                     else {
                         continue;
                     };
-                    return self.stage(
+                    return self.stage_normal(
+                        document,
+                        checked_controls,
+                        handles,
                         redraw,
                         event,
-                        ResumeAction::Normal {
-                            suppress_default: false,
-                            double_click: None,
-                        },
+                        false,
+                        None,
                     );
                 }
                 PlannedWork::Action(action) => {
@@ -1439,6 +1514,91 @@ impl DispatchStack {
         resume: ResumeAction,
     ) -> Result<DispatchStep, DispatchError> {
         let event_id = self.allocate_event_id()?;
+        Ok(self.finish_stage(redraw, event_id, event, resume))
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "normal event staging also owns event-specific pre-dispatch activation"
+    )]
+    fn stage_normal(
+        &mut self,
+        document: &mut BaseDocument,
+        checked_controls: &mut CheckedControlStates,
+        handles: &mut NodeHandles,
+        redraw: &AtomicBool,
+        event: GuardedDomEvent,
+        mut suppress_default: bool,
+        double_click: Option<Box<PendingDoubleClick>>,
+    ) -> Result<DispatchStep, DispatchError> {
+        // Allocate every fallible dispatch identifier before applying state which JavaScript can
+        // observe. A failed stage must never strand a checkbox in its pre-activated state.
+        let event_id = self.allocate_event_id()?;
+        let checkable_activation = if !suppress_default
+            && event.metadata.event_type_override.is_none()
+            && matches!(
+                &event.event.data,
+                DomEventData::Click(BlitzPointerEvent {
+                    button: MouseEventButton::Main,
+                    ..
+                })
+            ) {
+            let prepared = checked_controls.prepare_legacy_activation(document, event.target.raw);
+            if let Some(state) = prepared {
+                debug_assert_eq!(state.target(), event.target.raw);
+                if event.metadata.pointer.is_some()
+                    && is_html_actually_disabled(document, event.target.raw)
+                {
+                    // Keep exposing the currently synthesized trusted click until I-02 removes
+                    // it, but do not let either Quox or Blitz activate an actually-disabled input.
+                    suppress_default = true;
+                    None
+                } else {
+                    // The previous member can be destroyed and its raw slab slot reused while the
+                    // click listener runs. Guard it before applying any pre-click mutation.
+                    let previous_radio = state
+                        .previous_radio()
+                        .map(|target| {
+                            guard_node(document, handles, target)?.ok_or_else(|| {
+                                DispatchError::new(
+                                    "quox: the checked radio disappeared before click dispatch",
+                                )
+                            })
+                        })
+                        .transpose()?;
+                    if checked_controls.apply_legacy_activation(document, &state) {
+                        self.frames
+                            .last_mut()
+                            .expect("events are staged only for an active frame")
+                            .redraw_requested = true;
+                    }
+                    Some(Box::new(GuardedCheckableActivation {
+                        state,
+                        target: event.target,
+                        previous_radio,
+                    }))
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let resume = ResumeAction::Normal {
+            suppress_default,
+            double_click,
+            checkable_activation,
+        };
+        Ok(self.finish_stage(redraw, event_id, event, resume))
+    }
+
+    fn finish_stage(
+        &mut self,
+        redraw: &AtomicBool,
+        event_id: u32,
+        event: GuardedDomEvent,
+        resume: ResumeAction,
+    ) -> DispatchStep {
         let frame = self
             .frames
             .last_mut()
@@ -1465,7 +1625,7 @@ impl DispatchStack {
             resume,
         });
         self.capture_redraw(redraw);
-        Ok(DispatchStep::Event(step))
+        DispatchStep::Event(step)
     }
 
     fn observe_completed_click(
@@ -1602,6 +1762,7 @@ impl DispatchStack {
         checked_controls: &mut CheckedControlStates,
         handles: &mut NodeHandles,
         mut guarded: GuardedDomEvent,
+        protected_checked_target: Option<GuardedNode>,
     ) -> Result<(), DispatchError> {
         if !node_is_live(guarded.target, document, handles) {
             return Ok(());
@@ -1645,7 +1806,9 @@ impl DispatchStack {
                 (target, value)
             });
         let mut generated = Vec::new();
+        let temporary_radio_name = install_temporary_radio_name(document, protected_checked_target);
         run_engine_default(document, &mut guarded, &mut generated);
+        restore_temporary_radio_name(document, temporary_radio_name);
         preserve_default_focus(document, &mut generated, old_focus, preserve_focus);
         restore_shell_provider(document, original_shell);
         if document.viewport_scroll() != viewport_scroll_before_default {
@@ -1655,20 +1818,13 @@ impl DispatchStack {
             restore_file_input_value_attribute(document, target, value.as_deref());
             text_controls.sanitize_file_input_label(document, target);
         }
-        // Blitz mutates checkbox/radio render data before queuing `input`. Import the generated
-        // target now, then repair radio peers from Quox's stricter tree/form/name group model so
-        // the first JavaScript listener observes the new live checkedness.
-        let activated_inputs = generated
-            .iter()
-            .filter_map(|event| {
-                matches!(&event.data, DomEventData::Input(_)).then_some(event.target)
-            })
-            .collect::<Vec<_>>();
-        let mut checkedness_changed = false;
-        for target in activated_inputs {
-            checkedness_changed =
-                checked_controls.import_user_activation(document, target) || checkedness_changed;
-        }
+        let checkedness_changed = reconcile_generated_checkable_defaults(
+            document,
+            checked_controls,
+            handles,
+            &generated,
+            protected_checked_target,
+        );
         if checkedness_changed {
             self.frames
                 .last_mut()
@@ -2872,6 +3028,126 @@ fn node_is_live(guard: GuardedNode, document: &BaseDocument, handles: &NodeHandl
     handles.resolve(guard.handle) == Some(guard.raw) && document.get_node(guard.raw).is_some()
 }
 
+fn cancel_guarded_checkable_activation(
+    document: &mut BaseDocument,
+    checked_controls: &mut CheckedControlStates,
+    handles: &NodeHandles,
+    activation: &GuardedCheckableActivation,
+) -> bool {
+    if !node_is_live(activation.target, document, handles) {
+        return false;
+    }
+    debug_assert_eq!(activation.state.target(), activation.target.raw);
+    let previous_radio = activation
+        .previous_radio
+        .filter(|previous| node_is_live(*previous, document, handles))
+        .map(|previous| previous.raw);
+    checked_controls.cancel_legacy_activation(document, &activation.state, previous_radio)
+}
+
+fn reconcile_generated_checkable_defaults(
+    document: &mut BaseDocument,
+    checked_controls: &mut CheckedControlStates,
+    handles: &NodeHandles,
+    generated: &[DomEvent],
+    protected_checked_target: Option<GuardedNode>,
+) -> bool {
+    // Blitz mutates checkbox/radio render data before queuing `input`. A staged click already
+    // performed that activation before JavaScript, whose listener writes are authoritative;
+    // never import Blitz's second toggle for that same stable target. Other generated input
+    // targets still use the legacy import path until label activation is staged separately.
+    let activated_inputs = generated
+        .iter()
+        .filter_map(|event| matches!(&event.data, DomEventData::Input(_)).then_some(event.target));
+    let mut checkedness_changed = false;
+    for target in activated_inputs {
+        let is_protected_target = protected_checked_target.is_some_and(|protected| {
+            protected.raw == target && node_is_live(protected, document, handles)
+        });
+        if !is_protected_target {
+            checkedness_changed =
+                checked_controls.import_user_activation(document, target) || checkedness_changed;
+        }
+    }
+    if protected_checked_target.is_some_and(|protected| node_is_live(protected, document, handles))
+    {
+        // Reproject script-owned state over every Blitz radio peer as well as the protected
+        // target: pinned Blitz groups by name only and may have changed unrelated controls.
+        checkedness_changed = checked_controls.reconcile_document(document) || checkedness_changed;
+    }
+    checkedness_changed
+}
+
+fn install_temporary_radio_name(
+    document: &mut BaseDocument,
+    protected_checked_target: Option<GuardedNode>,
+) -> Option<TemporaryRadioNameFacade> {
+    let target = protected_checked_target?.raw;
+    let is_unnamed_radio = document
+        .get_node(target)
+        .and_then(blitz_dom::Node::element_data)
+        .is_some_and(|element| {
+            element.name.ns == ns!(html)
+                && element.name.local.as_ref() == "input"
+                && element.attr(local_name!("type")) == Some("radio")
+                && element.attr(local_name!("name")).is_none()
+        });
+    if !is_unnamed_radio {
+        return None;
+    }
+
+    // Pinned Blitz unwraps a radio's name and groups every special checkbox facade by that name.
+    // Give only this default a collision-free private group, then remove it before any generated
+    // event is exposed or Quox reconciles the author-visible input descriptor.
+    let mut suffix = 0_u32;
+    let value = loop {
+        let candidate = format!("__quox_unnamed_radio_{target}_{suffix}");
+        let collision = document.tree().iter().any(|(_, node)| {
+            node.element_data()
+                .and_then(|element| element.attr(local_name!("name")))
+                == Some(candidate.as_str())
+        });
+        if !collision {
+            break candidate;
+        }
+        suffix = suffix.checked_add(1)?;
+    };
+    document
+        .get_node_mut(target)
+        .and_then(blitz_dom::Node::element_data_mut)?
+        .attrs
+        .push(Attribute {
+            name: QualName {
+                prefix: None,
+                ns: ns!(),
+                local: local_name!("name"),
+            },
+            value: value.clone(),
+        });
+    Some(TemporaryRadioNameFacade { target, value })
+}
+
+fn restore_temporary_radio_name(
+    document: &mut BaseDocument,
+    temporary: Option<TemporaryRadioNameFacade>,
+) {
+    let Some(temporary) = temporary else {
+        return;
+    };
+    let Some(element) = document
+        .get_node_mut(temporary.target)
+        .and_then(blitz_dom::Node::element_data_mut)
+    else {
+        return;
+    };
+    let injected = element.attrs.remove(&QualName {
+        prefix: None,
+        ns: ns!(),
+        local: local_name!("name"),
+    });
+    debug_assert!(injected.is_some_and(|attribute| attribute.value == temporary.value));
+}
+
 fn raw_node_is_live(guard: GuardedRawNode, document: &BaseDocument, handles: &NodeHandles) -> bool {
     node_is_live(guard.public, document, handles)
         && document.get_node(guard.raw).is_some()
@@ -3825,11 +4101,20 @@ impl QuoxRenderer {
         let frame_id = positive_id(frame_id, "frameId")?;
         let mut state = self.state.borrow_mut();
         let QuoxRendererState {
+            document,
+            checked_controls,
+            node_handles,
             redraw_requested,
             dispatch_stack,
             ..
         } = &mut *state;
-        let redraw_requested = dispatch_stack.abort(redraw_requested.as_ref(), frame_id);
+        let redraw_requested = dispatch_stack.abort(
+            document,
+            checked_controls,
+            node_handles,
+            redraw_requested.as_ref(),
+            frame_id,
+        );
         state.refresh_ime_cursor_area();
         Ok(redraw_requested)
     }
@@ -3948,6 +4233,16 @@ mod tests {
                     default_prevented,
                 )
                 .expect("dispatch should resume")
+        }
+
+        fn abort(&mut self, frame_id: u32) -> bool {
+            self.stack.abort(
+                &mut self.document,
+                &mut self.checked_controls,
+                &self.handles,
+                self.redraw.as_ref(),
+                frame_id,
+            )
         }
 
         fn element(&self, id: &str) -> usize {
@@ -5022,9 +5317,7 @@ mod tests {
             metadata: EventMetadata::native(),
         }));
         assert_eq!(final_up.event_type, "pointerup");
-        let _ = context
-            .stack
-            .abort(context.redraw.as_ref(), final_up.frame_id);
+        let _ = context.abort(final_up.frame_id);
 
         let next_down = context.begin(DispatchRequest::Pointer {
             event: pointer(x, y, MouseEventButton::Main, MouseEventButtons::Primary),
@@ -7818,8 +8111,8 @@ mod tests {
             metadata: host_key_metadata("Escape"),
             suppress_default: false,
         }));
-        context.stack.abort(context.redraw.as_ref(), outer.frame_id);
-        context.stack.abort(context.redraw.as_ref(), outer.frame_id);
+        context.abort(outer.frame_id);
+        context.abort(outer.frame_id);
         assert!(
             context
                 .stack
@@ -7999,7 +8292,7 @@ mod tests {
             suppress_default: false,
         }));
         context.redraw.store(true, Ordering::Relaxed);
-        context.stack.abort(context.redraw.as_ref(), inner.frame_id);
+        context.abort(inner.frame_id);
         let (_, redraw_requested) = complete(context.resume(&outer, false));
         assert!(redraw_requested);
     }
@@ -8015,16 +8308,8 @@ mod tests {
             suppress_default: false,
         }));
         context.redraw.store(true, Ordering::Relaxed);
-        assert!(
-            context
-                .stack
-                .abort(context.redraw.as_ref(), pending.frame_id)
-        );
-        assert!(
-            !context
-                .stack
-                .abort(context.redraw.as_ref(), pending.frame_id)
-        );
+        assert!(context.abort(pending.frame_id));
+        assert!(!context.abort(pending.frame_id));
         assert!(!context.redraw.load(Ordering::Relaxed));
     }
 
@@ -8048,7 +8333,7 @@ mod tests {
                 .is_err()
         );
         assert!(context.redraw.load(Ordering::Relaxed));
-        assert!(!context.stack.abort(context.redraw.as_ref(), 1));
+        assert!(!context.abort(1));
         assert!(context.redraw.load(Ordering::Relaxed));
 
         let _ = context.redraw.swap(false, Ordering::Relaxed);
@@ -8092,11 +8377,7 @@ mod tests {
                 .is_err()
         );
         assert!(context.redraw.load(Ordering::Relaxed));
-        assert!(
-            !context
-                .stack
-                .abort(context.redraw.as_ref(), pending.frame_id + 1)
-        );
+        assert!(!context.abort(pending.frame_id + 1));
         assert!(context.redraw.load(Ordering::Relaxed));
 
         let (_, redraw_requested) = complete(context.resume(&pending, false));
@@ -8545,6 +8826,608 @@ mod tests {
                 "{input_type} checkedness changed without a focus edge must still repaint",
             );
         }
+    }
+
+    #[test]
+    fn checkbox_pre_activation_is_visible_and_uncanceled_listener_writes_survive() {
+        let mut context = TestContext::new("<input id='box' type='checkbox'>");
+        let checkbox = context.element("box");
+        context
+            .checked_controls
+            .set_indeterminate(&mut context.document, checkbox, true)
+            .unwrap();
+
+        let click = stage_generated(
+            &mut context,
+            checkbox,
+            DomEventData::Click(pointer(
+                1.0,
+                1.0,
+                MouseEventButton::Main,
+                MouseEventButtons::None,
+            )),
+        );
+        assert!(
+            context
+                .checked_controls
+                .checked(&mut context.document, checkbox)
+                .unwrap(),
+            "click listeners must observe legacy pre-click checkedness",
+        );
+        assert!(
+            !context
+                .checked_controls
+                .indeterminate(&mut context.document, checkbox)
+                .unwrap(),
+            "checkbox pre-click activation clears indeterminate",
+        );
+
+        // Model writes made by the click listener. Pinned Blitz will toggle its render facade
+        // again while running the default, but that must not overwrite these script-owned values.
+        context
+            .checked_controls
+            .set_checked(&mut context.document, checkbox, false)
+            .unwrap();
+        context
+            .checked_controls
+            .set_indeterminate(&mut context.document, checkbox, true)
+            .unwrap();
+        let step = context.resume(&click, false);
+        let (types, _, _) = drain(&mut context, step);
+        assert!(types.iter().any(|event_type| event_type == "input"));
+        assert!(
+            !context
+                .checked_controls
+                .checked(&mut context.document, checkbox)
+                .unwrap()
+        );
+        assert!(
+            context
+                .checked_controls
+                .indeterminate(&mut context.document, checkbox)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn canceled_checkbox_click_restores_pre_activation_values_but_stays_dirty() {
+        let mut context = TestContext::new("<input id='box' type='checkbox'>");
+        let checkbox = context.element("box");
+        context
+            .checked_controls
+            .set_indeterminate(&mut context.document, checkbox, true)
+            .unwrap();
+        let click = stage_generated(
+            &mut context,
+            checkbox,
+            DomEventData::Click(pointer(
+                1.0,
+                1.0,
+                MouseEventButton::Main,
+                MouseEventButtons::None,
+            )),
+        );
+
+        let (_, redraw_requested) = complete(context.resume(&click, true));
+        assert!(redraw_requested);
+        assert!(
+            !context
+                .checked_controls
+                .checked(&mut context.document, checkbox)
+                .unwrap()
+        );
+        assert!(
+            context
+                .checked_controls
+                .indeterminate(&mut context.document, checkbox)
+                .unwrap()
+        );
+
+        context.document.mutate().set_attribute(
+            checkbox,
+            QualName {
+                prefix: None,
+                ns: ns!(),
+                local: LocalName::from("checked"),
+            },
+            "",
+        );
+        assert!(
+            !context
+                .checked_controls
+                .checked(&mut context.document, checkbox)
+                .unwrap(),
+            "rollback restores checkedness without resetting its dirty flag",
+        );
+    }
+
+    #[test]
+    fn canceled_radio_click_restores_only_a_live_prior_member_in_the_current_group() {
+        let mut context = TestContext::new(
+            "<input id='before' type='radio' name='group' checked>\
+             <input id='target' type='radio' name='group'>",
+        );
+        let before = context.element("before");
+        let target = context.element("target");
+        let click = stage_generated(
+            &mut context,
+            target,
+            DomEventData::Click(pointer(
+                1.0,
+                1.0,
+                MouseEventButton::Main,
+                MouseEventButtons::None,
+            )),
+        );
+        assert!(
+            !context
+                .checked_controls
+                .checked(&mut context.document, before)
+                .unwrap()
+        );
+        assert!(
+            context
+                .checked_controls
+                .checked(&mut context.document, target)
+                .unwrap()
+        );
+        complete(context.resume(&click, true));
+        assert!(
+            context
+                .checked_controls
+                .checked(&mut context.document, before)
+                .unwrap()
+        );
+        assert!(
+            !context
+                .checked_controls
+                .checked(&mut context.document, target)
+                .unwrap()
+        );
+
+        let click = stage_generated(
+            &mut context,
+            target,
+            DomEventData::Click(pointer(
+                1.0,
+                1.0,
+                MouseEventButton::Main,
+                MouseEventButtons::None,
+            )),
+        );
+        context.document.mutate().set_attribute(
+            target,
+            QualName {
+                prefix: None,
+                ns: ns!(),
+                local: LocalName::from("name"),
+            },
+            "other-group",
+        );
+        complete(context.resume(&click, true));
+        assert!(
+            !context
+                .checked_controls
+                .checked(&mut context.document, before)
+                .unwrap(),
+            "a prior member from the old group must not be restored",
+        );
+        assert!(
+            !context
+                .checked_controls
+                .checked(&mut context.document, target)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn canceled_radio_click_does_not_restore_a_stale_prior_handle() {
+        let mut context = TestContext::new(
+            "<input id='before' type='radio' name='group' checked>\
+             <input id='target' type='radio' name='group'>",
+        );
+        let before = context.element("before");
+        let target = context.element("target");
+        let click = stage_generated(
+            &mut context,
+            target,
+            DomEventData::Click(pointer(
+                1.0,
+                1.0,
+                MouseEventButton::Main,
+                MouseEventButtons::None,
+            )),
+        );
+        let stale = context
+            .handles
+            .invalidate_node(before)
+            .expect("the previous radio was guarded before pre-activation");
+        let replacement = context.handles.expose(before).unwrap();
+        assert_ne!(replacement, stale);
+
+        complete(context.resume(&click, true));
+        assert!(
+            !context
+                .checked_controls
+                .checked(&mut context.document, before)
+                .unwrap()
+        );
+        assert!(
+            !context
+                .checked_controls
+                .checked(&mut context.document, target)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn canceled_checkable_click_uses_the_targets_current_type() {
+        let mut checkbox_to_radio = TestContext::new("<input id='target' type='checkbox'>");
+        let target = checkbox_to_radio.element("target");
+        checkbox_to_radio
+            .checked_controls
+            .set_indeterminate(&mut checkbox_to_radio.document, target, true)
+            .unwrap();
+        let click = stage_generated(
+            &mut checkbox_to_radio,
+            target,
+            DomEventData::Click(pointer(
+                1.0,
+                1.0,
+                MouseEventButton::Main,
+                MouseEventButtons::None,
+            )),
+        );
+        checkbox_to_radio.set_input_type(target, "radio");
+        complete(checkbox_to_radio.resume(&click, true));
+        assert!(
+            !checkbox_to_radio
+                .checked_controls
+                .checked(&mut checkbox_to_radio.document, target)
+                .unwrap()
+        );
+        assert!(
+            !checkbox_to_radio
+                .checked_controls
+                .indeterminate(&mut checkbox_to_radio.document, target)
+                .unwrap(),
+            "the current radio branch must not restore the checkbox's indeterminate flag",
+        );
+
+        let mut radio_to_checkbox = TestContext::new(
+            "<input id='before' type='radio' name='group' checked>\
+             <input id='target' type='radio' name='group'>",
+        );
+        let before = radio_to_checkbox.element("before");
+        let target = radio_to_checkbox.element("target");
+        radio_to_checkbox
+            .checked_controls
+            .set_indeterminate(&mut radio_to_checkbox.document, target, true)
+            .unwrap();
+        let click = stage_generated(
+            &mut radio_to_checkbox,
+            target,
+            DomEventData::Click(pointer(
+                1.0,
+                1.0,
+                MouseEventButton::Main,
+                MouseEventButtons::None,
+            )),
+        );
+        radio_to_checkbox.set_input_type(target, "checkbox");
+        radio_to_checkbox
+            .checked_controls
+            .set_indeterminate(&mut radio_to_checkbox.document, target, false)
+            .unwrap();
+        complete(radio_to_checkbox.resume(&click, true));
+        assert!(
+            !radio_to_checkbox
+                .checked_controls
+                .checked(&mut radio_to_checkbox.document, target)
+                .unwrap()
+        );
+        assert!(
+            radio_to_checkbox
+                .checked_controls
+                .indeterminate(&mut radio_to_checkbox.document, target)
+                .unwrap(),
+            "the current checkbox branch restores values captured before radio activation",
+        );
+        assert!(
+            !radio_to_checkbox
+                .checked_controls
+                .checked(&mut radio_to_checkbox.document, before)
+                .unwrap(),
+            "switching to checkbox does not run radio-group rollback",
+        );
+    }
+
+    #[test]
+    fn abort_rolls_back_nested_checkable_pre_activation_in_lifo_order() {
+        let mut context = TestContext::new("<input id='box' type='checkbox'>");
+        let checkbox = context.element("box");
+        let outer = stage_generated(
+            &mut context,
+            checkbox,
+            DomEventData::Click(pointer(
+                1.0,
+                1.0,
+                MouseEventButton::Main,
+                MouseEventButtons::None,
+            )),
+        );
+        assert!(
+            context
+                .checked_controls
+                .checked(&mut context.document, checkbox)
+                .unwrap()
+        );
+        let _inner = stage_generated(
+            &mut context,
+            checkbox,
+            DomEventData::Click(pointer(
+                1.0,
+                1.0,
+                MouseEventButton::Main,
+                MouseEventButtons::None,
+            )),
+        );
+        assert!(
+            !context
+                .checked_controls
+                .checked(&mut context.document, checkbox)
+                .unwrap()
+        );
+
+        assert!(context.abort(outer.frame_id));
+        assert!(context.stack.frames.is_empty());
+        assert!(
+            !context
+                .checked_controls
+                .checked(&mut context.document, checkbox)
+                .unwrap(),
+            "inner rollback must run before outer rollback",
+        );
+    }
+
+    #[test]
+    fn canceled_click_uses_a_noncheckable_inputs_snapshot_after_type_changes() {
+        let mut checkbox = TestContext::new("<input id='target' type='text' checked>");
+        let target = checkbox.element("target");
+        checkbox
+            .checked_controls
+            .set_indeterminate(&mut checkbox.document, target, true)
+            .unwrap();
+        let click = stage_generated(
+            &mut checkbox,
+            target,
+            DomEventData::Click(pointer(
+                1.0,
+                1.0,
+                MouseEventButton::Main,
+                MouseEventButtons::None,
+            )),
+        );
+        checkbox.set_input_type(target, "checkbox");
+        checkbox
+            .checked_controls
+            .set_checked(&mut checkbox.document, target, false)
+            .unwrap();
+        checkbox
+            .checked_controls
+            .set_indeterminate(&mut checkbox.document, target, false)
+            .unwrap();
+        complete(checkbox.resume(&click, true));
+        assert!(
+            checkbox
+                .checked_controls
+                .checked(&mut checkbox.document, target)
+                .unwrap(),
+            "the current checkbox branch restores the latent pre-click checkedness",
+        );
+        assert!(
+            checkbox
+                .checked_controls
+                .indeterminate(&mut checkbox.document, target)
+                .unwrap(),
+        );
+
+        let mut radio = TestContext::new("<input id='target' type='text' checked>");
+        let target = radio.element("target");
+        let click = stage_generated(
+            &mut radio,
+            target,
+            DomEventData::Click(pointer(
+                1.0,
+                1.0,
+                MouseEventButton::Main,
+                MouseEventButtons::None,
+            )),
+        );
+        radio.set_input_type(target, "radio");
+        complete(radio.resume(&click, true));
+        assert!(
+            !radio
+                .checked_controls
+                .checked(&mut radio.document, target)
+                .unwrap(),
+            "an input which was not initially a radio has no prior group member to restore",
+        );
+    }
+
+    #[test]
+    fn uncanceled_noncheckable_to_checkable_listener_writes_survive_blitz_default() {
+        for input_type in ["checkbox", "radio"] {
+            let mut context = TestContext::new("<input id='target' type='text'>");
+            let target = context.element("target");
+            let click = stage_generated(
+                &mut context,
+                target,
+                DomEventData::Click(pointer(
+                    1.0,
+                    1.0,
+                    MouseEventButton::Main,
+                    MouseEventButtons::None,
+                )),
+            );
+            context.set_input_type(target, input_type);
+            context
+                .checked_controls
+                .set_checked(&mut context.document, target, false)
+                .unwrap();
+            context
+                .checked_controls
+                .set_indeterminate(&mut context.document, target, true)
+                .unwrap();
+
+            let step = context.resume(&click, false);
+            let (types, _, _) = drain(&mut context, step);
+            assert!(types.iter().any(|event_type| event_type == "input"));
+            assert!(
+                !context
+                    .checked_controls
+                    .checked(&mut context.document, target)
+                    .unwrap(),
+                "pinned Blitz must not import a second {input_type} activation",
+            );
+            assert!(
+                context
+                    .checked_controls
+                    .indeterminate(&mut context.document, target)
+                    .unwrap(),
+            );
+            assert_eq!(
+                context
+                    .document
+                    .get_node(target)
+                    .and_then(blitz_dom::Node::element_data)
+                    .and_then(|element| element.attr(local_name!("name"))),
+                None,
+            );
+        }
+    }
+
+    #[test]
+    fn uncanceled_unnamed_radio_uses_and_removes_a_private_blitz_group() {
+        let mut context = TestContext::new("<input id='target' type='radio'>");
+        let target = context.element("target");
+        let click = stage_generated(
+            &mut context,
+            target,
+            DomEventData::Click(pointer(
+                1.0,
+                1.0,
+                MouseEventButton::Main,
+                MouseEventButtons::None,
+            )),
+        );
+        assert!(
+            context
+                .checked_controls
+                .checked(&mut context.document, target)
+                .unwrap()
+        );
+
+        let step = context.resume(&click, false);
+        let (types, _, _) = drain(&mut context, step);
+        assert!(types.iter().any(|event_type| event_type == "input"));
+        assert!(
+            context
+                .checked_controls
+                .checked(&mut context.document, target)
+                .unwrap()
+        );
+        assert_eq!(
+            context
+                .document
+                .get_node(target)
+                .and_then(blitz_dom::Node::element_data)
+                .and_then(|element| element.attr(local_name!("name"))),
+            None,
+            "the private Blitz group must not become an author-visible name attribute",
+        );
+    }
+
+    #[test]
+    fn trusted_pointer_click_does_not_activate_an_actually_disabled_checkbox() {
+        for body in [
+            "<input id='target' type='checkbox' disabled style='width:24px;height:24px'>",
+            "<fieldset disabled><input id='target' type='checkbox' \
+             style='width:24px;height:24px'></fieldset>",
+        ] {
+            let mut context = TestContext::new(body);
+            let target = context.element("target");
+            context
+                .checked_controls
+                .set_indeterminate(&mut context.document, target, true)
+                .unwrap();
+            let (x, y) = context.center(target);
+            assert!(context.document.set_hover_to(x, y));
+
+            let down = context.begin_trusted_pointer(
+                x,
+                y,
+                MouseEventButton::Main,
+                MouseEventButtons::Primary,
+                PointerFlavor::Down,
+            );
+            let _ = drain(&mut context, down);
+            let up = context.begin_trusted_pointer(
+                x,
+                y,
+                MouseEventButton::Main,
+                MouseEventButtons::None,
+                PointerFlavor::Up,
+            );
+            let (types, _, _) = drain(&mut context, up);
+            assert!(
+                types.iter().any(|event_type| event_type == "click"),
+                "I-02 will remove the currently exposed disabled-control click separately",
+            );
+            assert!(!types.iter().any(|event_type| event_type == "input"));
+            assert!(
+                !context
+                    .checked_controls
+                    .checked(&mut context.document, target)
+                    .unwrap()
+            );
+            assert!(
+                context
+                    .checked_controls
+                    .indeterminate(&mut context.document, target)
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn nonpointer_disabled_click_keeps_the_synthetic_activation_path() {
+        let mut context = TestContext::new("<input id='target' type='checkbox' disabled>");
+        let target = context.element("target");
+        let click = stage_generated(
+            &mut context,
+            target,
+            DomEventData::Click(pointer(
+                1.0,
+                1.0,
+                MouseEventButton::Main,
+                MouseEventButtons::None,
+            )),
+        );
+        assert!(
+            context
+                .checked_controls
+                .checked(&mut context.document, target)
+                .unwrap(),
+            "actual-disabled gating is specific to trusted native pointer activation",
+        );
+        complete(context.resume(&click, false));
+        assert!(
+            context
+                .checked_controls
+                .checked(&mut context.document, target)
+                .unwrap()
+        );
     }
 
     #[test]

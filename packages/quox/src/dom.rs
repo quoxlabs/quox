@@ -197,7 +197,7 @@ fn option_is_disabled(document: &BaseDocument, node_id: usize) -> bool {
     false
 }
 
-fn is_html_actually_disabled(document: &BaseDocument, node_id: usize) -> bool {
+pub(super) fn is_html_actually_disabled(document: &BaseDocument, node_id: usize) -> bool {
     let Some(element) = document
         .get_node(node_id)
         .and_then(blitz_dom::Node::element_data)

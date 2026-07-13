@@ -74,6 +74,29 @@ struct CheckedControlState {
     descriptor: CheckedInputDescriptor,
 }
 
+/// State captured before HTML's legacy pre-click activation can mutate an input.
+///
+/// The clicked input's current type is deliberately not used during cancellation. HTML chooses
+/// the rollback branch from the type after the click listeners have finished, while the values
+/// restored by the checkbox branch and the radio selected before activation come from here.
+pub(crate) struct LegacyCheckableActivation {
+    target: usize,
+    previous_checked: bool,
+    previous_indeterminate: bool,
+    previous_radio: Option<usize>,
+    initial_kind: CheckedInputKind,
+}
+
+impl LegacyCheckableActivation {
+    pub(crate) fn target(&self) -> usize {
+        self.target
+    }
+
+    pub(crate) fn previous_radio(&self) -> Option<usize> {
+        self.previous_radio
+    }
+}
+
 impl CheckedControlStates {
     /// Reconcile content attributes, input-type/group transitions, connectivity, and Blitz's
     /// render facade. The text-control owner must reconcile first so a type transition has
@@ -194,6 +217,120 @@ impl CheckedControlStates {
         Some(rendered_changed)
     }
 
+    /// Capture every input target, but do not yet apply legacy pre-click activation state.
+    ///
+    /// Keeping preparation separate lets the staged dispatcher assign stable handles to the
+    /// previously checked radio before any observable checkedness is changed. Non-checkable
+    /// inputs are also captured because a click listener can change their type before default or
+    /// canceled-activation processing.
+    pub(crate) fn prepare_legacy_activation(
+        &mut self,
+        document: &mut BaseDocument,
+        node_id: usize,
+    ) -> Option<LegacyCheckableActivation> {
+        self.reconcile_document(document);
+        let state = self.controls.get(&node_id)?;
+        let previous_radio = state.descriptor.radio_group().and_then(|group| {
+            self.controls.iter().find_map(|(other_id, other)| {
+                (other.checked && other.descriptor.radio_group().as_ref() == Some(&group))
+                    .then_some(*other_id)
+            })
+        });
+        Some(LegacyCheckableActivation {
+            target: node_id,
+            previous_checked: state.checked,
+            previous_indeterminate: state.indeterminate,
+            previous_radio,
+            initial_kind: state.descriptor.kind,
+        })
+    }
+
+    /// Apply legacy pre-click activation immediately before the click crosses into JavaScript.
+    pub(crate) fn apply_legacy_activation(
+        &mut self,
+        document: &mut BaseDocument,
+        activation: &LegacyCheckableActivation,
+    ) -> bool {
+        let previous_checkedness = self.checkedness_snapshot();
+        let mut indeterminate_changed = false;
+        match activation.initial_kind {
+            CheckedInputKind::Checkbox => {
+                let Some(state) = self.controls.get_mut(&activation.target) else {
+                    return false;
+                };
+                state.checked = !state.checked;
+                indeterminate_changed = state.indeterminate;
+                state.indeterminate = false;
+            }
+            CheckedInputKind::Radio => self.set_true_and_enforce_group(activation.target),
+            CheckedInputKind::Other => return false,
+        }
+
+        let logically_changed = self.mark_user_checkedness_changes(document, &previous_checkedness);
+        if indeterminate_changed {
+            mark_checkedness_restyle(document, activation.target);
+        }
+        self.project_document(document) || !logically_changed.is_empty() || indeterminate_changed
+    }
+
+    /// Run HTML's legacy canceled-activation behavior using the target's current type and group.
+    ///
+    /// `previous_radio` has already been checked against the dispatcher's stable node generation;
+    /// a destroyed and reused raw id is therefore passed as `None` rather than restoring a
+    /// replacement element.
+    pub(crate) fn cancel_legacy_activation(
+        &mut self,
+        document: &mut BaseDocument,
+        activation: &LegacyCheckableActivation,
+        previous_radio: Option<usize>,
+    ) -> bool {
+        let mut rendered_changed = self.reconcile_document(document);
+        let previous_checkedness = self.checkedness_snapshot();
+        let Some((current_kind, current_group)) = self
+            .controls
+            .get(&activation.target)
+            .map(|state| (state.descriptor.kind, state.descriptor.radio_group()))
+        else {
+            return rendered_changed;
+        };
+        let mut indeterminate_changed = false;
+
+        match current_kind {
+            CheckedInputKind::Checkbox => {
+                let state = self
+                    .controls
+                    .get_mut(&activation.target)
+                    .expect("the reconciled activation target remains present");
+                state.checked = activation.previous_checked;
+                indeterminate_changed = state.indeterminate != activation.previous_indeterminate;
+                state.indeterminate = activation.previous_indeterminate;
+            }
+            CheckedInputKind::Radio => {
+                let restorable = previous_radio.filter(|previous_radio| {
+                    current_group.is_some()
+                        && self
+                            .controls
+                            .get(previous_radio)
+                            .and_then(|state| state.descriptor.radio_group())
+                            == current_group
+                });
+                if let Some(previous_radio) = restorable {
+                    self.set_true_and_enforce_group(previous_radio);
+                } else if let Some(state) = self.controls.get_mut(&activation.target) {
+                    state.checked = false;
+                }
+            }
+            CheckedInputKind::Other => {}
+        }
+
+        let logically_changed = self.mark_user_checkedness_changes(document, &previous_checkedness);
+        if indeterminate_changed {
+            mark_checkedness_restyle(document, activation.target);
+        }
+        rendered_changed |= self.project_document(document);
+        rendered_changed || !logically_changed.is_empty() || indeterminate_changed
+    }
+
     /// Import a checkedness mutation made inside pinned Blitz's click default before the generated
     /// `input` record is exposed to JavaScript. Quox then reprojects every state, repairing Blitz's
     /// name-only radio grouping (which can otherwise uncheck unrelated radios and checkboxes).
@@ -279,6 +416,34 @@ impl CheckedControlStates {
                 other.checked = false;
             }
         }
+    }
+
+    fn checkedness_snapshot(&self) -> HashMap<usize, bool> {
+        self.controls
+            .iter()
+            .map(|(node_id, state)| (*node_id, state.checked))
+            .collect()
+    }
+
+    fn mark_user_checkedness_changes(
+        &mut self,
+        document: &mut BaseDocument,
+        previous: &HashMap<usize, bool>,
+    ) -> Vec<usize> {
+        let changed = self
+            .controls
+            .iter()
+            .filter_map(|(node_id, state)| {
+                (previous.get(node_id) != Some(&state.checked)).then_some(*node_id)
+            })
+            .collect::<Vec<_>>();
+        for node_id in &changed {
+            if let Some(state) = self.controls.get_mut(node_id) {
+                state.dirty_checkedness = true;
+            }
+            mark_checkedness_restyle(document, *node_id);
+        }
+        changed
     }
 
     fn project_document(&self, document: &mut BaseDocument) -> bool {
