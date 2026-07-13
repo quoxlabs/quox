@@ -897,10 +897,12 @@ export function validateDomDispatchStep(value: unknown): DomDispatchStep {
   }
 
   const type = assertEventType(requiredValue(descriptors, "type", "DOM dispatch step"));
+  const payloadDescriptor = Object.getOwnPropertyDescriptor(descriptors, "payload");
+  const payloadless = type === "scroll" || type === "change" || (type === "input" && payloadDescriptor === undefined);
   assertExactProperties(
     descriptors,
     "DOM dispatch step",
-    type === "scroll" || type === "change" ? EVENT_STEP_PROPERTIES : PAYLOAD_EVENT_STEP_PROPERTIES,
+    payloadless ? EVENT_STEP_PROPERTIES : PAYLOAD_EVENT_STEP_PROPERTIES,
   );
 
   const target = assertPositiveUint32(
@@ -912,7 +914,6 @@ export function validateDomDispatchStep(value: unknown): DomDispatchStep {
     throw new RangeError("quox: DOM dispatch path must begin with its target");
   }
 
-  const payloadDescriptor = Object.getOwnPropertyDescriptor(descriptors, "payload");
   const payload = validateEventPayload(
     type,
     payloadDescriptor !== undefined,
