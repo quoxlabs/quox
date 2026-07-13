@@ -13,6 +13,7 @@ use crate::ffi_numbers::{
 use crate::form_controls::{CheckedControlStates, LegacyCheckableActivation, TextControlStates};
 use crate::node_handles::NodeHandles;
 use crate::{QuoxRenderer, QuoxRendererState, sync_document_layout};
+use blitz_dom::node::SpecialElementData;
 use blitz_dom::{Attribute, BaseDocument, LocalName, QualName, local_name, ns};
 use blitz_traits::events::{
     BlitzImeEvent, BlitzPointerEvent, BlitzPointerId, BlitzScrollEvent, BlitzWheelDelta,
@@ -198,6 +199,12 @@ struct GuardedCheckableActivation {
 struct TemporaryRadioNameFacade {
     target: usize,
     value: String,
+}
+
+struct FileInputDefaultSnapshot {
+    target: usize,
+    authored_value: Option<String>,
+    selection: Vec<std::path::PathBuf>,
 }
 
 enum LabelClickDefault {
@@ -2287,6 +2294,10 @@ impl DispatchStack {
         Ok(())
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "default reconciliation keeps native mutations and their staged follow-ups atomic"
+    )]
     fn run_default(
         &mut self,
         document: &mut BaseDocument,
@@ -2321,7 +2332,7 @@ impl DispatchStack {
         let mut source_metadata = guarded.metadata.clone();
         let label_default = label_click_default(document, &guarded);
         let viewport_scroll_before_default = document.viewport_scroll();
-        let preserved_file_value = file_value_preserved_during_click(document, &guarded);
+        let file_input_snapshot = file_input_default_snapshot(document, &guarded);
         let mut generated = Vec::new();
         let protected_checked_target =
             protected_checked_activation.map(|activation| activation.target);
@@ -2339,9 +2350,27 @@ impl DispatchStack {
         if document.viewport_scroll() != viewport_scroll_before_default {
             generated.push(viewport_scroll_event(document));
         }
-        if let Some((target, value)) = preserved_file_value {
-            restore_file_input_value_attribute(document, target, value.as_deref());
-            text_controls.sanitize_file_input_label(document, target);
+        let changed_file_input = file_input_snapshot.and_then(|snapshot| {
+            let changed = reconcile_file_input_default(document, &snapshot);
+            restore_file_input_value_attribute(
+                document,
+                snapshot.target,
+                snapshot.authored_value.as_deref(),
+            );
+            text_controls.sanitize_file_input_label(document, snapshot.target);
+            changed.then_some(snapshot.target)
+        });
+        if let Some(target) = changed_file_input {
+            generated.push(DomEvent::new(
+                target,
+                DomEventData::Input(blitz_traits::events::BlitzInputEvent {
+                    value: String::new(),
+                }),
+            ));
+            self.frames
+                .last_mut()
+                .expect("file defaults run only for an active frame")
+                .redraw_requested = true;
         }
         let checkedness_changed = reconcile_generated_checkable_defaults(
             document,
@@ -2386,6 +2415,7 @@ impl DispatchStack {
             &source_metadata,
             (old_focus, new_focus),
             protected_checkable_default,
+            changed_file_input,
         )?;
         self.frames
             .last_mut()
@@ -2900,6 +2930,7 @@ fn guard_generated_default_events(
     source_metadata: &EventMetadata,
     focus: (Option<GuardedNode>, Option<GuardedNode>),
     protected: Option<ProtectedCheckableDefault>,
+    changed_file_input: Option<usize>,
 ) -> Result<VecDeque<GuardedDomEvent>, DispatchError> {
     let protected_input_present = protected.is_some_and(|protected| {
         generated.iter().any(|event| {
@@ -2948,8 +2979,19 @@ fn guard_generated_default_events(
             {
                 guarded.push_back(event);
             }
-        } else if let Some(event) = guard_queued_event(document, handles, event, metadata)? {
-            guarded.push_back(event);
+        } else {
+            let file_input = changed_file_input == Some(event.target)
+                && matches!(&event.data, DomEventData::Input(_));
+            let change_event = file_input.then(|| DomEvent::new(event.target, event.data.clone()));
+            if let Some(event) = guard_queued_event(document, handles, event, metadata.clone())? {
+                guarded.push_back(event);
+            }
+            if let Some(change_event) = change_event
+                && let Some(event) =
+                    guard_queued_event(document, handles, change_event, metadata.into_change())?
+            {
+                guarded.push_back(event);
+            }
         }
     }
     Ok(guarded)
@@ -3343,24 +3385,61 @@ fn pointer_author_chain(
     Ok(chain)
 }
 
-fn file_value_preserved_during_click(
+fn file_input_default_snapshot(
     document: &BaseDocument,
     guarded: &GuardedDomEvent,
-) -> Option<(usize, Option<String>)> {
+) -> Option<FileInputDefaultSnapshot> {
     let target = matches!(&guarded.event.data, DomEventData::Click(_))
         .then(|| activated_file_input(document, guarded.default_target.raw))
         .flatten()?;
-    let value = document
+    let element = document
         .get_node(target)
-        .and_then(blitz_dom::Node::element_data)
-        .and_then(|element| {
-            element.attrs.iter().find(|attribute| {
-                attribute.name.ns == ns!() && attribute.name.local == local_name!("value")
-            })
+        .and_then(blitz_dom::Node::element_data)?;
+    let authored_value = element
+        .attrs
+        .iter()
+        .find(|attribute| {
+            attribute.name.ns == ns!() && attribute.name.local == local_name!("value")
         })
         .map(|attribute| attribute.value.as_str())
         .map(str::to_owned);
-    Some((target, value))
+    let selection = element
+        .file_data()
+        .map_or_else(Vec::new, |files| files.iter().cloned().collect());
+    Some(FileInputDefaultSnapshot {
+        target,
+        authored_value,
+        selection,
+    })
+}
+
+fn reconcile_file_input_default(
+    document: &mut BaseDocument,
+    snapshot: &FileInputDefaultSnapshot,
+) -> bool {
+    let Some(element) = document
+        .get_node_mut(snapshot.target)
+        .and_then(blitz_dom::Node::element_data_mut)
+    else {
+        return false;
+    };
+    let selection = element
+        .file_data()
+        .map_or_else(Vec::new, |files| files.iter().cloned().collect::<Vec<_>>());
+    if selection.is_empty() {
+        // The pinned shell contract returns only a Vec, so an empty result is the sole cancel
+        // signal. Blitz clears FileData in that case; restore the selection which existed when
+        // the picker opened, exactly as browsers retain it after cancellation.
+        if selection != snapshot.selection {
+            element.special_data = if snapshot.selection.is_empty() {
+                SpecialElementData::None
+            } else {
+                SpecialElementData::FileInput(snapshot.selection.clone().into())
+            };
+        }
+        return false;
+    }
+    selection != snapshot.selection
 }
 
 fn activated_file_input(document: &BaseDocument, mut node_id: usize) -> Option<usize> {
@@ -12105,6 +12184,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "generated file events must retain the causal click's exact timestamp"
+    )]
     fn file_activation_preserves_author_value_attributes_and_hides_host_paths() {
         struct SelectingShell;
 
@@ -12147,8 +12230,32 @@ mod tests {
                 ),
             );
 
-            let step = context.resume(&click, false);
-            let _ = drain(&mut context, step);
+            let after_click = context.resume(&click, false);
+            let input = event(after_click);
+            assert_eq!(input.event_type, "input");
+            assert_eq!(input.time_stamp, 10.0);
+            assert_eq!(context.handles.resolve(input.target), Some(file));
+            assert!(input.bubbles);
+            assert!(!input.cancelable);
+            assert!(input.composed);
+            assert_eq!(input.payload.as_deref(), Some(&DispatchEventPayload::Input));
+            assert_eq!(
+                context
+                    .text_controls
+                    .value(&mut context.document, file)
+                    .as_deref(),
+                Some(r"C:\fakepath\selected.txt"),
+                "the live value must update before input listeners run",
+            );
+            let change = event(context.resume(&input, true));
+            assert_eq!(change.event_type, "change");
+            assert_eq!(change.time_stamp, 10.0);
+            assert_eq!(context.handles.resolve(change.target), Some(file));
+            assert!(change.bubbles);
+            assert!(!change.cancelable);
+            assert!(!change.composed);
+            assert_eq!(change.payload, None);
+            complete(context.resume(&change, true));
             assert_eq!(
                 context
                     .document
@@ -12171,6 +12278,226 @@ mod tests {
             assert!(!rendered_text.contains("Alice"));
             assert!(!rendered_text.contains(r"C:\"));
         }
+    }
+
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "each generated pair must retain its causal click's exact timestamp"
+    )]
+    fn file_reselection_compares_raw_ordered_paths_and_empty_results_cancel() {
+        use std::collections::VecDeque;
+        use std::sync::Mutex;
+
+        struct SequencedFileShell {
+            selections: Mutex<VecDeque<Vec<std::path::PathBuf>>>,
+        }
+
+        impl ShellProvider for SequencedFileShell {
+            fn open_file_dialog(
+                &self,
+                _multiple: bool,
+                _filter: Option<blitz_traits::shell::FileDialogFilter>,
+            ) -> Vec<std::path::PathBuf> {
+                self.selections
+                    .lock()
+                    .expect("test file selection lock should not be poisoned")
+                    .pop_front()
+                    .expect("every test click should have a dialog result")
+            }
+        }
+
+        let first = vec![
+            std::path::PathBuf::from("/first/shared.txt"),
+            std::path::PathBuf::from("/first/other.txt"),
+        ];
+        let reordered = vec![first[1].clone(), first[0].clone()];
+        let same_names_different_directory = vec![
+            std::path::PathBuf::from("/second/other.txt"),
+            std::path::PathBuf::from("/first/shared.txt"),
+        ];
+        let shell = Arc::new(SequencedFileShell {
+            selections: Mutex::new(VecDeque::from([
+                first.clone(),
+                first.clone(),
+                reordered.clone(),
+                same_names_different_directory.clone(),
+                Vec::new(),
+            ])),
+        });
+        let mut context = TestContext::with_shell(
+            "<input id='file' type='file' multiple style='display:block;width:160px;height:24px'>",
+            shell,
+        );
+        let file = context.element("file");
+
+        for (time_stamp, expected, emits) in [
+            (10.0, &first, true),
+            (20.0, &first, false),
+            (30.0, &reordered, true),
+            (40.0, &same_names_different_directory, true),
+            // The empty shell result is cancellation, so the previous raw selection survives.
+            (50.0, &same_names_different_directory, false),
+        ] {
+            let click = stage_generated_with_metadata(
+                &mut context,
+                file,
+                DomEventData::Click(pointer(
+                    1.0,
+                    1.0,
+                    MouseEventButton::Main,
+                    MouseEventButtons::None,
+                )),
+                EventMetadata::pointer(
+                    time_stamp,
+                    native_pointer_coordinates(1.0, 1.0, None, 0.0, 0.0),
+                    1,
+                ),
+            );
+            let after_click = context.resume(&click, false);
+            let events = drain_steps(&mut context, after_click);
+            assert_eq!(
+                events
+                    .iter()
+                    .map(|event| event.event_type.as_str())
+                    .collect::<Vec<_>>(),
+                if emits {
+                    vec!["input", "change"]
+                } else {
+                    Vec::new()
+                },
+            );
+            assert!(events.iter().all(|event| event.time_stamp == time_stamp));
+            let selection = context
+                .document
+                .get_node(file)
+                .and_then(blitz_dom::Node::element_data)
+                .and_then(blitz_dom::ElementData::file_data)
+                .map_or_else(Vec::new, |files| files.iter().cloned().collect::<Vec<_>>());
+            assert_eq!(&selection, expected);
+        }
+
+        assert_eq!(
+            context
+                .text_controls
+                .value(&mut context.document, file)
+                .as_deref(),
+            Some(r"C:\fakepath\other.txt"),
+        );
+        let rendered_text = context.document.get_node(file).unwrap().text_content();
+        assert!(rendered_text.contains("2 Files Selected"));
+        assert!(!rendered_text.contains("second"));
+    }
+
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "label-generated file events must retain the label click's exact timestamp"
+    )]
+    fn file_picker_respects_click_cancellation_disabled_labels_and_label_activation() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct CountingFileShell {
+            calls: AtomicUsize,
+        }
+
+        impl ShellProvider for CountingFileShell {
+            fn open_file_dialog(
+                &self,
+                _multiple: bool,
+                _filter: Option<blitz_traits::shell::FileDialogFilter>,
+            ) -> Vec<std::path::PathBuf> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                vec![std::path::PathBuf::from("/selected/from-label.txt")]
+            }
+        }
+
+        let shell = Arc::new(CountingFileShell {
+            calls: AtomicUsize::new(0),
+        });
+        let mut context = TestContext::with_shell(
+            "<input id='file' type='file'><label id='label' for='file'>Choose</label>",
+            shell.clone(),
+        );
+        let file = context.element("file");
+        let label = context.element("label");
+
+        let canceled = stage_generated_with_metadata(
+            &mut context,
+            file,
+            DomEventData::Click(pointer(
+                1.0,
+                1.0,
+                MouseEventButton::Main,
+                MouseEventButtons::None,
+            )),
+            EventMetadata::pointer(
+                10.0,
+                native_pointer_coordinates(1.0, 1.0, None, 0.0, 0.0),
+                1,
+            ),
+        );
+        complete(context.resume(&canceled, true));
+        assert_eq!(shell.calls.load(Ordering::Relaxed), 0);
+
+        set_disabled(&mut context, file, true);
+        let disabled_label = stage_generated_with_metadata(
+            &mut context,
+            label,
+            DomEventData::Click(pointer(
+                1.0,
+                1.0,
+                MouseEventButton::Main,
+                MouseEventButtons::None,
+            )),
+            EventMetadata::pointer(
+                20.0,
+                native_pointer_coordinates(1.0, 1.0, None, 0.0, 0.0),
+                1,
+            ),
+        );
+        complete(context.resume(&disabled_label, false));
+        assert_eq!(shell.calls.load(Ordering::Relaxed), 0);
+
+        set_disabled(&mut context, file, false);
+        let label_click = stage_generated_with_metadata(
+            &mut context,
+            label,
+            DomEventData::Click(pointer(
+                1.0,
+                1.0,
+                MouseEventButton::Main,
+                MouseEventButtons::None,
+            )),
+            EventMetadata::pointer(
+                30.0,
+                native_pointer_coordinates(1.0, 1.0, None, 0.0, 0.0),
+                1,
+            ),
+        );
+        let after_label = context.resume(&label_click, false);
+        let events = drain_steps(&mut context, after_label);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            ["click", "input", "change", "focus", "focusin"],
+        );
+        assert!(events.iter().all(|event| event.time_stamp == 30.0));
+        assert!(
+            events
+                .iter()
+                .all(|event| context.handles.resolve(event.target) == Some(file))
+        );
+        assert_eq!(shell.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            context
+                .text_controls
+                .value(&mut context.document, file)
+                .as_deref(),
+            Some(r"C:\fakepath\from-label.txt"),
+        );
     }
 
     #[test]
