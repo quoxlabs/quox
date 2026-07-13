@@ -2318,6 +2318,38 @@ impl DispatchStack {
         self.queue_focus_default(document, handles, destination, metadata)
     }
 
+    fn queue_enter_activation_default(
+        &mut self,
+        document: &BaseDocument,
+        handles: &mut NodeHandles,
+        target: GuardedNode,
+        key_event: &blitz_traits::events::BlitzKeyEvent,
+        metadata: EventMetadata,
+    ) -> Result<(), DispatchError> {
+        let click_modifiers = metadata.key.as_ref().map_or(key_event.modifiers, |key| {
+            super::build_pointer_modifiers(pointer_modifier_bits_from_key(key.modifier_bits))
+        });
+        let click = BlitzPointerEvent {
+            id: BlitzPointerId::Mouse,
+            is_primary: false,
+            coords: super::pointer_coords(0.0, 0.0, 0.0, 0.0),
+            button: MouseEventButton::Main,
+            buttons: MouseEventButtons::None,
+            mods: click_modifiers,
+            details: PointerDetails::default(),
+            element: ElementPoint::default(),
+        };
+        let event = DomEvent::new(target.raw, DomEventData::Click(click));
+        if let Some(event) = guard_queued_event(document, handles, event, metadata)? {
+            self.frames
+                .last_mut()
+                .expect("Enter defaults run only for an active frame")
+                .generated
+                .push_back(event);
+        }
+        Ok(())
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "default reconciliation keeps native mutations and their staged follow-ups atomic"
@@ -2341,6 +2373,21 @@ impl DispatchStack {
         }
         if !node_is_live(guarded.target, document, handles) {
             return Ok(());
+        }
+        if let Some(key_event) = enter_keydown(&guarded.event.data) {
+            document.resolve(0.0);
+            if is_enter_activatable(document, guarded.target.raw) {
+                return self.queue_enter_activation_default(
+                    document,
+                    handles,
+                    guarded.target,
+                    key_event,
+                    guarded.metadata,
+                );
+            }
+            if suppress_ineligible_enter_default(document, guarded.target.raw) {
+                return Ok(());
+            }
         }
         let needs_element_target = event_has_element_target(&guarded.event.data);
         let raw_target_is_usable = guarded.is_default_target_live(document, handles)
@@ -2663,6 +2710,69 @@ fn tab_key_default(data: &DomEventData) -> Option<TabKeyDefault> {
         }
         _ => None,
     }
+}
+
+fn enter_keydown(data: &DomEventData) -> Option<&blitz_traits::events::BlitzKeyEvent> {
+    match data {
+        DomEventData::KeyDown(event)
+            if event.key == keyboard_types::Key::Enter && !event.is_composing =>
+        {
+            Some(event)
+        }
+        _ => None,
+    }
+}
+
+fn is_enter_activatable(document: &BaseDocument, target: usize) -> bool {
+    let Some(node) = document.get_node(target) else {
+        return false;
+    };
+    let Some(element) = node
+        .element_data()
+        .filter(|element| element.name.ns == ns!(html))
+    else {
+        return false;
+    };
+    // Image-map areas have no independent layout box, so Blitz's general focusability helper
+    // rejects them even while they are the document's current focus target. Revalidate the
+    // hyperlink state and the DOM-wide eligibility which can meaningfully apply to an area.
+    if element.name.local.as_ref() == "area" {
+        return element.has_attr(LocalName::from("href"))
+            && node.flags.is_in_document()
+            && !document.node_chain(target).into_iter().any(|ancestor| {
+                document.get_node(ancestor).is_some_and(|node| {
+                    node.element_data()
+                        .is_some_and(|element| element.has_attr(LocalName::from("inert")))
+                })
+            });
+    }
+    if !is_programmatically_focusable(document, target) {
+        return false;
+    }
+    match element.name.local.as_ref() {
+        "a" => element.has_attr(LocalName::from("href")),
+        "button" => true,
+        "input" => element.attr(LocalName::from("type")).is_some_and(|kind| {
+            matches!(
+                kind.to_ascii_lowercase().as_str(),
+                "button" | "submit" | "reset" | "image"
+            )
+        }),
+        _ => false,
+    }
+}
+
+fn suppress_ineligible_enter_default(document: &BaseDocument, target: usize) -> bool {
+    document
+        .get_node(target)
+        .and_then(blitz_dom::Node::element_data)
+        .is_some_and(|element| {
+            element.name.ns == ns!(html)
+                && matches!(
+                    element.name.local.as_ref(),
+                    "a" | "area" | "button" | "input"
+                )
+        })
 }
 
 fn label_click_default(document: &BaseDocument, guarded: &GuardedDomEvent) -> LabelClickDefault {
@@ -4330,9 +4440,37 @@ fn mouse_payload(
         event.buttons.bits(),
         detail,
         event.mods,
-        metadata.pointer.and_then(|pointer| pointer.modifier_bits),
+        metadata
+            .pointer
+            .and_then(|pointer| pointer.modifier_bits)
+            .or_else(|| {
+                metadata
+                    .key
+                    .as_ref()
+                    .map(|key| pointer_modifier_bits_from_key(key.modifier_bits))
+            }),
         metadata.related_target,
     )
+}
+
+fn pointer_modifier_bits_from_key(bits: u32) -> u32 {
+    let mut pointer_bits = 0;
+    for (key_bit, pointer_bit) in [
+        (KEY_MOD_SHIFT, POINTER_MOD_SHIFT),
+        (KEY_MOD_CONTROL, POINTER_MOD_CONTROL),
+        (KEY_MOD_ALT, POINTER_MOD_ALT),
+        (KEY_MOD_META, POINTER_MOD_META),
+        (KEY_MOD_CAPS_LOCK, POINTER_MOD_CAPS_LOCK),
+        (KEY_MOD_ALT_GRAPH, POINTER_MOD_ALT_GRAPH),
+        (KEY_MOD_FN, POINTER_MOD_FN),
+        (KEY_MOD_NUM_LOCK, POINTER_MOD_NUM_LOCK),
+        (KEY_MOD_SCROLL_LOCK, POINTER_MOD_SCROLL_LOCK),
+    ] {
+        if bits & key_bit != 0 {
+            pointer_bits |= pointer_bit;
+        }
+    }
+    pointer_bits
 }
 
 fn pointer_detail(metadata: &EventMetadata) -> u32 {
@@ -6053,6 +6191,32 @@ mod tests {
                     key: "Tab".to_owned(),
                     keycode: 9,
                     modifier_bits: if shift { KEY_MOD_SHIFT } else { 0 },
+                    location: 0,
+                },
+            ),
+            suppress_default,
+        }
+    }
+
+    fn enter_request(
+        state: KeyState,
+        repeat: bool,
+        composing: bool,
+        suppress_default: bool,
+        modifier_bits: u32,
+    ) -> DispatchRequest {
+        let mut event = key(Key::Enter, Code::Enter, state);
+        event.is_auto_repeating = repeat;
+        event.is_composing = composing;
+        DispatchRequest::Key {
+            event,
+            metadata: EventMetadata::key(
+                700.25,
+                NativeKeyMetadata {
+                    code: "Enter".to_owned(),
+                    key: "Enter".to_owned(),
+                    keycode: 13,
+                    modifier_bits,
                     location: 0,
                 },
             ),
@@ -10497,6 +10661,207 @@ mod tests {
         }
         assert_eq!(focus_types, ["blur", "focusout", "focus", "focusin"]);
         assert_eq!(actual_focus_node_id(&context.document), Some(destination));
+    }
+
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "keyboard activation must retain the exact native key timestamp and zero coordinates"
+    )]
+    fn enter_activates_browser_controls_with_an_exact_ordinary_click() {
+        for markup in [
+            "<a id='target' href='/next'>link</a>",
+            "<map name='map'><area id='target' href='/next' alt='area'></map>",
+            "<button id='target'>button</button>",
+            "<input id='target' type='button' value='button'>",
+            "<input id='target' type='submit' value='submit'>",
+            "<input id='target' type='reset' value='reset'>",
+            "<input id='target' type='image' alt='image'>",
+        ] {
+            let mut context = TestContext::new(markup);
+            let target = context.element("target");
+            let target_handle = context.handles.expose(target).unwrap();
+            assert!(context.document.set_focus_to(target), "{markup}");
+            let modifier_bits = KEY_MOD_SHIFT
+                | KEY_MOD_CONTROL
+                | KEY_MOD_ALT
+                | KEY_MOD_META
+                | KEY_MOD_CAPS_LOCK
+                | KEY_MOD_ALT_GRAPH
+                | KEY_MOD_FN
+                | KEY_MOD_NUM_LOCK
+                | KEY_MOD_SCROLL_LOCK;
+
+            let keydown = event(context.begin(enter_request(
+                KeyState::Pressed,
+                false,
+                false,
+                false,
+                modifier_bits,
+            )));
+            assert_eq!(keydown.event_type, "keydown");
+            let click = event(context.resume(&keydown, false));
+            assert_eq!(click.event_type, "click", "{markup}");
+            assert_eq!(click.target, target_handle, "{markup}");
+            assert!(
+                click.bubbles && click.cancelable && click.composed,
+                "{markup}"
+            );
+            assert_eq!(click.time_stamp, 700.25);
+            let Some(DispatchEventPayload::Pointer(payload)) = click.payload.as_deref() else {
+                panic!("keyboard click should carry a pointer payload: {markup}");
+            };
+            assert_eq!(
+                (
+                    payload.mouse.client_x,
+                    payload.mouse.client_y,
+                    payload.mouse.screen_x,
+                    payload.mouse.screen_y,
+                    payload.mouse.page_x,
+                    payload.mouse.page_y,
+                    payload.mouse.offset_x,
+                    payload.mouse.offset_y,
+                    payload.mouse.movement_x,
+                    payload.mouse.movement_y,
+                ),
+                (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+                "{markup}",
+            );
+            assert_eq!(
+                (
+                    payload.mouse.button,
+                    payload.mouse.buttons,
+                    payload.mouse.detail,
+                ),
+                (0, 0, 0),
+            );
+            assert!(payload.mouse.shift_key);
+            assert!(payload.mouse.ctrl_key);
+            assert!(payload.mouse.alt_key);
+            assert!(payload.mouse.meta_key);
+            assert!(payload.mouse.caps_lock);
+            assert!(payload.mouse.alt_graph_key);
+            assert!(payload.mouse.fn_key);
+            assert!(payload.mouse.num_lock);
+            assert!(payload.mouse.scroll_lock);
+            assert!(!payload.is_primary);
+            assert_eq!(payload.pressure, 0.0);
+
+            // Cancel the ordinary click so link and form-control defaults do not obscure the
+            // activation event contract under test.
+            complete(context.resume(&click, true));
+        }
+    }
+
+    #[test]
+    fn enter_activation_honors_key_policy_and_repeat_but_not_keyup_or_composition() {
+        let mut context = TestContext::new("<button id='target'>button</button>");
+        let target = context.element("target");
+        assert!(context.document.set_focus_to(target));
+
+        let canceled =
+            event(context.begin(enter_request(KeyState::Pressed, false, false, false, 0)));
+        complete(context.resume(&canceled, true));
+
+        for request in [
+            enter_request(KeyState::Pressed, false, false, true, 0),
+            enter_request(KeyState::Released, false, false, false, 0),
+            enter_request(KeyState::Pressed, false, true, false, 0),
+        ] {
+            let first = context.begin(request);
+            let (types, _, _) = drain(&mut context, first);
+            assert!(!types.iter().any(|kind| kind == "click"), "{types:?}");
+        }
+
+        let repeated =
+            event(context.begin(enter_request(KeyState::Pressed, true, false, false, 0)));
+        let click = event(context.resume(&repeated, false));
+        assert_eq!(click.event_type, "click");
+        complete(context.resume(&click, true));
+    }
+
+    #[test]
+    fn enter_revalidates_activation_eligibility_after_the_key_listener() {
+        let href = QualName {
+            prefix: None,
+            ns: ns!(),
+            local: LocalName::from("href"),
+        };
+        let kind = QualName {
+            prefix: None,
+            ns: ns!(),
+            local: LocalName::from("type"),
+        };
+
+        let mut removed_href = TestContext::new("<a id='target' href='/next'>link</a>");
+        let target = removed_href.element("target");
+        assert!(removed_href.document.set_focus_to(target));
+        let keydown =
+            event(removed_href.begin(enter_request(KeyState::Pressed, false, false, false, 0)));
+        removed_href.document.mutate().clear_attribute(target, href);
+        complete(removed_href.resume(&keydown, false));
+
+        let mut added_type = TestContext::new("<input id='target'>");
+        let target = added_type.element("target");
+        assert!(added_type.document.set_focus_to(target));
+        let keydown =
+            event(added_type.begin(enter_request(KeyState::Pressed, false, false, false, 0)));
+        added_type
+            .document
+            .mutate()
+            .set_attribute(target, kind.clone(), "button");
+        let click = event(added_type.resume(&keydown, false));
+        assert_eq!(click.event_type, "click");
+        complete(added_type.resume(&click, true));
+
+        let mut changed_type = TestContext::new("<input id='target' type='button'>");
+        let target = changed_type.element("target");
+        assert!(changed_type.document.set_focus_to(target));
+        let keydown =
+            event(changed_type.begin(enter_request(KeyState::Pressed, false, false, false, 0)));
+        changed_type
+            .document
+            .mutate()
+            .set_attribute(target, kind, "text");
+        complete(changed_type.resume(&keydown, false));
+
+        let mut disabled = TestContext::new("<button id='target'>button</button>");
+        let target = disabled.element("target");
+        assert!(disabled.document.set_focus_to(target));
+        let keydown =
+            event(disabled.begin(enter_request(KeyState::Pressed, false, false, false, 0)));
+        set_disabled(&mut disabled, target, true);
+        complete(disabled.resume(&keydown, false));
+
+        let mut detached = TestContext::new("<button id='target'>button</button>");
+        let target = detached.element("target");
+        assert!(detached.document.set_focus_to(target));
+        let keydown =
+            event(detached.begin(enter_request(KeyState::Pressed, false, false, false, 0)));
+        detached.document.mutate().remove_node(target);
+        complete(detached.resume(&keydown, false));
+    }
+
+    #[test]
+    fn enter_does_not_add_implicit_submit_or_activate_ineligible_inputs() {
+        for markup in [
+            "<input id='target'>",
+            "<input id='target' type='checkbox'>",
+            "<input id='target' type='radio'>",
+            "<input id='target' type='file'>",
+            "<a id='target' tabindex='0'>link</a>",
+            "<form><input id='target'><button id='default'>submit</button></form>",
+        ] {
+            let mut context = TestContext::new(markup);
+            let target = context.element("target");
+            assert!(context.document.set_focus_to(target), "{markup}");
+            let first = context.begin(enter_request(KeyState::Pressed, false, false, false, 0));
+            let (types, _, _) = drain(&mut context, first);
+            assert!(
+                !types.iter().any(|kind| kind == "click"),
+                "{markup}: {types:?}"
+            );
+        }
     }
 
     #[test]
