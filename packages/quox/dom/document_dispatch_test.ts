@@ -940,6 +940,32 @@ Deno.test("pointer detail stays within the signed DOM UIEvent range", () => {
   );
 });
 
+Deno.test("native pointer entry points preserve screen-coordinate availability", () => {
+  const { document, renderer } = createHarness();
+
+  document.dispatchPointerMove(1, 2, 0, 0, 3, 101.5, 202.25);
+  document.dispatchPointerDown(1, 2, 0, 1, 0, 4, 1);
+  document.dispatchWheel(1, 2, 3, 4, 0, 0, -3, -4, 0, 5, 101.5, 202.25);
+
+  assertEquals(
+    renderer.calls.map(([method, _frame, ...args]) => [method, ...args]),
+    [
+      ["begin_pointer_move", 1, 2, true, 101.5, 202.25, 0, 0, 3],
+      ["begin_pointer_down", 1, 2, false, 0, 0, 0, 1, 0, 4, 1],
+      ["begin_wheel", 1, 2, true, 101.5, 202.25, 3, 4, -3, -4, 0, 0, 0, 5],
+    ],
+  );
+
+  assertThrows(
+    () => document.dispatchPointerMove(1, 2, 0, 0, 6, null, 202.25),
+    TypeError,
+  );
+  assertThrows(
+    () => document.dispatchPointerMove(1, 2, 0, 0, 6, Number.NaN, 202.25),
+    RangeError,
+  );
+});
+
 Deno.test("trusted focus relatedTarget is resolved before listener mutation invalidates its handle", () => {
   const { document, renderer } = createHarness();
   const container = document.createElement("main");

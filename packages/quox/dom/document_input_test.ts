@@ -22,8 +22,19 @@ class FakeInputRenderer {
     return 42;
   }
 
-  begin_pointer_move(x: number, y: number, buttons: number, modifierBits: number): unknown {
-    this.calls.push({ method: "pointerMove", args: [x, y, buttons, modifierBits] });
+  begin_pointer_move(
+    x: number,
+    y: number,
+    screenKnown: boolean,
+    screenX: number,
+    screenY: number,
+    buttons: number,
+    modifierBits: number,
+  ): unknown {
+    this.calls.push({
+      method: "pointerMove",
+      args: [x, y, screenKnown, screenX, screenY, buttons, modifierBits],
+    });
     if (this.throwOnPointerMove) throw this.pointerMoveError ?? new Error("pointer dispatch failed");
     return this.#complete(false);
   }

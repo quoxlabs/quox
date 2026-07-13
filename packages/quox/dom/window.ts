@@ -125,15 +125,45 @@ export class QuoxWindow extends QuoxEventTarget implements Disposable {
     );
     this.#inputRouter = new QuoxInputRouter(
       {
-        pointerMove: (x, y, buttons, modifiers, timeStamp) =>
-          this.document.dispatchPointerMove(x, y, buttons, modifiers, timeStamp),
-        pointerDown: (x, y, button, buttons, modifiers, timeStamp, detail) =>
-          this.document.dispatchPointerDown(x, y, button, buttons, modifiers, timeStamp, detail),
-        pointerUp: (x, y, button, buttons, modifiers, timeStamp, detail) =>
-          this.document.dispatchPointerUp(x, y, button, buttons, modifiers, timeStamp, detail),
+        pointerMove: (x, y, screenX, screenY, buttons, modifiers, timeStamp) =>
+          this.document.dispatchPointerMove(
+            x,
+            y,
+            buttons,
+            modifiers,
+            timeStamp,
+            screenX,
+            screenY,
+          ),
+        pointerDown: (x, y, screenX, screenY, button, buttons, modifiers, timeStamp, detail) =>
+          this.document.dispatchPointerDown(
+            x,
+            y,
+            button,
+            buttons,
+            modifiers,
+            timeStamp,
+            detail,
+            screenX,
+            screenY,
+          ),
+        pointerUp: (x, y, screenX, screenY, button, buttons, modifiers, timeStamp, detail) =>
+          this.document.dispatchPointerUp(
+            x,
+            y,
+            button,
+            buttons,
+            modifiers,
+            timeStamp,
+            detail,
+            screenX,
+            screenY,
+          ),
         wheel: (
           x,
           y,
+          screenX,
+          screenY,
           blitzDeltaX,
           blitzDeltaY,
           buttons,
@@ -154,6 +184,8 @@ export class QuoxWindow extends QuoxEventTarget implements Disposable {
             deltaY,
             deltaMode,
             timeStamp,
+            screenX,
+            screenY,
           ),
         key: (event) => this.document.dispatchKey(event),
         ime: (event) => this.document.dispatchIme(event),

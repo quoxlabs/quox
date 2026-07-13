@@ -31,6 +31,8 @@ const window = new FakeWindow();
 const pointer = {
   x: 7,
   y: 9,
+  screenX: 107.5,
+  screenY: 209.25,
   buttons: 5,
   timeStamp: 12,
   shiftKey: true,
@@ -40,7 +42,7 @@ const pointer = {
 };
 
 Deno.test("pointer adapter forwards native timing and click detail", () => {
-  const calls: Array<[string, ...number[]]> = [];
+  const calls: Array<[string, ...unknown[]]> = [];
   const router = new QuoxInputRouter({
     pointerMove: (...values) => calls.push(["move", ...values]),
     pointerDown: (...values) => calls.push(["down", ...values]),
@@ -60,14 +62,14 @@ Deno.test("pointer adapter forwards native timing and click detail", () => {
   router.route({ type: "mouseup", button: 0, detail: 2, ...pointer });
 
   assertEquals(calls, [
-    ["move", 7, 9, 5, 9, 12],
-    ["down", 7, 9, 0, 5, 9, 12, 2],
-    ["up", 7, 9, 0, 5, 9, 12, 2],
+    ["move", 7, 9, 107.5, 209.25, 5, 9, 12],
+    ["down", 7, 9, 107.5, 209.25, 0, 5, 9, 12, 2],
+    ["up", 7, 9, 107.5, 209.25, 0, 5, 9, 12, 2],
   ]);
 });
 
 Deno.test("wheel adapter preserves browser units and translates Blitz scroll direction", () => {
-  const calls: number[][] = [];
+  const calls: unknown[][] = [];
   const router = new QuoxInputRouter(
     {
       pointerMove() {},
@@ -106,10 +108,30 @@ Deno.test("wheel adapter preserves browser units and translates Blitz scroll dir
   router.route({ type: "wheel", deltaX: 0.5, deltaY: -1, deltaMode: 2, ...pointer });
 
   assertEquals(calls, [
-    [7, 9, -2.25, 3.5, 5, 9, 2.25, -3.5, 0, 12],
-    [7, 9, -1, 2, 5, 9, 1, -2, 1, 12],
-    [7, 9, -400, 600, 5, 9, 0.5, -1, 2, 12],
+    [7, 9, 107.5, 209.25, -2.25, 3.5, 5, 9, 2.25, -3.5, 0, 12],
+    [7, 9, 107.5, 209.25, -1, 2, 5, 9, 1, -2, 1, 12],
+    [7, 9, 107.5, 209.25, -400, 600, 5, 9, 0.5, -1, 2, 12],
   ]);
+});
+
+Deno.test("pointer adapter preserves unavailable global coordinates", () => {
+  const calls: unknown[][] = [];
+  const router = new QuoxInputRouter({
+    pointerMove: (...values) => calls.push(values),
+    pointerDown() {},
+    pointerUp() {},
+    wheel() {},
+    key() {},
+    ime() {},
+    appleCommand() {},
+    clearHover() {},
+    resize() {},
+    focusChange() {},
+    visibility() {},
+  });
+
+  router.route({ type: "mousemove", ...pointer, screenX: null, screenY: null });
+  assertEquals(calls, [[7, 9, null, null, 5, 9, 12]]);
 });
 
 Deno.test("resize adapter preserves logical and framebuffer dimensions", () => {

@@ -51,10 +51,20 @@ export type QuoxInputEvent =
   | QuoxVisibilityEvent;
 
 export interface QuoxInputRoutePort {
-  pointerMove(x: number, y: number, buttons: number, modifierBits: number, timeStamp: number): void;
+  pointerMove(
+    x: number,
+    y: number,
+    screenX: number | null,
+    screenY: number | null,
+    buttons: number,
+    modifierBits: number,
+    timeStamp: number,
+  ): void;
   pointerDown(
     x: number,
     y: number,
+    screenX: number | null,
+    screenY: number | null,
     button: number,
     buttons: number,
     modifierBits: number,
@@ -64,6 +74,8 @@ export interface QuoxInputRoutePort {
   pointerUp(
     x: number,
     y: number,
+    screenX: number | null,
+    screenY: number | null,
     button: number,
     buttons: number,
     modifierBits: number,
@@ -73,6 +85,8 @@ export interface QuoxInputRoutePort {
   wheel(
     x: number,
     y: number,
+    screenX: number | null,
+    screenY: number | null,
     blitzDeltaX: number,
     blitzDeltaY: number,
     buttons: number,
@@ -107,6 +121,8 @@ export class QuoxInputRouter {
         this.port.pointerMove(
           event.x,
           event.y,
+          event.screenX,
+          event.screenY,
           event.buttons,
           encodePointerModifiers(event),
           event.timeStamp,
@@ -116,6 +132,8 @@ export class QuoxInputRouter {
         this.port.pointerDown(
           event.x,
           event.y,
+          event.screenX,
+          event.screenY,
           event.button,
           event.buttons,
           encodePointerModifiers(event),
@@ -127,6 +145,8 @@ export class QuoxInputRouter {
         this.port.pointerUp(
           event.x,
           event.y,
+          event.screenX,
+          event.screenY,
           event.button,
           event.buttons,
           encodePointerModifiers(event),
@@ -145,6 +165,8 @@ export class QuoxInputRouter {
         this.port.wheel(
           event.x,
           event.y,
+          event.screenX,
+          event.screenY,
           deltaX,
           deltaY,
           event.buttons,
@@ -203,6 +225,8 @@ function pointerFields(
   event: WindingPointerModifiers & {
     x: number;
     y: number;
+    screenX: number | null;
+    screenY: number | null;
     buttons: number;
     timeStamp: number;
   },
@@ -210,6 +234,8 @@ function pointerFields(
   return {
     x: event.x,
     y: event.y,
+    screenX: event.screenX,
+    screenY: event.screenY,
     buttons: event.buttons,
     timeStamp: event.timeStamp,
     shiftKey: event.shiftKey,

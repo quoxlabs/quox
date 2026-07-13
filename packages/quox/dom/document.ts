@@ -68,6 +68,25 @@ function assertEventTimeStamp(value: unknown): number {
   return timeStamp;
 }
 
+function assertScreenCoordinates(
+  screenX: number | null,
+  screenY: number | null,
+): { known: boolean; x: number; y: number } {
+  if (screenX === null || screenY === null) {
+    if (screenX !== null || screenY !== null) {
+      throw new TypeError("quox: screen coordinates must both be numbers or both be null");
+    }
+    // The values are ignored by the flat ABI while `known` is false. Keeping an explicit
+    // availability bit prevents this placeholder from being mistaken for client coordinates.
+    return { known: false, x: 0, y: 0 };
+  }
+  return {
+    known: true,
+    x: assertFiniteNumber(screenX, "screenX"),
+    y: assertFiniteNumber(screenY, "screenY"),
+  };
+}
+
 export class QuoxDocument extends QuoxEventTarget {
   readonly #renderer: WasmRenderer;
   readonly #dispatchPort: DomDispatchRendererPort;
@@ -256,6 +275,8 @@ export class QuoxDocument extends QuoxEventTarget {
     buttons: number,
     modifierBits: number,
     timeStamp = performance.now(),
+    screenX: number | null = null,
+    screenY: number | null = null,
   ): void {
     this.#assertActive();
     x = assertFloat32(x, "x");
@@ -263,7 +284,19 @@ export class QuoxDocument extends QuoxEventTarget {
     buttons = assertKnownMask(buttons, POINTER_BUTTONS_MASK, "buttons");
     modifierBits = assertKnownMask(modifierBits, POINTER_MODIFIER_MASK, "modifierBits");
     timeStamp = assertEventTimeStamp(timeStamp);
-    this.#dispatchInputEvent(() => this.#dispatchPort.beginPointerMove(x, y, buttons, modifierBits, timeStamp));
+    const screen = assertScreenCoordinates(screenX, screenY);
+    this.#dispatchInputEvent(() =>
+      this.#dispatchPort.beginPointerMove(
+        x,
+        y,
+        screen.known,
+        screen.x,
+        screen.y,
+        buttons,
+        modifierBits,
+        timeStamp,
+      )
+    );
   }
 
   /** Feed a pointer-down event into Blitz. Drives `:active`, click timing, and focus. */
@@ -275,6 +308,8 @@ export class QuoxDocument extends QuoxEventTarget {
     modifierBits: number,
     timeStamp = performance.now(),
     detail = 0,
+    screenX: number | null = null,
+    screenY: number | null = null,
   ): void {
     this.#assertActive();
     x = assertFloat32(x, "x");
@@ -284,8 +319,20 @@ export class QuoxDocument extends QuoxEventTarget {
     modifierBits = assertKnownMask(modifierBits, POINTER_MODIFIER_MASK, "modifierBits");
     timeStamp = assertEventTimeStamp(timeStamp);
     detail = assertIntegerRange(detail, 0, 0x7fff_ffff, "detail");
+    const screen = assertScreenCoordinates(screenX, screenY);
     this.#dispatchInputEvent(() =>
-      this.#dispatchPort.beginPointerDown(x, y, button, buttons, modifierBits, timeStamp, detail)
+      this.#dispatchPort.beginPointerDown(
+        x,
+        y,
+        screen.known,
+        screen.x,
+        screen.y,
+        button,
+        buttons,
+        modifierBits,
+        timeStamp,
+        detail,
+      )
     );
   }
 
@@ -298,6 +345,8 @@ export class QuoxDocument extends QuoxEventTarget {
     modifierBits: number,
     timeStamp = performance.now(),
     detail = 0,
+    screenX: number | null = null,
+    screenY: number | null = null,
   ): void {
     this.#assertActive();
     x = assertFloat32(x, "x");
@@ -307,8 +356,20 @@ export class QuoxDocument extends QuoxEventTarget {
     modifierBits = assertKnownMask(modifierBits, POINTER_MODIFIER_MASK, "modifierBits");
     timeStamp = assertEventTimeStamp(timeStamp);
     detail = assertIntegerRange(detail, 0, 0x7fff_ffff, "detail");
+    const screen = assertScreenCoordinates(screenX, screenY);
     this.#dispatchInputEvent(() =>
-      this.#dispatchPort.beginPointerUp(x, y, button, buttons, modifierBits, timeStamp, detail)
+      this.#dispatchPort.beginPointerUp(
+        x,
+        y,
+        screen.known,
+        screen.x,
+        screen.y,
+        button,
+        buttons,
+        modifierBits,
+        timeStamp,
+        detail,
+      )
     );
   }
 
@@ -324,6 +385,8 @@ export class QuoxDocument extends QuoxEventTarget {
     deltaY = -blitzDeltaY,
     deltaMode = 0,
     timeStamp = performance.now(),
+    screenX: number | null = null,
+    screenY: number | null = null,
   ): void {
     this.#assertActive();
     x = assertFloat32(x, "x");
@@ -336,10 +399,14 @@ export class QuoxDocument extends QuoxEventTarget {
     buttons = assertKnownMask(buttons, POINTER_BUTTONS_MASK, "buttons");
     modifierBits = assertKnownMask(modifierBits, POINTER_MODIFIER_MASK, "modifierBits");
     timeStamp = assertEventTimeStamp(timeStamp);
+    const screen = assertScreenCoordinates(screenX, screenY);
     this.#dispatchInputEvent(() =>
       this.#dispatchPort.beginWheel(
         x,
         y,
+        screen.known,
+        screen.x,
+        screen.y,
         blitzDeltaX,
         blitzDeltaY,
         deltaX,

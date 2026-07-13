@@ -407,16 +407,32 @@ class FakeRenderer implements DomDispatchRendererSource {
   begin_pointer_move(
     x: number,
     y: number,
+    screenKnown: boolean,
+    screenX: number,
+    screenY: number,
     buttons: number,
     modifierBits: number,
     timeStamp: number,
   ): unknown {
-    return this.#call("begin_pointer_move", x, y, buttons, modifierBits, timeStamp);
+    return this.#call(
+      "begin_pointer_move",
+      x,
+      y,
+      screenKnown,
+      screenX,
+      screenY,
+      buttons,
+      modifierBits,
+      timeStamp,
+    );
   }
 
   begin_pointer_down(
     x: number,
     y: number,
+    screenKnown: boolean,
+    screenX: number,
+    screenY: number,
     button: number,
     buttons: number,
     modifierBits: number,
@@ -427,6 +443,9 @@ class FakeRenderer implements DomDispatchRendererSource {
       "begin_pointer_down",
       x,
       y,
+      screenKnown,
+      screenX,
+      screenY,
       button,
       buttons,
       modifierBits,
@@ -438,18 +457,36 @@ class FakeRenderer implements DomDispatchRendererSource {
   begin_pointer_up(
     x: number,
     y: number,
+    screenKnown: boolean,
+    screenX: number,
+    screenY: number,
     button: number,
     buttons: number,
     modifierBits: number,
     timeStamp: number,
     detail: number,
   ): unknown {
-    return this.#call("begin_pointer_up", x, y, button, buttons, modifierBits, timeStamp, detail);
+    return this.#call(
+      "begin_pointer_up",
+      x,
+      y,
+      screenKnown,
+      screenX,
+      screenY,
+      button,
+      buttons,
+      modifierBits,
+      timeStamp,
+      detail,
+    );
   }
 
   begin_wheel(
     x: number,
     y: number,
+    screenKnown: boolean,
+    screenX: number,
+    screenY: number,
     blitzDeltaX: number,
     blitzDeltaY: number,
     deltaX: number,
@@ -463,6 +500,9 @@ class FakeRenderer implements DomDispatchRendererSource {
       "begin_wheel",
       x,
       y,
+      screenKnown,
+      screenX,
+      screenY,
       blitzDeltaX,
       blitzDeltaY,
       deltaX,
@@ -531,10 +571,10 @@ Deno.test("renderer port forwards every staged entry point and validates its res
   const renderer = new FakeRenderer();
   const port = new DomDispatchRendererPort(renderer);
 
-  port.beginPointerMove(1, 2, 3, 4, 12.5);
-  port.beginPointerDown(1, 2, 0, 3, 4, 13, 2);
-  port.beginPointerUp(1, 2, 0, 2, 4, 14, 2);
-  port.beginWheel(1, 2, 3.5, -4.5, -0.25, 0.5, 1, 0, 4, 15);
+  port.beginPointerMove(1, 2, true, 101.5, 202.25, 3, 4, 12.5);
+  port.beginPointerDown(1, 2, true, 101.5, 202.25, 0, 3, 4, 13, 2);
+  port.beginPointerUp(1, 2, true, 101.5, 202.25, 0, 2, 4, 14, 2);
+  port.beginWheel(1, 2, false, 0, 0, 3.5, -4.5, -0.25, 0.5, 1, 0, 4, 15);
   port.beginKeyEvent("KeyA", "a", 44, 1, 0, 1);
   port.beginFocus(17);
   port.beginBlur(18);
@@ -546,10 +586,10 @@ Deno.test("renderer port forwards every staged entry point and validates its res
   port.beginImeDeleteSurrounding(2, 3);
 
   assertEquals(renderer.calls, [
-    ["begin_pointer_move", 1, 2, 3, 4, 12.5],
-    ["begin_pointer_down", 1, 2, 0, 3, 4, 13, 2],
-    ["begin_pointer_up", 1, 2, 0, 2, 4, 14, 2],
-    ["begin_wheel", 1, 2, 3.5, -4.5, -0.25, 0.5, 1, 0, 4, 15],
+    ["begin_pointer_move", 1, 2, true, 101.5, 202.25, 3, 4, 12.5],
+    ["begin_pointer_down", 1, 2, true, 101.5, 202.25, 0, 3, 4, 13, 2],
+    ["begin_pointer_up", 1, 2, true, 101.5, 202.25, 0, 2, 4, 14, 2],
+    ["begin_wheel", 1, 2, false, 0, 0, 3.5, -4.5, -0.25, 0.5, 1, 0, 4, 15],
     ["begin_key_event", "KeyA", "a", 44, 1, 0, 1],
     ["begin_focus", 17],
     ["begin_blur", 18],

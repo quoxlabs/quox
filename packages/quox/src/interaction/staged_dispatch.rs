@@ -197,6 +197,7 @@ impl GuardedRawNode {
 struct NativePointerCoordinates {
     client_x: f64,
     client_y: f64,
+    screen: Option<(f64, f64)>,
     page_x: f64,
     page_y: f64,
     offset_x: f64,
@@ -525,6 +526,7 @@ enum DispatchRequest {
 struct PointerInput {
     native_x: f64,
     native_y: f64,
+    screen: Option<(f64, f64)>,
     x: f32,
     y: f32,
     button: MouseEventButton,
@@ -539,6 +541,7 @@ struct PointerInput {
 struct WheelInput {
     native_x: f64,
     native_y: f64,
+    screen: Option<(f64, f64)>,
     x: f32,
     y: f32,
     blitz_delta_x: f64,
@@ -595,7 +598,13 @@ impl<'a> ResolvedInputLayout<'a> {
         let scroll = self.document.viewport_scroll();
         let metadata = EventMetadata::pointer(
             input.time_stamp,
-            native_pointer_coordinates(input.native_x, input.native_y, scroll.x, scroll.y),
+            native_pointer_coordinates(
+                input.native_x,
+                input.native_y,
+                input.screen,
+                scroll.x,
+                scroll.y,
+            ),
             input.detail,
         );
         super::viewport_point_to_page(
@@ -629,7 +638,13 @@ impl<'a> ResolvedInputLayout<'a> {
         let scroll = self.document.viewport_scroll();
         let metadata = EventMetadata::wheel(
             input.time_stamp,
-            native_pointer_coordinates(input.native_x, input.native_y, scroll.x, scroll.y),
+            native_pointer_coordinates(
+                input.native_x,
+                input.native_y,
+                input.screen,
+                scroll.x,
+                scroll.y,
+            ),
             input.delta_x,
             input.delta_y,
             input.delta_mode,
@@ -693,6 +708,8 @@ struct DispatchEventStep {
 struct MousePayload {
     client_x: f64,
     client_y: f64,
+    screen_x: f64,
+    screen_y: f64,
     page_x: f64,
     page_y: f64,
     offset_x: f64,
@@ -3359,6 +3376,7 @@ fn mouse_payload(
         NativePointerCoordinates {
             client_x: f64::from(event.coords.client_x),
             client_y: f64::from(event.coords.client_y),
+            screen: None,
             page_x: f64::from(event.coords.page_x),
             page_y: f64::from(event.coords.page_y),
             offset_x: f64::from(event.element.x),
@@ -3388,6 +3406,7 @@ fn wheel_mouse_payload(event: &BlitzWheelEvent, metadata: &EventMetadata) -> Mou
         NativePointerCoordinates {
             client_x: f64::from(event.coords.client_x),
             client_y: f64::from(event.coords.client_y),
+            screen: None,
             page_x: f64::from(event.coords.page_x),
             page_y: f64::from(event.coords.page_y),
             offset_x: 0.0,
@@ -3413,9 +3432,12 @@ fn mouse_payload_from_parts(
     mods: keyboard_types::Modifiers,
     related_target: Option<GuardedNode>,
 ) -> MousePayload {
+    let (screen_x, screen_y) = coords.screen.unwrap_or((0.0, 0.0));
     MousePayload {
         client_x: coords.client_x,
         client_y: coords.client_y,
+        screen_x,
+        screen_y,
         page_x: coords.page_x,
         page_y: coords.page_y,
         offset_x: coords.offset_x,
@@ -3504,15 +3526,31 @@ const fn key_location_number(location: keyboard_types::Location) -> u32 {
     }
 }
 
+fn native_screen_coordinates(
+    known: bool,
+    screen_x: f64,
+    screen_y: f64,
+) -> Result<Option<(f64, f64)>, NumericArgumentError> {
+    if !known {
+        return Ok(None);
+    }
+    Ok(Some((
+        finite_f64(screen_x, "screenX")?,
+        finite_f64(screen_y, "screenY")?,
+    )))
+}
+
 fn native_pointer_coordinates(
     client_x: f64,
     client_y: f64,
+    screen: Option<(f64, f64)>,
     scroll_x: f64,
     scroll_y: f64,
 ) -> NativePointerCoordinates {
     NativePointerCoordinates {
         client_x,
         client_y,
+        screen,
         page_x: client_x + scroll_x,
         page_y: client_y + scroll_y,
         offset_x: 0.0,
@@ -3662,8 +3700,8 @@ fn set_mouse_payload(object: &Object, mouse: &MousePayload) -> Result<(), JsValu
     set(object, "clientY", mouse.client_y.into())?;
     set(object, "pageX", mouse.page_x.into())?;
     set(object, "pageY", mouse.page_y.into())?;
-    set(object, "screenX", 0.0.into())?;
-    set(object, "screenY", 0.0.into())?;
+    set(object, "screenX", mouse.screen_x.into())?;
+    set(object, "screenY", mouse.screen_y.into())?;
     set(object, "offsetX", mouse.offset_x.into())?;
     set(object, "offsetY", mouse.offset_y.into())?;
     set(object, "button", f64::from(mouse.button).into())?;
@@ -3778,16 +3816,25 @@ fn finish_step(
 
 #[wasm_bindgen]
 impl QuoxRenderer {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the flat WASM ABI carries browser event fields without allocating an input object"
+    )]
     pub fn begin_pointer_move(
         &self,
         x: f64,
         y: f64,
+        screen_known: bool,
+        screen_x: f64,
+        screen_y: f64,
         buttons: f64,
         modifier_bits: f64,
         time_stamp: f64,
     ) -> Result<JsValue, JsValue> {
         let native_x = finite_f64(x, "x").map_err(NumericArgumentError::into_js)?;
         let native_y = finite_f64(y, "y").map_err(NumericArgumentError::into_js)?;
+        let screen = native_screen_coordinates(screen_known, screen_x, screen_y)
+            .map_err(NumericArgumentError::into_js)?;
         let x = finite_f32(x, "x").map_err(NumericArgumentError::into_js)?;
         let y = finite_f32(y, "y").map_err(NumericArgumentError::into_js)?;
         let buttons = pointer_buttons(buttons).map_err(NumericArgumentError::into_js)?;
@@ -3799,6 +3846,7 @@ impl QuoxRenderer {
         let request = resolve_input_layout(&mut state).pointer_request(PointerInput {
             native_x,
             native_y,
+            screen,
             x,
             y,
             button: MouseEventButton::Main,
@@ -3821,6 +3869,9 @@ impl QuoxRenderer {
         &self,
         x: f64,
         y: f64,
+        screen_known: bool,
+        screen_x: f64,
+        screen_y: f64,
         button: f64,
         buttons: f64,
         modifier_bits: f64,
@@ -3829,6 +3880,8 @@ impl QuoxRenderer {
     ) -> Result<JsValue, JsValue> {
         let native_x = finite_f64(x, "x").map_err(NumericArgumentError::into_js)?;
         let native_y = finite_f64(y, "y").map_err(NumericArgumentError::into_js)?;
+        let screen = native_screen_coordinates(screen_known, screen_x, screen_y)
+            .map_err(NumericArgumentError::into_js)?;
         let x = finite_f32(x, "x").map_err(NumericArgumentError::into_js)?;
         let y = finite_f32(y, "y").map_err(NumericArgumentError::into_js)?;
         let button = mouse_button(button).map_err(NumericArgumentError::into_js)?;
@@ -3842,6 +3895,7 @@ impl QuoxRenderer {
         let request = resolve_input_layout(&mut state).pointer_request(PointerInput {
             native_x,
             native_y,
+            screen,
             x,
             y,
             button,
@@ -3864,6 +3918,9 @@ impl QuoxRenderer {
         &self,
         x: f64,
         y: f64,
+        screen_known: bool,
+        screen_x: f64,
+        screen_y: f64,
         button: f64,
         buttons: f64,
         modifier_bits: f64,
@@ -3872,6 +3929,8 @@ impl QuoxRenderer {
     ) -> Result<JsValue, JsValue> {
         let native_x = finite_f64(x, "x").map_err(NumericArgumentError::into_js)?;
         let native_y = finite_f64(y, "y").map_err(NumericArgumentError::into_js)?;
+        let screen = native_screen_coordinates(screen_known, screen_x, screen_y)
+            .map_err(NumericArgumentError::into_js)?;
         let x = finite_f32(x, "x").map_err(NumericArgumentError::into_js)?;
         let y = finite_f32(y, "y").map_err(NumericArgumentError::into_js)?;
         let button = mouse_button(button).map_err(NumericArgumentError::into_js)?;
@@ -3885,6 +3944,7 @@ impl QuoxRenderer {
         let request = resolve_input_layout(&mut state).pointer_request(PointerInput {
             native_x,
             native_y,
+            screen,
             x,
             y,
             button,
@@ -3907,6 +3967,9 @@ impl QuoxRenderer {
         &self,
         x: f64,
         y: f64,
+        screen_known: bool,
+        screen_x: f64,
+        screen_y: f64,
         blitz_delta_x: f64,
         blitz_delta_y: f64,
         delta_x: f64,
@@ -3918,6 +3981,8 @@ impl QuoxRenderer {
     ) -> Result<JsValue, JsValue> {
         let native_x = finite_f64(x, "x").map_err(NumericArgumentError::into_js)?;
         let native_y = finite_f64(y, "y").map_err(NumericArgumentError::into_js)?;
+        let screen = native_screen_coordinates(screen_known, screen_x, screen_y)
+            .map_err(NumericArgumentError::into_js)?;
         let x = finite_f32(x, "x").map_err(NumericArgumentError::into_js)?;
         let y = finite_f32(y, "y").map_err(NumericArgumentError::into_js)?;
         let blitz_delta_x =
@@ -3937,6 +4002,7 @@ impl QuoxRenderer {
         let request = resolve_input_layout(&mut state).wheel_request(WheelInput {
             native_x,
             native_y,
+            screen,
             x,
             y,
             blitz_delta_x,
@@ -4432,6 +4498,7 @@ mod tests {
             .pointer_request(PointerInput {
                 native_x: f64::from(x),
                 native_y: f64::from(y),
+                screen: None,
                 x,
                 y,
                 button,
@@ -4463,6 +4530,7 @@ mod tests {
             .wheel_request(WheelInput {
                 native_x: f64::from(x),
                 native_y: f64::from(y),
+                screen: None,
                 x,
                 y,
                 blitz_delta_x: 0.0,
@@ -4660,12 +4728,29 @@ mod tests {
         time_stamp: f64,
         detail: u32,
     ) -> DispatchRequest {
+        pointer_request_with_screen_at(x, y, button, buttons, flavor, time_stamp, detail, None)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the test helper exposes the complete native pointer occurrence"
+    )]
+    fn pointer_request_with_screen_at(
+        x: f32,
+        y: f32,
+        button: MouseEventButton,
+        buttons: MouseEventButtons,
+        flavor: PointerFlavor,
+        time_stamp: f64,
+        detail: u32,
+        screen: Option<(f64, f64)>,
+    ) -> DispatchRequest {
         DispatchRequest::Pointer {
             event: pointer(x, y, button, buttons),
             flavor,
             metadata: EventMetadata::pointer(
                 time_stamp,
-                native_pointer_coordinates(f64::from(x), f64::from(y), 0.0, 0.0),
+                native_pointer_coordinates(f64::from(x), f64::from(y), screen, 0.0, 0.0),
                 detail,
             ),
         }
@@ -6909,7 +6994,7 @@ mod tests {
         let related_handle = context.handles.expose(b).unwrap();
         let metadata = EventMetadata::pointer(
             10.0,
-            native_pointer_coordinates(f64::from(bx), f64::from(by), 0.0, 0.0),
+            native_pointer_coordinates(f64::from(bx), f64::from(by), None, 0.0, 0.0),
             0,
         );
 
@@ -8518,6 +8603,7 @@ mod tests {
             NativePointerCoordinates {
                 client_x,
                 client_y,
+                screen: Some((1_201.123_456_789, 902.987_654_321)),
                 page_x: client_x + 2.75,
                 page_y: client_y + 4.5,
                 offset_x: 0.0,
@@ -8545,6 +8631,8 @@ mod tests {
         };
         assert_eq!(payload.mouse.client_x, client_x);
         assert_eq!(payload.mouse.client_y, client_y);
+        assert_eq!(payload.mouse.screen_x, 1_201.123_456_789);
+        assert_eq!(payload.mouse.screen_y, 902.987_654_321);
         assert_eq!(payload.mouse.page_x, client_x + 2.75);
         assert_eq!(payload.mouse.page_y, client_y + 4.5);
         assert_eq!(payload.mouse.offset_x, client_x - rect.x - border_left);
@@ -8562,6 +8650,92 @@ mod tests {
         assert_eq!(payload.height, 1.0);
         assert_eq!(payload.pressure, 0.5);
         assert_eq!(payload.altitude_angle, std::f64::consts::FRAC_PI_2);
+    }
+
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "the native f64 screen coordinates must survive every generated event exactly"
+    )]
+    fn pointer_screen_coordinates_flow_through_boundaries_mouse_events_and_clicks() {
+        let mut context = TestContext::new(
+            "<button id='target' style='display:block;width:120px;height:40px'>go</button>",
+        );
+        let target = context.element("target");
+        let (x, y) = context.center(target);
+        let payload_screen = |step: &DispatchEventStep| match step.payload.as_deref() {
+            Some(DispatchEventPayload::Pointer(payload)) => {
+                Some((payload.mouse.screen_x, payload.mouse.screen_y))
+            }
+            Some(DispatchEventPayload::Mouse(payload)) => {
+                Some((payload.screen_x, payload.screen_y))
+            }
+            _ => None,
+        };
+
+        let entered = context.begin(pointer_request_with_screen_at(
+            x,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::None,
+            PointerFlavor::Move,
+            1.0,
+            0,
+            Some((1001.125, 702.875)),
+        ));
+        let entered = drain_steps(&mut context, entered);
+        assert!(entered.iter().any(|step| step.event_type == "pointerover"));
+        assert!(entered.iter().any(|step| step.event_type == "mouseenter"));
+        for step in &entered {
+            if let Some(screen) = payload_screen(step) {
+                assert_eq!(screen, (1001.125, 702.875));
+            }
+        }
+
+        let down = context.begin(pointer_request_with_screen_at(
+            x,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            PointerFlavor::Down,
+            2.0,
+            1,
+            Some((1002.25, 704.5)),
+        ));
+        let _ = drain(&mut context, down);
+        let up = context.begin(pointer_request_with_screen_at(
+            x,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::None,
+            PointerFlavor::Up,
+            3.0,
+            1,
+            Some((1003.5, 706.75)),
+        ));
+        let released = drain_steps(&mut context, up);
+        assert!(released.iter().any(|step| step.event_type == "click"));
+        for step in &released {
+            if let Some(screen) = payload_screen(step) {
+                assert_eq!(screen, (1003.5, 706.75));
+            }
+        }
+
+        let unavailable = context.begin(pointer_request_with_screen_at(
+            x,
+            y,
+            MouseEventButton::Main,
+            MouseEventButtons::None,
+            PointerFlavor::Move,
+            4.0,
+            0,
+            None,
+        ));
+        for step in drain_steps(&mut context, unavailable) {
+            if let Some(screen) = payload_screen(&step) {
+                assert_eq!(screen, (0.0, 0.0));
+            }
+        }
     }
 
     #[test]
@@ -8588,7 +8762,7 @@ mod tests {
             azimuth: 1.25,
         };
         let metadata =
-            EventMetadata::pointer(1.0, native_pointer_coordinates(1.0, 2.0, 0.0, 0.0), 2);
+            EventMetadata::pointer(1.0, native_pointer_coordinates(1.0, 2.0, None, 0.0, 0.0), 2);
 
         for data in [
             DomEventData::Click(pointer.clone()),
@@ -8619,7 +8793,7 @@ mod tests {
     fn pointer_transitions_zero_detail_but_mouse_and_click_events_keep_the_count() {
         let pointer = pointer(1.0, 2.0, MouseEventButton::Main, MouseEventButtons::Primary);
         let metadata =
-            EventMetadata::pointer(1.0, native_pointer_coordinates(1.0, 2.0, 0.0, 0.0), 4);
+            EventMetadata::pointer(1.0, native_pointer_coordinates(1.0, 2.0, None, 0.0, 0.0), 4);
         let detail = |data| match event_payload(&data, &metadata).unwrap() {
             DispatchEventPayload::Pointer(payload) => payload.mouse.detail,
             DispatchEventPayload::Mouse(payload) => payload.detail,
@@ -8651,6 +8825,7 @@ mod tests {
             NativePointerCoordinates {
                 client_x: f64::from(x),
                 client_y: f64::from(y),
+                screen: Some((401.25, 302.5)),
                 page_x: f64::from(x) + 10.0,
                 page_y: f64::from(y) + 20.0,
                 offset_x: 0.0,
@@ -8685,6 +8860,10 @@ mod tests {
         assert_eq!((payload.delta_x, payload.delta_y), (1.25, -2.5));
         assert_eq!(payload.delta_mode, 1);
         assert_eq!(payload.delta_z, 0.0);
+        assert_eq!(
+            (payload.mouse.screen_x, payload.mouse.screen_y),
+            (401.25, 302.5)
+        );
         assert!(payload.mouse.meta_key);
         let pending = context
             .stack
@@ -8724,14 +8903,14 @@ mod tests {
             flavor: PointerFlavor::Down,
             metadata: EventMetadata::pointer(
                 776.0,
-                native_pointer_coordinates(f64::from(x), f64::from(y), 0.0, 0.0),
+                native_pointer_coordinates(f64::from(x), f64::from(y), None, 0.0, 0.0),
                 2,
             ),
         });
         assert_focus_transition_metadata(&mut context, down, 776.0, old_handle, checkbox_handle);
         let metadata = EventMetadata::pointer(
             777.0,
-            native_pointer_coordinates(f64::from(x), f64::from(y), 0.0, 0.0),
+            native_pointer_coordinates(f64::from(x), f64::from(y), None, 0.0, 0.0),
             2,
         );
         let mut step = context.begin(DispatchRequest::Pointer {
@@ -8813,7 +8992,7 @@ mod tests {
                 )),
                 EventMetadata::pointer(
                     12.0,
-                    native_pointer_coordinates(f64::from(x), f64::from(y), 0.0, 0.0),
+                    native_pointer_coordinates(f64::from(x), f64::from(y), None, 0.0, 0.0),
                     1,
                 ),
             );
@@ -9468,7 +9647,7 @@ mod tests {
                 )),
                 EventMetadata::pointer(
                     10.0,
-                    native_pointer_coordinates(f64::from(x), f64::from(y), 0.0, 0.0),
+                    native_pointer_coordinates(f64::from(x), f64::from(y), None, 0.0, 0.0),
                     1,
                 ),
             );
@@ -9556,7 +9735,11 @@ mod tests {
                 MouseEventButton::Main,
                 MouseEventButtons::None,
             )),
-            EventMetadata::pointer(10.0, native_pointer_coordinates(1.0, 1.0, 0.0, 0.0), 1),
+            EventMetadata::pointer(
+                10.0,
+                native_pointer_coordinates(1.0, 1.0, None, 0.0, 0.0),
+                1,
+            ),
         );
         let step = context.resume(&click, false);
         let _ = drain(&mut context, step);
@@ -9613,7 +9796,7 @@ mod tests {
             )),
             EventMetadata::pointer(
                 10.0,
-                native_pointer_coordinates(f64::from(x), f64::from(y), 0.0, 0.0),
+                native_pointer_coordinates(f64::from(x), f64::from(y), None, 0.0, 0.0),
                 1,
             ),
         );
@@ -9652,7 +9835,7 @@ mod tests {
             flavor: PointerFlavor::Down,
             metadata: EventMetadata::pointer(
                 10.0,
-                native_pointer_coordinates(f64::from(x), f64::from(y), 0.0, 0.0),
+                native_pointer_coordinates(f64::from(x), f64::from(y), None, 0.0, 0.0),
                 1,
             ),
         });

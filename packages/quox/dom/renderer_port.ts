@@ -167,6 +167,9 @@ export interface DomDispatchRendererSource {
   begin_pointer_move(
     x: number,
     y: number,
+    screenKnown: boolean,
+    screenX: number,
+    screenY: number,
     buttons: number,
     modifierBits: number,
     timeStamp: number,
@@ -174,6 +177,9 @@ export interface DomDispatchRendererSource {
   begin_pointer_down(
     x: number,
     y: number,
+    screenKnown: boolean,
+    screenX: number,
+    screenY: number,
     button: number,
     buttons: number,
     modifierBits: number,
@@ -183,6 +189,9 @@ export interface DomDispatchRendererSource {
   begin_pointer_up(
     x: number,
     y: number,
+    screenKnown: boolean,
+    screenX: number,
+    screenY: number,
     button: number,
     buttons: number,
     modifierBits: number,
@@ -192,6 +201,9 @@ export interface DomDispatchRendererSource {
   begin_wheel(
     x: number,
     y: number,
+    screenKnown: boolean,
+    screenX: number,
+    screenY: number,
     blitzDeltaX: number,
     blitzDeltaY: number,
     deltaX: number,
@@ -836,18 +848,33 @@ export class DomDispatchRendererPort {
   beginPointerMove(
     x: number,
     y: number,
+    screenKnown: boolean,
+    screenX: number,
+    screenY: number,
     buttons: number,
     modifierBits: number,
     timeStamp: number,
   ): DomDispatchStep {
     return this.#validateInitial(
-      this.#renderer.begin_pointer_move(x, y, buttons, modifierBits, timeStamp),
+      this.#renderer.begin_pointer_move(
+        x,
+        y,
+        screenKnown,
+        screenX,
+        screenY,
+        buttons,
+        modifierBits,
+        timeStamp,
+      ),
     );
   }
 
   beginPointerDown(
     x: number,
     y: number,
+    screenKnown: boolean,
+    screenX: number,
+    screenY: number,
     button: number,
     buttons: number,
     modifierBits: number,
@@ -858,6 +885,9 @@ export class DomDispatchRendererPort {
       this.#renderer.begin_pointer_down(
         x,
         y,
+        screenKnown,
+        screenX,
+        screenY,
         button,
         buttons,
         modifierBits,
@@ -870,6 +900,9 @@ export class DomDispatchRendererPort {
   beginPointerUp(
     x: number,
     y: number,
+    screenKnown: boolean,
+    screenX: number,
+    screenY: number,
     button: number,
     buttons: number,
     modifierBits: number,
@@ -877,13 +910,27 @@ export class DomDispatchRendererPort {
     detail: number,
   ): DomDispatchStep {
     return this.#validateInitial(
-      this.#renderer.begin_pointer_up(x, y, button, buttons, modifierBits, timeStamp, detail),
+      this.#renderer.begin_pointer_up(
+        x,
+        y,
+        screenKnown,
+        screenX,
+        screenY,
+        button,
+        buttons,
+        modifierBits,
+        timeStamp,
+        detail,
+      ),
     );
   }
 
   beginWheel(
     x: number,
     y: number,
+    screenKnown: boolean,
+    screenX: number,
+    screenY: number,
     blitzDeltaX: number,
     blitzDeltaY: number,
     deltaX: number,
@@ -897,6 +944,9 @@ export class DomDispatchRendererPort {
       this.#renderer.begin_wheel(
         x,
         y,
+        screenKnown,
+        screenX,
+        screenY,
         blitzDeltaX,
         blitzDeltaY,
         deltaX,
