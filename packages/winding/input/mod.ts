@@ -26,6 +26,7 @@ export {
   type KeyDownEventInit,
   type KeyEventInit,
   NativeEventClock,
+  SourceKeyInputIdSequence,
 } from "./events.ts";
 export { DeferredNativeError, guardNativeCallback } from "./callback.ts";
 export { EventQueue } from "./event_queue.ts";

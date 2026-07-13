@@ -9,6 +9,7 @@ import {
   createKeyUpEvent,
   type KeyEventInit,
   NativeEventClock,
+  SourceKeyInputIdSequence,
 } from "./events.ts";
 
 Deno.test("click counters preserve releases and reset by button, time, or distance", () => {
@@ -28,6 +29,11 @@ Deno.test("native event clocks map monotonic time and unwrap 32-bit rollover", (
   assertEquals(clock.timeStamp(0xffff_fff8), 258);
   assertEquals(clock.timeStamp(8), 274);
   assertEquals(clock.timeStamp(Number.NaN), 250);
+});
+
+Deno.test("source key input ids are fresh within one controller lifetime", () => {
+  const ids = new SourceKeyInputIdSequence();
+  assertEquals([ids.take(), ids.take(), ids.take()], [1, 2, 3]);
 });
 
 const window = {} as Window;

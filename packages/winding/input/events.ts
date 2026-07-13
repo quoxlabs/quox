@@ -26,6 +26,18 @@ export interface KeyDownEventInit extends KeyEventInit {
   sourceKeyInputId?: number;
 }
 
+/** Allocate non-reused causal key identifiers for one window or controller lifetime. */
+export class SourceKeyInputIdSequence {
+  #next: number | undefined = 1;
+
+  take(): number | undefined {
+    const value = this.#next;
+    if (value === undefined) return undefined;
+    this.#next = value === 0xffff_ffff ? undefined : value + 1;
+    return value;
+  }
+}
+
 /**
  * Maps a native monotonic millisecond clock to DOMHighResTimeStamp values.
  * A finite `wrapAt` unwraps 32-bit protocol clocks across their rollover.
