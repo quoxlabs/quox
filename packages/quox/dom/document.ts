@@ -759,6 +759,8 @@ export class QuoxDocument extends QuoxEventTarget {
         ctrlKey: payload.ctrlKey,
         altKey: payload.altKey,
         metaKey: payload.metaKey,
+        movementX: payload.movementX,
+        movementY: payload.movementY,
         relatedTarget: this.#relatedTarget(payload.relatedTarget),
         ...extra,
       },

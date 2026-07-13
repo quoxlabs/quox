@@ -49,6 +49,9 @@ pub(crate) struct DispatchStack {
     prevent_compatibility_mouse: bool,
     mouse_button_presses: [Option<MouseButtonPress>; 5],
     click_sequence: Option<ClickSequence>,
+    // UI Events defines the movement baseline at Window scope and only advances it for native
+    // mouse moves, so button, wheel, and generated boundary records cannot disturb the delta.
+    last_mouse_move: Option<NativePointerCoordinates>,
 }
 
 #[derive(Clone, Copy)]
@@ -208,6 +211,8 @@ struct NativePointerCoordinates {
 struct NativePointerMetadata {
     coords: NativePointerCoordinates,
     detail: u32,
+    movement_x: f64,
+    movement_y: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -262,7 +267,12 @@ impl EventMetadata {
     fn pointer(time_stamp: f64, coords: NativePointerCoordinates, detail: u32) -> Self {
         Self {
             time_stamp,
-            pointer: Some(NativePointerMetadata { coords, detail }),
+            pointer: Some(NativePointerMetadata {
+                coords,
+                detail,
+                movement_x: 0.0,
+                movement_y: 0.0,
+            }),
             pointer_move_button: None,
             pointer_release_click: None,
             wheel: None,
@@ -325,6 +335,14 @@ impl EventMetadata {
 
     fn with_pointer_move_button(mut self, button: Option<MouseEventButton>) -> Self {
         self.pointer_move_button = button.map(mouse_button_number);
+        self
+    }
+
+    fn with_pointer_movement(mut self, movement_x: f64, movement_y: f64) -> Self {
+        if let Some(pointer) = &mut self.pointer {
+            pointer.movement_x = movement_x;
+            pointer.movement_y = movement_y;
+        }
         self
     }
 
@@ -714,6 +732,8 @@ struct MousePayload {
     page_y: f64,
     offset_x: f64,
     offset_y: f64,
+    movement_x: f64,
+    movement_y: f64,
     button: i16,
     buttons: u8,
     detail: u32,
@@ -810,6 +830,7 @@ impl Default for DispatchStack {
             prevent_compatibility_mouse: false,
             mouse_button_presses: [None; 5],
             click_sequence: None,
+            last_mouse_move: None,
         }
     }
 }
@@ -1134,6 +1155,7 @@ impl DispatchStack {
         let wheel_transaction = &mut self.wheel_transaction;
         let prevent_compatibility_mouse = &mut self.prevent_compatibility_mouse;
         let mouse_button_presses = &mut self.mouse_button_presses;
+        let last_mouse_move = &mut self.last_mouse_move;
         let planned = &mut self
             .frames
             .last_mut()
@@ -1145,9 +1167,16 @@ impl DispatchStack {
             DispatchRequest::Pointer {
                 event,
                 flavor,
-                metadata,
+                mut metadata,
             } => {
                 end_wheel_transaction_for_pointer_down(wheel_transaction, flavor);
+                if event.is_mouse()
+                    && matches!(flavor, PointerFlavor::Move)
+                    && let Some(coords) = metadata.pointer.map(|pointer| pointer.coords)
+                {
+                    let (movement_x, movement_y) = mouse_movement(last_mouse_move, coords);
+                    metadata = metadata.with_pointer_movement(movement_x, movement_y);
+                }
                 let stream = update_pointer_stream_state(
                     prevent_compatibility_mouse,
                     mouse_button_presses,
@@ -3224,12 +3253,13 @@ fn event_payload(data: &DomEventData, metadata: &EventMetadata) -> Option<Dispat
             metadata,
             metadata.pointer_move_button.unwrap_or(-1),
             0,
+            true,
         ))),
         DomEventData::PointerEnter(event)
         | DomEventData::PointerLeave(event)
         | DomEventData::PointerOver(event)
         | DomEventData::PointerOut(event) => Some(DispatchEventPayload::Pointer(pointer_payload(
-            event, metadata, -1, 0,
+            event, metadata, -1, 0, false,
         ))),
         DomEventData::PointerDown(event) | DomEventData::PointerUp(event) => {
             Some(DispatchEventPayload::Pointer(pointer_payload(
@@ -3237,6 +3267,7 @@ fn event_payload(data: &DomEventData, metadata: &EventMetadata) -> Option<Dispat
                 metadata,
                 mouse_button_number(event.button),
                 0,
+                false,
             )))
         }
         DomEventData::Click(event) => Some(DispatchEventPayload::Pointer(click_pointer_payload(
@@ -3253,7 +3284,11 @@ fn event_payload(data: &DomEventData, metadata: &EventMetadata) -> Option<Dispat
         | DomEventData::MouseLeave(event)
         | DomEventData::MouseOver(event)
         | DomEventData::MouseOut(event) => Some(DispatchEventPayload::Mouse(mouse_payload(
-            event, metadata, 0, 0,
+            event,
+            metadata,
+            0,
+            0,
+            matches!(data, DomEventData::MouseMove(_)),
         ))),
         DomEventData::MouseDown(event)
         | DomEventData::MouseUp(event)
@@ -3262,6 +3297,7 @@ fn event_payload(data: &DomEventData, metadata: &EventMetadata) -> Option<Dispat
             metadata,
             mouse_button_number(event.button),
             pointer_detail(metadata),
+            false,
         ))),
         DomEventData::Wheel(event) => {
             let mouse = wheel_mouse_payload(event, metadata);
@@ -3303,6 +3339,7 @@ fn pointer_payload(
     metadata: &EventMetadata,
     button: i16,
     detail: u32,
+    include_movement: bool,
 ) -> PointerPayload {
     let (pointer_id, pointer_type) = match event.id {
         BlitzPointerId::Mouse => (1.0, "mouse"),
@@ -3316,7 +3353,7 @@ fn pointer_payload(
             (id + 3.0, "touch")
         }
     };
-    let mouse = mouse_payload(event, metadata, button, detail);
+    let mouse = mouse_payload(event, metadata, button, detail, include_movement);
     let active = mouse.buttons != 0;
     let pressure = if event.is_mouse() {
         if active { 0.5 } else { 0.0 }
@@ -3351,7 +3388,7 @@ fn click_pointer_payload(
     button: i16,
     detail: u32,
 ) -> PointerPayload {
-    let mut payload = pointer_payload(event, metadata, button, detail);
+    let mut payload = pointer_payload(event, metadata, button, detail, false);
     payload.is_primary = false;
     payload.width = 1.0;
     payload.height = 1.0;
@@ -3371,6 +3408,7 @@ fn mouse_payload(
     metadata: &EventMetadata,
     button: i16,
     detail: u32,
+    include_movement: bool,
 ) -> MousePayload {
     let coords = metadata.pointer.map_or(
         NativePointerCoordinates {
@@ -3386,6 +3424,13 @@ fn mouse_payload(
     );
     mouse_payload_from_parts(
         coords,
+        if include_movement {
+            metadata.pointer.map_or((0.0, 0.0), |pointer| {
+                (pointer.movement_x, pointer.movement_y)
+            })
+        } else {
+            (0.0, 0.0)
+        },
         button,
         event.buttons.bits(),
         detail,
@@ -3416,6 +3461,7 @@ fn wheel_mouse_payload(event: &BlitzWheelEvent, metadata: &EventMetadata) -> Mou
     );
     mouse_payload_from_parts(
         coords,
+        (0.0, 0.0),
         0,
         event.buttons.bits(),
         0,
@@ -3426,6 +3472,7 @@ fn wheel_mouse_payload(event: &BlitzWheelEvent, metadata: &EventMetadata) -> Mou
 
 fn mouse_payload_from_parts(
     coords: NativePointerCoordinates,
+    movement: (f64, f64),
     button: i16,
     buttons: u8,
     detail: u32,
@@ -3442,6 +3489,8 @@ fn mouse_payload_from_parts(
         page_y: coords.page_y,
         offset_x: coords.offset_x,
         offset_y: coords.offset_y,
+        movement_x: movement.0,
+        movement_y: movement.1,
         button,
         buttons,
         detail,
@@ -3555,6 +3604,24 @@ fn native_pointer_coordinates(
         page_y: client_y + scroll_y,
         offset_x: 0.0,
         offset_y: 0.0,
+    }
+}
+
+fn mouse_movement(
+    last: &mut Option<NativePointerCoordinates>,
+    current: NativePointerCoordinates,
+) -> (f64, f64) {
+    let Some(previous) = last.replace(current) else {
+        return (0.0, 0.0);
+    };
+    // Screen positions remain authoritative while moving the application window. Wayland does
+    // not expose global coordinates, so its stable client positions are the best available basis.
+    match (previous.screen, current.screen) {
+        (Some(previous), Some(current)) => (current.0 - previous.0, current.1 - previous.1),
+        _ => (
+            current.client_x - previous.client_x,
+            current.client_y - previous.client_y,
+        ),
     }
 }
 
@@ -3704,6 +3771,8 @@ fn set_mouse_payload(object: &Object, mouse: &MousePayload) -> Result<(), JsValu
     set(object, "screenY", mouse.screen_y.into())?;
     set(object, "offsetX", mouse.offset_x.into())?;
     set(object, "offsetY", mouse.offset_y.into())?;
+    set(object, "movementX", mouse.movement_x.into())?;
+    set(object, "movementY", mouse.movement_y.into())?;
     set(object, "button", f64::from(mouse.button).into())?;
     set(object, "buttons", f64::from(mouse.buttons).into())?;
     set(object, "detail", f64::from(mouse.detail).into())?;
@@ -8736,6 +8805,129 @@ mod tests {
                 assert_eq!(screen, (0.0, 0.0));
             }
         }
+    }
+
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "the test proves that native f64 movement deltas are shared without narrowing"
+    )]
+    fn mouse_moves_share_screen_deltas_while_other_mouse_events_stay_zero() {
+        let mut context = TestContext::new(
+            "<div id='a' style='display:inline-block;width:100px;height:40px'></div>\
+             <div id='b' style='display:inline-block;width:100px;height:40px'></div>",
+        );
+        let a = context.element("a");
+        let b = context.element("b");
+        let (ax, ay) = context.center(a);
+        let (bx, by) = context.center(b);
+        let movement = |step: &DispatchEventStep| match step.payload.as_deref() {
+            Some(DispatchEventPayload::Pointer(payload)) => {
+                Some((payload.mouse.movement_x, payload.mouse.movement_y))
+            }
+            Some(DispatchEventPayload::Mouse(payload)) => {
+                Some((payload.movement_x, payload.movement_y))
+            }
+            _ => None,
+        };
+
+        let first = context.begin(pointer_request_with_screen_at(
+            ax,
+            ay,
+            MouseEventButton::Main,
+            MouseEventButtons::None,
+            PointerFlavor::Move,
+            1.0,
+            0,
+            Some((1_000.125, 700.875)),
+        ));
+        let first = drain_steps(&mut context, first);
+        assert!(first.iter().any(|step| step.event_type == "pointermove"));
+        assert!(first.iter().any(|step| step.event_type == "mousemove"));
+        assert!(
+            first
+                .iter()
+                .filter_map(&movement)
+                .all(|delta| delta == (0.0, 0.0))
+        );
+
+        let second = context.begin(pointer_request_with_screen_at(
+            bx,
+            by,
+            MouseEventButton::Main,
+            MouseEventButtons::None,
+            PointerFlavor::Move,
+            2.0,
+            0,
+            Some((1_002.375, 697.125)),
+        ));
+        let second = drain_steps(&mut context, second);
+        for step in &second {
+            let Some(delta) = movement(step) else {
+                continue;
+            };
+            if matches!(step.event_type.as_str(), "pointermove" | "mousemove") {
+                assert_eq!(delta, (2.25, -3.75));
+            } else {
+                assert_eq!(delta, (0.0, 0.0));
+            }
+        }
+
+        // Button and click-family occurrences do not update the last mouse-move position.
+        let down = context.begin(pointer_request_with_screen_at(
+            bx,
+            by,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            PointerFlavor::Down,
+            3.0,
+            1,
+            Some((9_000.0, 8_000.0)),
+        ));
+        for step in drain_steps(&mut context, down) {
+            assert_eq!(movement(&step), Some((0.0, 0.0)));
+        }
+        let third = context.begin(pointer_request_with_screen_at(
+            bx,
+            by,
+            MouseEventButton::Main,
+            MouseEventButtons::Primary,
+            PointerFlavor::Move,
+            4.0,
+            0,
+            Some((1_003.625, 699.5)),
+        ));
+        for step in drain_steps(&mut context, third) {
+            if matches!(step.event_type.as_str(), "pointermove" | "mousemove") {
+                assert_eq!(movement(&step), Some((1.25, 2.375)));
+            }
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "the client-coordinate fallback must retain exact host f64 values"
+    )]
+    fn mouse_movement_falls_back_to_client_coordinates_without_screen_coordinates() {
+        let coords = |client_x, client_y| NativePointerCoordinates {
+            client_x,
+            client_y,
+            screen: None,
+            page_x: client_x,
+            page_y: client_y,
+            offset_x: 0.0,
+            offset_y: 0.0,
+        };
+        let mut last = None;
+        assert_eq!(
+            mouse_movement(&mut last, coords(11.123_456_789, 12.987_654_321)),
+            (0.0, 0.0)
+        );
+        assert_eq!(
+            mouse_movement(&mut last, coords(13.373_456_789, 9.237_654_321)),
+            (2.25, -3.75)
+        );
     }
 
     #[test]

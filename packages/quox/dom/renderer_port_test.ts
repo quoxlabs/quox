@@ -18,6 +18,8 @@ function mousePayload(overrides: Record<string, unknown> = {}): Record<string, u
     screenY: 0,
     offsetX: 1.5,
     offsetY: 2.25,
+    movementX: 0,
+    movementY: 0,
     button: 0,
     buttons: 1,
     detail: 2,
@@ -247,7 +249,7 @@ Deno.test("DOM dispatch validator requires the exact payload family and rejects 
   delete missingPayload.payload;
 
   const extraPointerField = pointerPayload();
-  extraPointerField.movementX = 1;
+  extraPointerField.futureField = 1;
 
   const invalidValues = [
     missingPayload,
@@ -271,6 +273,7 @@ Deno.test("DOM dispatch validator requires the exact payload family and rejects 
 Deno.test("DOM dispatch validator enforces payload types, finite values, ranges, and handles", () => {
   const invalidValues = [
     eventStep({ payload: pointerPayload({ clientX: NaN }) }),
+    eventStep({ payload: pointerPayload({ movementY: Infinity }) }),
     eventStep({ payload: pointerPayload({ button: 0.5 }) }),
     eventStep({ payload: pointerPayload({ button: -2 }) }),
     eventStep({ payload: pointerPayload({ button: 5 }) }),
@@ -310,6 +313,8 @@ Deno.test("DOM dispatch validator preserves accepted mouse and pointer boundarie
       button: -1,
       buttons: 0x1f,
       detail: 0x7fff_ffff,
+      movementX: 2.25,
+      movementY: -3.75,
       pointerId: -1,
       pressure: Math.fround(0.1),
       tangentialPressure: Math.fround(-0.1),
@@ -324,6 +329,8 @@ Deno.test("DOM dispatch validator preserves accepted mouse and pointer boundarie
       payload.button,
       payload.buttons,
       payload.detail,
+      payload.movementX,
+      payload.movementY,
       payload.pointerId,
       payload.pressure,
       payload.tangentialPressure,
@@ -334,6 +341,8 @@ Deno.test("DOM dispatch validator preserves accepted mouse and pointer boundarie
       -1,
       0x1f,
       0x7fff_ffff,
+      2.25,
+      -3.75,
       -1,
       Math.fround(0.1),
       Math.fround(-0.1),

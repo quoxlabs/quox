@@ -43,6 +43,8 @@ function mousePayload(overrides: Record<string, unknown> = {}): Record<string, u
     screenY: 0,
     offsetX: 1.5,
     offsetY: 2.25,
+    movementX: 0,
+    movementY: 0,
     button: 0,
     buttons: 1,
     detail: 2,
@@ -575,6 +577,7 @@ Deno.test("trusted staged payloads create browser-style event subclasses with ex
   const related = document.createElement("aside");
   const events = new Map<string, QuoxEvent>();
   const eventTypes: DomDispatchEventType[] = [
+    "pointermove",
     "click",
     "auxclick",
     "contextmenu",
@@ -591,6 +594,12 @@ Deno.test("trusted staged payloads create browser-style event subclasses with ex
   }
 
   renderer.queueFrame([
+    {
+      type: "pointermove",
+      target: target.nodeId,
+      path: [target.nodeId],
+      payload: pointerPayload({ movementX: 2.25, movementY: -3.75 }),
+    },
     {
       type: "click",
       target: target.nodeId,
@@ -674,6 +683,10 @@ Deno.test("trusted staged payloads create browser-style event subclasses with ex
   document.dispatchPointerMove(1, 2, 0, 0);
   assertEquals(events.get("scroll"), undefined);
   document.flushPendingScrollEvents();
+
+  const pointerMove = events.get("pointermove");
+  assert(pointerMove instanceof QuoxPointerEvent);
+  assertEquals([pointerMove.movementX, pointerMove.movementY], [2.25, -3.75]);
 
   const click = events.get("click");
   assert(click instanceof QuoxPointerEvent);

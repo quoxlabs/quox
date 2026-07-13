@@ -51,6 +51,8 @@ export interface DomDispatchMousePayload {
   readonly screenY: number;
   readonly offsetX: number;
   readonly offsetY: number;
+  readonly movementX: number;
+  readonly movementY: number;
   readonly button: number;
   readonly buttons: number;
   readonly detail: number;
@@ -359,6 +361,8 @@ const MOUSE_PAYLOAD_PROPERTIES = Object.freeze(
     "screenY",
     "offsetX",
     "offsetY",
+    "movementX",
+    "movementY",
     "button",
     "buttons",
     "detail",
@@ -446,6 +450,8 @@ function mousePayloadFields(descriptors: OwnPropertyDescriptors): DomDispatchMou
     screenY: assertFiniteNumber(field("screenY"), "DOM dispatch payload.screenY"),
     offsetX: assertFiniteNumber(field("offsetX"), "DOM dispatch payload.offsetX"),
     offsetY: assertFiniteNumber(field("offsetY"), "DOM dispatch payload.offsetY"),
+    movementX: assertFiniteNumber(field("movementX"), "DOM dispatch payload.movementX"),
+    movementY: assertFiniteNumber(field("movementY"), "DOM dispatch payload.movementY"),
     button: assertIntegerRange(field("button"), -1, 4, "DOM dispatch payload.button"),
     buttons: assertKnownMask(field("buttons"), 0x1f, "DOM dispatch payload.buttons"),
     detail: assertIntegerRange(
