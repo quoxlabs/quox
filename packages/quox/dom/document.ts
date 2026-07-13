@@ -481,7 +481,7 @@ export class QuoxDocument extends QuoxEventTarget {
     );
   }
 
-  /** Feed a wheel event into Blitz, scrolling whatever's hovered (not just the viewport). */
+  /** Feed a wheel event into Blitz with occurrence hit-testing and browser-style transaction targeting. */
   dispatchWheel(
     x: number,
     y: number,
