@@ -1373,8 +1373,7 @@ impl DispatchStack {
                 metadata,
                 suppress_default,
             } => {
-                let target =
-                    guarded_target_or_root(document, handles, document.get_focussed_node_id())?;
+                let target = guarded_keyboard_target(document, handles)?;
                 let data = if event.state.is_pressed() {
                     DomEventData::KeyDown(event)
                 } else {
@@ -3164,6 +3163,33 @@ fn guarded_target_or_root(
         .ok_or_else(|| DispatchError::new("quox: the DOM event target disappeared before dispatch"))
 }
 
+/// UI Events sends unfocused keyboard input to the HTML body when present, then the document
+/// element. Blitz reports the document element from `get_focussed_node_id()` even when nothing
+/// owns focus, so the retained focus bit must distinguish the real focused-element case.
+fn guarded_keyboard_target(
+    document: &BaseDocument,
+    handles: &mut NodeHandles,
+) -> Result<GuardedNode, DispatchError> {
+    let raw = actual_focus_node_id(document).unwrap_or_else(|| {
+        let root = document.root_element();
+        root.children
+            .iter()
+            .copied()
+            .find(|child_id| {
+                document.get_node(*child_id).is_some_and(|child| {
+                    child.flags.is_in_document()
+                        && child.element_data().is_some_and(|element| {
+                            element.name.ns == ns!(html) && element.name.local.as_ref() == "body"
+                        })
+                })
+            })
+            .unwrap_or(root.id)
+    });
+    guard_node(document, handles, raw)?.ok_or_else(|| {
+        DispatchError::new("quox: the keyboard event target disappeared before dispatch")
+    })
+}
+
 fn guarded_hit_target_or_root(
     document: &BaseDocument,
     handles: &mut NodeHandles,
@@ -4760,6 +4786,22 @@ mod tests {
                     })
                 })
                 .unwrap_or_else(|| panic!("test element #{id} should exist"))
+        }
+
+        fn body(&self) -> usize {
+            self.document
+                .root_element()
+                .children
+                .iter()
+                .copied()
+                .find(|child_id| {
+                    self.document.get_node(*child_id).is_some_and(|child| {
+                        child.element_data().is_some_and(|element| {
+                            element.name.ns == ns!(html) && element.name.local.as_ref() == "body"
+                        })
+                    })
+                })
+                .expect("test document should have a body")
         }
 
         fn text_child(&self, parent_id: usize) -> usize {
@@ -8826,6 +8868,64 @@ mod tests {
         let remainder = context.resume(&focus, false);
         let _ = drain(&mut context, remainder);
         assert_eq!(actual_focus_node_id(&context.document), Some(new));
+    }
+
+    #[test]
+    fn unfocused_native_keys_target_the_html_body() {
+        let mut context = TestContext::new("<button id='button'>go</button>");
+        let body = context.body();
+        let root = context.document.root_element().id;
+        assert_eq!(actual_focus_node_id(&context.document), None);
+
+        let keydown = event(context.begin(DispatchRequest::Key {
+            event: key(Key::Character("a".into()), Code::KeyA, KeyState::Pressed),
+            metadata: host_key_metadata("a"),
+            suppress_default: false,
+        }));
+        assert_eq!(keydown.event_type, "keydown");
+        assert_eq!(context.handles.resolve(keydown.target), Some(body));
+        let raw_path = keydown
+            .path
+            .iter()
+            .map(|handle| context.handles.resolve(*handle).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(raw_path.first(), Some(&body));
+        assert_eq!(raw_path.last(), Some(&root));
+        complete(context.resume(&keydown, false));
+    }
+
+    #[test]
+    fn unfocused_native_keys_fall_back_to_the_document_element_without_a_body() {
+        let mut context = TestContext::new("");
+        let body = context.body();
+        let root = context.document.root_element().id;
+        context.document.mutate().remove_node(body);
+        assert_eq!(actual_focus_node_id(&context.document), None);
+
+        let keyup = event(context.begin(DispatchRequest::Key {
+            event: key(Key::Escape, Code::Escape, KeyState::Released),
+            metadata: host_key_metadata("Escape"),
+            suppress_default: false,
+        }));
+        assert_eq!(keyup.event_type, "keyup");
+        assert_eq!(context.handles.resolve(keyup.target), Some(root));
+        complete(context.resume(&keyup, false));
+    }
+
+    #[test]
+    fn native_keys_prefer_the_actually_focused_element_over_body() {
+        let mut context = TestContext::new("<button id='button'>go</button>");
+        let button = context.element("button");
+        assert!(context.document.set_focus_to(button));
+
+        let keydown = event(context.begin(DispatchRequest::Key {
+            event: key(Key::Escape, Code::Escape, KeyState::Pressed),
+            metadata: host_key_metadata("Escape"),
+            suppress_default: false,
+        }));
+        assert_eq!(keydown.event_type, "keydown");
+        assert_eq!(context.handles.resolve(keydown.target), Some(button));
+        complete(context.resume(&keydown, false));
     }
 
     #[test]
