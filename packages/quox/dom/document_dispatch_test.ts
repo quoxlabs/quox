@@ -359,7 +359,7 @@ class FakeDispatchRenderer {
         composed: event.composed ?? true,
         timeStamp: event.timeStamp ?? 1,
       };
-      const payload = event.payload ?? payloadForType(event.type);
+      const payload = Object.hasOwn(event, "payload") ? event.payload : payloadForType(event.type);
       if (payload !== undefined) step.payload = payload;
       return step;
     });
@@ -911,6 +911,7 @@ Deno.test("payloadless trusted input uses HTML's plain Event shape", () => {
     bubbles: true,
     cancelable: false,
     composed: true,
+    payload: undefined,
   }]);
 
   document.dispatchPointerMove(1, 2, 0, 0);
