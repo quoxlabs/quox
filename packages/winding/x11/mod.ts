@@ -38,6 +38,7 @@ import {
   isTopLevelFocusTransition,
   x11CommittedText,
   x11KeyEditDisposition,
+  X11ModifierKeyState,
   type X11ModifierMapping,
   x11ModifierSnapshot,
   X11PointerButtonState,
@@ -115,6 +116,7 @@ class X11Window implements Window {
   readonly input: XimContext;
   readonly pressedKeys = new PressedLogicalKeyCache<number>();
   readonly pointerButtons = new X11PointerButtonState();
+  readonly modifierKeys = new X11ModifierKeyState();
   readonly #gc: Deno.PointerObject;
   #image: NativeXImage;
   #width: number;
@@ -619,6 +621,7 @@ class X11Library implements Library {
         this.X11.symbols.XRefreshKeyboardMapping(eventPointer);
         this.#refreshModifierMapping();
         this.#refreshDomCodes();
+        for (const candidate of this.windows.values()) candidate.modifierKeys.clear();
         continue;
       }
 
@@ -626,7 +629,7 @@ class X11Library implements Library {
         const state = view.getUint32(80, true);
         const keycode = view.getUint32(84, true);
         const code = this.#domCodes.get(keycode) ?? "Unidentified";
-        const modifiers = x11ModifierSnapshot(
+        const modifiers = window.modifierKeys.snapshot(
           state,
           keycode,
           type === XEventType.KeyPress,
@@ -767,6 +770,7 @@ class X11Library implements Library {
           return { type: "focus", window };
         }
         if (!window.input.setNativeFocused(false)) continue;
+        window.modifierKeys.clear();
         window.pressedKeys.clear();
         const imeEvent = this.#events.shift();
         if (imeEvent !== undefined) {

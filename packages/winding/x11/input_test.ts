@@ -7,6 +7,7 @@ import {
   isTopLevelFocusTransition,
   x11CommittedText,
   x11KeyEditDisposition,
+  X11ModifierKeyState,
   x11ModifierSnapshot,
   X11PointerButtonState,
   x11ScreenPosition,
@@ -301,6 +302,37 @@ Deno.test("X11 modifier snapshots apply the reported transition", () => {
   assertEquals(x11ModifierSnapshot(0, 78, true, mapping).scrollLock, true);
   assertEquals(x11ModifierSnapshot(0, 79, true, mapping).fnKey, true);
   assertEquals(x11ModifierSnapshot(16, 79, false, mapping).fnKey, false);
+});
+
+Deno.test("X11 modifier chords remain active until their final side is released", () => {
+  const groups = [
+    { mask: 1, left: 50, right: 62, field: "shiftKey" },
+    { mask: 4, left: 37, right: 105, field: "ctrlKey" },
+    { mask: 8, left: 64, right: 108, field: "altKey" },
+    { mask: 64, left: 133, right: 134, field: "metaKey" },
+    { mask: 128, left: 92, right: 93, field: "altGraphKey" },
+  ] as const;
+  const mapping = {
+    shiftMask: 1,
+    controlMask: 4,
+    altMask: 8,
+    metaMask: 64,
+    capsLockMask: 0,
+    altGraphMask: 128,
+    fnMask: 0,
+    numLockMask: 0,
+    scrollLockMask: 0,
+    maskByKeycode: new Map(groups.flatMap(({ mask, left, right }) => [[left, mask], [right, mask]])),
+    toggleKeycodes: new Set<number>(),
+  };
+
+  for (const { mask, left, right, field } of groups) {
+    const modifiers = new X11ModifierKeyState();
+    assertEquals(modifiers.snapshot(0, left, true, mapping)[field], true);
+    assertEquals(modifiers.snapshot(mask, right, true, mapping)[field], true);
+    assertEquals(modifiers.snapshot(mask, left, false, mapping)[field], true);
+    assertEquals(modifiers.snapshot(mask, right, false, mapping)[field], false);
+  }
 });
 
 Deno.test("X11 pointer snapshots retain extended-button chords", () => {

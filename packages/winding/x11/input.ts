@@ -16,6 +16,42 @@ export interface X11ModifierMapping {
   readonly toggleKeycodes: ReadonlySet<number>;
 }
 
+/**
+ * Retain physical modifier presses which XKeyEvent's aggregate state cannot
+ * distinguish. In particular, releasing one side of a modifier must not clear
+ * the browser-visible state while its other side remains held.
+ */
+export class X11ModifierKeyState {
+  readonly #pressed = new Set<number>();
+
+  snapshot(
+    state: number,
+    keycode: number,
+    pressed: boolean,
+    mapping: X11ModifierMapping,
+  ): KeyModifiers {
+    const ownMask = mapping.maskByKeycode.get(keycode) ?? 0;
+    if (mapping.toggleKeycodes.has(keycode)) {
+      if (pressed) state ^= ownMask;
+    } else if (pressed) {
+      if (ownMask !== 0) this.#pressed.add(keycode);
+      state |= ownMask;
+    } else {
+      this.#pressed.delete(keycode);
+      let retainedMask = 0;
+      for (const retainedKeycode of this.#pressed) {
+        retainedMask |= mapping.maskByKeycode.get(retainedKeycode) ?? 0;
+      }
+      state = (state & ~ownMask) | (retainedMask & ownMask);
+    }
+    return modifierSnapshotFromState(state, mapping);
+  }
+
+  clear(): void {
+    this.#pressed.clear();
+  }
+}
+
 /** Read Xlib's root-relative occurrence point, which is undefined across screens. */
 export function x11ScreenPosition(
   event: DataView<ArrayBuffer>,
@@ -90,6 +126,13 @@ export function x11ModifierSnapshot(
   } else {
     state &= ~ownMask;
   }
+  return modifierSnapshotFromState(state, mapping);
+}
+
+function modifierSnapshotFromState(
+  state: number,
+  mapping: X11ModifierMapping,
+): KeyModifiers {
   const ctrlKey = (state & mapping.controlMask) !== 0;
   const altGraphKey = (state & mapping.altGraphMask) !== 0;
   return {
