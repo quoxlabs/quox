@@ -340,7 +340,12 @@ export class DarwinInputState {
     if (committed === undefined) return undefined;
     const sourceKeyInputId = this.#claimDirectKeySource();
     this.#removeTrailingPreeditClear();
-    const replaced = this.#emitDocumentReplacement(replacementLocation, replacementLength, committed);
+    const replaced = this.#emitDocumentReplacement(
+      replacementLocation,
+      replacementLength,
+      committed,
+      sourceKeyInputId,
+    );
     this.#clearMarkedText();
     this.#composition.commit();
     if (!replaced) {
@@ -458,6 +463,7 @@ export class DarwinInputState {
     location: number | bigint,
     length: number | bigint,
     committed: string,
+    sourceKeyInputId?: number,
   ): boolean {
     if (location === NS_NOT_FOUND || location === -1 || location === -1n) return false;
     const surrounding = this.#surrounding;
@@ -478,6 +484,7 @@ export class DarwinInputState {
       range[0],
       range[1],
       committed,
+      sourceKeyInputId,
     );
     if (replacement === undefined) {
       throw new RangeError("winding(darwin): replacementRange does not map to UTF-8 boundaries");

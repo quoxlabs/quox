@@ -199,6 +199,15 @@ Deno.test("IME builders enforce canonical cursor, commit, and deletion shapes", 
     endBytes: 5,
     text: "x",
   });
+  assertEquals(createImeReplaceEvent(window, "A🙂B", 1, 5, "x", 18), {
+    type: "ime",
+    kind: "replace",
+    window,
+    startBytes: 1,
+    endBytes: 5,
+    text: "x",
+    sourceKeyInputId: 18,
+  });
   assertEquals(createImeReplaceEvent(window, "A🙂B", 2, 5, "x"), undefined);
   assertEquals(createImeReplaceEvent(window, "A🙂B", 5, 1, "x"), undefined);
 });
@@ -214,6 +223,8 @@ Deno.test("source key input ids must be positive uint32 values", () => {
   );
   assertRangeError(() => createImeCommitEvent(window, "x", 1.5));
   assertRangeError(() => createImeCommitEvent(window, "x", 0x1_0000_0000));
+  assertRangeError(() => createImeReplaceEvent(window, "x", 0, 1, "y", 0));
+  assertRangeError(() => createImeReplaceEvent(window, "x", 0, 1, "y", 1.5));
 });
 
 function assertEquals(actual: unknown, expected: unknown): void {

@@ -108,6 +108,23 @@ Deno.test("Darwin turns document replacement ranges into atomic application edit
     },
   ]);
 
+  const sourced = inputState();
+  sourced.setSurroundingText("A🙂BC", 7, 7);
+  sourced.beginKey(keyEvent({ sourceKeyInputId: 23 }));
+  sourced.insertText("x", 1, 3);
+  assertEquals(sourced.finishKey(), [
+    keyEvent({ editDisposition: "text-input", sourceKeyInputId: 23 }),
+    {
+      type: "ime",
+      kind: "replace",
+      startBytes: 1,
+      endBytes: 6,
+      text: "x",
+      window: TEST_WINDOW,
+      sourceKeyInputId: 23,
+    },
+  ]);
+
   const withoutContext = inputState();
   assertThrows(
     () => withoutContext.insertText("x", 0, 1),

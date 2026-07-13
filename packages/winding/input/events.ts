@@ -202,6 +202,7 @@ export function createImeReplaceEvent(
   startBytes: number,
   endBytes: number,
   text: string,
+  sourceId?: number,
 ): ImeEvent | undefined {
   const range = validateImeCursorRange(surroundingText, startBytes, endBytes);
   if (range === null) return undefined;
@@ -212,6 +213,7 @@ export function createImeReplaceEvent(
     startBytes: range[0],
     endBytes: range[1],
     text,
+    ...sourceKeyInputId(sourceId),
   };
 }
 

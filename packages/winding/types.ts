@@ -127,6 +127,8 @@ export type ImeEvent =
     endBytes: number;
     /** Replacement text; an empty string performs an atomic deletion. */
     text: string;
+    /** Matches the single directly causing keydown when the backend can prove that relationship. */
+    sourceKeyInputId?: number;
   });
 export interface AppleStandardKeybindingEvent extends WindowEvent<"apple-standard-keybinding"> {
   /** Original AppKit action selector, for example `deleteBackward:`. */
