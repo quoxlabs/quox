@@ -63,6 +63,7 @@ pub(crate) struct DispatchStack {
     mouse_button_presses: [Option<MouseButtonPress>; 5],
     ignored_mouse_ups: MouseEventButtons,
     click_sequence: Option<ClickSequence>,
+    space_activation_press: Option<SpaceActivationPress>,
     // UI Events defines the movement baseline at Window scope and only advances it for native
     // mouse moves, so button, wheel, and generated boundary records cannot disturb the delta.
     last_mouse_move: Option<NativePointerCoordinates>,
@@ -89,6 +90,35 @@ struct ClickSequence {
     target: GuardedNode,
     native_detail: u32,
     detail: u32,
+}
+
+#[derive(Clone, Copy)]
+struct SpaceActivationPress {
+    target: GuardedNode,
+    generation: u32,
+    kind: SpaceActivationKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SpaceActivationKind {
+    Button,
+    InputButton,
+    InputSubmit,
+    InputReset,
+    InputImage,
+    Checkbox,
+    Radio,
+}
+
+#[derive(Clone, Copy)]
+enum SpaceKeyContinuation {
+    Down {
+        observed_generation: Option<u32>,
+        candidate_generation: u32,
+    },
+    Up {
+        press: Option<SpaceActivationPress>,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -219,6 +249,11 @@ enum LabelClickDefault {
 enum TabKeyDefault {
     Traverse { backwards: bool },
     SuppressKeyUp,
+}
+
+enum SpaceKeyEvent<'a> {
+    Down(&'a blitz_traits::events::BlitzKeyEvent),
+    Up(&'a blitz_traits::events::BlitzKeyEvent),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -558,6 +593,7 @@ enum PlannedWork {
         data: DomEventData,
         metadata: EventMetadata,
         suppress_default: bool,
+        space_key: Option<SpaceKeyContinuation>,
     },
     Pointer {
         default_target: GuardedRawNode,
@@ -636,6 +672,7 @@ enum ResumeAction {
         suppress_default: bool,
         double_click: Option<Box<PendingDoubleClick>>,
         checkable_activation: Option<Box<GuardedCheckableActivation>>,
+        space_key: Option<SpaceKeyContinuation>,
     },
     PointerLead {
         pointer_default: Box<GuardedDomEvent>,
@@ -1138,6 +1175,7 @@ impl Default for DispatchStack {
             mouse_button_presses: [None; 5],
             ignored_mouse_ups: MouseEventButtons::None,
             click_sequence: None,
+            space_activation_press: None,
             last_mouse_move: None,
         }
     }
@@ -1252,6 +1290,7 @@ impl DispatchStack {
                 suppress_default,
                 double_click,
                 checkable_activation,
+                space_key,
             } => {
                 if cancelled {
                     if let Some(activation) = checkable_activation.as_deref()
@@ -1275,6 +1314,7 @@ impl DispatchStack {
                         handles,
                         pending.guarded,
                         checkable_activation.as_deref(),
+                        space_key,
                     )?;
                 }
                 if let Some(double_click) = double_click {
@@ -1360,6 +1400,7 @@ impl DispatchStack {
                         handles,
                         pointer_default,
                         None,
+                        None,
                     )?;
                 }
                 self.queue_generated_pointer_release(suppressed_release_activation);
@@ -1392,6 +1433,7 @@ impl DispatchStack {
                             checked_controls,
                             handles,
                             *pointer_default,
+                            None,
                             None,
                         )?;
                     }
@@ -1477,10 +1519,16 @@ impl DispatchStack {
             }
             request => request,
         };
+        let frame_id = self
+            .frames
+            .last()
+            .expect("begin pushed a frame before planning")
+            .id;
         let wheel_transaction = &mut self.wheel_transaction;
         let prevent_compatibility_mouse = &mut self.prevent_compatibility_mouse;
         let mouse_button_presses = &mut self.mouse_button_presses;
         let last_mouse_move = &mut self.last_mouse_move;
+        let space_activation_press = &mut self.space_activation_press;
         let planned = &mut self
             .frames
             .last_mut()
@@ -1578,6 +1626,20 @@ impl DispatchStack {
                 suppress_default,
             } => {
                 let target = guarded_keyboard_target(document, handles)?;
+                let space_key = is_space_key(&event).then(|| {
+                    if event.state.is_pressed() {
+                        SpaceKeyContinuation::Down {
+                            observed_generation: space_activation_press
+                                .as_ref()
+                                .map(|press| press.generation),
+                            candidate_generation: frame_id,
+                        }
+                    } else {
+                        SpaceKeyContinuation::Up {
+                            press: space_activation_press.take(),
+                        }
+                    }
+                });
                 let data = if event.state.is_pressed() {
                     DomEventData::KeyDown(event)
                 } else {
@@ -1588,6 +1650,7 @@ impl DispatchStack {
                     data,
                     metadata,
                     suppress_default,
+                    space_key,
                 });
             }
             DispatchRequest::Focus(target_id) => {
@@ -1675,6 +1738,7 @@ impl DispatchStack {
             data: DomEventData::PointerMove(event.clone()),
             metadata: cancel_metadata,
             suppress_default: true,
+            space_key: None,
         });
 
         // Publish interruption state before JavaScript sees pointercancel, so nested input cannot
@@ -1766,6 +1830,7 @@ impl DispatchStack {
                         event,
                         suppress_default,
                         double_click,
+                        None,
                     );
                 }
                 continue;
@@ -1789,6 +1854,7 @@ impl DispatchStack {
                     data,
                     metadata,
                     suppress_default,
+                    space_key,
                 } => {
                     if let Some(event) =
                         guard_planned_event(document, handles, target, data, metadata)?
@@ -1801,6 +1867,7 @@ impl DispatchStack {
                             event,
                             suppress_default,
                             None,
+                            space_key,
                         );
                     }
                 }
@@ -1929,6 +1996,7 @@ impl DispatchStack {
                         event,
                         false,
                         None,
+                        None,
                     );
                 }
                 PlannedWork::DefaultOnly {
@@ -1945,6 +2013,7 @@ impl DispatchStack {
                             checked_controls,
                             handles,
                             event,
+                            None,
                             None,
                         )?;
                     }
@@ -1968,6 +2037,7 @@ impl DispatchStack {
                         checked_controls,
                         handles,
                         *guarded,
+                        None,
                         None,
                     )?;
                 }
@@ -1996,6 +2066,7 @@ impl DispatchStack {
                         redraw,
                         event,
                         false,
+                        None,
                         None,
                     );
                 }
@@ -2029,6 +2100,7 @@ impl DispatchStack {
         event: GuardedDomEvent,
         mut suppress_default: bool,
         double_click: Option<Box<PendingDoubleClick>>,
+        space_key: Option<SpaceKeyContinuation>,
     ) -> Result<DispatchStep, DispatchError> {
         // Allocate every fallible dispatch identifier before applying state which JavaScript can
         // observe. A failed stage must never strand a checkbox in its pre-activated state.
@@ -2086,6 +2158,7 @@ impl DispatchStack {
             suppress_default,
             double_click,
             checkable_activation,
+            space_key,
         };
         Ok(self.finish_stage(redraw, event_id, event, resume))
     }
@@ -2318,7 +2391,7 @@ impl DispatchStack {
         self.queue_focus_default(document, handles, destination, metadata)
     }
 
-    fn queue_enter_activation_default(
+    fn queue_keyboard_activation_default(
         &mut self,
         document: &BaseDocument,
         handles: &mut NodeHandles,
@@ -2343,7 +2416,7 @@ impl DispatchStack {
         if let Some(event) = guard_queued_event(document, handles, event, metadata)? {
             self.frames
                 .last_mut()
-                .expect("Enter defaults run only for an active frame")
+                .expect("keyboard defaults run only for an active frame")
                 .generated
                 .push_back(event);
         }
@@ -2351,6 +2424,7 @@ impl DispatchStack {
     }
 
     #[allow(
+        clippy::too_many_arguments,
         clippy::too_many_lines,
         reason = "default reconciliation keeps native mutations and their staged follow-ups atomic"
     )]
@@ -2362,6 +2436,7 @@ impl DispatchStack {
         handles: &mut NodeHandles,
         mut guarded: GuardedDomEvent,
         protected_checked_activation: Option<&GuardedCheckableActivation>,
+        space_key: Option<SpaceKeyContinuation>,
     ) -> Result<(), DispatchError> {
         if let Some(tab_default) = tab_key_default(&guarded.event.data) {
             return match tab_default {
@@ -2371,13 +2446,88 @@ impl DispatchStack {
                 TabKeyDefault::SuppressKeyUp => Ok(()),
             };
         }
+        if let Some(space_event) = space_key_event(&guarded.event.data) {
+            document.resolve(0.0);
+            let activation_control = is_space_activation_control(document, guarded.target.raw);
+            match (space_event, space_key) {
+                (
+                    SpaceKeyEvent::Down(event),
+                    Some(SpaceKeyContinuation::Down {
+                        observed_generation,
+                        candidate_generation,
+                    }),
+                ) => {
+                    let occurrence_still_current = self
+                        .space_activation_press
+                        .as_ref()
+                        .map(|press| press.generation)
+                        == observed_generation;
+                    if event.is_auto_repeating {
+                        if (occurrence_still_current && self.space_activation_press.is_some())
+                            || activation_control
+                        {
+                            return Ok(());
+                        }
+                    } else if occurrence_still_current {
+                        self.space_activation_press = None;
+                        if !event.is_composing
+                            && node_is_live(guarded.target, document, handles)
+                            && actual_focus_node_id(document) == Some(guarded.target.raw)
+                            && let Some(kind) = space_activation_kind(document, guarded.target.raw)
+                        {
+                            self.space_activation_press = Some(SpaceActivationPress {
+                                target: guarded.target,
+                                generation: candidate_generation,
+                                kind,
+                            });
+                            return Ok(());
+                        }
+                        if activation_control {
+                            return Ok(());
+                        }
+                    } else if activation_control {
+                        // A nested key dispatch established newer state while this listener was
+                        // running. Suppress only this control's pinned default and leave the
+                        // nested press untouched.
+                        return Ok(());
+                    }
+                }
+                (SpaceKeyEvent::Up(event), Some(SpaceKeyContinuation::Up { press })) => {
+                    if !event.is_composing
+                        && press.is_some_and(|press| {
+                            press.target == guarded.target
+                                && node_is_live(press.target, document, handles)
+                                && actual_focus_node_id(document) == Some(press.target.raw)
+                                && space_activation_kind(document, press.target.raw)
+                                    == Some(press.kind)
+                        })
+                    {
+                        return self.queue_keyboard_activation_default(
+                            document,
+                            handles,
+                            guarded.target,
+                            event,
+                            guarded.metadata,
+                        );
+                    }
+                    if press.is_some() || activation_control {
+                        return Ok(());
+                    }
+                }
+                (SpaceKeyEvent::Down(_) | SpaceKeyEvent::Up(_), _) => {
+                    if activation_control {
+                        return Ok(());
+                    }
+                }
+            }
+        }
         if !node_is_live(guarded.target, document, handles) {
             return Ok(());
         }
         if let Some(key_event) = enter_keydown(&guarded.event.data) {
             document.resolve(0.0);
             if is_enter_activatable(document, guarded.target.raw) {
-                return self.queue_enter_activation_default(
+                return self.queue_keyboard_activation_default(
                     document,
                     handles,
                     guarded.target,
@@ -2545,6 +2695,7 @@ impl DispatchStack {
                 }
 
                 text_controls.sync_editor_value(document, target.raw);
+                self.space_activation_press = None;
                 document.clear_focus();
                 self.frames
                     .last_mut()
@@ -2575,6 +2726,7 @@ impl DispatchStack {
                     return Ok(());
                 }
 
+                self.space_activation_press = None;
                 self.frames
                     .last_mut()
                     .expect("focus changes run only for an active frame")
@@ -2718,6 +2870,70 @@ fn enter_keydown(data: &DomEventData) -> Option<&blitz_traits::events::BlitzKeyE
             if event.key == keyboard_types::Key::Enter && !event.is_composing =>
         {
             Some(event)
+        }
+        _ => None,
+    }
+}
+
+fn space_key_event(data: &DomEventData) -> Option<SpaceKeyEvent<'_>> {
+    match data {
+        DomEventData::KeyDown(event) if is_space_key(event) => Some(SpaceKeyEvent::Down(event)),
+        DomEventData::KeyUp(event) if is_space_key(event) => Some(SpaceKeyEvent::Up(event)),
+        _ => None,
+    }
+}
+
+fn is_space_key(event: &blitz_traits::events::BlitzKeyEvent) -> bool {
+    matches!(&event.key, keyboard_types::Key::Character(value) if value.as_str() == " ")
+}
+
+fn is_space_activation_control(document: &BaseDocument, target: usize) -> bool {
+    let Some(element) = document
+        .get_node(target)
+        .and_then(blitz_dom::Node::element_data)
+        .filter(|element| element.name.ns == ns!(html))
+    else {
+        return false;
+    };
+    match element.name.local.as_ref() {
+        "button" => true,
+        "input" => element.attr(LocalName::from("type")).is_some_and(|kind| {
+            matches!(
+                kind.to_ascii_lowercase().as_str(),
+                "button" | "submit" | "reset" | "image" | "checkbox" | "radio"
+            )
+        }),
+        _ => false,
+    }
+}
+
+fn space_activation_kind(document: &BaseDocument, target: usize) -> Option<SpaceActivationKind> {
+    if !is_programmatically_focusable(document, target) {
+        return None;
+    }
+    let element = document.get_node(target)?.element_data()?;
+    if element.name.ns != ns!(html) {
+        return None;
+    }
+    match element.name.local.as_ref() {
+        "button" => Some(SpaceActivationKind::Button),
+        "input" => {
+            let kind = element.attr(LocalName::from("type"))?;
+            if kind.eq_ignore_ascii_case("button") {
+                Some(SpaceActivationKind::InputButton)
+            } else if kind.eq_ignore_ascii_case("submit") {
+                Some(SpaceActivationKind::InputSubmit)
+            } else if kind.eq_ignore_ascii_case("reset") {
+                Some(SpaceActivationKind::InputReset)
+            } else if kind.eq_ignore_ascii_case("image") {
+                Some(SpaceActivationKind::InputImage)
+            } else if kind.eq_ignore_ascii_case("checkbox") {
+                Some(SpaceActivationKind::Checkbox)
+            } else if kind.eq_ignore_ascii_case("radio") {
+                Some(SpaceActivationKind::Radio)
+            } else {
+                None
+            }
         }
         _ => None,
     }
@@ -3511,6 +3727,7 @@ fn push_guarded_work(
         data,
         metadata,
         suppress_default: false,
+        space_key: None,
     });
 }
 
@@ -6216,6 +6433,33 @@ mod tests {
                     code: "Enter".to_owned(),
                     key: "Enter".to_owned(),
                     keycode: 13,
+                    modifier_bits,
+                    location: 0,
+                },
+            ),
+            suppress_default,
+        }
+    }
+
+    fn space_request(
+        state: KeyState,
+        repeat: bool,
+        composing: bool,
+        suppress_default: bool,
+        modifier_bits: u32,
+        time_stamp: f64,
+    ) -> DispatchRequest {
+        let mut event = key(Key::Character(" ".into()), Code::Space, state);
+        event.is_auto_repeating = repeat;
+        event.is_composing = composing;
+        DispatchRequest::Key {
+            event,
+            metadata: EventMetadata::key(
+                time_stamp,
+                NativeKeyMetadata {
+                    code: "Space".to_owned(),
+                    key: " ".to_owned(),
+                    keycode: 32,
                     modifier_bits,
                     location: 0,
                 },
@@ -10865,6 +11109,421 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "Space activation must retain the exact keyup timestamp and zero click coordinates"
+    )]
+    fn space_arms_browser_controls_and_clicks_once_on_keyup() {
+        for markup in [
+            "<button id='target'>button</button>",
+            "<input id='target' type='button' value='button'>",
+            "<input id='target' type='submit' value='submit'>",
+            "<input id='target' type='reset' value='reset'>",
+            "<input id='target' type='image' alt='image'>",
+            "<input id='target' type='checkbox'>",
+            "<input id='target' type='radio'>",
+        ] {
+            let mut context = TestContext::new(markup);
+            let target = context.element("target");
+            let target_handle = context.handles.expose(target).unwrap();
+            assert!(context.document.set_focus_to(target), "{markup}");
+            let modifier_bits = KEY_MOD_SHIFT
+                | KEY_MOD_CONTROL
+                | KEY_MOD_ALT
+                | KEY_MOD_META
+                | KEY_MOD_CAPS_LOCK
+                | KEY_MOD_ALT_GRAPH
+                | KEY_MOD_FN
+                | KEY_MOD_NUM_LOCK
+                | KEY_MOD_SCROLL_LOCK;
+
+            let keydown = event(context.begin(space_request(
+                KeyState::Pressed,
+                false,
+                false,
+                false,
+                modifier_bits,
+                800.5,
+            )));
+            complete(context.resume(&keydown, false));
+            assert!(context.stack.space_activation_press.is_some(), "{markup}");
+
+            let keyup = event(context.begin(space_request(
+                KeyState::Released,
+                false,
+                false,
+                false,
+                modifier_bits,
+                900.75,
+            )));
+            assert!(context.stack.space_activation_press.is_none(), "{markup}");
+            let click = event(context.resume(&keyup, false));
+            assert_eq!(click.event_type, "click", "{markup}");
+            assert_eq!(click.target, target_handle, "{markup}");
+            assert!(click.bubbles && click.cancelable && click.composed);
+            assert_eq!(click.time_stamp, 900.75);
+            let Some(DispatchEventPayload::Pointer(payload)) = click.payload.as_deref() else {
+                panic!("Space click should carry a pointer payload: {markup}");
+            };
+            assert_eq!(
+                (
+                    payload.mouse.client_x,
+                    payload.mouse.client_y,
+                    payload.mouse.screen_x,
+                    payload.mouse.screen_y,
+                    payload.mouse.page_x,
+                    payload.mouse.page_y,
+                    payload.mouse.offset_x,
+                    payload.mouse.offset_y,
+                ),
+                (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            );
+            assert_eq!(
+                (
+                    payload.mouse.button,
+                    payload.mouse.buttons,
+                    payload.mouse.detail,
+                ),
+                (0, 0, 0),
+            );
+            assert!(
+                payload.mouse.shift_key
+                    && payload.mouse.ctrl_key
+                    && payload.mouse.alt_key
+                    && payload.mouse.meta_key
+                    && payload.mouse.caps_lock
+                    && payload.mouse.alt_graph_key
+                    && payload.mouse.fn_key
+                    && payload.mouse.num_lock
+                    && payload.mouse.scroll_lock
+            );
+            complete(context.resume(&click, true));
+            if markup.contains("checkbox") || markup.contains("radio") {
+                assert!(
+                    !context
+                        .checked_controls
+                        .checked(&mut context.document, target)
+                        .unwrap(),
+                    "a canceled ordinary click must roll checkable preactivation back: {markup}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn space_checkable_click_uses_existing_input_change_and_cancellation_pipeline() {
+        let mut context = TestContext::new("<input id='target' type='checkbox'>");
+        let target = context.element("target");
+        assert!(context.document.set_focus_to(target));
+        let down = context.begin(space_request(
+            KeyState::Pressed,
+            false,
+            false,
+            false,
+            0,
+            1.0,
+        ));
+        let _ = drain(&mut context, down);
+        assert!(
+            !context
+                .checked_controls
+                .checked(&mut context.document, target)
+                .unwrap()
+        );
+
+        let keyup = event(context.begin(space_request(
+            KeyState::Released,
+            false,
+            false,
+            false,
+            0,
+            2.0,
+        )));
+        let click = event(context.resume(&keyup, false));
+        assert!(
+            context
+                .checked_controls
+                .checked(&mut context.document, target)
+                .unwrap()
+        );
+        let remainder = context.resume(&click, false);
+        let (types, _, _) = drain(&mut context, remainder);
+        assert_eq!(types, ["input", "change"]);
+        assert!(
+            context
+                .checked_controls
+                .checked(&mut context.document, target)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one state-machine test keeps cancellation, suppression, repeat, composition, and abort ownership in sequence"
+    )]
+    fn space_cancellation_repeat_suppression_and_abort_own_only_their_press() {
+        let mut context = TestContext::new("<button id='target'>button</button>");
+        let target = context.element("target");
+        assert!(context.document.set_focus_to(target));
+
+        for suppressed in [false, true] {
+            let keydown = event(context.begin(space_request(
+                KeyState::Pressed,
+                false,
+                false,
+                suppressed,
+                0,
+                1.0,
+            )));
+            complete(context.resume(&keydown, !suppressed));
+            assert!(context.stack.space_activation_press.is_none());
+            let keyup = context.begin(space_request(
+                KeyState::Released,
+                false,
+                false,
+                false,
+                0,
+                2.0,
+            ));
+            let (types, _, _) = drain(&mut context, keyup);
+            assert_eq!(types, ["keyup"]);
+        }
+
+        let repeated = context.begin(space_request(KeyState::Pressed, true, false, false, 0, 3.0));
+        let (types, _, _) = drain(&mut context, repeated);
+        assert_eq!(types, ["keydown"]);
+        assert!(context.stack.space_activation_press.is_none());
+
+        let down = event(context.begin(space_request(
+            KeyState::Pressed,
+            false,
+            false,
+            false,
+            0,
+            4.0,
+        )));
+        complete(context.resume(&down, false));
+        let generation = context.stack.space_activation_press.unwrap().generation;
+
+        let repeated =
+            event(context.begin(space_request(KeyState::Pressed, true, false, false, 0, 5.0)));
+        complete(context.resume(&repeated, false));
+        assert_eq!(
+            context.stack.space_activation_press.unwrap().generation,
+            generation
+        );
+
+        let canceled_repeat =
+            event(context.begin(space_request(KeyState::Pressed, true, false, false, 0, 5.5)));
+        complete(context.resume(&canceled_repeat, true));
+        assert_eq!(
+            context.stack.space_activation_press.unwrap().generation,
+            generation
+        );
+
+        let aborted_repeat =
+            event(context.begin(space_request(KeyState::Pressed, true, false, false, 0, 6.0)));
+        assert!(!context.abort(aborted_repeat.frame_id));
+        assert_eq!(
+            context.stack.space_activation_press.unwrap().generation,
+            generation
+        );
+
+        let canceled_up = event(context.begin(space_request(
+            KeyState::Released,
+            false,
+            false,
+            false,
+            0,
+            7.0,
+        )));
+        assert!(context.stack.space_activation_press.is_none());
+        complete(context.resume(&canceled_up, true));
+
+        let down = context.begin(space_request(
+            KeyState::Pressed,
+            false,
+            false,
+            false,
+            0,
+            8.0,
+        ));
+        let _ = drain(&mut context, down);
+        let suppressed_up = context.begin(space_request(
+            KeyState::Released,
+            false,
+            false,
+            true,
+            0,
+            8.5,
+        ));
+        let (types, _, _) = drain(&mut context, suppressed_up);
+        assert_eq!(types, ["keyup"]);
+        assert!(context.stack.space_activation_press.is_none());
+
+        let down = context.begin(space_request(
+            KeyState::Pressed,
+            false,
+            false,
+            false,
+            0,
+            8.75,
+        ));
+        let _ = drain(&mut context, down);
+        let aborted_up = event(context.begin(space_request(
+            KeyState::Released,
+            false,
+            false,
+            false,
+            0,
+            9.0,
+        )));
+        assert!(context.stack.space_activation_press.is_none());
+        assert!(!context.abort(aborted_up.frame_id));
+
+        for state in [KeyState::Pressed, KeyState::Released] {
+            let composing = context.begin(space_request(state, false, true, false, 0, 10.0));
+            let (types, _, _) = drain(&mut context, composing);
+            assert!(!types.iter().any(|event| event == "click"));
+            assert!(context.stack.space_activation_press.is_none());
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::float_cmp,
+        reason = "the outer frame-owned keyup must retain its exact timestamp through nested dispatch"
+    )]
+    fn nested_space_dispatch_during_keyup_cannot_consume_the_outer_press() {
+        let mut context = TestContext::new("<button id='target'>button</button>");
+        let target = context.element("target");
+        assert!(context.document.set_focus_to(target));
+        let down = context.begin(space_request(
+            KeyState::Pressed,
+            false,
+            false,
+            false,
+            0,
+            1.0,
+        ));
+        let _ = drain(&mut context, down);
+
+        let outer_up = event(context.begin(space_request(
+            KeyState::Released,
+            false,
+            false,
+            false,
+            0,
+            2.0,
+        )));
+        assert!(context.stack.space_activation_press.is_none());
+
+        let nested_down = context.begin(space_request(
+            KeyState::Pressed,
+            false,
+            false,
+            false,
+            0,
+            3.0,
+        ));
+        let _ = drain(&mut context, nested_down);
+        let nested_up = event(context.begin(space_request(
+            KeyState::Released,
+            false,
+            false,
+            false,
+            0,
+            4.0,
+        )));
+        let nested_click = event(context.resume(&nested_up, false));
+        assert_eq!(nested_click.event_type, "click");
+        complete(context.resume(&nested_click, true));
+
+        let outer_click = event(context.resume(&outer_up, false));
+        assert_eq!(outer_click.event_type, "click");
+        assert_eq!(outer_click.time_stamp, 2.0);
+        complete(context.resume(&outer_click, true));
+    }
+
+    #[test]
+    fn space_keyup_revalidates_focus_type_disabledness_and_connectivity() {
+        let kind = QualName {
+            prefix: None,
+            ns: ns!(),
+            local: LocalName::from("type"),
+        };
+        for mutation in ["type", "disabled", "detached"] {
+            let mut context = TestContext::new("<input id='target' type='checkbox'>");
+            let target = context.element("target");
+            assert!(context.document.set_focus_to(target));
+            let down = context.begin(space_request(
+                KeyState::Pressed,
+                false,
+                false,
+                false,
+                0,
+                1.0,
+            ));
+            let _ = drain(&mut context, down);
+            match mutation {
+                "type" => context
+                    .document
+                    .mutate()
+                    .set_attribute(target, kind.clone(), "radio"),
+                "disabled" => set_disabled(&mut context, target, true),
+                "detached" => context.document.mutate().remove_node(target),
+                _ => unreachable!(),
+            }
+            let up = context.begin(space_request(
+                KeyState::Released,
+                false,
+                false,
+                false,
+                0,
+                2.0,
+            ));
+            let (types, _, _) = drain(&mut context, up);
+            assert!(
+                !types.iter().any(|event| event == "click"),
+                "{mutation}: {types:?}"
+            );
+            assert!(context.stack.space_activation_press.is_none());
+        }
+
+        let mut context = TestContext::new(
+            "<button id='target'>target</button><button id='other'>other</button>",
+        );
+        let target = context.element("target");
+        let other = context.element("other");
+        assert!(context.document.set_focus_to(target));
+        let down = context.begin(space_request(
+            KeyState::Pressed,
+            false,
+            false,
+            false,
+            0,
+            1.0,
+        ));
+        let _ = drain(&mut context, down);
+        let focus_other = context.begin_programmatic_focus(other);
+        let _ = drain(&mut context, focus_other);
+        assert!(context.stack.space_activation_press.is_none());
+        let focus_target = context.begin_programmatic_focus(target);
+        let _ = drain(&mut context, focus_target);
+        let up = context.begin(space_request(
+            KeyState::Released,
+            false,
+            false,
+            false,
+            0,
+            2.0,
+        ));
+        let (types, _, _) = drain(&mut context, up);
+        assert_eq!(types, ["keyup"]);
+    }
+
+    #[test]
     fn unfocused_native_keys_target_the_html_body() {
         let mut context = TestContext::new("<button id='button'>go</button>");
         let body = context.body();
@@ -13299,6 +13958,7 @@ mod tests {
                 }),
                 metadata: EventMetadata::native(),
                 suppress_default: false,
+                space_key: None,
             })
             .collect();
         context.stack.frames.push(DispatchFrame {
