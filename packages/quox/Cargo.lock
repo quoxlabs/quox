@@ -1787,6 +1787,7 @@ dependencies = [
  "blitz-paint",
  "blitz-traits",
  "console_error_panic_hook",
+ "image",
  "keyboard-types",
  "linebender_resource_handle",
  "smol_str",
