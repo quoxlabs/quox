@@ -1,10 +1,14 @@
 use super::{QuoxRenderer, QuoxRendererState};
-use blitz_dom::{Document, EventDriver, EventHandler};
+use crate::event_bridge::{ElementEventKind, KeyboardMetadata};
+#[cfg(test)]
+use blitz_dom::{Document, EventHandler};
 use blitz_traits::events::{
     BlitzImeEvent, BlitzKeyEvent, BlitzPointerEvent, BlitzPointerId, BlitzWheelDelta,
-    BlitzWheelEvent, DomEvent, DomEventData, EventState, KeyState, MouseEventButton,
-    MouseEventButtons, Point as ElementPoint, PointerCoords, PointerDetails, UiEvent,
+    BlitzWheelEvent, KeyState, MouseEventButton, MouseEventButtons, Point as ElementPoint,
+    PointerCoords, PointerDetails, UiEvent,
 };
+#[cfg(test)]
+use blitz_traits::events::{DomEvent, DomEventData, EventState};
 use keyboard_types::{Code, Key, Location, Modifiers};
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
@@ -50,6 +54,7 @@ pub enum KeyModifierMask {
     CapsLock = 8,
     AltGraph = 16,
     Accelerator = 32,
+    Control = 64,
 }
 
 /// Stable event-state bit values used by the generated TypeScript keyboard bridge.
@@ -66,12 +71,14 @@ const KEY_MOD_META: u32 = KeyModifierMask::Meta as u32;
 const KEY_MOD_CAPS_LOCK: u32 = KeyModifierMask::CapsLock as u32;
 const KEY_MOD_ALT_GRAPH: u32 = KeyModifierMask::AltGraph as u32;
 const KEY_MOD_ACCEL: u32 = KeyModifierMask::Accelerator as u32;
+const KEY_MOD_CONTROL: u32 = KeyModifierMask::Control as u32;
 const KEY_MOD_KNOWN: u32 = KEY_MOD_SHIFT
     | KEY_MOD_ALT
     | KEY_MOD_META
     | KEY_MOD_CAPS_LOCK
     | KEY_MOD_ALT_GRAPH
-    | KEY_MOD_ACCEL;
+    | KEY_MOD_ACCEL
+    | KEY_MOD_CONTROL;
 
 const KEY_EVENT_PRESSED: u32 = KeyEventFlag::Pressed as u32;
 const KEY_EVENT_REPEAT: u32 = KeyEventFlag::Repeat as u32;
@@ -102,6 +109,29 @@ fn build_editor_modifiers(bits: u32) -> Modifiers {
     }
     if bits & KEY_MOD_ACCEL != 0 {
         mods |= Modifiers::CONTROL;
+    }
+    mods
+}
+
+fn build_raw_modifiers(bits: u32) -> Modifiers {
+    let mut mods = Modifiers::empty();
+    if bits & KEY_MOD_SHIFT != 0 {
+        mods |= Modifiers::SHIFT;
+    }
+    if bits & KEY_MOD_CONTROL != 0 {
+        mods |= Modifiers::CONTROL;
+    }
+    if bits & KEY_MOD_ALT != 0 {
+        mods |= Modifiers::ALT;
+    }
+    if bits & KEY_MOD_META != 0 {
+        mods |= Modifiers::META;
+    }
+    if bits & KEY_MOD_CAPS_LOCK != 0 {
+        mods |= Modifiers::CAPS_LOCK;
+    }
+    if bits & KEY_MOD_ALT_GRAPH != 0 {
+        mods |= Modifiers::ALT_GRAPH;
     }
     mods
 }
@@ -225,18 +255,19 @@ fn key_event(
     }
 }
 
-/// Records, per dispatched `DomEvent`, the element path for the handful of event kinds a
+/// Records, per dispatched `DomEvent`, the target node id for the handful of event kinds a
 /// host application cares about invoking a JS-registered handler for. Populated by
-/// `RecordingEventHandler` and drained by `QuoxRenderer::take_*_path()`.
+/// `RecordingEventHandler` and drained by `QuoxRenderer::take_*_node()`.
+#[cfg(test)]
 #[derive(Default)]
 pub(super) struct RecordedEvents {
-    click: Vec<u32>,
-    double_click: Vec<u32>,
-    context_menu: Vec<u32>,
-    input: Vec<u32>,
-    focus: Vec<u32>,
-    blur: Vec<u32>,
-    scroll: Vec<u32>,
+    click: Option<usize>,
+    double_click: Option<usize>,
+    context_menu: Option<usize>,
+    input: Option<usize>,
+    focus: Option<usize>,
+    blur: Option<usize>,
+    scroll: Option<usize>,
     #[cfg(test)]
     input_count: usize,
 }
@@ -244,107 +275,68 @@ pub(super) struct RecordedEvents {
 /// Bridges Blitz's `EventHandler` hook (normally a no-op via `NoopEventHandler`) to a
 /// `RecordedEvents` buffer, so the wasm boundary can tell the TS side which node/event kind
 /// fired and let it invoke the matching browser-style `on*` property on `QuoxElement`.
+#[cfg(test)]
 struct RecordingEventHandler<'a> {
     recorded: &'a mut RecordedEvents,
     cancel_keydown_default: bool,
 }
 
+#[cfg(test)]
 impl EventHandler for RecordingEventHandler<'_> {
     fn handle_event(
         &mut self,
         chain: &[usize],
         event: &mut DomEvent,
-        doc: &mut dyn Document,
+        _doc: &mut dyn Document,
         event_state: &mut EventState,
     ) {
         if self.cancel_keydown_default && matches!(event.data, DomEventData::KeyDown(_)) {
             event_state.prevent_default();
         }
 
-        let document = doc.inner();
-        let path = chain
-            .iter()
-            .copied()
-            .filter(|node_id| {
-                document
-                    .get_node(*node_id)
-                    .and_then(blitz_dom::Node::element_data)
-                    .is_some()
-            })
-            .filter_map(|node_id| u32::try_from(node_id).ok())
-            .collect::<Vec<_>>();
+        let Some(target) = chain.first().copied() else {
+            return;
+        };
 
         match &event.data {
-            DomEventData::Click(_) => self.recorded.click = path,
-            DomEventData::DoubleClick(_) => self.recorded.double_click = path,
-            DomEventData::ContextMenu(_) => self.recorded.context_menu = path,
+            DomEventData::Click(_) => self.recorded.click = Some(target),
+            DomEventData::DoubleClick(_) => self.recorded.double_click = Some(target),
+            DomEventData::ContextMenu(_) => self.recorded.context_menu = Some(target),
             DomEventData::Input(_) => {
-                self.recorded.input = path;
+                self.recorded.input = Some(target);
                 #[cfg(test)]
                 {
                     self.recorded.input_count += 1;
                 }
             }
-            DomEventData::Focus(_) => self.recorded.focus = path,
-            DomEventData::Blur(_) => self.recorded.blur = path,
-            DomEventData::Scroll(_) => self.recorded.scroll = path,
+            DomEventData::Focus(_) => self.recorded.focus = Some(target),
+            DomEventData::Blur(_) => self.recorded.blur = Some(target),
+            DomEventData::Scroll(_) => self.recorded.scroll = Some(target),
             _ => {}
         }
     }
 }
 
 impl QuoxRendererState {
-    /// Run one host dispatch inside a single `EventDriver`/recording scope while preserving
-    /// the generated DOM-event mailbox for the entire dispatch.
-    fn with_event_driver(
+    fn dispatch(&mut self, event: UiEvent) -> Result<bool, JsValue> {
+        self.dispatch_with_policy(event, None, false)
+    }
+
+    fn dispatch_with_policy(
         &mut self,
-        cancel_keydown_default: bool,
-        drive: impl FnOnce(&mut EventDriver<'_, RecordingEventHandler<'_>>),
-    ) -> bool {
-        self.recorded_events = RecordedEvents::default();
-
-        {
-            let QuoxRendererState {
-                document,
-                recorded_events,
-                ..
-            } = self;
-            let mut driver = EventDriver::new(
-                document,
-                RecordingEventHandler {
-                    recorded: recorded_events,
-                    cancel_keydown_default,
-                },
-            );
-            drive(&mut driver);
-        }
-
-        self.redraw_requested.swap(false, Ordering::Relaxed)
+        event: UiEvent,
+        keyboard: Option<KeyboardMetadata>,
+        host_prevent_default: bool,
+    ) -> Result<bool, JsValue> {
+        self.event_bridge
+            .begin(&mut self.document, event, keyboard, host_prevent_default)?;
+        Ok(self.redraw_requested.swap(false, Ordering::Relaxed))
     }
 
-    fn dispatch(&mut self, event: UiEvent) -> bool {
-        self.dispatch_with_policy(event, false)
-    }
-
-    fn dispatch_with_policy(&mut self, event: UiEvent, cancel_keydown_default: bool) -> bool {
-        self.with_event_driver(cancel_keydown_default, |driver| {
-            driver.handle_ui_event(event);
-        })
-    }
-
-    /// Pinned Blitz's `UiEvent::AppleStandardKeybinding` path runs the default directly but
-    /// leaves the resulting DOM `input` queued inside `EventDriver`. Entering through the public
-    /// DOM-event path processes that queue and lets `RecordingEventHandler` expose the input.
-    fn dispatch_apple_standard_keybinding(&mut self, command: &str) -> bool {
-        let target = self
-            .document
-            .get_focussed_node_id()
-            .unwrap_or_else(|| self.document.root_element().id);
-        let event = DomEvent::new(
-            target,
-            DomEventData::AppleStandardKeybinding(command.into()),
-        );
-        self.with_event_driver(false, |driver| driver.handle_dom_event(event))
+    fn finish_dom_event(&mut self, token: u32, default_prevented: bool) -> Result<bool, JsValue> {
+        self.event_bridge
+            .finish(&mut self.document, token, default_prevented)?;
+        Ok(self.redraw_requested.swap(false, Ordering::Relaxed))
     }
 }
 
@@ -373,10 +365,10 @@ impl QuoxRenderer {
     /// cadence) would be a real perf regression; staleness is bounded to about one frame.
     /// `buttons` is a `MouseEventButtons` bitmask (`Primary=1, Secondary=2, Auxiliary=4`).
     /// Returns whether a redraw was requested.
-    pub fn dispatch_pointer_move(&self, x: f32, y: f32, buttons: u8) -> bool {
+    pub fn dispatch_pointer_move(&self, x: f32, y: f32, buttons: u8) -> Result<bool, JsValue> {
         let mut state = self.state.borrow_mut();
         let Some(event) = pointer_event(&state, x, y, MouseEventButton::Main, buttons) else {
-            return false;
+            return Ok(false);
         };
         state.dispatch(UiEvent::PointerMove(event))
     }
@@ -386,10 +378,16 @@ impl QuoxRenderer {
     /// `MouseEventButton`'s discriminants (`Main=0, Auxiliary=1, Secondary=2, Fourth=3,
     /// Fifth=4`); `buttons` is the currently-held bitmask. Returns whether a redraw was
     /// requested.
-    pub fn dispatch_pointer_down(&self, x: f32, y: f32, button: u8, buttons: u8) -> bool {
+    pub fn dispatch_pointer_down(
+        &self,
+        x: f32,
+        y: f32,
+        button: u8,
+        buttons: u8,
+    ) -> Result<bool, JsValue> {
         let mut state = self.state.borrow_mut();
         let Some(event) = pointer_event(&state, x, y, mouse_button(button), buttons) else {
-            return false;
+            return Ok(false);
         };
         state.dispatch(UiEvent::PointerDown(event))
     }
@@ -397,10 +395,16 @@ impl QuoxRenderer {
     /// Feed a pointer-up event into Blitz (clears `:active`, ends drag/selection, and is
     /// the trigger Blitz uses internally to synthesize `click`/`contextmenu`/`dblclick`).
     /// Returns whether a redraw was requested.
-    pub fn dispatch_pointer_up(&self, x: f32, y: f32, button: u8, buttons: u8) -> bool {
+    pub fn dispatch_pointer_up(
+        &self,
+        x: f32,
+        y: f32,
+        button: u8,
+        buttons: u8,
+    ) -> Result<bool, JsValue> {
         let mut state = self.state.borrow_mut();
         let Some(event) = pointer_event(&state, x, y, mouse_button(button), buttons) else {
-            return false;
+            return Ok(false);
         };
         state.dispatch(UiEvent::PointerUp(event))
     }
@@ -411,13 +415,20 @@ impl QuoxRenderer {
     /// caller) — passed as `BlitzWheelDelta::Pixels`, which Blitz applies directly (unlike
     /// `Lines`, which it internally multiplies ×20). Returns whether a redraw was
     /// requested.
-    pub fn dispatch_wheel(&self, x: f32, y: f32, delta_x: f64, delta_y: f64, buttons: u8) -> bool {
+    pub fn dispatch_wheel(
+        &self,
+        x: f32,
+        y: f32,
+        delta_x: f64,
+        delta_y: f64,
+        buttons: u8,
+    ) -> Result<bool, JsValue> {
         let mut state = self.state.borrow_mut();
         let scroll = state.document.viewport_scroll();
         let Some((page_x, page_y)) =
             viewport_point_to_page(x, y, state.width, state.height, scroll.x, scroll.y)
         else {
-            return false;
+            return Ok(false);
         };
 
         let event = BlitzWheelEvent {
@@ -439,22 +450,33 @@ impl QuoxRenderer {
         modifier_bits: u32,
         location: u32,
         event_flags: u32,
-    ) -> bool {
+    ) -> Result<bool, JsValue> {
         validate_key_abi(modifier_bits, location, event_flags);
         let mut state = self.state.borrow_mut();
         let event = key_event(code, key, modifier_bits, location, event_flags);
-        let cancel_keydown_default = event_flags & KEY_EVENT_PREVENT_DEFAULT != 0;
+        let keyboard = KeyboardMetadata {
+            code: code.to_owned(),
+            key: key.to_owned(),
+            location,
+            repeat: event_flags & KEY_EVENT_REPEAT != 0,
+            modifiers: build_raw_modifiers(modifier_bits),
+        };
+        let host_prevent_default = event_flags & KEY_EVENT_PREVENT_DEFAULT != 0;
         if event.state.is_pressed() {
-            state.dispatch_with_policy(UiEvent::KeyDown(event), cancel_keydown_default)
+            state.dispatch_with_policy(
+                UiEvent::KeyDown(event),
+                Some(keyboard),
+                host_prevent_default,
+            )
         } else {
-            state.dispatch(UiEvent::KeyUp(event))
+            state.dispatch_with_policy(UiEvent::KeyUp(event), Some(keyboard), false)
         }
     }
 
     /// Insert non-control text committed by the active keyboard layout.
-    pub fn dispatch_text_input(&self, text: &str) -> bool {
+    pub fn dispatch_text_input(&self, text: &str) -> Result<bool, JsValue> {
         if !is_insertable_text(text) {
-            return false;
+            return Ok(false);
         }
         self.state
             .borrow_mut()
@@ -462,10 +484,10 @@ impl QuoxRenderer {
     }
 
     /// Forward an `AppKit` `doCommandBySelector:` edit through Blitz's existing selector map.
-    pub fn dispatch_apple_standard_keybinding(&self, command: &str) -> bool {
+    pub fn dispatch_apple_standard_keybinding(&self, command: &str) -> Result<bool, JsValue> {
         self.state
             .borrow_mut()
-            .dispatch_apple_standard_keybinding(command)
+            .dispatch(UiEvent::AppleStandardKeybinding(command.into()))
     }
 
     /// Clear Blitz's hover state (and reset the cursor), e.g. when the pointer leaves the
@@ -477,39 +499,25 @@ impl QuoxRenderer {
         state.redraw_requested.swap(false, Ordering::Relaxed)
     }
 
-    /// Drain the element path a `click` followed since the last dispatch.
-    pub fn take_click_path(&self) -> Vec<u32> {
-        std::mem::take(&mut self.state.borrow_mut().recorded_events.click)
+    /// Mirror whether an element has a property handler so uninterested high-frequency events
+    /// can remain entirely inside Rust.
+    pub fn set_event_handler(&self, node_id: usize, kind: ElementEventKind, enabled: bool) {
+        self.state
+            .borrow_mut()
+            .event_bridge
+            .set_interest(node_id, kind, enabled);
     }
 
-    /// Drain the element path a `dblclick` followed since the last dispatch.
-    pub fn take_double_click_path(&self) -> Vec<u32> {
-        std::mem::take(&mut self.state.borrow_mut().recorded_events.double_click)
+    /// Take the next JavaScript event frame produced by the staged driver.
+    pub fn take_dom_event(&self) -> Result<JsValue, JsValue> {
+        self.state.borrow_mut().event_bridge.take_frame()
     }
 
-    /// Drain the element path a `contextmenu` followed since the last dispatch.
-    pub fn take_context_menu_path(&self) -> Vec<u32> {
-        std::mem::take(&mut self.state.borrow_mut().recorded_events.context_menu)
-    }
-
-    /// Drain the element path an `input` followed since the last dispatch.
-    pub fn take_input_path(&self) -> Vec<u32> {
-        std::mem::take(&mut self.state.borrow_mut().recorded_events.input)
-    }
-
-    /// Drain the element path a `focus` followed since the last dispatch.
-    pub fn take_focus_path(&self) -> Vec<u32> {
-        std::mem::take(&mut self.state.borrow_mut().recorded_events.focus)
-    }
-
-    /// Drain the element path a `blur` followed since the last dispatch.
-    pub fn take_blur_path(&self) -> Vec<u32> {
-        std::mem::take(&mut self.state.borrow_mut().recorded_events.blur)
-    }
-
-    /// Drain the element path a `scroll` followed since the last dispatch.
-    pub fn take_scroll_path(&self) -> Vec<u32> {
-        std::mem::take(&mut self.state.borrow_mut().recorded_events.scroll)
+    /// Resume the staged driver with JavaScript's cancellation decision.
+    pub fn finish_dom_event(&self, token: u32, default_prevented: bool) -> Result<bool, JsValue> {
+        self.state
+            .borrow_mut()
+            .finish_dom_event(token, default_prevented)
     }
 }
 
@@ -728,7 +736,7 @@ mod tests {
 
         dispatch_to_document(&mut document, &mut recorded, UiEvent::KeyDown(key), true);
         assert_eq!(input_raw_text(&mut document, input_id), "");
-        assert!(recorded.input.is_empty());
+        assert_eq!(recorded.input, None);
 
         recorded = RecordedEvents::default();
         dispatch_to_document(
@@ -738,10 +746,7 @@ mod tests {
             false,
         );
         assert_eq!(input_raw_text(&mut document, input_id), "ß");
-        assert_eq!(
-            recorded.input.first().copied(),
-            u32::try_from(input_id).ok()
-        );
+        assert_eq!(recorded.input, Some(input_id));
         assert_eq!(recorded.input_count, 1);
     }
 
@@ -760,10 +765,7 @@ mod tests {
 
         dispatch_to_document(&mut document, &mut recorded, UiEvent::KeyDown(key), false);
         assert_eq!(input_raw_text(&mut document, input_id), "");
-        assert_eq!(
-            recorded.input.first().copied(),
-            u32::try_from(input_id).ok()
-        );
+        assert_eq!(recorded.input, Some(input_id));
     }
 
     #[test]
@@ -785,7 +787,7 @@ mod tests {
                 UiEvent::KeyDown(key_event(key, key, 0, 0, KEY_EVENT_PRESSED)),
                 false,
             );
-            assert!(recorded.input.is_empty());
+            assert_eq!(recorded.input, None);
         }
 
         recorded = RecordedEvents::default();
@@ -824,10 +826,7 @@ mod tests {
             false,
         );
         assert_eq!(input_raw_text(&mut document, input_id), "a");
-        assert_eq!(
-            recorded.input.first().copied(),
-            u32::try_from(input_id).ok()
-        );
+        assert_eq!(recorded.input, Some(input_id));
         assert_eq!(recorded.input_count, 1);
     }
 
@@ -850,7 +849,7 @@ mod tests {
             false,
         );
         assert_eq!(input_raw_text(&mut document, input_id), "a");
-        assert!(recorded.input.is_empty());
+        assert_eq!(recorded.input, None);
     }
 
     #[test]
@@ -886,7 +885,7 @@ mod tests {
         assert_eq!(document.get_focussed_node_id(), Some(inputs[1]));
         assert_eq!(input_raw_text(&mut document, inputs[0]), "a");
         assert_eq!(input_raw_text(&mut document, inputs[1]), "b");
-        assert!(recorded.input.is_empty());
+        assert_eq!(recorded.input, None);
     }
 
     #[test]
@@ -911,9 +910,6 @@ mod tests {
         );
 
         assert_eq!(input_raw_text(&mut document, input_id), "");
-        assert_eq!(
-            recorded.input.first().copied(),
-            u32::try_from(input_id).ok()
-        );
+        assert_eq!(recorded.input, Some(input_id));
     }
 }

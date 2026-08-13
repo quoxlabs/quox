@@ -204,6 +204,7 @@ export function encodeKeyEvent(event: QuoxKeyboardEvent): EncodedKeyEvent {
   if (event.capsLock) modifierBits |= KeyModifierMask.CapsLock;
   if (event.altGraphKey) modifierBits |= KeyModifierMask.AltGraph;
   if (event.accelKey) modifierBits |= KeyModifierMask.Accelerator;
+  if (event.ctrlKey) modifierBits |= KeyModifierMask.Control;
 
   let eventFlags = 0;
   if (event.type === "keydown") {

@@ -1,5 +1,5 @@
 import type { QuoxDocument } from "./document.ts";
-import type { QuoxElement, QuoxEventHandler, QuoxNode } from "./node.ts";
+import type { QuoxElement, QuoxNode } from "./node.ts";
 
 const QUOX_VNODE = Symbol.for("quox.vnode");
 
@@ -119,7 +119,7 @@ function applyProps(element: QuoxElement, props: QuoxProps): void {
       if (property === undefined) {
         throw new TypeError(`Cannot set function value as "${rawName}" property.`);
       }
-      element[property] = value as QuoxEventHandler;
+      (element as unknown as Record<string, unknown>)[property] = value;
       continue;
     }
 
@@ -149,7 +149,26 @@ function applyProps(element: QuoxElement, props: QuoxProps): void {
 function eventPropertyName(name: string):
   | keyof Pick<
     QuoxElement,
-    "onclick" | "ondblclick" | "oncontextmenu" | "oninput" | "onfocus" | "onblur" | "onscroll"
+    | "onclick"
+    | "ondblclick"
+    | "oncontextmenu"
+    | "oninput"
+    | "onfocus"
+    | "onblur"
+    | "onscroll"
+    | "onpointermove"
+    | "onpointerdown"
+    | "onpointerup"
+    | "onpointerover"
+    | "onpointerout"
+    | "onmousemove"
+    | "onmousedown"
+    | "onmouseup"
+    | "onmouseover"
+    | "onmouseout"
+    | "onwheel"
+    | "onkeydown"
+    | "onkeyup"
   >
   | undefined {
   switch (name) {
@@ -174,6 +193,45 @@ function eventPropertyName(name: string):
     case "onScroll":
     case "onscroll":
       return "onscroll";
+    case "onPointerMove":
+    case "onpointermove":
+      return "onpointermove";
+    case "onPointerDown":
+    case "onpointerdown":
+      return "onpointerdown";
+    case "onPointerUp":
+    case "onpointerup":
+      return "onpointerup";
+    case "onPointerOver":
+    case "onpointerover":
+      return "onpointerover";
+    case "onPointerOut":
+    case "onpointerout":
+      return "onpointerout";
+    case "onMouseMove":
+    case "onmousemove":
+      return "onmousemove";
+    case "onMouseDown":
+    case "onmousedown":
+      return "onmousedown";
+    case "onMouseUp":
+    case "onmouseup":
+      return "onmouseup";
+    case "onMouseOver":
+    case "onmouseover":
+      return "onmouseover";
+    case "onMouseOut":
+    case "onmouseout":
+      return "onmouseout";
+    case "onWheel":
+    case "onwheel":
+      return "onwheel";
+    case "onKeyDown":
+    case "onkeydown":
+      return "onkeydown";
+    case "onKeyUp":
+    case "onkeyup":
+      return "onkeyup";
     default:
       return undefined;
   }
