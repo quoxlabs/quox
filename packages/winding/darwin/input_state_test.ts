@@ -46,6 +46,21 @@ Deno.test("Darwin dead key emits no text and completion emits one composed value
   ]);
 });
 
+Deno.test("Darwin dead-key cancellation emits a command but no text", () => {
+  const state = new DarwinInputState(window);
+  state.beginKey(keyEvent("Dead", "Quote"));
+  assertEquals(state.finishKey(), [keyEvent("Dead", "Quote")]);
+
+  state.beginKey(keyEvent("Escape", "Escape"));
+  state.performCommand("cancelOperation:");
+  const cancelled = state.finishKey();
+  assertEquals(cancelled, [
+    { ...keyEvent("Escape", "Escape"), editDisposition: "text-input" },
+    { type: "apple-standard-keybinding", command: "cancelOperation:", window },
+  ]);
+  assertEquals(cancelled.some((event) => event.type === "textinput"), false);
+});
+
 Deno.test("Darwin retains AppKit editing commands", () => {
   const state = new DarwinInputState(window);
   state.beginKey(keyEvent("Backspace", "Backspace"));

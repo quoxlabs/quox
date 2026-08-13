@@ -39,6 +39,44 @@ Deno.test("Wayland Compose keeps dead-key state private and commits once", () =>
   assertEquals({ text: complete.text, pending: complete.composePending }, { text: "é", pending: false });
 });
 
+Deno.test("Wayland Compose cancellation emits no text and resets private state", () => {
+  let step = 0;
+  let resets = 0;
+  const compose: ComposeAdapter = {
+    feed: () => ComposeFeedResult.ACCEPTED,
+    status: () => step++ === 0 ? ComposeStatus.COMPOSING : ComposeStatus.CANCELLED,
+    utf8: () => {
+      throw new Error("cancelled Compose state must not request text");
+    },
+    reset: () => resets++,
+  };
+  const dead = translateKey(40, "press", translator(0xfe51, ""), compose);
+  const cancelled = translateKey(1, "press", translator(0xff1b, ""), compose);
+  assertEquals({ text: dead.text, pending: dead.composePending }, { text: undefined, pending: true });
+  assertEquals(
+    { text: cancelled.text, pending: cancelled.composePending, resets },
+    { text: undefined, pending: false, resets: 1 },
+  );
+});
+
+Deno.test("Wayland Compose ignores an unaccepted key without exposing text", () => {
+  const compose: ComposeAdapter = {
+    feed: () => ComposeFeedResult.IGNORED,
+    status: () => ComposeStatus.COMPOSING,
+    utf8: () => {
+      throw new Error("ignored Compose input must not request text");
+    },
+    reset: () => {
+      throw new Error("ignored Compose input must not reset pending state");
+    },
+  };
+  const ignored = translateKey(42, "press", translator(0xffe1, ""), compose);
+  assertEquals(
+    { text: ignored.text, pending: ignored.composePending },
+    { text: undefined, pending: true },
+  );
+});
+
 Deno.test("Wayland text ownership excludes Ctrl shortcuts but includes AltGr", () => {
   const plain = {
     shiftKey: false,

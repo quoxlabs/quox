@@ -752,6 +752,126 @@ mod tests {
     }
 
     #[test]
+    fn key_default_arrows_move_the_caret_without_inserting_text() {
+        let (mut document, input_id) = focused_input_document();
+        let mut recorded = RecordedEvents::default();
+        dispatch_to_document(
+            &mut document,
+            &mut recorded,
+            UiEvent::Ime(BlitzImeEvent::Commit("ab".to_owned())),
+            false,
+        );
+
+        for key in ["ArrowLeft", "ArrowRight", "ArrowLeft"] {
+            recorded = RecordedEvents::default();
+            dispatch_to_document(
+                &mut document,
+                &mut recorded,
+                UiEvent::KeyDown(key_event(key, key, 0, 0, KEY_EVENT_PRESSED)),
+                false,
+            );
+            assert_eq!(recorded.input, None);
+        }
+
+        recorded = RecordedEvents::default();
+        dispatch_to_document(
+            &mut document,
+            &mut recorded,
+            UiEvent::Ime(BlitzImeEvent::Commit("X".to_owned())),
+            false,
+        );
+        assert_eq!(input_raw_text(&mut document, input_id), "aXb");
+        assert_eq!(recorded.input_count, 1);
+    }
+
+    #[test]
+    fn key_default_delete_preserves_forward_deletion() {
+        let (mut document, input_id) = focused_input_document();
+        let mut recorded = RecordedEvents::default();
+        dispatch_to_document(
+            &mut document,
+            &mut recorded,
+            UiEvent::Ime(BlitzImeEvent::Commit("ab".to_owned())),
+            false,
+        );
+        dispatch_to_document(
+            &mut document,
+            &mut recorded,
+            UiEvent::KeyDown(key_event("ArrowLeft", "ArrowLeft", 0, 0, KEY_EVENT_PRESSED)),
+            false,
+        );
+        recorded = RecordedEvents::default();
+
+        dispatch_to_document(
+            &mut document,
+            &mut recorded,
+            UiEvent::KeyDown(key_event("Delete", "Delete", 0, 0, KEY_EVENT_PRESSED)),
+            false,
+        );
+        assert_eq!(input_raw_text(&mut document, input_id), "a");
+        assert_eq!(recorded.input, Some(input_id));
+        assert_eq!(recorded.input_count, 1);
+    }
+
+    #[test]
+    fn key_default_enter_does_not_insert_text_into_a_single_line_input() {
+        let (mut document, input_id) = focused_input_document();
+        let mut recorded = RecordedEvents::default();
+        dispatch_to_document(
+            &mut document,
+            &mut recorded,
+            UiEvent::Ime(BlitzImeEvent::Commit("a".to_owned())),
+            false,
+        );
+        recorded = RecordedEvents::default();
+
+        dispatch_to_document(
+            &mut document,
+            &mut recorded,
+            UiEvent::KeyDown(key_event("Enter", "Enter", 0, 0, KEY_EVENT_PRESSED)),
+            false,
+        );
+        assert_eq!(input_raw_text(&mut document, input_id), "a");
+        assert_eq!(recorded.input, None);
+    }
+
+    #[test]
+    fn key_default_tab_moves_focus_without_inserting_text() {
+        let mut document = HtmlDocument::from_html(
+            "<!doctype html><html><body><input value=\"a\"><input value=\"b\"></body></html>",
+            DocumentConfig {
+                viewport: Some(Viewport::new(800, 600, 1.0, ColorScheme::Light)),
+                ..Default::default()
+            },
+        )
+        .into_inner();
+        document.resolve(0.0);
+        let inputs: Vec<_> = document
+            .tree()
+            .iter()
+            .filter_map(|(id, node)| {
+                node.element_data()
+                    .is_some_and(|element| element.name.local.as_ref() == "input")
+                    .then_some(id)
+            })
+            .collect();
+        assert_eq!(inputs.len(), 2);
+        assert!(document.set_focus_to(inputs[0]));
+        let mut recorded = RecordedEvents::default();
+
+        dispatch_to_document(
+            &mut document,
+            &mut recorded,
+            UiEvent::KeyDown(key_event("Tab", "Tab", 0, 0, KEY_EVENT_PRESSED)),
+            false,
+        );
+        assert_eq!(document.get_focussed_node_id(), Some(inputs[1]));
+        assert_eq!(input_raw_text(&mut document, inputs[0]), "a");
+        assert_eq!(input_raw_text(&mut document, inputs[1]), "b");
+        assert_eq!(recorded.input, None);
+    }
+
+    #[test]
     fn apple_standard_command_processes_the_generated_input_event() {
         let (mut document, input_id) = focused_input_document();
         let mut recorded = RecordedEvents::default();

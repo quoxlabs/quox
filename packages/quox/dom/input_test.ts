@@ -52,14 +52,14 @@ Deno.test("AltGraph excludes synthetic Control from the editor projection", () =
   assertEquals(encodeKeyEvent(mapped).modifierBits, 18);
 });
 
-Deno.test("router preserves keydown then textinput order", () => {
+Deno.test("router preserves keydown, textinput, then keyup order", () => {
   const order: string[] = [];
   const router = new QuoxInputRouter({
     pointerMove() {},
     pointerDown() {},
     pointerUp() {},
     wheel() {},
-    key: () => order.push("keydown"),
+    key: (event) => order.push(event.type),
     textInput: (event) => order.push(`text:${event.text}`),
     appleCommand() {},
     clearHover() {},
@@ -68,5 +68,6 @@ Deno.test("router preserves keydown then textinput order", () => {
   });
   router.route(mapWindingEvent({ ...base, type: "keydown", repeat: false, editDisposition: "text-input" }));
   router.route(mapWindingEvent({ type: "textinput", text: "y", window }));
-  assertEquals(order, ["keydown", "text:y"]);
+  router.route(mapWindingEvent({ ...base, type: "keyup", repeat: false }));
+  assertEquals(order, ["keydown", "text:y", "keyup"]);
 });
