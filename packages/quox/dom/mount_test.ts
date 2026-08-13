@@ -310,7 +310,8 @@ Deno.test("mount rejects unsupported function-valued DOM props", async () => {
   await assertRejects(
     () => mount(root, createVNode("div", { unsupported: () => undefined })),
     TypeError,
-    'Cannot set function value as "unsupported" property.',
+    'The "unsupported" prop received a function, but Quox only accepts functions for supported event props ' +
+      '(such as "onClick" or "onInput"). Use a supported event prop, or call the function and pass its return value instead.',
   );
 });
 

@@ -117,7 +117,10 @@ function applyProps(element: QuoxElement, props: QuoxProps): void {
     if (typeof value === "function") {
       const property = eventPropertyName(rawName);
       if (property === undefined) {
-        throw new TypeError(`Cannot set function value as "${rawName}" property.`);
+        throw new TypeError(
+          `The "${rawName}" prop received a function, but Quox only accepts functions for supported event props ` +
+            '(such as "onClick" or "onInput"). Use a supported event prop, or call the function and pass its return value instead.',
+        );
       }
       (element as unknown as Record<string, unknown>)[property] = value;
       continue;
