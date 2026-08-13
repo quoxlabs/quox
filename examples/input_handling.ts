@@ -42,7 +42,7 @@ if (import.meta.main) {
         console.log(
           `Key ${event.type === "keydown" ? "pressed" : "released"}: ${event.key} (${event.code})${
             formatModifiers(event)
-          }`,
+          }${event.repeat ? " (repeated)" : ""}`,
         );
         break;
       case "textinput":
