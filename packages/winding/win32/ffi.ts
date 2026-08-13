@@ -28,6 +28,14 @@ export const gdi32functions = {
 } as const satisfies Deno.ForeignLibraryInterface;
 
 export const user32functions = {
+  // DPI_AWARENESS_CONTEXT is a pointer-sized pseudo-handle, passed here as an
+  // isize (see DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 in mod.ts).
+  SetProcessDpiAwarenessContext: { parameters: ["isize"], result: "bool" },
+  GetClientRect: { parameters: ["pointer", "buffer"], result: "bool" },
+  SetWindowPos: {
+    parameters: ["pointer", "pointer", "i32", "i32", "i32", "i32", "u32"],
+    result: "bool",
+  },
   GetDC: { parameters: ["pointer"], result: "pointer" },
   GetKeyState: { parameters: ["i32"], result: "i16" },
   GetKeyboardState: { parameters: ["buffer"], result: "bool" },

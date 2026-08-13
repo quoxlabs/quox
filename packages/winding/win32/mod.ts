@@ -23,6 +23,20 @@ const DIB_RGB_COLORS = 0;
 const TRACKMOUSEEVENT_SIZE = 24;
 const TME_LEAVE = 0x00000002;
 
+// DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 == (HANDLE)-4. Declaring the
+// process per-monitor DPI aware makes window sizes and the blitted bitmap map
+// to physical device pixels 1:1 with the render buffer, instead of being
+// virtualized at 96 DPI and stretched by DWM on scaled displays.
+const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4n;
+
+// CW_USEDEFAULT: let the OS choose (used for the window's x/y position).
+const CW_USEDEFAULT = 0x80000000;
+
+// SetWindowPos flags: keep the position and z-order chosen at creation.
+const SWP_NOMOVE = 0x2;
+const SWP_NOZORDER = 0x4;
+const SWP_NOACTIVATE = 0x10;
+
 const DOWN_BUTTON: Partial<Record<WM, "left" | "middle" | "right">> = {
   [WM.LBUTTONDOWN]: "left",
   [WM.MBUTTONDOWN]: "middle",
@@ -67,16 +81,16 @@ class Win32Window implements Window {
   minimized = false;
   #closed = false;
 
-  constructor(readonly lib: Win32Library, classNameBuf: ArrayBuffer) {
+  constructor(readonly lib: Win32Library, classNameBuf: ArrayBuffer, w = 800, h = 600) {
     const window = lib.user32.symbols.CreateWindowExW(
       0,
       classNameBuf,
       null,
       0x10CF0000,
-      0x80000000,
-      0x80000000,
-      0x80000000,
-      0x80000000,
+      CW_USEDEFAULT, // x: OS-chosen position (y is ignored when x is CW_USEDEFAULT)
+      CW_USEDEFAULT, // y
+      w,
+      h,
       null,
       null,
       lib.instance,
@@ -84,6 +98,7 @@ class Win32Window implements Window {
     );
     if (window == null) throw new Error(lib.getLastError());
     this.#hwnd = window;
+    this.#resizeClientTo(w, h);
     this.id = BigInt(Deno.UnsafePointer.value(window));
     lib.windows.set(this.id, this);
     try {
@@ -103,6 +118,32 @@ class Win32Window implements Window {
 
   get hwnd(): Deno.PointerObject {
     return this.#hwnd;
+  }
+
+  /**
+   * Grow the window so its *client* area is exactly w×h. CreateWindowExW's
+   * width/height size the whole window (title bar and borders included), but
+   * the render buffer and `blit` target the client area, so without this the
+   * drawable would be smaller than requested and the blit would be clipped.
+   */
+  #resizeClientTo(w: number, h: number): void {
+    const rect = new ArrayBuffer(16); // RECT { left, top, right, bottom } as i32
+    if (!this.lib.user32.symbols.GetClientRect(this.#hwnd, rect)) return;
+    const dv = new DataView(rect);
+    const clientW = dv.getInt32(8, true) - dv.getInt32(0, true);
+    const clientH = dv.getInt32(12, true) - dv.getInt32(4, true);
+    const frameW = w - clientW;
+    const frameH = h - clientH;
+    if (frameW === 0 && frameH === 0) return;
+    this.lib.user32.symbols.SetWindowPos(
+      this.#hwnd,
+      null,
+      0,
+      0,
+      w + frameW,
+      h + frameH,
+      SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+    );
   }
 
   setTitle(title: string): void {
@@ -211,6 +252,12 @@ class Win32Library implements Library {
     this.kernel32 = Deno.dlopen("kernel32", kernel32functions);
     this.user32 = Deno.dlopen("user32", user32functions);
     this.gdi32 = Deno.dlopen("gdi32", gdi32functions);
+
+    // Opt the whole process into per-monitor DPI awareness before creating any
+    // window. Best-effort: this fails harmlessly if awareness was already set
+    // (e.g. via an application manifest).
+    this.user32.symbols.SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
     this.input = new Win32InputController(
       this.user32,
       (event) => this.#events.push(event),
@@ -395,9 +442,9 @@ class Win32Library implements Library {
   }
 
   readonly windows = new Map<bigint, Win32Window>();
-  openWindow(_x = 0, _y = 0, _w = 800, _h = 600): Win32Window {
+  openWindow(_x = 0, _y = 0, w = 800, h = 600): Win32Window {
     if (this.#closed) throw new Error("winding(win32): library is closed");
-    const window = new Win32Window(this, this.#classNameBuffer);
+    const window = new Win32Window(this, this.#classNameBuffer, w, h);
     try {
       this.#callbackErrors.throwIfPending();
       return window;
