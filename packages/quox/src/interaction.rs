@@ -225,25 +225,25 @@ fn key_event(
     }
 }
 
-/// Records, per dispatched `DomEvent`, the target node id for the handful of event kinds a
+/// Records, per dispatched `DomEvent`, the element path for the handful of event kinds a
 /// host application cares about invoking a JS-registered handler for. Populated by
-/// `RecordingEventHandler` and drained by `QuoxRenderer::take_*_node()`.
+/// `RecordingEventHandler` and drained by `QuoxRenderer::take_*_path()`.
 #[derive(Default)]
 pub(super) struct RecordedEvents {
-    click: Option<usize>,
-    double_click: Option<usize>,
-    context_menu: Option<usize>,
-    input: Option<usize>,
-    focus: Option<usize>,
-    blur: Option<usize>,
-    scroll: Option<usize>,
+    click: Vec<u32>,
+    double_click: Vec<u32>,
+    context_menu: Vec<u32>,
+    input: Vec<u32>,
+    focus: Vec<u32>,
+    blur: Vec<u32>,
+    scroll: Vec<u32>,
     #[cfg(test)]
     input_count: usize,
 }
 
 /// Bridges Blitz's `EventHandler` hook (normally a no-op via `NoopEventHandler`) to a
 /// `RecordedEvents` buffer, so the wasm boundary can tell the TS side which node/event kind
-/// fired and let it invoke the matching JSX `onXxx` prop from `handlers.ts`'s registry.
+/// fired and let it invoke the matching browser-style `on*` property on `QuoxElement`.
 struct RecordingEventHandler<'a> {
     recorded: &'a mut RecordedEvents,
     cancel_keydown_default: bool,
@@ -254,31 +254,40 @@ impl EventHandler for RecordingEventHandler<'_> {
         &mut self,
         chain: &[usize],
         event: &mut DomEvent,
-        _doc: &mut dyn Document,
+        doc: &mut dyn Document,
         event_state: &mut EventState,
     ) {
         if self.cancel_keydown_default && matches!(event.data, DomEventData::KeyDown(_)) {
             event_state.prevent_default();
         }
 
-        let Some(target) = chain.first().copied() else {
-            return;
-        };
+        let document = doc.inner();
+        let path = chain
+            .iter()
+            .copied()
+            .filter(|node_id| {
+                document
+                    .get_node(*node_id)
+                    .and_then(blitz_dom::Node::element_data)
+                    .is_some()
+            })
+            .filter_map(|node_id| u32::try_from(node_id).ok())
+            .collect::<Vec<_>>();
 
         match &event.data {
-            DomEventData::Click(_) => self.recorded.click = Some(target),
-            DomEventData::DoubleClick(_) => self.recorded.double_click = Some(target),
-            DomEventData::ContextMenu(_) => self.recorded.context_menu = Some(target),
+            DomEventData::Click(_) => self.recorded.click = path,
+            DomEventData::DoubleClick(_) => self.recorded.double_click = path,
+            DomEventData::ContextMenu(_) => self.recorded.context_menu = path,
             DomEventData::Input(_) => {
-                self.recorded.input = Some(target);
+                self.recorded.input = path;
                 #[cfg(test)]
                 {
                     self.recorded.input_count += 1;
                 }
             }
-            DomEventData::Focus(_) => self.recorded.focus = Some(target),
-            DomEventData::Blur(_) => self.recorded.blur = Some(target),
-            DomEventData::Scroll(_) => self.recorded.scroll = Some(target),
+            DomEventData::Focus(_) => self.recorded.focus = path,
+            DomEventData::Blur(_) => self.recorded.blur = path,
+            DomEventData::Scroll(_) => self.recorded.scroll = path,
             _ => {}
         }
     }
@@ -468,39 +477,39 @@ impl QuoxRenderer {
         state.redraw_requested.swap(false, Ordering::Relaxed)
     }
 
-    /// Drain the node id a `click` fired on since the last dispatch, if any.
-    pub fn take_click_node(&self) -> Option<usize> {
-        self.state.borrow_mut().recorded_events.click.take()
+    /// Drain the element path a `click` followed since the last dispatch.
+    pub fn take_click_path(&self) -> Vec<u32> {
+        std::mem::take(&mut self.state.borrow_mut().recorded_events.click)
     }
 
-    /// Drain the node id a `dblclick` fired on since the last dispatch, if any.
-    pub fn take_double_click_node(&self) -> Option<usize> {
-        self.state.borrow_mut().recorded_events.double_click.take()
+    /// Drain the element path a `dblclick` followed since the last dispatch.
+    pub fn take_double_click_path(&self) -> Vec<u32> {
+        std::mem::take(&mut self.state.borrow_mut().recorded_events.double_click)
     }
 
-    /// Drain the node id a `contextmenu` fired on since the last dispatch, if any.
-    pub fn take_context_menu_node(&self) -> Option<usize> {
-        self.state.borrow_mut().recorded_events.context_menu.take()
+    /// Drain the element path a `contextmenu` followed since the last dispatch.
+    pub fn take_context_menu_path(&self) -> Vec<u32> {
+        std::mem::take(&mut self.state.borrow_mut().recorded_events.context_menu)
     }
 
-    /// Drain the node id an `input` fired on since the last dispatch, if any.
-    pub fn take_input_node(&self) -> Option<usize> {
-        self.state.borrow_mut().recorded_events.input.take()
+    /// Drain the element path an `input` followed since the last dispatch.
+    pub fn take_input_path(&self) -> Vec<u32> {
+        std::mem::take(&mut self.state.borrow_mut().recorded_events.input)
     }
 
-    /// Drain the node id a `focus` fired on since the last dispatch, if any.
-    pub fn take_focus_node(&self) -> Option<usize> {
-        self.state.borrow_mut().recorded_events.focus.take()
+    /// Drain the element path a `focus` followed since the last dispatch.
+    pub fn take_focus_path(&self) -> Vec<u32> {
+        std::mem::take(&mut self.state.borrow_mut().recorded_events.focus)
     }
 
-    /// Drain the node id a `blur` fired on since the last dispatch, if any.
-    pub fn take_blur_node(&self) -> Option<usize> {
-        self.state.borrow_mut().recorded_events.blur.take()
+    /// Drain the element path a `blur` followed since the last dispatch.
+    pub fn take_blur_path(&self) -> Vec<u32> {
+        std::mem::take(&mut self.state.borrow_mut().recorded_events.blur)
     }
 
-    /// Drain the node id a `scroll` fired on since the last dispatch, if any.
-    pub fn take_scroll_node(&self) -> Option<usize> {
-        self.state.borrow_mut().recorded_events.scroll.take()
+    /// Drain the element path a `scroll` followed since the last dispatch.
+    pub fn take_scroll_path(&self) -> Vec<u32> {
+        std::mem::take(&mut self.state.borrow_mut().recorded_events.scroll)
     }
 }
 
@@ -719,7 +728,7 @@ mod tests {
 
         dispatch_to_document(&mut document, &mut recorded, UiEvent::KeyDown(key), true);
         assert_eq!(input_raw_text(&mut document, input_id), "");
-        assert_eq!(recorded.input, None);
+        assert!(recorded.input.is_empty());
 
         recorded = RecordedEvents::default();
         dispatch_to_document(
@@ -729,7 +738,10 @@ mod tests {
             false,
         );
         assert_eq!(input_raw_text(&mut document, input_id), "ß");
-        assert_eq!(recorded.input, Some(input_id));
+        assert_eq!(
+            recorded.input.first().copied(),
+            u32::try_from(input_id).ok()
+        );
         assert_eq!(recorded.input_count, 1);
     }
 
@@ -748,7 +760,10 @@ mod tests {
 
         dispatch_to_document(&mut document, &mut recorded, UiEvent::KeyDown(key), false);
         assert_eq!(input_raw_text(&mut document, input_id), "");
-        assert_eq!(recorded.input, Some(input_id));
+        assert_eq!(
+            recorded.input.first().copied(),
+            u32::try_from(input_id).ok()
+        );
     }
 
     #[test]
@@ -770,7 +785,7 @@ mod tests {
                 UiEvent::KeyDown(key_event(key, key, 0, 0, KEY_EVENT_PRESSED)),
                 false,
             );
-            assert_eq!(recorded.input, None);
+            assert!(recorded.input.is_empty());
         }
 
         recorded = RecordedEvents::default();
@@ -809,7 +824,10 @@ mod tests {
             false,
         );
         assert_eq!(input_raw_text(&mut document, input_id), "a");
-        assert_eq!(recorded.input, Some(input_id));
+        assert_eq!(
+            recorded.input.first().copied(),
+            u32::try_from(input_id).ok()
+        );
         assert_eq!(recorded.input_count, 1);
     }
 
@@ -832,7 +850,7 @@ mod tests {
             false,
         );
         assert_eq!(input_raw_text(&mut document, input_id), "a");
-        assert_eq!(recorded.input, None);
+        assert!(recorded.input.is_empty());
     }
 
     #[test]
@@ -868,7 +886,7 @@ mod tests {
         assert_eq!(document.get_focussed_node_id(), Some(inputs[1]));
         assert_eq!(input_raw_text(&mut document, inputs[0]), "a");
         assert_eq!(input_raw_text(&mut document, inputs[1]), "b");
-        assert_eq!(recorded.input, None);
+        assert!(recorded.input.is_empty());
     }
 
     #[test]
@@ -893,6 +911,9 @@ mod tests {
         );
 
         assert_eq!(input_raw_text(&mut document, input_id), "");
-        assert_eq!(recorded.input, Some(input_id));
+        assert_eq!(
+            recorded.input.first().copied(),
+            u32::try_from(input_id).ok()
+        );
     }
 }

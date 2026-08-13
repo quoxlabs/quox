@@ -1,4 +1,4 @@
-import { openWindow, setElementFunctionProp } from "../packages/quox/mod.ts";
+import { openWindow } from "../packages/quox/mod.ts";
 
 const head = `
 <style>
@@ -88,14 +88,14 @@ if (import.meta.main) {
     counter.textContent = String(value);
   };
 
-  setElementFunctionProp(decrement, "onClick", () => {
+  decrement.onclick = () => {
     value -= 1;
     render();
-  });
-  setElementFunctionProp(increment, "onClick", () => {
+  };
+  increment.onclick = () => {
     value += 1;
     render();
-  });
+  };
 
   render();
   controls.appendChild(decrement);
