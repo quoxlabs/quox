@@ -3,32 +3,24 @@ import { QuoxRenderer as WasmRenderer } from "../lib/quox.js";
 import { load as windingLoad } from "@quoxlabs/winding";
 import type { Library as WindingLibrary, UIEvent as WindingUIEvent, Window as WindingWindow } from "@quoxlabs/winding";
 import { QuoxDocument } from "./document.ts";
+import { mapWindingEvent, notifyInputListeners, type QuoxInputEvent, QuoxInputRouter } from "./input.ts";
 import { isVNode, mount, type QuoxRenderable } from "./mount.ts";
 import type { QuoxElement, QuoxInnerHTML } from "./node.ts";
 
-export type QuoxInputEvent =
-  | QuoxMouseMoveEvent
-  | QuoxMouseButtonEvent
-  | QuoxMouseWheelEvent
-  | QuoxKeyboardEvent
-  | QuoxResizeEvent
-  | QuoxCloseEvent;
-
-export type QuoxMouseMoveEvent = { type: "mousemove"; x: number; y: number };
-export type QuoxMouseButtonEvent = { type: "mousedown" | "mouseup"; button: number };
-export type QuoxMouseWheelEvent = { type: "wheel"; deltaX: number; deltaY: number };
-export type QuoxKeyboardEvent = {
-  type: "keydown" | "keyup";
-  key: string;
-  code: string;
-  shiftKey: boolean;
-  ctrlKey: boolean;
-  altKey: boolean;
-  metaKey: boolean;
-  accelKey: boolean;
-};
-export type QuoxResizeEvent = { type: "resize"; width: number; height: number };
-export type QuoxCloseEvent = { type: "close" };
+export type {
+  QuoxAppleStandardKeybindingEvent,
+  QuoxCloseEvent,
+  QuoxFocusChangeEvent,
+  QuoxInputEvent,
+  QuoxKeyboardEvent,
+  QuoxMouseButtonEvent,
+  QuoxMouseEnterLeaveEvent,
+  QuoxMouseMoveEvent,
+  QuoxMouseWheelEvent,
+  QuoxResizeEvent,
+  QuoxTextInputEvent,
+  QuoxVisibilityEvent,
+} from "./input.ts";
 
 export type QuoxWindowContent = QuoxInnerHTML | QuoxRenderable;
 
@@ -46,7 +38,6 @@ export interface WindowOptions {
 }
 
 const DEFAULT_WINDOW_TITLE = "quox";
-const BUTTON_INDEX: Record<"left" | "middle" | "right", number> = { left: 0, middle: 1, right: 2 };
 
 /** Anything that isn't itself renderable content (a string, array, or vnode) is an options bag. */
 function isWindowOptions(value: QuoxWindowContent | WindowOptions | undefined): value is WindowOptions {
@@ -64,45 +55,6 @@ async function mountWindowContent(parent: QuoxElement, value: QuoxWindowContent 
   await mount(parent, value);
 }
 
-function mapWindingEvent(ev: WindingUIEvent): QuoxInputEvent | null {
-  switch (ev.type) {
-    case "mousemove":
-      return { type: "mousemove", x: ev.x, y: ev.y };
-    case "mousedown":
-      return { type: "mousedown", button: BUTTON_INDEX[ev.button] };
-    case "mouseup":
-      return { type: "mouseup", button: BUTTON_INDEX[ev.button] };
-    case "wheel":
-      return { type: "wheel", deltaX: ev.deltaX, deltaY: ev.deltaY };
-    case "keydown":
-      return {
-        type: "keydown",
-        key: String(ev.keycode),
-        code: ev.code,
-        shiftKey: ev.shiftKey,
-        ctrlKey: ev.ctrlKey,
-        altKey: ev.altKey,
-        metaKey: ev.metaKey,
-        accelKey: ev.accelKey,
-      };
-    case "keyup":
-      return {
-        type: "keyup",
-        key: String(ev.keycode),
-        code: ev.code,
-        shiftKey: ev.shiftKey,
-        ctrlKey: ev.ctrlKey,
-        altKey: ev.altKey,
-        metaKey: ev.metaKey,
-        accelKey: ev.accelKey,
-      };
-    case "resize":
-      return { type: "resize", width: ev.width, height: ev.height };
-    case "close":
-      return { type: "close" };
-  }
-}
-
 export class QuoxWindow implements Disposable {
   readonly #lib: WindingLibrary;
   readonly #win: WindingWindow;
@@ -116,7 +68,9 @@ export class QuoxWindow implements Disposable {
   #stopped = false;
   #disposed = false;
   #rendererFreed = false;
+  #visible = true;
   readonly #listeners: Array<(event: QuoxInputEvent) => void> = [];
+  readonly #inputRouter: QuoxInputRouter;
   readonly document: QuoxDocument;
 
   private constructor(
@@ -137,9 +91,29 @@ export class QuoxWindow implements Disposable {
       () => this.#assertActiveDocument(),
       (title) => this.#win.setTitle(title),
     );
+    this.#inputRouter = new QuoxInputRouter({
+      pointerMove: (x, y, buttons) => this.document.dispatchPointerMove(x, y, buttons),
+      pointerDown: (x, y, button, buttons) => this.document.dispatchPointerDown(x, y, button, buttons),
+      pointerUp: (x, y, button, buttons) => this.document.dispatchPointerUp(x, y, button, buttons),
+      wheel: (x, y, deltaX, deltaY, buttons) => this.document.dispatchWheel(x, y, deltaX, deltaY, buttons),
+      key: (event) => this.document.dispatchKey(event),
+      textInput: (event) => this.document.dispatchTextInput(event),
+      appleCommand: (event) => this.document.dispatchAppleStandardKeybinding(event),
+      clearHover: () => this.document.clearHover(),
+      resize: (event) => {
+        this.#width = event.width;
+        this.#height = event.height;
+        this.#renderer.resize(event.width, event.height);
+        this.#requestRender();
+      },
+      visibility: (event) => {
+        this.#visible = event.visible;
+        if (event.visible) this.#requestRender();
+      },
+    });
   }
 
-  /** Open a window and create a WASM renderer with a live document. */
+  /** Create a window with a live document without starting event processing. */
   static async create(options: WindowOptions = {}): Promise<QuoxWindow> {
     const width = options.width ?? 800;
     const height = options.height ?? 600;
@@ -147,23 +121,32 @@ export class QuoxWindow implements Disposable {
     const body = contentToString(options.body);
 
     const lib = windingLoad();
-    const win = lib.openWindow(0, 0, width, height);
-    const renderer = await WasmRenderer.create(width, height, head, body);
-    const quoxWindow = new QuoxWindow(lib, win, width, height, renderer);
-
+    let win: WindingWindow | undefined;
+    let renderer: WasmRenderer | undefined;
     try {
+      win = lib.openWindow(0, 0, width, height);
+      renderer = await WasmRenderer.create(width, height, head, body);
+      const quoxWindow = new QuoxWindow(lib, win, width, height, renderer);
       await mountWindowContent(quoxWindow.document.head, options.head);
       await mountWindowContent(quoxWindow.document.body, options.body);
       quoxWindow.setTitle(options.title ?? (quoxWindow.document.title || DEFAULT_WINDOW_TITLE));
+      return quoxWindow;
     } catch (error) {
-      quoxWindow[Symbol.dispose]();
-      throw error;
+      const errors = [error];
+      if (renderer !== undefined) {
+        const ownedRenderer = renderer;
+        captureCleanupError(errors, () => ownedRenderer.free());
+      }
+      if (win !== undefined) {
+        const ownedWindow = win;
+        captureCleanupError(errors, () => ownedWindow.close());
+      }
+      captureCleanupError(errors, () => lib.close());
+      throw cleanupError(errors, "Quox window initialization failed");
     }
-
-    return quoxWindow;
   }
 
-  /** Start native event polling and queue an initial render. */
+  /** Begin processing window events and render the initial document. */
   start(): void {
     if (this.#intervalId !== null) return;
     this.#intervalId = setInterval(() => {
@@ -174,40 +157,35 @@ export class QuoxWindow implements Disposable {
 
   #pollEvents(): void {
     // Drain all pending events and forward input events to listeners.
-    let ev: WindingUIEvent | undefined;
-    while ((ev = this.#lib.event()) !== undefined) {
-      const mapped = mapWindingEvent(ev);
-      if (mapped === null) continue;
+    const listenerErrors: unknown[] = [];
+    try {
+      let ev: WindingUIEvent | undefined;
+      while ((ev = this.#lib.event()) !== undefined) {
+        const mapped = mapWindingEvent(ev);
 
-      if (mapped.type === "close") {
-        // Notify listeners before tearing down so they can react.
-        for (const cb of this.#listeners) cb(mapped);
-        this[Symbol.dispose]();
-        return;
+        if (this.#inputRouter.route(mapped) === "close") {
+          // Notify listeners before tearing down so they can react.
+          this.#notifyListeners(mapped, listenerErrors);
+          this[Symbol.dispose]();
+          return;
+        }
+
+        this.#notifyListeners(mapped, listenerErrors);
       }
-
-      if (mapped.type === "resize") {
-        this.#width = mapped.width;
-        this.#height = mapped.height;
-        // Propagate new dimensions to the WASM renderer so Blitz/Vello reflows
-        // the layout at the correct viewport size.
-        this.#renderer.resize(mapped.width, mapped.height);
-        this.#requestRender();
+    } finally {
+      if (listenerErrors.length > 0) {
+        const error = listenerErrors.length === 1
+          ? listenerErrors[0]
+          : new AggregateError(listenerErrors, "Quox input listeners failed");
+        queueMicrotask(() => {
+          throw error;
+        });
       }
-
-      if (mapped.type === "wheel") {
-        // Scale raw wheel notches (±1) to pixels so the viewport scrolls a
-        // comfortable distance per tick.
-        const SCROLL_SPEED = 40;
-        this.#renderer.scroll(
-          Math.round(mapped.deltaX * SCROLL_SPEED),
-          Math.round(mapped.deltaY * SCROLL_SPEED),
-        );
-        this.#requestRender();
-      }
-
-      for (const cb of this.#listeners) cb(mapped);
     }
+  }
+
+  #notifyListeners(event: QuoxInputEvent, errors: unknown[]): void {
+    notifyInputListeners(this.#listeners, event, (error) => errors.push(error));
   }
 
   #requestRender(): void {
@@ -231,6 +209,9 @@ export class QuoxWindow implements Disposable {
 
   async #renderIfNeeded(): Promise<void> {
     if (this.#stopped || this.#disposed || this.#rendering || !this.#needsRender) return;
+    // Skip the actual render while minimized, but leave `#needsRender` set so becoming
+    // visible again immediately catches up. Event polling itself is never gated.
+    if (!this.#visible) return;
 
     this.#rendering = true;
     this.#needsRender = false;
@@ -254,7 +235,7 @@ export class QuoxWindow implements Disposable {
     }
   }
 
-  /** Register a callback that is invoked for every input event during a tick. */
+  /** Register a callback that is invoked for each window event. */
   addEventListener(callback: (event: QuoxInputEvent) => void): void {
     this.#listeners.push(callback);
   }
@@ -270,7 +251,7 @@ export class QuoxWindow implements Disposable {
     this.document.title = title;
   }
 
-  /** Stop the render loop and free WASM resources. */
+  /** Stop processing events and rendering, making the document inactive. */
   stop(): void {
     if (this.#stopped) return;
     this.#stopped = true;
@@ -292,14 +273,28 @@ export class QuoxWindow implements Disposable {
   [Symbol.dispose](): void {
     if (this.#disposed) return;
     this.#disposed = true;
-    this.stop();
-    this.#win.close();
-    this.#lib.close();
+    const errors: unknown[] = [];
+    captureCleanupError(errors, () => this.stop());
+    captureCleanupError(errors, () => this.#win.close());
+    captureCleanupError(errors, () => this.#lib.close());
+    if (errors.length > 0) throw cleanupError(errors, "Quox window shutdown failed");
   }
 }
 
+function captureCleanupError(errors: unknown[], operation: () => void): void {
+  try {
+    operation();
+  } catch (error) {
+    errors.push(error);
+  }
+}
+
+function cleanupError(errors: unknown[], message: string): unknown {
+  return errors.length === 1 ? errors[0] : new AggregateError(errors, message);
+}
+
 /**
- * Open a blank native window with a live DOM facade backed by Blitz's WASM document mutator.
+ * Open a native window with a live DOM-like document.
  *
  * Accepts either a `WindowOptions` bag, or content (an HTML string or JSX) as shorthand for
  * `{ body: content }`.

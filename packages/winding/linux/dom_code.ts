@@ -3,7 +3,7 @@
 // found in Chromium's LICENSE file.
 // Derived from Chromium's dom_code_data.inc.
 
-const KEYCODE_TO_DOM_CODE: Record<number, string> = {
+const EVDEV_TO_DOM_CODE: Readonly<Record<number, string>> = {
   0x0001: "Escape",
   0x0002: "Digit1",
   0x0003: "Digit2",
@@ -128,6 +128,7 @@ const KEYCODE_TO_DOM_CODE: Record<number, string> = {
   0x007f: "ContextMenu",
   0x0080: "BrowserStop",
   0x0081: "Again",
+  0x0082: "Props",
   0x0083: "Undo",
   0x0084: "Select",
   0x0085: "Copy",
@@ -175,9 +176,11 @@ const KEYCODE_TO_DOM_CODE: Record<number, string> = {
   0x00e0: "BrightnessDown",
   0x00e1: "BrightnessUp",
   0x00e3: "DisplayToggleIntExt",
+  0x00e4: "KeyboardBacklightToggle",
   0x00e7: "MailSend",
   0x00e8: "MailReply",
   0x00e9: "MailForward",
+  0x00f8: "MicrophoneMuteToggle",
   0x0174: "ZoomToggle",
   0x01d0: "Fn",
   0x0243: "LaunchControlPanel",
@@ -185,8 +188,15 @@ const KEYCODE_TO_DOM_CODE: Record<number, string> = {
   0x0245: "LaunchScreenSaver",
   0x0247: "LaunchAssistant",
   0x0248: "KeyboardLayoutSelect",
+  0x0279: "PrivacyScreenToggle",
 };
 
-export function getDomCode(keycode: number): string {
-  return KEYCODE_TO_DOM_CODE[keycode] ?? "Unidentified";
+/** Translate a Linux evdev keycode to a DOM KeyboardEvent.code value. */
+export function domCodeFromEvdev(keycode: number): string {
+  return Number.isInteger(keycode) ? EVDEV_TO_DOM_CODE[keycode] ?? "Unidentified" : "Unidentified";
+}
+
+/** Core X11 keycodes are the equivalent evdev keycode plus eight. */
+export function domCodeFromX11(keycode: number): string {
+  return domCodeFromEvdev(keycode - 8);
 }

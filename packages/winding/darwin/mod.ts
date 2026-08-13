@@ -1,5 +1,22 @@
-import type { KeyModifiers, Library, LoadLibrary, UIEvent, Window } from "../types.ts";
+import type {
+  KeyDownEvent,
+  KeyEventBase,
+  KeyModifiers,
+  KeyUpEvent,
+  Library,
+  LoadLibrary,
+  UIEvent,
+  Window,
+} from "../types.ts";
+import {
+  createKeyDownEvent,
+  createKeyUpEvent,
+  EventQueue,
+  keyLocationForCode,
+  PressedLogicalKeyCache,
+} from "../input/mod.ts";
 import { getDomCode } from "./dom_code.ts";
+import { DarwinInputState } from "./input_state.ts";
 import {
   addMethod as runtimeAddMethod,
   allocateClassPair as runtimeAllocateClassPair,
@@ -14,21 +31,52 @@ import {
   NSPOINT,
   NSRECT,
   type ObjcRuntime,
+  openNSRectMsgSend,
+  readCFString,
   readStructF64,
   RGBA_BITMAP_INFO,
   runtimeSymbols,
   sel as runtimeSel,
+  selectorName as runtimeSelectorName,
 } from "./ffi.ts";
+import { type DarwinNativeClasses, type DarwinNativeResponder, ensureNativeClasses } from "./native_classes.ts";
+import { isPotentiallyPrintableCode, logicalKeyForEvent, uninterpretedCommitText } from "./text_input.ts";
 
 // NSWindowStyleMask: Titled | Closable | Resizable | Miniaturizable
 const NS_WINDOW_STYLE_MASK = 1 | 2 | 8 | 4;
 const NS_BACKING_STORE_BUFFERED = 2n;
 const NS_APPLICATION_ACTIVATION_POLICY_REGULAR = 0n;
 const NS_EVENT_MASK_ANY = 0xFFFFFFFFFFFFFFFFn;
+const NS_EVENT_MODIFIER_FLAG_CAPS_LOCK = 1n << 16n;
 const NS_EVENT_MODIFIER_FLAG_SHIFT = 1n << 17n;
 const NS_EVENT_MODIFIER_FLAG_CONTROL = 1n << 18n;
 const NS_EVENT_MODIFIER_FLAG_OPTION = 1n << 19n;
 const NS_EVENT_MODIFIER_FLAG_COMMAND = 1n << 20n;
+// NSTrackingAreaOptions: MouseEnteredAndExited | ActiveInKeyWindow | InVisibleRect. The rect
+// passed to `initWithRect:` is ignored when InVisibleRect is set — AppKit tracks the owning
+// view's visible rect automatically, so the area stays correct across resizes for free.
+const NS_TRACKING_AREA_OPTIONS = 0x01 | 0x20 | 0x200;
+
+function modifierFlagForCode(code: string): bigint | undefined {
+  switch (code) {
+    case "CapsLock":
+      return NS_EVENT_MODIFIER_FLAG_CAPS_LOCK;
+    case "ShiftLeft":
+    case "ShiftRight":
+      return NS_EVENT_MODIFIER_FLAG_SHIFT;
+    case "ControlLeft":
+    case "ControlRight":
+      return NS_EVENT_MODIFIER_FLAG_CONTROL;
+    case "AltLeft":
+    case "AltRight":
+      return NS_EVENT_MODIFIER_FLAG_OPTION;
+    case "MetaLeft":
+    case "MetaRight":
+      return NS_EVENT_MODIFIER_FLAG_COMMAND;
+    default:
+      return undefined;
+  }
+}
 
 type Closeable = { close(): void };
 
@@ -52,9 +100,16 @@ function openMsgSendSymbols(libraries: Closeable[]) {
   return {
     id: openMsgSend(libraries, ["pointer", "pointer"], "pointer"),
     id_cstr: openMsgSend(libraries, ["pointer", "pointer", "buffer"], "pointer"),
+    id_id: openMsgSend(libraries, ["pointer", "pointer", "pointer"], "pointer"),
+    id_rect: openMsgSend(libraries, ["pointer", "pointer", NSRECT], "pointer"),
     id_rectU64U64Bool: openMsgSend(
       libraries,
       ["pointer", "pointer", NSRECT, "u64", "u64", "bool"],
+      "pointer",
+    ),
+    id_rectU64PtrPtr: openMsgSend(
+      libraries,
+      ["pointer", "pointer", NSRECT, "u64", "pointer", "pointer"],
       "pointer",
     ),
     id_u64PtrPtrBool: openMsgSend(
@@ -64,10 +119,11 @@ function openMsgSendSymbols(libraries: Closeable[]) {
     ),
     void: openMsgSend(libraries, ["pointer", "pointer"], "void"),
     void_id: openMsgSend(libraries, ["pointer", "pointer", "pointer"], "void"),
+    bool: openMsgSend(libraries, ["pointer", "pointer"], "bool"),
+    bool_id: openMsgSend(libraries, ["pointer", "pointer", "pointer"], "bool"),
     void_bool: openMsgSend(libraries, ["pointer", "pointer", "bool"], "void"),
     void_i64: openMsgSend(libraries, ["pointer", "pointer", "i64"], "void"),
     point: openMsgSend(libraries, ["pointer", "pointer"], NSPOINT),
-    rect: openMsgSend(libraries, ["pointer", "pointer"], NSRECT),
     f64: openMsgSend(libraries, ["pointer", "pointer"], "f64"),
     u16: openMsgSend(libraries, ["pointer", "pointer"], "u16"),
     i64: openMsgSend(libraries, ["pointer", "pointer"], "i64"),
@@ -87,6 +143,7 @@ function openDarwinFfi() {
     opened.push(runtime);
 
     const send = openMsgSendSymbols(opened);
+    const nsrect = openNSRectMsgSend(opened);
 
     const cg = Deno.dlopen(CORE_GRAPHICS, cgSymbols);
     opened.push(cg);
@@ -98,12 +155,14 @@ function openDarwinFfi() {
       appKit,
       runtime,
       send,
+      nsrect,
       cg,
       cf,
       getClass: (name: string) => runtimeGetClass(runtime, name),
       sel: (name: string) => runtimeSel(runtime, name),
       allocateClassPair: (superclass: Deno.PointerObject, name: string) =>
         runtimeAllocateClassPair(runtime, superclass, name),
+      selectorName: (selector: Deno.PointerValue) => runtimeSelectorName(runtime, selector),
       registerClassPair: runtime.symbols.objc_registerClassPair,
       addMethod: (
         cls: Deno.PointerObject,
@@ -134,6 +193,7 @@ const NSEventType = {
   RightMouseDragged: 7n,
   KeyDown: 10n,
   KeyUp: 11n,
+  FlagsChanged: 12n,
   ScrollWheel: 22n,
   OtherMouseDown: 25n,
   OtherMouseUp: 26n,
@@ -150,8 +210,8 @@ function pointerId(p: Deno.PointerValue): bigint {
   return BigInt(Deno.UnsafePointer.value(p));
 }
 
-function getModifiers(event: Deno.PointerValue, lib: DarwinLibrary): KeyModifiers {
-  const { sel, send } = lib.ffi;
+function getModifiers(event: Deno.PointerValue, ffi: DarwinFfi): KeyModifiers {
+  const { sel, send } = ffi;
   const flags = send.u64(event, sel("modifierFlags"));
   const metaKey = (flags & NS_EVENT_MODIFIER_FLAG_COMMAND) !== 0n;
   return {
@@ -160,17 +220,29 @@ function getModifiers(event: Deno.PointerValue, lib: DarwinLibrary): KeyModifier
     altKey: (flags & NS_EVENT_MODIFIER_FLAG_OPTION) !== 0n,
     metaKey,
     accelKey: metaKey,
+    capsLock: (flags & NS_EVENT_MODIFIER_FLAG_CAPS_LOCK) !== 0n,
+    altGraphKey: false,
   };
 }
 
-class DarwinWindow implements Window {
+function readInputString(value: Deno.PointerValue, ffi: DarwinFfi): string {
+  if (value === null) return "";
+  return readCFString(ffi.cf, value);
+}
+
+class DarwinWindow implements Window, DarwinNativeResponder {
   readonly id: bigint;
   readonly nsWindow: Deno.PointerValue;
   readonly contentView: Deno.PointerValue;
   readonly #layer: Deno.PointerValue;
   readonly #delegate: Deno.PointerValue;
+  readonly inputState: DarwinInputState;
   #width: number;
   #height: number;
+  #keyDispatchActive = false;
+  #producedText: string | undefined;
+  readonly #pressedKeys = new PressedLogicalKeyCache<number>();
+  #closed = false;
   // Kept alive for one extra frame: CGImage/CGDataProvider wrap this memory
   // without copying it, and CALayer's `contents` assignment is composited
   // asynchronously, so the previous frame's buffer must outlive the call that
@@ -195,20 +267,85 @@ class DarwinWindow implements Window {
     this.id = pointerId(win);
     this.#width = w;
     this.#height = h;
+    this.inputState = new DarwinInputState(this);
+    let delegate: Deno.PointerValue = null;
+    let contentView: Deno.PointerValue = null;
+    let delegateRegistered = false;
+    let viewRegistered = false;
+    try {
+      const delegateAlloc = send.id(lib.nativeClasses.delegate, sel("alloc"));
+      delegate = send.id(delegateAlloc, sel("init"));
+      if (delegate === null) throw new Error("winding(darwin): failed to create window delegate");
+      this.#delegate = delegate;
+      lib.nativeClasses.registerDelegate(delegate, this);
+      delegateRegistered = true;
+      send.void_id(win, sel("setDelegate:"), delegate);
 
-    const delegateAlloc = send.id(lib.delegateClass, sel("alloc"));
-    this.#delegate = send.id(delegateAlloc, sel("init"));
-    lib.delegates.set(pointerId(this.#delegate), this);
-    send.void_id(win, sel("setDelegate:"), this.#delegate);
+      const viewAlloc = send.id(lib.nativeClasses.contentView, sel("alloc"));
+      contentView = send.id_rect(
+        viewAlloc,
+        sel("initWithFrame:"),
+        new Float64Array([0, 0, w, h]),
+      );
+      if (contentView === null) throw new Error("winding(darwin): failed to create content view");
+      this.contentView = contentView;
+      lib.nativeClasses.registerView(contentView, this);
+      viewRegistered = true;
+      send.void_id(win, sel("setContentView:"), contentView);
+      send.void_bool(contentView, sel("setWantsLayer:"), true);
+      const layer = send.id(contentView, sel("layer"));
+      if (layer === null) throw new Error("winding(darwin): failed to create content layer");
+      this.#layer = layer;
 
-    this.contentView = send.id(win, sel("contentView"));
-    send.void_bool(this.contentView, sel("setWantsLayer:"), true);
-    this.#layer = send.id(this.contentView, sel("layer"));
+      // Tracking area to receive mouseEntered:/mouseExited: on our delegate (registered as its
+      // owner below), which AppKit invokes directly rather than delivering as queued NSEvents.
+      const trackingAreaAlloc = send.id(getClass("NSTrackingArea"), sel("alloc"));
+      const trackingArea = send.id_rectU64PtrPtr(
+        trackingAreaAlloc,
+        sel("initWithRect:options:owner:userInfo:"),
+        new Float64Array(4),
+        BigInt(NS_TRACKING_AREA_OPTIONS),
+        delegate,
+        null,
+      );
+      if (trackingArea === null) throw new Error("winding(darwin): failed to create tracking area");
+      try {
+        send.void_id(contentView, sel("addTrackingArea:"), trackingArea);
+      } finally {
+        send.void(trackingArea, sel("release"));
+      }
 
-    send.void_bool(win, sel("makeKeyAndOrderFront:"), false);
-    send.void_bool(lib.nsApp, sel("activateIgnoringOtherApps:"), true);
-
-    lib.windows.set(this.id, this);
+      // A window cannot reliably become key while its application is inactive.
+      // Activate first so AppKit delivers windowDidBecomeKey: synchronously when
+      // the desktop session permits foreground activation.
+      send.void_bool(lib.nsApp, sel("activateIgnoringOtherApps:"), true);
+      send.void_bool(win, sel("makeKeyAndOrderFront:"), false);
+      if (!send.bool_id(win, sel("makeFirstResponder:"), contentView)) {
+        throw new Error("winding(darwin): failed to make content view first responder");
+      }
+      lib.registerWindow(this);
+    } catch (error) {
+      const errors = [error];
+      const cleanup = (operation: () => void): void => {
+        try {
+          operation();
+        } catch (cleanupError) {
+          errors.push(cleanupError);
+        }
+      };
+      if (viewRegistered) cleanup(() => lib.nativeClasses.unregisterView(contentView));
+      if (delegateRegistered) cleanup(() => lib.nativeClasses.unregisterDelegate(delegate));
+      cleanup(() => this.inputState.close());
+      cleanup(() => send.void_id(win, sel("setDelegate:"), null));
+      cleanup(() => send.bool_id(win, sel("makeFirstResponder:"), null));
+      cleanup(() => send.void_id(win, sel("orderOut:"), null));
+      if (contentView !== null) cleanup(() => send.void(contentView, sel("release")));
+      cleanup(() => send.void(win, sel("release")));
+      if (delegate !== null) cleanup(() => send.void(delegate, sel("release")));
+      throw errors.length === 1
+        ? errors[0]
+        : new AggregateError(errors, "winding(darwin): errors while unwinding window creation");
+    }
   }
 
   setSize(width: number, height: number): void {
@@ -218,6 +355,231 @@ class DarwinWindow implements Window {
 
   get height(): number {
     return this.#height;
+  }
+
+  handleNativeWindowEvent(
+    kind:
+      | "close"
+      | "resize"
+      | "mouseenter"
+      | "mouseleave"
+      | "focus"
+      | "blur"
+      | "hidden"
+      | "visible",
+  ): void {
+    switch (kind) {
+      case "close":
+        this.lib.pushEvent({ type: "close", window: this });
+        return;
+      case "resize":
+        this.handleResize();
+        return;
+      case "mouseenter":
+      case "mouseleave":
+        this.lib.pushEvent({ type: kind, window: this });
+        return;
+      case "focus":
+        this.handleFocusGained();
+        return;
+      case "blur":
+        this.handleFocusLost();
+        return;
+      case "hidden":
+      case "visible":
+        this.lib.pushEvent({
+          type: "visibilitychange",
+          visible: kind === "visible",
+          window: this,
+        });
+        return;
+    }
+  }
+
+  handleNativeKeyEvent(
+    kind: "keydown" | "keyup" | "flagschanged",
+    event: Deno.PointerValue,
+  ): void {
+    switch (kind) {
+      case "keydown":
+        this.handleKeyDown(event);
+        return;
+      case "keyup":
+        this.handleKeyUp(event);
+        return;
+      case "flagschanged":
+        this.handleFlagsChanged(event);
+        return;
+    }
+  }
+
+  handleNativeInsertText(text: Deno.PointerValue): void {
+    this.handleInsertText(text);
+  }
+
+  handleNativeCommand(command: Deno.PointerValue): void {
+    this.handleCommand(command);
+  }
+
+  handleResize(): void {
+    if (this.#closed) return;
+    const { nsrect, sel } = this.lib.ffi;
+    const frame = nsrect.noArgs(this.contentView, sel("frame"));
+    const width = Math.round(readStructF64(frame, 16));
+    const height = Math.round(readStructF64(frame, 24));
+    this.setSize(width, height);
+    this.lib.pushEvent({ type: "resize", width, height, window: this });
+  }
+
+  handleFocusGained(): void {
+    if (this.#closed) return;
+    this.lib.pushEvent({ type: "focus", window: this });
+  }
+
+  handleFocusLost(): void {
+    if (this.#closed) return;
+    this.resetModifierState();
+    this.#pressedKeys.clear();
+    this.lib.pushEvent({ type: "blur", window: this });
+  }
+
+  handleKeyDown(event: Deno.PointerValue): void {
+    if (this.#closed || event === null) return;
+    this.lib.markNativeEventHandled(event);
+    const native = this.#nativeKeyData(event);
+    const key: KeyDownEvent = createKeyDownEvent({
+      ...native.base,
+      repeat: this.lib.ffi.send.bool(event, this.lib.ffi.sel("isARepeat")),
+      editDisposition: "key-default",
+    });
+    this.inputState.beginKey(key);
+    this.#keyDispatchActive = true;
+    this.#producedText = undefined;
+    try {
+      const directText = uninterpretedCommitText(
+        native.characters,
+        native.base.ctrlKey,
+        native.base.metaKey,
+      );
+      if (directText !== undefined || isPotentiallyPrintableCode(native.base.code)) {
+        this.#producedText = this.inputState.insertText(directText ?? "");
+      } else {
+        const { getClass, sel, send } = this.lib.ffi;
+        const events = send.id_id(getClass("NSArray"), sel("arrayWithObject:"), event);
+        send.void_id(this.contentView, sel("interpretKeyEvents:"), events);
+      }
+    } finally {
+      const batch = this.inputState.finishKey();
+      const completedKey = batch[0];
+      if (completedKey?.type === "keydown") {
+        const resolvedKey = logicalKeyForEvent({
+          code: completedKey.code,
+          characters: native.characters,
+          charactersIgnoringModifiers: native.charactersIgnoringModifiers,
+          producedText: this.#producedText,
+        });
+        completedKey.key = this.#pressedKeys.press(completedKey.keycode, resolvedKey);
+      }
+      this.#keyDispatchActive = false;
+      this.#producedText = undefined;
+      this.lib.pushEvents(batch);
+    }
+  }
+
+  handleKeyUp(event: Deno.PointerValue): void {
+    if (this.#closed || event === null) return;
+    this.lib.markNativeEventHandled(event);
+    const native = this.#nativeKeyData(event);
+    const key: KeyUpEvent = createKeyUpEvent({
+      ...native.base,
+      key: this.#pressedKeys.release(native.base.keycode),
+    });
+    this.lib.pushEvent(key);
+  }
+
+  /** A keydown consumed by AppKit before reaching the content responder is OS-owned. */
+  handlePlatformKeyDown(event: Deno.PointerValue): void {
+    if (this.#closed || event === null) return;
+    const native = this.#nativeKeyData(event);
+    const key = createKeyDownEvent({
+      ...native.base,
+      repeat: this.lib.ffi.send.bool(event, this.lib.ffi.sel("isARepeat")),
+      editDisposition: "platform",
+    });
+    key.key = this.#pressedKeys.press(key.keycode, key.key);
+    this.lib.pushEvent(key);
+  }
+
+  handleFlagsChanged(event: Deno.PointerValue): void {
+    if (this.#closed || event === null) return;
+    this.lib.markNativeEventHandled(event);
+    const native = this.#nativeKeyData(event);
+    const code = native.base.code;
+    const flags = this.lib.ffi.send.u64(event, this.lib.ffi.sel("modifierFlags"));
+    const flag = modifierFlagForCode(code);
+    const type = this.inputState.modifierTransition(code, flags, flag);
+    if (type === "keydown") {
+      const key: KeyDownEvent = createKeyDownEvent({
+        ...native.base,
+        repeat: false,
+        editDisposition: "key-default",
+      });
+      this.#pressedKeys.press(key.keycode, key.key);
+      this.lib.pushEvent(key);
+    } else {
+      const key: KeyUpEvent = createKeyUpEvent({
+        ...native.base,
+        key: this.#pressedKeys.release(native.base.keycode, native.base.key),
+      });
+      this.lib.pushEvent(key);
+    }
+  }
+
+  resetModifierState(): void {
+    this.inputState.resetModifiers();
+  }
+
+  handleInsertText(value: Deno.PointerValue): void {
+    if (this.#closed) return;
+    const text = readInputString(value, this.lib.ffi);
+    const committed = this.inputState.insertText(text);
+    if (this.#keyDispatchActive) this.#producedText = committed;
+    this.#flushInputState();
+  }
+
+  handleCommand(command: Deno.PointerValue): void {
+    if (this.#closed || command === null) return;
+    this.inputState.performCommand(this.lib.ffi.selectorName(command));
+    this.#flushInputState();
+  }
+
+  #flushInputState(): void {
+    this.lib.pushEvents(this.inputState.drainEvents());
+  }
+
+  #nativeKeyData(event: Deno.PointerValue): {
+    base: Omit<KeyEventBase, "type">;
+    characters: string;
+    charactersIgnoringModifiers: string;
+  } {
+    const { sel, send } = this.lib.ffi;
+    const keycode = send.u16(event, sel("keyCode"));
+    const code = getDomCode(keycode);
+    const charactersPointer = send.id(event, sel("characters"));
+    const charactersIgnoringModifiersPointer = send.id(event, sel("charactersIgnoringModifiers"));
+    const characters = charactersPointer === null ? "" : readCFString(this.lib.ffi.cf, charactersPointer);
+    const charactersIgnoringModifiers = charactersIgnoringModifiersPointer === null
+      ? ""
+      : readCFString(this.lib.ffi.cf, charactersIgnoringModifiersPointer);
+    const base: Omit<KeyEventBase, "type"> = {
+      keycode,
+      code,
+      key: logicalKeyForEvent({ code, characters, charactersIgnoringModifiers }),
+      location: keyLocationForCode(code),
+      ...getModifiers(event, this.lib.ffi),
+      window: this,
+    };
+    return { base, characters, charactersIgnoringModifiers };
   }
 
   setTitle(title: string): void {
@@ -262,8 +624,32 @@ class DarwinWindow implements Window {
     this.close();
   }
   close(): void {
-    this.lib.windows.delete(this.id);
-    this.lib.delegates.delete(pointerId(this.#delegate));
+    if (this.#closed) return;
+    this.#closed = true;
+    const errors: unknown[] = [];
+    const cleanup = (operation: () => void): void => {
+      try {
+        operation();
+      } catch (error) {
+        errors.push(error);
+      }
+    };
+    cleanup(() => this.lib.unregisterWindow(this));
+    cleanup(() => this.lib.nativeClasses.unregisterView(this.contentView));
+    cleanup(() => this.lib.nativeClasses.unregisterDelegate(this.#delegate));
+    cleanup(() => this.#pressedKeys.clear());
+    cleanup(() => this.inputState.close());
+    const { sel, send } = this.lib.ffi;
+    cleanup(() => send.void_id(this.nsWindow, sel("setDelegate:"), null));
+    cleanup(() => send.bool_id(this.nsWindow, sel("makeFirstResponder:"), null));
+    cleanup(() => send.void_id(this.nsWindow, sel("orderOut:"), null));
+    cleanup(() => send.void(this.contentView, sel("release")));
+    cleanup(() => send.void(this.nsWindow, sel("release")));
+    cleanup(() => send.void(this.#delegate, sel("release")));
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) {
+      throw new AggregateError(errors, "winding(darwin): errors while closing window");
+    }
   }
 }
 
@@ -273,30 +659,18 @@ class DarwinLibrary implements Library {
   readonly ffi: DarwinFfi;
   readonly nsApp: Deno.PointerValue;
   readonly colorSpace: Deno.PointerObject;
-  readonly delegateClass: Deno.PointerObject;
+  readonly nativeClasses: DarwinNativeClasses;
   readonly windows = new Map<bigint, DarwinWindow>();
-  readonly delegates = new Map<bigint, DarwinWindow>();
   readonly #distantPast: Deno.PointerValue;
   readonly #runLoopMode: Deno.PointerValue;
-  readonly #shouldCloseCallback: Deno.UnsafeCallback<
-    { parameters: ["pointer", "pointer", "pointer"]; result: "bool" }
-  >;
-  readonly #didResizeCallback: Deno.UnsafeCallback<
-    { parameters: ["pointer", "pointer", "pointer"]; result: "void" }
-  >;
-  #queue: UIEvent[] = [];
+  readonly #queue = new EventQueue<UIEvent>();
+  #handledNativeEvent: bigint | undefined;
+  #closed = false;
 
   constructor() {
     this.ffi = openDarwinFfi();
-    const {
-      addMethod,
-      allocateClassPair,
-      cg,
-      getClass,
-      registerClassPair,
-      sel,
-      send,
-    } = this.ffi;
+    const { cg, getClass, sel, send } = this.ffi;
+    this.nativeClasses = ensureNativeClasses(this.ffi);
     this.nsApp = send.id(getClass("NSApplication"), sel("sharedApplication"));
     send.void_i64(this.nsApp, sel("setActivationPolicy:"), NS_APPLICATION_ACTIVATION_POLICY_REGULAR);
     send.void(this.nsApp, sel("finishLaunching"));
@@ -305,72 +679,136 @@ class DarwinLibrary implements Library {
     const colorSpace = cg.symbols.CGColorSpaceCreateDeviceRGB();
     if (colorSpace === null) throw new Error("winding(darwin): CGColorSpaceCreateDeviceRGB failed");
     this.colorSpace = colorSpace;
+  }
 
-    this.#shouldCloseCallback = new Deno.UnsafeCallback(
-      { parameters: ["pointer", "pointer", "pointer"], result: "bool" },
-      (self) => {
-        const window = this.delegates.get(pointerId(self));
-        this.#queue.push({ type: "close", window });
-        // Never let AppKit tear the window down itself; the application
-        // decides when to actually close, matching the win32/x11 backends.
-        return false;
-      },
-    );
-    this.#didResizeCallback = new Deno.UnsafeCallback(
-      { parameters: ["pointer", "pointer", "pointer"], result: "void" },
-      (self) => {
-        const window = this.delegates.get(pointerId(self));
-        if (window === undefined) return;
-        const frame = send.rect(window.contentView, sel("frame")) as Uint8Array;
-        const width = Math.round(readStructF64(frame, 16));
-        const height = Math.round(readStructF64(frame, 24));
-        window.setSize(width, height);
-        this.#queue.push({ type: "resize", width, height, window });
-      },
-    );
+  registerWindow(window: DarwinWindow): void {
+    this.windows.set(window.id, window);
+  }
 
-    this.delegateClass = allocateClassPair(getClass("NSObject"), "WindingWindowDelegate");
-    addMethod(this.delegateClass, sel("windowShouldClose:"), this.#shouldCloseCallback.pointer, "c@:@");
-    addMethod(this.delegateClass, sel("windowDidResize:"), this.#didResizeCallback.pointer, "v@:@");
-    registerClassPair(this.delegateClass);
+  unregisterWindow(window: DarwinWindow): void {
+    if (this.windows.get(window.id) === window) this.windows.delete(window.id);
+    this.#queue.purgeWindow(window);
+  }
+
+  pushEvent(event: UIEvent): void {
+    this.#queue.push(event);
+  }
+
+  pushEvents(events: UIEvent[]): void {
+    this.#queue.pushBatch(events);
+  }
+
+  markNativeEventHandled(event: Deno.PointerValue): void {
+    if (event !== null) this.#handledNativeEvent = pointerId(event);
   }
 
   openWindow(x = 0, y = 0, w = 800, h = 600): DarwinWindow {
+    if (this.#closed) throw new Error("winding(darwin): library is closed");
     return new DarwinWindow(this, x, y, w, h);
   }
 
   event(): UIEvent | undefined {
-    const { sel, send } = this.ffi;
+    if (this.#closed) return undefined;
+    this.nativeClasses.throwIfCallbackFailed();
+    const { getClass, sel, send } = this.ffi;
     if (this.#queue.length) return this.#queue.shift();
     while (true) {
-      const event = send.id_u64PtrPtrBool(
-        this.nsApp,
-        sel("nextEventMatchingMask:untilDate:inMode:dequeue:"),
-        NS_EVENT_MASK_ANY,
-        this.#distantPast,
-        this.#runLoopMode,
-        true,
-      );
-      if (event === null) break;
-      // Let AppKit do its normal internal dispatch (dragging, resizing, the
-      // close button's default action, ...); this may also invoke our
-      // delegate synchronously and push onto #queue.
-      send.void_id(this.nsApp, sel("sendEvent:"), event);
-      if (this.#queue.length) return this.#queue.shift();
-      const translated = importEvent(event, this);
-      if (translated !== undefined) return translated;
+      const poolAlloc = send.id(getClass("NSAutoreleasePool"), sel("alloc"));
+      const pool = send.id(poolAlloc, sel("init"));
+      try {
+        const event = send.id_u64PtrPtrBool(
+          this.nsApp,
+          sel("nextEventMatchingMask:untilDate:inMode:dequeue:"),
+          NS_EVENT_MASK_ANY,
+          this.#distantPast,
+          this.#runLoopMode,
+          true,
+        );
+        this.nativeClasses.throwIfCallbackFailed();
+        if (event === null) break;
+
+        this.#handledNativeEvent = undefined;
+        const nativeType = send.u64(event, sel("type"));
+        send.void_id(this.nsApp, sel("sendEvent:"), event);
+        this.nativeClasses.throwIfCallbackFailed();
+
+        if (
+          (nativeType === NSEventType.KeyDown ||
+            nativeType === NSEventType.KeyUp ||
+            nativeType === NSEventType.FlagsChanged) &&
+          this.#handledNativeEvent !== pointerId(event)
+        ) {
+          this.#pushKeyboardFallback(event, nativeType);
+          this.nativeClasses.throwIfCallbackFailed();
+        }
+
+        if (this.#queue.length) return this.#queue.shift();
+        const translated = importEvent(event, this);
+        this.nativeClasses.throwIfCallbackFailed();
+        if (translated !== undefined) return translated;
+      } finally {
+        if (pool !== null) send.void(pool, sel("drain"));
+        this.nativeClasses.throwIfCallbackFailed();
+      }
     }
-    return this.#queue.length ? this.#queue.shift() : undefined;
+    this.nativeClasses.throwIfCallbackFailed();
+    return this.#queue.shift();
+  }
+
+  #pushKeyboardFallback(event: Deno.PointerValue, type: bigint): void {
+    const { sel, send } = this.ffi;
+    const windowPointer = send.id(event, sel("window"));
+    const window = windowPointer === null ? undefined : this.windows.get(pointerId(windowPointer));
+    if (window === undefined) return;
+    if (type === NSEventType.FlagsChanged) {
+      window.handleFlagsChanged(event);
+      return;
+    }
+    if (type === NSEventType.KeyDown) window.handlePlatformKeyDown(event);
+    else window.handleKeyUp(event);
   }
 
   [Symbol.dispose](): void {
     this.close();
   }
   close(): void {
-    this.#shouldCloseCallback.close();
-    this.#didResizeCallback.close();
-    this.ffi.cf.symbols.CFRelease(this.colorSpace);
-    this.ffi.close();
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#queue.close();
+
+    const cleanupErrors: unknown[] = [];
+    for (const window of [...this.windows.values()]) {
+      try {
+        window.close();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+    }
+    try {
+      this.ffi.send.void(this.#runLoopMode, this.ffi.sel("release"));
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+    try {
+      this.ffi.cf.symbols.CFRelease(this.colorSpace);
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+    try {
+      this.ffi.close();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+    try {
+      this.nativeClasses.throwIfCallbackFailed();
+    } catch (error) {
+      cleanupErrors.push(error);
+    }
+
+    if (cleanupErrors.length === 1) throw cleanupErrors[0];
+    if (cleanupErrors.length > 1) {
+      throw new AggregateError(cleanupErrors, "winding(darwin): errors during native shutdown");
+    }
   }
 }
 
@@ -379,6 +817,7 @@ function importEvent(event: Deno.PointerValue, lib: DarwinLibrary): UIEvent | un
   const type = send.u64(event, sel("type"));
   const windowPtr = send.id(event, sel("window"));
   const window = windowPtr !== null ? lib.windows.get(pointerId(windowPtr)) : undefined;
+  if (window === undefined) return undefined;
 
   switch (type) {
     case NSEventType.LeftMouseDown:
@@ -405,20 +844,12 @@ function importEvent(event: Deno.PointerValue, lib: DarwinLibrary): UIEvent | un
       const y = readStructF64(point, 8);
       // Cocoa's window-local origin is bottom-left; flip to the top-left
       // origin used by the other winding backends.
-      return { type: "mousemove", x, y: window !== undefined ? window.height - y : y, window };
+      return { type: "mousemove", x, y: window.height - y, window };
     }
     case NSEventType.ScrollWheel: {
       const deltaX = send.f64(event, sel("deltaX"));
       const deltaY = send.f64(event, sel("deltaY"));
       return { type: "wheel", deltaX: -deltaX, deltaY: -deltaY, window };
-    }
-    case NSEventType.KeyDown: {
-      const keycode = send.u16(event, sel("keyCode"));
-      return { type: "keydown", keycode, code: getDomCode(keycode), ...getModifiers(event, lib), window };
-    }
-    case NSEventType.KeyUp: {
-      const keycode = send.u16(event, sel("keyCode"));
-      return { type: "keyup", keycode, code: getDomCode(keycode), ...getModifiers(event, lib), window };
     }
     default:
       return undefined;
