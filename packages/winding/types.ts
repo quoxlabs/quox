@@ -13,8 +13,8 @@ export type UIEvent =
   | VisibilityEvent;
 export type UIEventType = UIEvent["type"];
 
-export interface WindowEvent<Type extends string = string> {
-  type: Type;
+export interface WindowEvent<T extends string = string> {
+  type: T;
   /** The live Winding window that originated this event. */
   window: Window;
 }
