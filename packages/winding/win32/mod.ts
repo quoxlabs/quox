@@ -2,40 +2,29 @@ import type { Library, LoadLibrary, UIEvent, Window } from "../types.ts";
 import { DeferredNativeError, guardNativeCallback } from "../input/callback.ts";
 import { EventQueue } from "../input/event_queue.ts";
 import {
+  BI_RGB,
+  BITMAPINFOHEADER_SIZE,
+  CLASS_STYLE,
+  CW_USEDEFAULT,
+  DIB_RGB_COLORS,
+  DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+  FORMAT_MESSAGE_FROM_SYSTEM,
   gdi32functions,
+  IDC_ARROW,
   kernel32functions,
   PM_REMOVE,
   SIZE_MINIMIZED,
+  SWP_NOACTIVATE,
+  SWP_NOMOVE,
+  SWP_NOZORDER,
+  TME_LEAVE,
+  TRACKMOUSEEVENT_SIZE,
   user32functions,
   WHEEL_DELTA,
+  WINDOW_STYLE,
   WM,
 } from "./ffi.ts";
 import { Win32InputController } from "./input_controller.ts";
-
-// BITMAPINFOHEADER is 40 bytes; for 32bpp BI_RGB no color table follows, so
-// this buffer alone is a valid BITMAPINFO for SetDIBitsToDevice.
-const BITMAPINFOHEADER_SIZE = 40;
-const BI_RGB = 0;
-const DIB_RGB_COLORS = 0;
-
-// TRACKMOUSEEVENT: cbSize(4) + dwFlags(4) + hwndTrack(8, 8-byte aligned) +
-// dwHoverTime(4) + 4 bytes trailing padding to the struct's 8-byte alignment = 24 bytes.
-const TRACKMOUSEEVENT_SIZE = 24;
-const TME_LEAVE = 0x00000002;
-
-// DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 == (HANDLE)-4. Declaring the
-// process per-monitor DPI aware makes window sizes and the blitted bitmap map
-// to physical device pixels 1:1 with the render buffer, instead of being
-// virtualized at 96 DPI and stretched by DWM on scaled displays.
-const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4n;
-
-// CW_USEDEFAULT: let the OS choose (used for the window's x/y position).
-const CW_USEDEFAULT = 0x80000000;
-
-// SetWindowPos flags: keep the position and z-order chosen at creation.
-const SWP_NOMOVE = 0x2;
-const SWP_NOZORDER = 0x4;
-const SWP_NOACTIVATE = 0x10;
 
 const DOWN_BUTTON: Partial<Record<WM, "left" | "middle" | "right">> = {
   [WM.LBUTTONDOWN]: "left",
@@ -86,7 +75,7 @@ class Win32Window implements Window {
       0,
       classNameBuf,
       null,
-      0x10CF0000,
+      WINDOW_STYLE,
       CW_USEDEFAULT, // x: OS-chosen position (y is ignored when x is CW_USEDEFAULT)
       CW_USEDEFAULT, // y
       w,
@@ -272,7 +261,7 @@ class Win32Library implements Library {
     off += 4;
 
     // style
-    wndClassDv.setUint32(off, 0x1 | 0x2 | 0x20, true);
+    wndClassDv.setUint32(off, CLASS_STYLE, true);
     off += 4;
 
     // lpfnWndProc
@@ -404,7 +393,7 @@ class Win32Library implements Library {
     off += 8;
 
     // hCursor
-    const cursor = this.user32.symbols.LoadCursorW(null, 32512n);
+    const cursor = this.user32.symbols.LoadCursorW(null, IDC_ARROW);
     // (IDC_ARROW - https://learn.microsoft.com/en-us/windows/win32/menurc/about-cursors)
     if (BigInt(cursor) === 0n) throw new Error(this.getLastError());
     wndClassDv.setBigUint64(off, BigInt(cursor), true);
@@ -483,7 +472,7 @@ class Win32Library implements Library {
     const code = this.kernel32.symbols.GetLastError();
     const bufU16 = new Uint16Array(this.#lastErrorBuffer);
     const bytesWritten = this.kernel32.symbols.FormatMessageW(
-      0x1000,
+      FORMAT_MESSAGE_FROM_SYSTEM,
       null,
       code,
       0,
