@@ -1,13 +1,26 @@
 import type { Library, LoadLibrary, UIEvent, Window } from "../types.ts";
 import { DeferredNativeError, guardNativeCallback } from "../input/callback.ts";
 import { EventQueue } from "../input/event_queue.ts";
-import { kernel32functions, PM_REMOVE, SIZE_MINIMIZED, user32functions, WHEEL_DELTA, WM } from "./ffi.ts";
+import {
+  CLASS_STYLE,
+  CW_USEDEFAULT,
+  DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+  FORMAT_MESSAGE_FROM_SYSTEM,
+  IDC_ARROW,
+  kernel32functions,
+  PM_REMOVE,
+  SIZE_MINIMIZED,
+  SWP_NOACTIVATE,
+  SWP_NOMOVE,
+  SWP_NOZORDER,
+  TME_LEAVE,
+  TRACKMOUSEEVENT_SIZE,
+  user32functions,
+  WHEEL_DELTA,
+  WINDOW_STYLE,
+  WM,
+} from "./ffi.ts";
 import { Win32InputController } from "./input_controller.ts";
-
-// TRACKMOUSEEVENT: cbSize(4) + dwFlags(4) + hwndTrack(8, 8-byte aligned) +
-// dwHoverTime(4) + 4 bytes trailing padding to the struct's 8-byte alignment = 24 bytes.
-const TRACKMOUSEEVENT_SIZE = 24;
-const TME_LEAVE = 0x00000002;
 
 const DOWN_BUTTON: Partial<Record<WM, "left" | "middle" | "right">> = {
   [WM.LBUTTONDOWN]: "left",
@@ -53,16 +66,16 @@ class Win32Window implements Window {
   minimized = false;
   #closed = false;
 
-  constructor(readonly lib: Win32Library, classNameBuf: ArrayBuffer, width: number, height: number) {
+  constructor(readonly lib: Win32Library, classNameBuf: ArrayBuffer, w: number, h: number) {
     const window = lib.user32.symbols.CreateWindowExW(
       0,
       classNameBuf,
       null,
-      0x10CF0000,
-      0x80000000,
-      0x80000000,
-      width,
-      height,
+      WINDOW_STYLE,
+      CW_USEDEFAULT, // x: OS-chosen position (y is ignored when x is CW_USEDEFAULT)
+      CW_USEDEFAULT, // y
+      w,
+      h,
       null,
       null,
       lib.instance,
@@ -70,9 +83,10 @@ class Win32Window implements Window {
     );
     if (window == null) throw new Error(lib.getLastError());
     this.#hwnd = window;
+    this.#resizeClientTo(w, h);
     this.id = BigInt(Deno.UnsafePointer.value(window));
-    this.#width = width;
-    this.#height = height;
+    this.#width = w;
+    this.#height = h;
     lib.windows.set(this.id, this);
     try {
       lib.input.attach(this);
@@ -91,6 +105,32 @@ class Win32Window implements Window {
 
   get hwnd(): Deno.PointerObject {
     return this.#hwnd;
+  }
+
+  /**
+   * Grow the window so its *client* area is exactly w×h. CreateWindowExW's
+   * width/height size the whole window (title bar and borders included), but
+   * the WebGPU surface targets the client area, so without this the drawable
+   * would be smaller than requested.
+   */
+  #resizeClientTo(w: number, h: number): void {
+    const rect = new ArrayBuffer(16); // RECT { left, top, right, bottom } as i32
+    if (!this.lib.user32.symbols.GetClientRect(this.#hwnd, rect)) return;
+    const dv = new DataView(rect);
+    const clientW = dv.getInt32(8, true) - dv.getInt32(0, true);
+    const clientH = dv.getInt32(12, true) - dv.getInt32(4, true);
+    const frameW = w - clientW;
+    const frameH = h - clientH;
+    if (frameW === 0 && frameH === 0) return;
+    this.lib.user32.symbols.SetWindowPos(
+      this.#hwnd,
+      null,
+      0,
+      0,
+      w + frameW,
+      h + frameH,
+      SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+    );
   }
 
   setTitle(title: string): void {
@@ -159,6 +199,12 @@ class Win32Library implements Library {
   constructor() {
     this.kernel32 = Deno.dlopen("kernel32", kernel32functions);
     this.user32 = Deno.dlopen("user32", user32functions);
+
+    // Opt the whole process into per-monitor DPI awareness before creating any
+    // window. Best-effort: this fails harmlessly if awareness was already set
+    // (e.g. via an application manifest).
+    this.user32.symbols.SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
     this.input = new Win32InputController(
       this.user32,
       (event) => this.#events.push(event),
@@ -173,7 +219,7 @@ class Win32Library implements Library {
     off += 4;
 
     // style
-    wndClassDv.setUint32(off, 0x1 | 0x2 | 0x20, true);
+    wndClassDv.setUint32(off, CLASS_STYLE, true);
     off += 4;
 
     // lpfnWndProc
@@ -306,7 +352,7 @@ class Win32Library implements Library {
     off += 8;
 
     // hCursor
-    const cursor = this.user32.symbols.LoadCursorW(null, 32512n);
+    const cursor = this.user32.symbols.LoadCursorW(null, IDC_ARROW);
     // (IDC_ARROW - https://learn.microsoft.com/en-us/windows/win32/menurc/about-cursors)
     if (BigInt(cursor) === 0n) throw new Error(this.getLastError());
     wndClassDv.setBigUint64(off, BigInt(cursor), true);
@@ -385,7 +431,7 @@ class Win32Library implements Library {
     const code = this.kernel32.symbols.GetLastError();
     const bufU16 = new Uint16Array(this.#lastErrorBuffer);
     const bytesWritten = this.kernel32.symbols.FormatMessageW(
-      0x1000,
+      FORMAT_MESSAGE_FROM_SYSTEM,
       null,
       code,
       0,
