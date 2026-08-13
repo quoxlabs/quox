@@ -71,3 +71,24 @@ Deno.test("router preserves keydown, textinput, then keyup order", () => {
   router.route(mapWindingEvent({ ...base, type: "keyup", repeat: false }));
   assertEquals(order, ["keydown", "text:y", "keyup"]);
 });
+
+Deno.test("router translates browser-style wheel deltas to Blitz's scroll direction", () => {
+  const calls: unknown[][] = [];
+  const router = new QuoxInputRouter({
+    pointerMove() {},
+    pointerDown() {},
+    pointerUp() {},
+    wheel: (...args) => calls.push(args),
+    key() {},
+    textInput() {},
+    appleCommand() {},
+    clearHover() {},
+    resize() {},
+    visibility() {},
+  });
+
+  router.route({ type: "mousemove", x: 12, y: 34 });
+  router.route({ type: "wheel", deltaX: 2, deltaY: -3 });
+
+  assertEquals(calls, [[12, 34, -80, 120, 0]]);
+});

@@ -77,8 +77,10 @@ export class QuoxInputRouter {
         this.port.wheel(
           this.#pointerX,
           this.#pointerY,
-          event.deltaX * WHEEL_SCROLL_SPEED,
-          event.deltaY * WHEEL_SCROLL_SPEED,
+          // Winding uses browser-style positive-right/down deltas, while Blitz
+          // subtracts wheel deltas from the current scroll offset.
+          -event.deltaX * WHEEL_SCROLL_SPEED,
+          -event.deltaY * WHEEL_SCROLL_SPEED,
           this.#buttons,
         );
         return undefined;
