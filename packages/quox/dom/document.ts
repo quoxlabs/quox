@@ -102,27 +102,27 @@ export class QuoxDocument {
     return nodeId === undefined ? null : new QuoxNode(this, nodeId);
   }
 
-  /** Feed a pointer-move event into Blitz. Drives hover/`:hover` and cursor resolution. */
+  /** Feed a pointer-move event into the engine. Drives hover/`:hover` and cursor resolution. */
   dispatchPointerMove(x: number, y: number, buttons: number): void {
     this.#dispatchInputEvent(() => this.#renderer.dispatch_pointer_move(x, y, buttons));
   }
 
-  /** Feed a pointer-down event into Blitz. Drives `:active`, click timing, and focus. */
+  /** Feed a pointer-down event into the engine. Drives `:active`, click timing, and focus. */
   dispatchPointerDown(x: number, y: number, button: number, buttons: number): void {
     this.#dispatchInputEvent(() => this.#renderer.dispatch_pointer_down(x, y, button, buttons));
   }
 
-  /** Feed a pointer-up event into Blitz. Synthesizes `click`/`dblclick`/`contextmenu`. */
+  /** Feed a pointer-up event into the engine. Synthesizes `click`/`dblclick`/`contextmenu`. */
   dispatchPointerUp(x: number, y: number, button: number, buttons: number): void {
     this.#dispatchInputEvent(() => this.#renderer.dispatch_pointer_up(x, y, button, buttons));
   }
 
-  /** Feed a wheel event into Blitz, scrolling whatever's hovered (not just the viewport). */
+  /** Feed a wheel event into the engine, scrolling whatever's hovered (not just the viewport). */
   dispatchWheel(x: number, y: number, deltaX: number, deltaY: number, buttons: number): void {
     this.#dispatchInputEvent(() => this.#renderer.dispatch_wheel(x, y, deltaX, deltaY, buttons));
   }
 
-  /** Feed a canonical native key event into Blitz. Character insertion remains a later Commit. */
+  /** Feed a canonical native key event into the engine. Character insertion remains a later Commit. */
   dispatchKey(event: QuoxKeyboardEvent): void {
     const encoded = encodeKeyEvent(event);
     this.#dispatchInputEvent(() =>
@@ -136,7 +136,7 @@ export class QuoxDocument {
     );
   }
 
-  /** Apply an AppKit editing selector through Blitz's platform-command adapter. */
+  /** Apply an AppKit editing selector through the engine's platform-command adapter. */
   dispatchAppleStandardKeybinding(event: QuoxAppleStandardKeybindingEvent): void {
     this.#dispatchInputEvent(() => this.#renderer.dispatch_apple_standard_keybinding(event.command));
   }
@@ -146,7 +146,7 @@ export class QuoxDocument {
     this.#dispatchInputEvent(() => this.#renderer.dispatch_text_input(event.text));
   }
 
-  /** Clear Blitz's hover state, e.g. when the pointer leaves the window entirely. */
+  /** Clear the engine's hover state, e.g. when the pointer leaves the window entirely. */
   clearHover(): void {
     this.#dispatchInputEvent(() => this.#renderer.clear_hover(), false);
   }
