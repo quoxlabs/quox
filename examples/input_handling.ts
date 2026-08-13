@@ -21,11 +21,13 @@ if (import.meta.main) {
 
   window.addEventListener((event) => {
     switch (event.type) {
-      case "mousemove":
+      case "mousemove": {
+        const hit = window.document.nodeFromPoint(event.x, event.y);
         console.log(
-          `Mouse moved to (${event.x.toFixed(1)}, ${event.y.toFixed(1)})`,
+          `Mouse moved to (${event.x.toFixed(1)}, ${event.y.toFixed(1)}); hit node: ${hit?.nodeId ?? "none"}`,
         );
         break;
+      }
       case "mousedown":
       case "mouseup":
         console.log(
@@ -40,8 +42,11 @@ if (import.meta.main) {
         console.log(
           `Key ${event.type === "keydown" ? "pressed" : "released"}: ${event.key} (${event.code})${
             formatModifiers(event)
-          }`,
+          }${event.repeat ? " (repeated)" : ""}`,
         );
+        break;
+      case "textinput":
+        console.log(`Committed text: ${event.text}`);
         break;
       case "resize":
         console.log(`Window resized to ${event.width}x${event.height}`);
@@ -50,7 +55,7 @@ if (import.meta.main) {
         console.log("Window closed");
         break;
       default:
-        console.log("Other even thrown:", event);
+        console.log("Other event:", event);
         break;
     }
   });

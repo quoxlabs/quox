@@ -1,10 +1,9 @@
 import { createVNode, Fragment, type QuoxRenderable, type QuoxVNodeType } from "@quoxlabs/jsx";
-import { assert, assertEquals, assertRejects } from "@std/assert";
+import { assert, assertEquals, assertRejects, assertStrictEquals } from "@std/assert";
 import type { QuoxRenderer as WasmRenderer } from "../lib/quox.js";
 import { QuoxDocument } from "./document.ts";
-import { getElementFunctionProps } from "./handlers.ts";
 import { mount } from "./mount.ts";
-import { QuoxElement } from "./node.ts";
+import { QuoxElement, QuoxNode } from "./node.ts";
 
 type Operation =
   | { type: "create_element"; id: number; tagName: string }
@@ -79,6 +78,22 @@ class FakeRenderer {
   remove_attribute(nodeId: number, name: string): void {
     void nodeId;
     void name;
+  }
+
+  #hitNodeId: number | undefined = undefined;
+  #lastHitPoint: { x: number; y: number } | undefined;
+
+  node_from_point(x: number, y: number): number | undefined {
+    this.#lastHitPoint = { x, y };
+    return this.#hitNodeId;
+  }
+
+  setHitNodeId(id: number | undefined): void {
+    this.#hitNodeId = id;
+  }
+
+  get lastHitPoint(): { x: number; y: number } | undefined {
+    return this.#lastHitPoint;
   }
 }
 
@@ -197,7 +212,7 @@ Deno.test("mount walks fragments, function components, and nested arrays", async
   ]);
 });
 
-Deno.test("mount lowers props and stores function-valued DOM props", async () => {
+Deno.test("mount lowers props and assigns browser-style event handlers", async () => {
   const { renderer, root } = createTestDocument();
   const onClick = () => "clicked";
   const [node] = await mount(
@@ -234,7 +249,42 @@ Deno.test("mount lowers props and stores function-valued DOM props", async () =>
     { type: "append_child", parentId: 1, childId: 2 },
     { type: "append_child", parentId: 0, childId: 1 },
   ]);
-  assert(getElementFunctionProps(node as QuoxElement)?.get("onClick") === onClick, "onClick was not stored");
+  assert((node as QuoxElement).onclick === onClick, "onclick was not assigned");
+});
+
+Deno.test("mount maps every supported JSX event prop to its browser-style property", async () => {
+  const { root } = createTestDocument();
+  const handlers = {
+    onClick: () => "click",
+    onDoubleClick: () => "dblclick",
+    onContextMenu: () => "contextmenu",
+    onInput: () => "input",
+    onFocus: () => "focus",
+    onBlur: () => "blur",
+    onScroll: () => "scroll",
+  };
+
+  const [node] = await mount(root, createVNode("div", handlers));
+  const element = node as QuoxElement;
+
+  assertStrictEquals(element.onclick, handlers.onClick);
+  assertStrictEquals(element.ondblclick, handlers.onDoubleClick);
+  assertStrictEquals(element.oncontextmenu, handlers.onContextMenu);
+  assertStrictEquals(element.oninput, handlers.onInput);
+  assertStrictEquals(element.onfocus, handlers.onFocus);
+  assertStrictEquals(element.onblur, handlers.onBlur);
+  assertStrictEquals(element.onscroll, handlers.onScroll);
+});
+
+Deno.test("mount rejects unsupported function-valued DOM props", async () => {
+  const { root } = createTestDocument();
+
+  await assertRejects(
+    () => mount(root, createVNode("div", { unsupported: () => undefined })),
+    TypeError,
+    'The "unsupported" prop received a function, but Quox only accepts functions for supported event props ' +
+      '(such as "onClick" or "onInput"). Use a supported event prop, or call the function and pass its return value instead.',
+  );
 });
 
 Deno.test("mount kebab-cases vendor-prefixed style properties", async () => {
@@ -381,4 +431,30 @@ Deno.test("mount resolves Preact-shaped fragments and function components withou
     { type: "append_child", parentId: 0, childId: 1 },
     { type: "append_child", parentId: 0, childId: 3 },
   ]);
+});
+
+Deno.test("document.nodeFromPoint returns null when nothing is hit", () => {
+  const { document, renderer } = createTestDocument();
+  renderer.setHitNodeId(undefined);
+
+  assertEquals(document.nodeFromPoint(10, 20), null);
+});
+
+Deno.test("document.nodeFromPoint wraps the hit node id", () => {
+  const { document, renderer } = createTestDocument();
+  renderer.setHitNodeId(5);
+
+  const hit = document.nodeFromPoint(10, 20);
+
+  assert(hit instanceof QuoxNode);
+  assertEquals(hit?.nodeId, 5);
+});
+
+Deno.test("document.nodeFromPoint forwards coordinates unchanged", () => {
+  const { document, renderer } = createTestDocument();
+  renderer.setHitNodeId(5);
+
+  document.nodeFromPoint(12.5, 34.5);
+
+  assertEquals(renderer.lastHitPoint, { x: 12.5, y: 34.5 });
 });

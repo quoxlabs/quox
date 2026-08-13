@@ -67,6 +67,20 @@ export enum XEventMask {
   OwnerGrabButtonMask = 1 << 24,
 }
 
+// `mode` value from X11/X.h shared by XCrossingEvent (Enter/LeaveNotify) and
+// XFocusChangeEvent (FocusIn/FocusOut). Only NotifyNormal represents a real user-facing
+// hover/focus transition; NotifyGrab/NotifyUngrab/NotifyWhileGrabbed are WM-internal (e.g.
+// alt-tab, an interactive move/resize grab) and must be filtered out.
+export const NotifyNormal = 0;
+
+// XIM requires the process C locale to be initialised before XOpenIM. Kept in
+// this module because it is only used by the X11 backend.
+export const libcFunctions = {
+  free: { parameters: ["pointer"], result: "void" },
+  malloc: { parameters: ["usize"], result: "pointer" },
+  setlocale: { parameters: ["i32", "buffer"], result: "pointer" },
+} as const satisfies Deno.ForeignLibraryInterface;
+
 // Function declarations from X11/Xlib.h
 export const x11functions = {
   XActivateScreenSaver: { parameters: ["pointer"], result: "i32" },
@@ -135,7 +149,20 @@ export const x11functions = {
   XCreateColormap: { parameters: ["pointer", "usize", "pointer", "i32"], result: "usize" },
   XCreateFontCursor: { parameters: ["pointer", "u32"], result: "usize" },
   XCreateFontSet: { parameters: ["pointer", "buffer", "pointer", "pointer", "pointer"], result: "pointer" },
+  XCreateGC: { parameters: ["pointer", "usize", "u64", "buffer"], result: "usize" },
   XCreateGlyphCursor: { parameters: ["pointer", "usize", "usize", "u32", "u32", "buffer", "buffer"], result: "usize" },
+  XCreateImage: {
+    parameters: ["pointer", "pointer", "u32", "i32", "i32", "buffer", "u32", "u32", "i32", "i32"],
+    result: "pointer",
+  },
+  // The XIM APIs below are C varargs. Deno FFI has no variadic descriptor, so
+  // bind each all-GPR call shape used by this backend to a fixed alias. This is
+  // intentionally limited to the repository's existing LP64 Linux target.
+  XCreateICSimple: {
+    name: "XCreateIC",
+    parameters: ["pointer", "buffer", "usize", "buffer", "usize", "buffer", "usize", "pointer"],
+    result: "pointer",
+  },
   XCreatePixmap: { parameters: ["pointer", "usize", "u32", "u32", "u32"], result: "usize" },
   XCreatePixmapCursor: { parameters: ["pointer", "usize", "usize", "buffer", "buffer", "u32", "u32"], result: "usize" },
   XCreatePixmapFromBitmapData: {
@@ -152,17 +179,20 @@ export const x11functions = {
   },
   XDefaultColormap: { parameters: ["pointer", "i32"], result: "usize" },
   XDefaultColormapOfScreen: { parameters: ["pointer"], result: "usize" },
+  XDefaultDepth: { parameters: ["pointer", "i32"], result: "i32" },
   XDefaultDepthOfScreen: { parameters: ["pointer"], result: "i32" },
   XDefaultGC: { parameters: ["pointer", "i32"], result: "usize" },
   XDefaultGCOfScreen: { parameters: ["pointer"], result: "usize" },
   XDefaultRootWindow: { parameters: ["pointer"], result: "usize" },
   XDefaultScreen: { parameters: ["pointer"], result: "i32" },
   XDefaultScreenOfDisplay: { parameters: ["pointer"], result: "pointer" },
+  XDefaultVisual: { parameters: ["pointer", "i32"], result: "pointer" },
   XDefaultVisualOfScreen: { parameters: ["pointer"], result: "pointer" },
   XDefineCursor: { parameters: ["pointer", "usize", "usize"], result: "i32" },
   XDeleteModifiermapEntry: { parameters: ["pointer", "u32", "i32"], result: "pointer" },
   XDeleteProperty: { parameters: ["pointer", "usize", "usize"], result: "i32" },
   XDestroyIC: { parameters: ["pointer"], result: "void" },
+  XDestroyImage: { parameters: ["pointer"], result: "i32" },
   XDestroyOC: { parameters: ["pointer"], result: "void" },
   XDestroySubwindows: { parameters: ["pointer", "usize"], result: "i32" },
   XDestroyWindow: { parameters: ["pointer", "usize"], result: "i32" },
@@ -225,6 +255,16 @@ export const x11functions = {
   XFreeFontInfo: { parameters: ["pointer", "pointer", "i32"], result: "i32" },
   XFreeFontNames: { parameters: ["pointer"], result: "i32" },
   XFreeFontPath: { parameters: ["pointer"], result: "i32" },
+  XGetICValuesFilterEvents: {
+    name: "XGetICValues",
+    parameters: ["pointer", "buffer", "buffer", "pointer"],
+    result: "pointer",
+  },
+  XGetIMValuesQueryInputStyle: {
+    name: "XGetIMValues",
+    parameters: ["pointer", "buffer", "buffer", "pointer"],
+    result: "pointer",
+  },
   XFreeFontSet: { parameters: ["pointer", "pointer"], result: "void" },
   XFreeGC: { parameters: ["pointer", "usize"], result: "i32" },
   XFreeModifiermap: { parameters: ["pointer"], result: "i32" },
@@ -326,6 +366,7 @@ export const x11functions = {
   XKeycodeToKeysym: { parameters: ["pointer", "u32", "i32"], result: "usize" },
   XKeysymToKeycode: { parameters: ["pointer", "usize"], result: "u32" },
   XKeysymToString: { parameters: ["usize"], result: "pointer" },
+  XkbKeysymToModifiers: { parameters: ["pointer", "usize"], result: "u32" },
   XKillClient: { parameters: ["pointer", "usize"], result: "i32" },
   XListDepths: { parameters: ["pointer", "i32", "pointer"], result: "pointer" },
   XListExtensions: { parameters: ["pointer", "pointer"], result: "pointer" },
@@ -343,6 +384,10 @@ export const x11functions = {
   XLockDisplay: { parameters: ["pointer"], result: "void" },
   XLookupColor: { parameters: ["pointer", "usize", "buffer", "buffer", "buffer"], result: "i32" },
   XLookupKeysym: { parameters: ["pointer", "i32"], result: "usize" },
+  XLookupString: {
+    parameters: ["pointer", "buffer", "i32", "buffer", "pointer"],
+    result: "i32",
+  },
   XLowerWindow: { parameters: ["pointer", "usize"], result: "i32" },
   XMapRaised: { parameters: ["pointer", "usize"], result: "i32" },
   XMapSubwindows: { parameters: ["pointer", "usize"], result: "i32" },
@@ -388,6 +433,10 @@ export const x11functions = {
   XProtocolRevision: { parameters: ["pointer"], result: "i32" },
   XProtocolVersion: { parameters: ["pointer"], result: "i32" },
   XPutBackEvent: { parameters: ["pointer", "pointer"], result: "i32" },
+  XPutImage: {
+    parameters: ["pointer", "usize", "usize", "pointer", "i32", "i32", "i32", "i32", "u32", "u32"],
+    result: "i32",
+  },
   XQLength: { parameters: ["pointer"], result: "i32" },
   XQueryBestCursor: { parameters: ["pointer", "usize", "u32", "u32", "pointer", "pointer"], result: "i32" },
   XQueryBestSize: { parameters: ["pointer", "i32", "usize", "u32", "u32", "pointer", "pointer"], result: "i32" },
@@ -421,10 +470,6 @@ export const x11functions = {
   XRecolorCursor: { parameters: ["pointer", "usize", "buffer", "buffer"], result: "i32" },
   XReconfigureWMWindow: { parameters: ["pointer", "usize", "i32", "u32", "buffer"], result: "i32" },
   XRefreshKeyboardMapping: { parameters: ["pointer"], result: "i32" },
-  XRegisterIMInstantiateCallback: {
-    parameters: ["pointer", "pointer", "buffer", "buffer", "pointer", "pointer"],
-    result: "i32",
-  },
   XRemoveConnectionWatch: { parameters: ["pointer", "pointer", "pointer"], result: "void" },
   XRemoveFromSaveSet: { parameters: ["pointer", "usize"], result: "i32" },
   XRemoveHost: { parameters: ["pointer", "pointer"], result: "i32" },
@@ -465,6 +510,11 @@ export const x11functions = {
   XSetGraphicsExposures: { parameters: ["pointer", "usize", "i32"], result: "i32" },
   XSetICFocus: { parameters: ["pointer"], result: "void" },
   XSetIconName: { parameters: ["pointer", "usize", "buffer"], result: "i32" },
+  XSetIMValuesDestroyCallback: {
+    name: "XSetIMValues",
+    parameters: ["pointer", "buffer", "buffer", "pointer"],
+    result: "pointer",
+  },
   XSetInputFocus: { parameters: ["pointer", "usize", "i32", "u64"], result: "i32" },
   XSetIOErrorExitHandler: { parameters: ["pointer", "pointer", "pointer"], result: "void" },
   XSetIOErrorHandler: { parameters: ["pointer"], result: "pointer" },
@@ -521,10 +571,6 @@ export const x11functions = {
   XUnlockDisplay: { parameters: ["pointer"], result: "void" },
   XUnmapSubwindows: { parameters: ["pointer", "usize"], result: "i32" },
   XUnmapWindow: { parameters: ["pointer", "usize"], result: "i32" },
-  XUnregisterIMInstantiateCallback: {
-    parameters: ["pointer", "pointer", "buffer", "buffer", "pointer", "pointer"],
-    result: "i32",
-  },
   XUnsetICFocus: { parameters: ["pointer"], result: "void" },
   XVendorRelease: { parameters: ["pointer"], result: "i32" },
   XVisualIDFromVisual: { parameters: ["pointer"], result: "usize" },
@@ -565,8 +611,7 @@ export const x11functions = {
     result: "void",
   },
   Xutf8DrawText: { parameters: ["pointer", "usize", "usize", "i32", "i32", "buffer", "i32"], result: "void" },
-  Xutf8LookupString: { parameters: ["pointer", "pointer", "pointer", "i32", "pointer", "pointer"], result: "i32" },
-  Xutf8ResetIC: { parameters: ["pointer"], result: "pointer" },
+  Xutf8LookupString: { parameters: ["pointer", "pointer", "buffer", "i32", "buffer", "buffer"], result: "i32" },
   Xutf8TextEscapement: { parameters: ["pointer", "buffer", "i32"], result: "i32" },
   Xutf8TextExtents: { parameters: ["pointer", "buffer", "i32", "buffer", "buffer"], result: "i32" },
   Xutf8TextPerCharExtents: {
