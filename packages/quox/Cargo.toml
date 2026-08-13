@@ -12,15 +12,17 @@ crate-type = ["cdylib"]
 name = "quox"
 
 [dependencies]
-anyrender_vello = "0.8"
+anyrender_vello = "0.12"
 linebender_resource_handle = "0.1.1"
-blitz-dom = { git = "https://github.com/DioxusLabs/blitz", rev = "4c9fb2820dc74860d3b2d972493fa4e9fa83eb48", package = "blitz-dom" }
-blitz-html = { git = "https://github.com/DioxusLabs/blitz", rev = "4c9fb2820dc74860d3b2d972493fa4e9fa83eb48", package = "blitz-html" }
-blitz-paint = { git = "https://github.com/DioxusLabs/blitz", rev = "4c9fb2820dc74860d3b2d972493fa4e9fa83eb48", package = "blitz-paint" }
-blitz-traits = { git = "https://github.com/DioxusLabs/blitz", rev = "4c9fb2820dc74860d3b2d972493fa4e9fa83eb48", package = "blitz-traits" }
+blitz-dom = "=0.3.0-alpha.6"
+blitz-html = "=0.3.0-alpha.6"
+blitz-paint = "=0.3.0-alpha.6"
+blitz-traits = "=0.3.0-alpha.6"
 console_error_panic_hook = "0.1"
 futures-intrusive = "0.5"
-vello = "0.8"
-wasm-bindgen = "=0.2.106"
-wasm-bindgen-futures = "=0.4.56"
-wgpu_context = "0.4"
+keyboard-types = "0.7"
+smol_str = "0.3.6"
+vello = "0.9"
+wasm-bindgen = "=0.2.108"
+wasm-bindgen-futures = "=0.4.58"
+wgpu_context = "0.7"

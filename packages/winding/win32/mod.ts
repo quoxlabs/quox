@@ -1,17 +1,27 @@
-import type { KeyModifiers, Library, LoadLibrary, UIEvent, Window } from "../types.ts";
-import { getDomCode } from "./dom_code.ts";
-import { gdi32functions, kernel32functions, user32functions, WHEEL_DELTA, WM } from "./ffi.ts";
+import type { Library, LoadLibrary, UIEvent, Window } from "../types.ts";
+import { DeferredNativeError, guardNativeCallback } from "../input/callback.ts";
+import { EventQueue } from "../input/event_queue.ts";
+import {
+  gdi32functions,
+  kernel32functions,
+  PM_REMOVE,
+  SIZE_MINIMIZED,
+  user32functions,
+  WHEEL_DELTA,
+  WM,
+} from "./ffi.ts";
+import { Win32InputController } from "./input_controller.ts";
 
 // BITMAPINFOHEADER is 40 bytes; for 32bpp BI_RGB no color table follows, so
 // this buffer alone is a valid BITMAPINFO for SetDIBitsToDevice.
 const BITMAPINFOHEADER_SIZE = 40;
 const BI_RGB = 0;
 const DIB_RGB_COLORS = 0;
-const VK_SHIFT = 0x10;
-const VK_CONTROL = 0x11;
-const VK_MENU = 0x12;
-const VK_LWIN = 0x5b;
-const VK_RWIN = 0x5c;
+
+// TRACKMOUSEEVENT: cbSize(4) + dwFlags(4) + hwndTrack(8, 8-byte aligned) +
+// dwHoverTime(4) + 4 bytes trailing padding to the struct's 8-byte alignment = 24 bytes.
+const TRACKMOUSEEVENT_SIZE = 24;
+const TME_LEAVE = 0x00000002;
 
 const DOWN_BUTTON: Partial<Record<WM, "left" | "middle" | "right">> = {
   [WM.LBUTTONDOWN]: "left",
@@ -32,19 +42,20 @@ function wideStringBuffer(value: string): ArrayBuffer {
   return buffer;
 }
 
-function isKeyDown(lib: Win32Library, virtualKey: number): boolean {
-  return (lib.user32.symbols.GetKeyState(virtualKey) & 0x8000) !== 0;
-}
-
-function getModifiers(lib: Win32Library): KeyModifiers {
-  const ctrlKey = isKeyDown(lib, VK_CONTROL);
-  return {
-    shiftKey: isKeyDown(lib, VK_SHIFT),
-    ctrlKey,
-    altKey: isKeyDown(lib, VK_MENU),
-    metaKey: isKeyDown(lib, VK_LWIN) || isKeyDown(lib, VK_RWIN),
-    accelKey: ctrlKey,
-  };
+/**
+ * Arm a one-shot `WM_MOUSELEAVE` for `hWnd`. Win32 doesn't report the pointer leaving a
+ * window on its own (unlike X11's `LeaveNotify`); the window has to opt in via
+ * `TrackMouseEvent`, and tracking is consumed by the very `WM_MOUSELEAVE` it requests, so it
+ * must be re-armed on every `WM_MOUSEMOVE` to reliably catch the next leave.
+ */
+function trackMouseLeave(lib: Win32Library, hWnd: Deno.PointerValue): void {
+  const buf = new ArrayBuffer(TRACKMOUSEEVENT_SIZE);
+  const dv = new DataView(buf);
+  dv.setUint32(0, TRACKMOUSEEVENT_SIZE, true); // cbSize
+  dv.setUint32(4, TME_LEAVE, true); // dwFlags
+  dv.setBigUint64(8, BigInt(Deno.UnsafePointer.value(hWnd)), true); // hwndTrack
+  dv.setUint32(16, 0, true); // dwHoverTime (unused without TME_HOVER)
+  lib.user32.symbols.TrackMouseEvent(buf);
 }
 
 class Win32Window implements Window {
@@ -52,6 +63,9 @@ class Win32Window implements Window {
   readonly #hwnd: Deno.PointerObject;
   #bgra = new Uint8Array(0) as Uint8Array<ArrayBuffer>;
   #bmi = new ArrayBuffer(BITMAPINFOHEADER_SIZE);
+  /** Tracks minimized state so `WM_SIZE` transitions map to a single `visibilitychange` event instead of firing on every resize message. */
+  minimized = false;
+  #closed = false;
 
   constructor(readonly lib: Win32Library, classNameBuf: ArrayBuffer) {
     const window = lib.user32.symbols.CreateWindowExW(
@@ -65,13 +79,30 @@ class Win32Window implements Window {
       0x80000000,
       null,
       null,
-      null,
+      lib.instance,
       0n,
     );
     if (window == null) throw new Error(lib.getLastError());
     this.#hwnd = window;
     this.id = BigInt(Deno.UnsafePointer.value(window));
     lib.windows.set(this.id, this);
+    try {
+      lib.input.attach(this);
+    } catch (error) {
+      lib.purgeWindowEvents(this);
+      lib.windows.delete(this.id);
+      const errors = [error];
+      try {
+        if (!lib.user32.symbols.DestroyWindow(window)) errors.push(new Error(lib.getLastError()));
+      } catch (cleanupError) {
+        errors.push(cleanupError);
+      }
+      throw collectedError(errors, "Failed to initialize Win32 window input");
+    }
+  }
+
+  get hwnd(): Deno.PointerObject {
+    return this.#hwnd;
   }
 
   setTitle(title: string): void {
@@ -135,7 +166,22 @@ class Win32Window implements Window {
     this.close();
   }
   close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    const errors: unknown[] = [];
+    try {
+      this.lib.input.detach(this);
+    } catch (error) {
+      errors.push(error);
+    }
+    this.lib.purgeWindowEvents(this);
     this.lib.windows.delete(this.id);
+    try {
+      if (!this.lib.user32.symbols.DestroyWindow(this.#hwnd)) errors.push(new Error(this.lib.getLastError()));
+    } catch (error) {
+      errors.push(error);
+    }
+    throwCollected(errors, "Failed to close Win32 window");
   }
 }
 
@@ -151,15 +197,25 @@ class Win32Library implements Library {
     parameters: ["pointer", "u32", "usize", "usize"];
     result: "usize";
   }>;
-  #event: UIEvent | undefined;
+  readonly #events = new EventQueue<UIEvent>();
+  readonly #callbackErrors = new DeferredNativeError();
+  readonly input: Win32InputController;
+  readonly instance: Deno.PointerObject;
+  readonly #instance: bigint;
   // Tracks how many mouse buttons are currently held, so capture is only
   // released once the last button of a (possibly multi-button) drag is
   // released rather than on every individual button-up.
   #captureCount = 0;
+  #closed = false;
   constructor() {
     this.kernel32 = Deno.dlopen("kernel32", kernel32functions);
     this.user32 = Deno.dlopen("user32", user32functions);
     this.gdi32 = Deno.dlopen("gdi32", gdi32functions);
+    this.input = new Win32InputController(
+      this.user32,
+      (event) => this.#events.push(event),
+      (id) => this.windows.get(id),
+    );
 
     const wndClassDv = new DataView(this.#wndClass);
     let off = 0;
@@ -173,99 +229,107 @@ class Win32Library implements Library {
     off += 4;
 
     // lpfnWndProc
-    this.#wndProc = new Deno.UnsafeCallback({
-      parameters: ["pointer", "u32", "usize", "usize"],
-      result: "usize",
-    }, (hWnd, uMsg, wParam, lParam) => {
-      const win = this.windows.get(BigInt(Deno.UnsafePointer.value(hWnd)));
-      switch (uMsg) {
-        case WM.SIZE: {
-          const w = Number(BigInt(lParam) & 0xFFFFn);
-          const h = Number((BigInt(lParam) >> 16n) & 0xFFFFn);
-          if (w > 0 && h > 0) {
-            this.#event = { type: "resize", width: w, height: h, window: win };
+    this.#wndProc = new Deno.UnsafeCallback(
+      {
+        parameters: ["pointer", "u32", "usize", "usize"],
+        result: "usize",
+      },
+      guardNativeCallback(this.#callbackErrors, (hWnd, uMsg, wParam, lParam) => {
+        const win = this.windows.get(BigInt(Deno.UnsafePointer.value(hWnd)));
+        const inputResult = this.input.handleMessage(win, uMsg, wParam, lParam);
+        if (inputResult !== undefined) return inputResult;
+        switch (uMsg) {
+          case WM.SIZE: {
+            if (win === undefined) break;
+            const w = Number(BigInt(lParam) & 0xFFFFn);
+            const h = Number((BigInt(lParam) >> 16n) & 0xFFFFn);
+            const minimized = Number(wParam) === SIZE_MINIMIZED;
+            if (win !== undefined && minimized !== win.minimized) {
+              win.minimized = minimized;
+              this.#events.push({ type: "visibilitychange", visible: !minimized, window: win });
+            } else if (w > 0 && h > 0) {
+              this.#events.push({ type: "resize", width: w, height: h, window: win });
+            }
+            break;
           }
-          break;
+          case WM.CLOSE:
+            if (win === undefined) break;
+            this.#events.push({ type: "close", window: win });
+            // Return without calling DefWindowProcW to prevent immediate window
+            // destruction; let the application decide when to tear down.
+            return 0n;
+          case WM.MOUSEMOVE: {
+            if (win === undefined) break;
+            // Re-arm on every move: `WM_MOUSELEAVE` tracking is consumed by the leave
+            // event itself, so it must be requested again to catch the next one.
+            trackMouseLeave(this, hWnd);
+            this.#events.push({
+              type: "mousemove",
+              x: Number(BigInt(lParam) & 0xFFFFn),
+              y: Number((BigInt(lParam) >> 16n) & 0xFFFFn),
+              window: win,
+            });
+            break;
+          }
+          case WM.MOUSELEAVE:
+            if (win === undefined) break;
+            this.#events.push({ type: "mouseleave", window: win });
+            break;
+          case WM.LBUTTONDOWN:
+          case WM.MBUTTONDOWN:
+          case WM.RBUTTONDOWN: {
+            if (win === undefined) break;
+            // Capture the mouse so drags that leave the client area (e.g.
+            // dragging a scrollbar thumb) still deliver the eventual button-up,
+            // matching X11's implicit passive grab on button press.
+            if (this.#captureCount++ === 0) this.user32.symbols.SetCapture(hWnd);
+            this.#events.push({ type: "mousedown", button: DOWN_BUTTON[uMsg as WM]!, window: win });
+            break;
+          }
+          case WM.LBUTTONUP:
+          case WM.MBUTTONUP:
+          case WM.RBUTTONUP: {
+            if (win === undefined) break;
+            if (this.#captureCount > 0 && --this.#captureCount === 0) {
+              this.user32.symbols.ReleaseCapture();
+            }
+            this.#events.push({ type: "mouseup", button: UP_BUTTON[uMsg as WM]!, window: win });
+            break;
+          }
+          case WM.MOUSEWHEEL:
+          case WM.MOUSEHWHEEL: {
+            if (win === undefined) break;
+            // wParam's high word is a *signed* 16-bit tilt/rotation amount, in
+            // multiples of WHEEL_DELTA per notch (unlike the unsigned x/y words
+            // read elsewhere in this file).
+            const raw = Number((BigInt(wParam) >> 16n) & 0xFFFFn);
+            const signed = raw > 0x7FFF ? raw - 0x10000 : raw;
+            const notches = signed / WHEEL_DELTA;
+            this.#events.push(
+              uMsg === WM.MOUSEWHEEL
+                // Win32 reports a positive vertical delta for "rotated away from
+                // the user" (scroll up); every other winding backend uses the
+                // opposite convention (positive deltaY = scroll down), so flip it.
+                ? { type: "wheel", deltaX: 0, deltaY: -notches, window: win }
+                // Horizontal tilt-right is already positive in both Win32 and the
+                // other backends (see Wayland's unflipped axis===1 handling), so
+                // no sign flip is needed here.
+                : { type: "wheel", deltaX: notches, deltaY: 0, window: win },
+            );
+            break;
+          }
         }
-        case WM.CLOSE:
-          this.#event = { type: "close", window: win };
-          // Return without calling DefWindowProcW to prevent immediate window
-          // destruction; let the application decide when to tear down.
+        return this.user32.symbols.DefWindowProcW(hWnd, uMsg, wParam, lParam);
+      }, (hWnd, uMsg, wParam, lParam) => {
+        try {
+          return this.user32.symbols.DefWindowProcW(hWnd, uMsg, wParam, lParam);
+        } catch {
+          // The primary callback error is already deferred. Never let a
+          // secondary fallback failure unwind through the WndProc ABI.
           return 0n;
-        case WM.MOUSEMOVE: {
-          this.#event = {
-            type: "mousemove",
-            x: Number(BigInt(lParam) & 0xFFFFn),
-            y: Number((BigInt(lParam) >> 16n) & 0xFFFFn),
-            window: win,
-          };
-          break;
         }
-        case WM.LBUTTONDOWN:
-        case WM.MBUTTONDOWN:
-        case WM.RBUTTONDOWN: {
-          // Capture the mouse so drags that leave the client area (e.g.
-          // dragging a scrollbar thumb) still deliver the eventual button-up,
-          // matching X11's implicit passive grab on button press.
-          if (this.#captureCount++ === 0) this.user32.symbols.SetCapture(hWnd);
-          this.#event = { type: "mousedown", button: DOWN_BUTTON[uMsg as WM]!, window: win };
-          break;
-        }
-        case WM.LBUTTONUP:
-        case WM.MBUTTONUP:
-        case WM.RBUTTONUP: {
-          if (this.#captureCount > 0 && --this.#captureCount === 0) {
-            this.user32.symbols.ReleaseCapture();
-          }
-          this.#event = { type: "mouseup", button: UP_BUTTON[uMsg as WM]!, window: win };
-          break;
-        }
-        case WM.MOUSEWHEEL:
-        case WM.MOUSEHWHEEL: {
-          // wParam's high word is a *signed* 16-bit tilt/rotation amount, in
-          // multiples of WHEEL_DELTA per notch (unlike the unsigned x/y words
-          // read elsewhere in this file).
-          const raw = Number((BigInt(wParam) >> 16n) & 0xFFFFn);
-          const signed = raw > 0x7FFF ? raw - 0x10000 : raw;
-          const notches = signed / WHEEL_DELTA;
-          this.#event = uMsg === WM.MOUSEWHEEL
-            // Win32 reports a positive vertical delta for "rotated away from
-            // the user" (scroll up); every other winding backend uses the
-            // opposite convention (positive deltaY = scroll down), so flip it.
-            ? { type: "wheel", deltaX: 0, deltaY: -notches, window: win }
-            // Horizontal tilt-right is already positive in both Win32 and the
-            // other backends (see Wayland's unflipped axis===1 handling), so
-            // no sign flip is needed here.
-            : { type: "wheel", deltaX: notches, deltaY: 0, window: win };
-          break;
-        }
-        case WM.KEYDOWN:
-        // Alt-held key combinations arrive as WM_SYSKEYDOWN instead of
-        // WM_KEYDOWN; fold them into the same "keydown" event since winding
-        // has no separate "system key" event type. DefWindowProcW still runs
-        // below, so system behaviors (Alt+F4, the system menu, ...) keep working.
-        case WM.SYSKEYDOWN:
-          this.#event = {
-            type: "keydown",
-            keycode: Number(wParam),
-            code: getDomCode(lParam),
-            ...getModifiers(this),
-            window: win,
-          };
-          break;
-        case WM.KEYUP:
-        case WM.SYSKEYUP:
-          this.#event = {
-            type: "keyup",
-            keycode: Number(wParam),
-            code: getDomCode(lParam),
-            ...getModifiers(this),
-            window: win,
-          };
-          break;
-      }
-      return this.user32.symbols.DefWindowProcW(hWnd, uMsg, wParam, lParam);
-    });
+      }),
+    );
     wndClassDv.setBigUint64(
       off,
       BigInt(Deno.UnsafePointer.value(this.#wndProc.pointer)),
@@ -282,7 +346,11 @@ class Win32Library implements Library {
     // hInstance
     const instance = this.kernel32.symbols.GetModuleHandleW(null);
     if (BigInt(instance) == 0n) throw new Error(this.getLastError());
-    wndClassDv.setBigUint64(off, BigInt(instance), true);
+    this.#instance = BigInt(instance);
+    const instancePointer = Deno.UnsafePointer.create(this.#instance);
+    if (instancePointer === null) throw new Error("winding(win32): invalid module handle");
+    this.instance = instancePointer;
+    wndClassDv.setBigUint64(off, this.#instance, true);
     off += 8;
 
     // hIcon
@@ -321,24 +389,47 @@ class Win32Library implements Library {
     const wndClass = this.user32.symbols.RegisterClassExW(this.#wndClass);
     if (wndClass == 0) throw new Error(this.getLastError());
   }
+
+  purgeWindowEvents(window: Win32Window): void {
+    this.#events.purgeWindow(window);
+  }
+
   readonly windows = new Map<bigint, Win32Window>();
   openWindow(_x = 0, _y = 0, _w = 800, _h = 600): Win32Window {
-    return new Win32Window(this, this.#classNameBuffer);
+    if (this.#closed) throw new Error("winding(win32): library is closed");
+    const window = new Win32Window(this, this.#classNameBuffer);
+    try {
+      this.#callbackErrors.throwIfPending();
+      return window;
+    } catch (error) {
+      const errors = [error];
+      try {
+        window.close();
+      } catch (cleanupError) {
+        errors.push(cleanupError);
+      }
+      throw collectedError(errors, "Failed to open Win32 window");
+    }
   }
   #msg = new ArrayBuffer(48);
   event(): UIEvent | undefined {
+    if (this.#closed) return undefined;
+    this.#callbackErrors.throwIfPending();
+    const queued = this.#events.shift();
+    if (queued !== undefined) return queued;
+
     const ptr = Deno.UnsafePointer.of(this.#msg);
-    if (this.user32.symbols.PeekMessageW(ptr, null, 0, 0, 1)) {
-      this.user32.symbols.TranslateMessage(
-        Deno.UnsafePointer.of(this.#msg),
-      );
-      this.user32.symbols.DispatchMessageW(
-        Deno.UnsafePointer.of(this.#msg),
-      );
+    while (this.#events.length === 0 && this.user32.symbols.PeekMessageW(ptr, null, 0, 0, PM_REMOVE)) {
+      this.input.prepareKeyMessage(this.#msg);
+      try {
+        this.user32.symbols.TranslateMessage(ptr);
+        this.user32.symbols.DispatchMessageW(ptr);
+      } finally {
+        this.input.clearPreparedKey();
+      }
     }
-    const event = this.#event;
-    if (event !== undefined) this.#event = undefined;
-    return event;
+    this.#callbackErrors.throwIfPending();
+    return this.#events.shift();
   }
   #lastErrorBuffer = new ArrayBuffer(4096);
   getLastError() {
@@ -368,11 +459,46 @@ class Win32Library implements Library {
     this.close();
   }
   close(): void {
-    this.#wndProc.close();
-    this.gdi32.close();
-    this.user32.close();
-    this.kernel32.close();
+    if (this.#closed) return;
+    this.#closed = true;
+    const errors: unknown[] = [];
+    this.#events.close();
+    for (const window of [...this.windows.values()]) {
+      try {
+        window.close();
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    captureError(errors, () => this.input.close());
+    captureError(errors, () => {
+      if (!this.user32.symbols.UnregisterClassW(this.#classNameBuffer, this.#instance)) {
+        throw new Error(this.getLastError());
+      }
+    });
+    captureError(errors, () => this.#callbackErrors.throwIfPending());
+    captureError(errors, () => this.#wndProc.close());
+    captureError(errors, () => this.gdi32.close());
+    captureError(errors, () => this.user32.close());
+    captureError(errors, () => this.kernel32.close());
+    throwCollected(errors, "Failed to close Win32 library");
   }
+}
+
+function captureError(errors: unknown[], operation: () => void): void {
+  try {
+    operation();
+  } catch (error) {
+    errors.push(error);
+  }
+}
+
+function throwCollected(errors: unknown[], message: string): void {
+  if (errors.length > 0) throw collectedError(errors, message);
+}
+
+function collectedError(errors: unknown[], message: string): unknown {
+  return errors.length === 1 ? errors[0] : new AggregateError(errors, message);
 }
 
 export const load: LoadLibrary = () => new Win32Library();

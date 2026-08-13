@@ -1,7 +1,6 @@
 import { getDomCode as getDarwinDomCode } from "./darwin/dom_code.ts";
-import { getDomCode as getWaylandDomCode } from "./wayland/dom_code.ts";
 import { getDomCode as getWin32DomCode } from "./win32/dom_code.ts";
-import { getDomCode as getX11DomCode } from "./x11/dom_code.ts";
+import { domCodeFromEvdev as getWaylandDomCode, domCodeFromX11 as getX11DomCode } from "./linux/mod.ts";
 
 Deno.test("DOM code mappings normalize Q across native key identifiers", () => {
   assertEquals(getX11DomCode(24), "KeyQ");

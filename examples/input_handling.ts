@@ -42,8 +42,11 @@ if (import.meta.main) {
         console.log(
           `Key ${event.type === "keydown" ? "pressed" : "released"}: ${event.key} (${event.code})${
             formatModifiers(event)
-          }`,
+          }${event.repeat ? " (repeated)" : ""}`,
         );
+        break;
+      case "textinput":
+        console.log(`Committed text: ${event.text}`);
         break;
       case "resize":
         console.log(`Window resized to ${event.width}x${event.height}`);
@@ -52,7 +55,7 @@ if (import.meta.main) {
         console.log("Window closed");
         break;
       default:
-        console.log("Other even thrown:", event);
+        console.log("Other event:", event);
         break;
     }
   });

@@ -1,6 +1,13 @@
 import type { QuoxRenderer as WasmRenderer } from "../lib/quox.js";
+import { invokeEventHandlers } from "./event_handlers.ts";
+import {
+  encodeKeyEvent,
+  type QuoxAppleStandardKeybindingEvent,
+  type QuoxKeyboardEvent,
+  type QuoxTextInputEvent,
+} from "./input.ts";
 import { type AssertActive, attachDocumentInternals, type RequestRender } from "./internals.ts";
-import { QuoxElement, QuoxNode, QuoxText } from "./node.ts";
+import { QuoxElement, type QuoxEventType, QuoxNode, QuoxText } from "./node.ts";
 
 type SetNativeTitle = (title: string) => void;
 
@@ -39,12 +46,7 @@ export class QuoxDocument {
     this.#requestRender();
   }
 
-  /**
-   * Push the live `<title>` text to the native window if it changed since the last push. Called
-   * once per render pass so title-affecting DOM edits (e.g. appending a `<title>` element, or
-   * editing one via `textContent`/`innerHTML`) reach the OS without every DOM mutation in the
-   * document paying for a `<head>` lookup.
-   */
+  /** Synchronize the window title with the document's current `<title>` text. */
   syncNativeTitle(): void {
     this.#assertActive();
     const title = this.#renderer.title();
@@ -78,6 +80,80 @@ export class QuoxDocument {
     this.#assertActive();
     const nodeId = this.#renderer.node_from_point(x, y);
     return nodeId === undefined ? null : new QuoxNode(this, nodeId);
+  }
+
+  /** Dispatch a pointer-move event, updating hover styles and the cursor. */
+  dispatchPointerMove(x: number, y: number, buttons: number): void {
+    this.#dispatchInputEvent(() => this.#renderer.dispatch_pointer_move(x, y, buttons));
+  }
+
+  /** Dispatch a pointer-down event, updating `:active`, focus, and click interactions. */
+  dispatchPointerDown(x: number, y: number, button: number, buttons: number): void {
+    this.#dispatchInputEvent(() => this.#renderer.dispatch_pointer_down(x, y, button, buttons));
+  }
+
+  /** Dispatch a pointer-up event, potentially firing `click`, `dblclick`, or `contextmenu`. */
+  dispatchPointerUp(x: number, y: number, button: number, buttons: number): void {
+    this.#dispatchInputEvent(() => this.#renderer.dispatch_pointer_up(x, y, button, buttons));
+  }
+
+  /** Dispatch a wheel event, scrolling the content under the pointer. */
+  dispatchWheel(x: number, y: number, deltaX: number, deltaY: number, buttons: number): void {
+    this.#dispatchInputEvent(() => this.#renderer.dispatch_wheel(x, y, deltaX, deltaY, buttons));
+  }
+
+  /** Dispatch a keyboard event. Use `dispatchTextInput` separately for text committed by the keyboard layout. */
+  dispatchKey(event: QuoxKeyboardEvent): void {
+    const encoded = encodeKeyEvent(event);
+    this.#dispatchInputEvent(() =>
+      this.#renderer.dispatch_key_event(
+        encoded.code,
+        encoded.key,
+        encoded.modifierBits,
+        encoded.location,
+        encoded.eventFlags,
+      )
+    );
+  }
+
+  /** Dispatch a standard macOS editing command identified by its AppKit selector. */
+  dispatchAppleStandardKeybinding(event: QuoxAppleStandardKeybindingEvent): void {
+    this.#dispatchInputEvent(() => this.#renderer.dispatch_apple_standard_keybinding(event.command));
+  }
+
+  /** Insert text committed by the active keyboard layout. */
+  dispatchTextInput(event: QuoxTextInputEvent): void {
+    this.#dispatchInputEvent(() => this.#renderer.dispatch_text_input(event.text));
+  }
+
+  /** Clear hover styles and reset the cursor, such as when the pointer leaves the window. */
+  clearHover(): void {
+    this.#dispatchInputEvent(() => this.#renderer.clear_hover(), false);
+  }
+
+  #dispatchInputEvent(dispatch: () => boolean, drainFiredEvents = true): void {
+    this.#assertActive();
+    if (dispatch()) this.#requestRender();
+    if (drainFiredEvents) this.#drainFiredEvents();
+  }
+
+  /**
+   * After a dispatch call, check which (if any) of the JS-handler-relevant DOM events fired
+   * and invoke matching `on*` handlers target-to-root along Blitz's frozen element path.
+   */
+  #drainFiredEvents(): void {
+    this.#invokeHandlers(this.#renderer.take_click_path(), "click");
+    this.#invokeHandlers(this.#renderer.take_double_click_path(), "dblclick");
+    this.#invokeHandlers(this.#renderer.take_context_menu_path(), "contextmenu");
+    this.#invokeHandlers(this.#renderer.take_input_path(), "input");
+    this.#invokeHandlers(this.#renderer.take_focus_path(), "focus");
+    this.#invokeHandlers(this.#renderer.take_blur_path(), "blur");
+    this.#invokeHandlers(this.#renderer.take_scroll_path(), "scroll");
+  }
+
+  #invokeHandlers(path: Uint32Array, type: QuoxEventType): void {
+    if (path.length === 0) return;
+    invokeEventHandlers(this, path, type);
   }
 
   createElement(tagName: string): QuoxElement {
