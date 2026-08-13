@@ -1,5 +1,5 @@
 import type { QuoxRenderer as WasmRenderer } from "../lib/quox.js";
-import { dispatchEventFrame, type QuoxEventFrame } from "./event_handlers.ts";
+import { invokeEventHandlers } from "./event_handlers.ts";
 import {
   encodeKeyEvent,
   type QuoxAppleStandardKeybindingEvent,
@@ -17,7 +17,6 @@ export class QuoxDocument {
   readonly #assertActive: AssertActive;
   readonly #setNativeTitle: SetNativeTitle;
   #lastNativeTitle: string;
-  #suppressNextKeyFollowup = false;
 
   constructor(
     renderer: WasmRenderer,
@@ -111,7 +110,7 @@ export class QuoxDocument {
   /** Feed a canonical native key event into the engine. Character insertion remains a later Commit. */
   dispatchKey(event: QuoxKeyboardEvent): void {
     const encoded = encodeKeyEvent(event);
-    const prevented = this.#dispatchInputEvent(() =>
+    this.#dispatchInputEvent(() =>
       this.#renderer.dispatch_key_event(
         encoded.code,
         encoded.key,
@@ -120,27 +119,15 @@ export class QuoxDocument {
         encoded.eventFlags,
       )
     );
-    this.#suppressNextKeyFollowup = event.type === "keydown" &&
-      event.editDisposition === "text-input" && prevented.has("keydown");
   }
 
   /** Apply an AppKit editing selector through the engine's platform-command adapter. */
   dispatchAppleStandardKeybinding(event: QuoxAppleStandardKeybindingEvent): void {
-    if (this.#suppressNextKeyFollowup) {
-      this.#suppressNextKeyFollowup = false;
-      return;
-    }
-    this.#suppressNextKeyFollowup = false;
     this.#dispatchInputEvent(() => this.#renderer.dispatch_apple_standard_keybinding(event.command));
   }
 
   /** Insert text committed by the active keyboard layout. */
   dispatchTextInput(event: QuoxTextInputEvent): void {
-    if (this.#suppressNextKeyFollowup) {
-      this.#suppressNextKeyFollowup = false;
-      return;
-    }
-    this.#suppressNextKeyFollowup = false;
     this.#dispatchInputEvent(() => this.#renderer.dispatch_text_input(event.text));
   }
 
@@ -149,36 +136,29 @@ export class QuoxDocument {
     this.#dispatchInputEvent(() => this.#renderer.clear_hover(), false);
   }
 
-  #dispatchInputEvent(dispatch: () => boolean, drainFiredEvents = true): Set<QuoxEventType> {
+  #dispatchInputEvent(dispatch: () => boolean, drainFiredEvents = true): void {
     this.#assertActive();
-    let renderRequested = dispatch();
-    const prevented = new Set<QuoxEventType>();
-    const errors: unknown[] = [];
-
-    if (drainFiredEvents) {
-      for (;;) {
-        const frame = this.#renderer.take_dom_event() as QuoxEventFrame | undefined;
-        if (frame === undefined) break;
-        const result = dispatchEventFrame(this, frame);
-        if (result.defaultPrevented) prevented.add(frame.type);
-        errors.push(...result.errors);
-        if (this.#renderer.finish_dom_event(frame.token, result.defaultPrevented)) {
-          renderRequested = true;
-        }
-      }
-    }
-
-    if (renderRequested) this.#requestRender();
-    this.#reportHandlerErrors(errors);
-    return prevented;
+    if (dispatch()) this.#requestRender();
+    if (drainFiredEvents) this.#drainFiredEvents();
   }
 
-  #reportHandlerErrors(errors: readonly unknown[]): void {
-    if (errors.length === 0) return;
-    const error = errors.length === 1 ? errors[0] : new AggregateError(errors, "Quox event handlers failed");
-    queueMicrotask(() => {
-      throw error;
-    });
+  /**
+   * After a dispatch call, check which (if any) of the JS-handler-relevant DOM events fired
+   * and invoke matching `on*` handlers target-to-root along Blitz's frozen element path.
+   */
+  #drainFiredEvents(): void {
+    this.#invokeHandlers(this.#renderer.take_click_path(), "click");
+    this.#invokeHandlers(this.#renderer.take_double_click_path(), "dblclick");
+    this.#invokeHandlers(this.#renderer.take_context_menu_path(), "contextmenu");
+    this.#invokeHandlers(this.#renderer.take_input_path(), "input");
+    this.#invokeHandlers(this.#renderer.take_focus_path(), "focus");
+    this.#invokeHandlers(this.#renderer.take_blur_path(), "blur");
+    this.#invokeHandlers(this.#renderer.take_scroll_path(), "scroll");
+  }
+
+  #invokeHandlers(path: Uint32Array, type: QuoxEventType): void {
+    if (path.length === 0) return;
+    invokeEventHandlers(this, path, type);
   }
 
   createElement(tagName: string): QuoxElement {

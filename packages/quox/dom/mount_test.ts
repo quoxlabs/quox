@@ -80,8 +80,6 @@ class FakeRenderer {
     void name;
   }
 
-  set_event_handler(_nodeId: number, _kind: number, _enabled: boolean): void {}
-
   #hitNodeId: number | undefined = undefined;
   #lastHitPoint: { x: number; y: number } | undefined;
 
@@ -264,19 +262,6 @@ Deno.test("mount maps every supported JSX event prop to its browser-style proper
     onFocus: () => "focus",
     onBlur: () => "blur",
     onScroll: () => "scroll",
-    onPointerMove: () => "pointermove",
-    onPointerDown: () => "pointerdown",
-    onPointerUp: () => "pointerup",
-    onPointerOver: () => "pointerover",
-    onPointerOut: () => "pointerout",
-    onMouseMove: () => "mousemove",
-    onMouseDown: () => "mousedown",
-    onMouseUp: () => "mouseup",
-    onMouseOver: () => "mouseover",
-    onMouseOut: () => "mouseout",
-    onWheel: () => "wheel",
-    onKeyDown: () => "keydown",
-    onKeyUp: () => "keyup",
   };
 
   const [node] = await mount(root, createVNode("div", handlers));
@@ -289,19 +274,6 @@ Deno.test("mount maps every supported JSX event prop to its browser-style proper
   assertStrictEquals(element.onfocus, handlers.onFocus);
   assertStrictEquals(element.onblur, handlers.onBlur);
   assertStrictEquals(element.onscroll, handlers.onScroll);
-  assertStrictEquals(element.onpointermove, handlers.onPointerMove);
-  assertStrictEquals(element.onpointerdown, handlers.onPointerDown);
-  assertStrictEquals(element.onpointerup, handlers.onPointerUp);
-  assertStrictEquals(element.onpointerover, handlers.onPointerOver);
-  assertStrictEquals(element.onpointerout, handlers.onPointerOut);
-  assertStrictEquals(element.onmousemove, handlers.onMouseMove);
-  assertStrictEquals(element.onmousedown, handlers.onMouseDown);
-  assertStrictEquals(element.onmouseup, handlers.onMouseUp);
-  assertStrictEquals(element.onmouseover, handlers.onMouseOver);
-  assertStrictEquals(element.onmouseout, handlers.onMouseOut);
-  assertStrictEquals(element.onwheel, handlers.onWheel);
-  assertStrictEquals(element.onkeydown, handlers.onKeyDown);
-  assertStrictEquals(element.onkeyup, handlers.onKeyUp);
 });
 
 Deno.test("mount rejects unsupported function-valued DOM props", async () => {

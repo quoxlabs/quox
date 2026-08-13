@@ -1,5 +1,4 @@
 mod dom;
-mod event_bridge;
 mod interaction;
 mod render;
 
@@ -7,7 +6,7 @@ use blitz_dom::{BaseDocument, DEFAULT_CSS, DocumentConfig, FontContext};
 use blitz_html::{HtmlDocument, HtmlProvider};
 use blitz_traits::net::DummyNetProvider;
 use blitz_traits::shell::{ColorScheme, ShellProvider, Viewport};
-use event_bridge::EventBridge;
+use interaction::RecordedEvents;
 use linebender_resource_handle::Blob;
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -46,7 +45,7 @@ struct QuoxRendererState {
     dev_id: usize,
     renderer: Renderer,
     redraw_requested: Arc<AtomicBool>,
-    event_bridge: EventBridge,
+    recorded_events: RecordedEvents,
 }
 
 /// Notices Blitz-internal redraw requests (hover/active/focus/scroll/text-input state
@@ -140,7 +139,7 @@ impl QuoxRenderer {
                 dev_id,
                 renderer,
                 redraw_requested,
-                event_bridge: EventBridge::default(),
+                recorded_events: RecordedEvents::default(),
             }),
         })
     }

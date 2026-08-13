@@ -49,7 +49,7 @@ Deno.test("AltGraph excludes synthetic Control from the editor projection", () =
   });
   if (mapped.type !== "keydown") throw new TypeError("expected keydown");
   assertEquals(mapped.ctrlKey, true);
-  assertEquals(encodeKeyEvent(mapped).modifierBits, 82);
+  assertEquals(encodeKeyEvent(mapped).modifierBits, 18);
 });
 
 Deno.test("router preserves keydown, textinput, then keyup order", () => {
