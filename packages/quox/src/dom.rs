@@ -1,5 +1,9 @@
 use super::{QuoxRenderer, QuoxRendererState};
+use blitz_dom::node::{ImageData, RasterImageData, SpecialElementData};
 use blitz_dom::{DocumentMutator, LocalName, NodeData, QualName, ns};
+use image::ImageReader;
+use std::io::Cursor;
+use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 
 fn html_name(local_name: &str) -> QualName {
@@ -155,6 +159,77 @@ impl QuoxRenderer {
             mutator.set_attribute(node_id, attr_name(name), value);
             Ok(())
         })
+    }
+
+    /// Decode an encoded image from `bytes` and display it in an `<img>` element.
+    ///
+    /// You pass the raw bytes of an image file — exactly what `Deno.readFile`
+    /// returns — not pre-decoded pixels; decoding happens inside quox's WebAssembly
+    /// module, so the caller only ever provides a byte buffer.
+    ///
+    /// Supported formats are PNG, JPEG, GIF and WebP. Animated formats (e.g. GIF)
+    /// are shown as a still first frame, not animated.
+    ///
+    /// The image's intrinsic size becomes the element's natural size; `width`/`height`
+    /// attributes or CSS on the element override it as usual. Errors if `node_id`
+    /// isn't an `<img>` element or the bytes can't be decoded.
+    //
+    // Format support is pinned in `Cargo.toml` (`image` with `default-features =
+    // false`); see the comment there for why we don't just take `image`'s defaults.
+    pub fn set_image_data(&self, node_id: usize, bytes: &[u8]) -> Result<(), JsValue> {
+        let mut state = self.state.borrow_mut();
+
+        // Restrict this to <img>. In HTML/CSS an <img> is a "replaced element": its
+        // box isn't laid out from child content but is sized from an external
+        // resource's own intrinsic dimensions — here, the decoded pixels.
+        // (See https://developer.mozilla.org/en-US/docs/Glossary/Replaced_elements)
+        // Blitz only derives that intrinsic size for replaced elements
+        // (img/canvas/svg), so an <img> lays out and paints at the image's natural
+        // size, as callers expect.
+        //
+        // On any other element (e.g. a <div>) the image decodes fine and would even
+        // paint if the element were given an explicit CSS size, but it gets no
+        // intrinsic size from the image — so by default the box collapses and nothing
+        // shows. We reject non-<img> up front rather than ship that half-working case.
+        let is_img = state
+            .document
+            .get_node(node_id)
+            .ok_or_else(|| invalid_node(node_id))?
+            .element_data()
+            .ok_or_else(|| invalid_element(node_id))?
+            .name
+            .local
+            .as_ref()
+            == "img";
+        if !is_img {
+            return Err(JsValue::from_str(&format!(
+                "DOM node id is not an <img> element: {node_id}"
+            )));
+        }
+
+        let decoded = ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()
+            .map_err(|e| JsValue::from_str(&format!("Image format: {e}")))?
+            .decode()
+            .map_err(|e| JsValue::from_str(&format!("Image decode: {e}")))?;
+        let width = decoded.width();
+        let height = decoded.height();
+        let rgba = decoded.into_rgba8().into_raw();
+
+        let node = state
+            .document
+            .get_node_mut(node_id)
+            .ok_or_else(|| invalid_node(node_id))?;
+        node.element_data_mut()
+            .ok_or_else(|| invalid_element(node_id))?
+            .special_data = SpecialElementData::Image(Box::new(ImageData::Raster(
+            RasterImageData::new(width, height, Arc::new(rgba)),
+        )));
+        // Drop the node's cached intrinsic-size measurement so the next layout pass
+        // (`sync_layout` fully re-resolves on every render) picks up the new image.
+        node.cache.clear();
+
+        Ok(())
     }
 
     /// Create an element node in the retained document.

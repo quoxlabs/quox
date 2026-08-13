@@ -120,6 +120,21 @@ export class QuoxElement extends QuoxNode {
     requestRender();
   }
 
+  /**
+   * Display an image in this `<img>` element from a byte buffer of encoded image
+   * data — e.g. the `Uint8Array` returned by `Deno.readFile`. You pass the raw
+   * bytes of the image file (not pre-decoded pixels); decoding happens inside
+   * quox's WebAssembly module. Throws if this element is not an `<img>`.
+   *
+   * Supported formats are PNG, JPEG, GIF and WebP. GIFs are supported but only
+   * as a still image: an animated GIF renders as its first frame, not animated.
+   */
+  setImageData(bytes: Uint8Array): void {
+    const { renderer, requestRender } = documentInternals(this.ownerDocument);
+    renderer.set_image_data(this.nodeId, bytes);
+    requestRender();
+  }
+
   removeAttribute(name: string): void {
     const { renderer, requestRender } = documentInternals(this.ownerDocument);
     renderer.remove_attribute(this.nodeId, name);
