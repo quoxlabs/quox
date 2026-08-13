@@ -1,4 +1,4 @@
-import type { ImeEvent, Library, Window } from "../types.ts";
+import type { Library, TextInputEvent, Window } from "../types.ts";
 import { UNICODE_NOCHAR, WM } from "./ffi.ts";
 import { load } from "./mod.ts";
 
@@ -48,9 +48,6 @@ function runLifecycle(user32: Deno.DynamicLibrary<typeof testUser32Functions>): 
     try {
       // Keep hosted CI independent of foreground-window and desktop behavior.
       user32.symbols.ShowWindow(window.hwnd, 0);
-      window.setImeCursorArea(4, 8, 2, 16);
-      window.setImeEnabled(true);
-      window.setImeEnabled(false);
       drainEvents(library);
 
       const probe = user32.symbols.SendMessageW(
@@ -65,9 +62,9 @@ function runLifecycle(user32: Deno.DynamicLibrary<typeof testUser32Functions>): 
         throw new Error("PostMessageW rejected the synthetic Unicode character");
       }
 
-      const commit = nextImeEdit(library, window);
-      if (commit?.kind !== "commit" || commit.text !== "A") {
-        throw new Error("Expected a Win32 commit containing A");
+      const commit = nextTextInput(library, window);
+      if (commit?.text !== "A") {
+        throw new Error("Expected Win32 committed text containing A");
       }
     } finally {
       window.close();
@@ -81,13 +78,12 @@ function drainEvents(library: Library): void {
   for (let count = 0; count < 64 && library.event() !== undefined; count++);
 }
 
-function nextImeEdit(library: Library, window: Window): ImeEvent | undefined {
+function nextTextInput(library: Library, window: Window): TextInputEvent | undefined {
   for (let count = 0; count < 128; count++) {
     const event = library.event();
     if (event === undefined) return undefined;
     if (
-      event.type === "ime" && event.window === window &&
-      (event.kind === "preedit" || event.kind === "commit")
+      event.type === "textinput" && event.window === window
     ) return event;
   }
   throw new Error("Win32 smoke test exceeded its event limit");

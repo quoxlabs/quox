@@ -3,14 +3,13 @@ import { getElementFunctionProps } from "./handlers.ts";
 import {
   encodeKeyEvent,
   type QuoxAppleStandardKeybindingEvent,
-  type QuoxImeEvent,
   type QuoxKeyboardEvent,
+  type QuoxTextInputEvent,
 } from "./input.ts";
 import { type AssertActive, attachDocumentInternals, type RequestRender } from "./internals.ts";
 import { QuoxElement, QuoxNode, QuoxText } from "./node.ts";
 
 type SetNativeTitle = (title: string) => void;
-type SyncNativeImeRequests = () => void;
 
 /**
  * Maps the DOM event kinds quox can invoke a JS handler for to their JSX prop name.
@@ -32,7 +31,6 @@ export class QuoxDocument {
   readonly #requestRender: RequestRender;
   readonly #assertActive: AssertActive;
   readonly #setNativeTitle: SetNativeTitle;
-  readonly #syncNativeImeRequests: SyncNativeImeRequests;
   #lastNativeTitle: string;
 
   constructor(
@@ -40,13 +38,11 @@ export class QuoxDocument {
     requestRender: RequestRender,
     assertActive: AssertActive,
     setNativeTitle: SetNativeTitle = () => undefined,
-    syncNativeImeRequests: SyncNativeImeRequests = () => undefined,
   ) {
     this.#renderer = renderer;
     this.#requestRender = requestRender;
     this.#assertActive = assertActive;
     this.#setNativeTitle = setNativeTitle;
-    this.#syncNativeImeRequests = syncNativeImeRequests;
     this.#lastNativeTitle = renderer.title();
     attachDocumentInternals(this, { renderer, requestRender, assertActive });
   }
@@ -145,32 +141,9 @@ export class QuoxDocument {
     this.#dispatchInputEvent(() => this.#renderer.dispatch_apple_standard_keybinding(event.command));
   }
 
-  /** Feed native IME lifecycle and edit events into Blitz. */
-  dispatchIme(event: QuoxImeEvent): void {
-    switch (event.kind) {
-      case "enabled":
-        this.#dispatchInputEvent(() => this.#renderer.dispatch_ime_enabled());
-        break;
-      case "disabled":
-        this.#dispatchInputEvent(() => this.#renderer.dispatch_ime_disabled());
-        break;
-      case "preedit": {
-        const start = event.cursorRange?.[0] ?? undefined;
-        const end = event.cursorRange?.[1] ?? undefined;
-        this.#dispatchInputEvent(() => this.#renderer.dispatch_ime_preedit(event.text, start, end));
-        break;
-      }
-      case "commit":
-        this.#dispatchInputEvent(() => this.#renderer.dispatch_ime_commit(event.text));
-        break;
-      case "deleteSurrounding":
-        this.#dispatchInputEvent(() =>
-          this.#renderer.dispatch_ime_delete_surrounding(event.beforeBytes, event.afterBytes)
-        );
-        break;
-      default:
-        return assertNever(event);
-    }
+  /** Insert text committed by the active keyboard layout. */
+  dispatchTextInput(event: QuoxTextInputEvent): void {
+    this.#dispatchInputEvent(() => this.#renderer.dispatch_text_input(event.text));
   }
 
   /** Clear Blitz's hover state, e.g. when the pointer leaves the window entirely. */
@@ -180,12 +153,8 @@ export class QuoxDocument {
 
   #dispatchInputEvent(dispatch: () => boolean, drainFiredEvents = true): void {
     this.#assertActive();
-    try {
-      if (dispatch()) this.#requestRender();
-      if (drainFiredEvents) this.#drainFiredEvents();
-    } finally {
-      this.#syncNativeImeRequests();
-    }
+    if (dispatch()) this.#requestRender();
+    if (drainFiredEvents) this.#drainFiredEvents();
   }
 
   /**
@@ -218,8 +187,4 @@ export class QuoxDocument {
     this.#assertActive();
     return new QuoxText(this, this.#renderer.create_text_node(text));
   }
-}
-
-function assertNever(_value: never): never {
-  throw new TypeError("Unsupported Quox IME event");
 }

@@ -19,13 +19,8 @@ export function fallbackLookupText(bytes: Uint8Array, keysymText: string): strin
 export function x11KeyEditDisposition(
   key: string,
   hasCommittedText: boolean,
-  wasComposing: boolean,
-  isComposing: boolean,
-  hasSemanticEvents: boolean,
 ): KeyEditDisposition {
-  return key === "Dead" || hasCommittedText || wasComposing || isComposing || hasSemanticEvents
-    ? "text-input"
-    : "key-default";
+  return key === "Dead" || hasCommittedText ? "text-input" : "key-default";
 }
 
 /** Core X11 represents auto-repeat as a release immediately followed by a matching press. */

@@ -1,21 +1,12 @@
 import { normalizeCommittedText } from "../input/mod.ts";
 
-/** Selectors implemented by WindingContentView's NSTextInputClient bridge. */
+/** Selectors implemented by WindingContentView's commit/command bridge. */
 export const REQUIRED_TEXT_INPUT_SELECTORS = [
   "acceptsFirstResponder",
   "keyDown:",
   "keyUp:",
   "flagsChanged:",
   "insertText:replacementRange:",
-  "setMarkedText:selectedRange:replacementRange:",
-  "unmarkText",
-  "hasMarkedText",
-  "markedRange",
-  "selectedRange",
-  "validAttributesForMarkedText",
-  "attributedSubstringForProposedRange:actualRange:",
-  "characterIndexForPoint:",
-  "firstRectForCharacterRange:actualRange:",
   "doCommandBySelector:",
 ] as const;
 
@@ -59,8 +50,6 @@ export interface NativeLogicalKeyInput {
   charactersIgnoringModifiers: string;
   /** Text delivered synchronously through insertText:, when available. */
   producedText?: string;
-  /** Whether interpretKeyEvents: produced marked text for this key. */
-  producedPreedit?: boolean;
 }
 
 /**
@@ -81,10 +70,6 @@ export function logicalKeyForEvent(input: NativeLogicalKeyInput): string {
 
   // A dead key commonly has no `characters`, while
   // `charactersIgnoringModifiers` still names the underlying physical key.
-  // Prefer AppKit's actual marked-text signal in that case. Ordinary IME
-  // preedit keystrokes still keep their layout-aware `characters` above.
-  if (input.producedPreedit) return "Dead";
-
   const unmodified = printableText(input.charactersIgnoringModifiers);
   if (input.characters.length === 0 && unmodified !== undefined && isPotentiallyPrintableCode(input.code)) {
     return "Dead";
@@ -117,7 +102,7 @@ export function uninterpretedCommitText(
   return ctrlKey || metaKey ? undefined : printableText(characters);
 }
 
-function isPotentiallyPrintableCode(code: string): boolean {
+export function isPotentiallyPrintableCode(code: string): boolean {
   return code.startsWith("Key") ||
     code.startsWith("Digit") ||
     code.startsWith("Numpad") ||
@@ -136,25 +121,4 @@ function isPotentiallyPrintableCode(code: string): boolean {
     code === "IntlBackslash" ||
     code === "IntlYen" ||
     code === "IntlRo";
-}
-
-export interface ClientRect {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-}
-
-/** Convert top-left client coordinates into an unflipped NSView's local coordinates. */
-export function cocoaRectFromClient(rect: ClientRect, viewHeight: number): ClientRect {
-  const width = Number.isFinite(rect.width) ? Math.max(0, rect.width) : 0;
-  const height = Number.isFinite(rect.height) ? Math.max(0, rect.height) : 0;
-  const x = Number.isFinite(rect.x) ? rect.x : 0;
-  const y = Number.isFinite(rect.y) ? rect.y : 0;
-  return {
-    x,
-    y: viewHeight - y - height,
-    width,
-    height,
-  };
 }

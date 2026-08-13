@@ -35,18 +35,13 @@ export interface XdgIfaces {
   xdgToplevelIface: Deno.PointerObject;
   wpCursorShapeManagerIface: Deno.PointerObject;
   wpCursorShapeDeviceIface: Deno.PointerObject;
-  zwpTextInputManagerIface: Deno.PointerObject;
-  zwpTextInputIface: Deno.PointerObject;
 }
 
 // Request/event signatures come from the corresponding generated protocol
-// code (xdg-shell, cursor-shape-v1, and text-input-unstable-v3).
+// code (xdg-shell and cursor-shape-v1).
 // Called once inside WaylandLibrary's constructor so no FFI work happens at
 // module-load time.
-export function buildXdgIfaces(
-  wlSeatIface: Deno.PointerObject,
-  wlSurfaceIface: Deno.PointerObject,
-): XdgIfaces {
+export function buildXdgIfaces(): XdgIfaces {
   const mem = new Uint8Array(16384);
   let off = 0;
   const base = Deno.UnsafePointer.value(Deno.UnsafePointer.of(mem));
@@ -179,33 +174,6 @@ export function buildXdgIfaces(
     ], []),
   )!;
 
-  const zwpTextInputIface = Deno.UnsafePointer.create(
-    buildIface("zwp_text_input_v3", 1, [
-      ["destroy", ""],
-      ["enable", ""],
-      ["disable", ""],
-      ["set_surrounding_text", "sii"],
-      ["set_text_change_cause", "u"],
-      ["set_content_type", "uu"],
-      ["set_cursor_rectangle", "iiii"],
-      ["commit", ""],
-    ], [
-      ["enter", "o", [wlSurfaceIface]],
-      ["leave", "o", [wlSurfaceIface]],
-      ["preedit_string", "?sii"],
-      ["commit_string", "?s"],
-      ["delete_surrounding_text", "uu"],
-      ["done", "u"],
-    ]),
-  )!;
-
-  const zwpTextInputManagerIface = Deno.UnsafePointer.create(
-    buildIface("zwp_text_input_manager_v3", 1, [
-      ["destroy", ""],
-      ["get_text_input", "no", [zwpTextInputIface, wlSeatIface]],
-    ], []),
-  )!;
-
   return {
     mem,
     xdgWmBaseIface,
@@ -213,8 +181,6 @@ export function buildXdgIfaces(
     xdgToplevelIface,
     wpCursorShapeManagerIface,
     wpCursorShapeDeviceIface,
-    zwpTextInputManagerIface,
-    zwpTextInputIface,
   };
 }
 
@@ -269,18 +235,6 @@ export const WlOp = {
   // wp_cursor_shape_device_v1 requests
   WP_CURSOR_SHAPE_DEVICE_DESTROY: 0,
   WP_CURSOR_SHAPE_DEVICE_SET_SHAPE: 1,
-  // zwp_text_input_manager_v3 requests
-  ZWP_TEXT_INPUT_MANAGER_DESTROY: 0,
-  ZWP_TEXT_INPUT_MANAGER_GET_TEXT_INPUT: 1,
-  // zwp_text_input_v3 requests
-  ZWP_TEXT_INPUT_DESTROY: 0,
-  ZWP_TEXT_INPUT_ENABLE: 1,
-  ZWP_TEXT_INPUT_DISABLE: 2,
-  ZWP_TEXT_INPUT_SET_SURROUNDING_TEXT: 3,
-  ZWP_TEXT_INPUT_SET_TEXT_CHANGE_CAUSE: 4,
-  ZWP_TEXT_INPUT_SET_CONTENT_TYPE: 5,
-  ZWP_TEXT_INPUT_SET_CURSOR_RECTANGLE: 6,
-  ZWP_TEXT_INPUT_COMMIT: 7,
 } as const;
 
 export const WlShmFormat = {

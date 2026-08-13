@@ -16,14 +16,11 @@ export const CORE_FOUNDATION = "/System/Library/Frameworks/CoreFoundation.framew
 
 export const runtimeSymbols = {
   objc_getClass: { parameters: ["buffer"], result: "pointer" },
-  objc_getProtocol: { parameters: ["buffer"], result: "pointer" },
   sel_registerName: { parameters: ["buffer"], result: "pointer" },
   sel_getName: { parameters: ["pointer"], result: "pointer" },
   objc_allocateClassPair: { parameters: ["pointer", "buffer", "usize"], result: "pointer" },
   objc_registerClassPair: { parameters: ["pointer"], result: "void" },
   class_addMethod: { parameters: ["pointer", "pointer", "pointer", "buffer"], result: "bool" },
-  class_addProtocol: { parameters: ["pointer", "pointer"], result: "bool" },
-  class_conformsToProtocol: { parameters: ["pointer", "pointer"], result: "bool" },
 } as const satisfies Deno.ForeignLibraryInterface;
 
 export type ObjcRuntime = Deno.DynamicLibrary<typeof runtimeSymbols>;
@@ -40,11 +37,6 @@ export function selectorName(runtime: ObjcRuntime, selector: Deno.PointerValue):
   const p = runtime.symbols.sel_getName(selector);
   if (p === null) throw new Error("winding(darwin) could not read Objective-C selector name");
   return new Deno.UnsafePointerView(p).getCString();
-}
-export function getProtocol(runtime: ObjcRuntime, name: string): Deno.PointerObject {
-  const p = runtime.symbols.objc_getProtocol(cStr(name));
-  if (p === null) throw new Error(`winding(darwin) could not find Objective-C protocol '${name}'`);
-  return p;
 }
 export function allocateClassPair(
   runtime: ObjcRuntime,
@@ -65,23 +57,6 @@ export function addMethod(
   const ok = runtime.symbols.class_addMethod(cls, selector, imp, cStr(typeEncoding));
   if (!ok) throw new Error("winding(darwin) failed to add method");
 }
-export function addProtocol(
-  runtime: ObjcRuntime,
-  cls: Deno.PointerObject,
-  protocol: Deno.PointerObject,
-): void {
-  const ok = runtime.symbols.class_addProtocol(cls, protocol);
-  if (!ok) throw new Error("winding(darwin) failed to add protocol to class");
-}
-
-export function classConformsToProtocol(
-  runtime: ObjcRuntime,
-  cls: Deno.PointerObject,
-  protocol: Deno.PointerObject,
-): boolean {
-  return runtime.symbols.class_conformsToProtocol(cls, protocol);
-}
-
 // Objective-C's BOOL is a C++ bool on Apple arm64 and a signed char on
 // x86_64. This matters in dynamic method type encodings even though Deno uses
 // the same `bool` FFI type for both calling conventions.
@@ -134,15 +109,6 @@ export function makeNSRange(
   return range;
 }
 
-export function readNSRange(view: StructBytes): NSRangeValue {
-  if (view.byteLength < 16) throw new RangeError("winding(darwin) NSRange buffer is too small");
-  const data = structDataView(view);
-  return {
-    location: data.getBigUint64(0, true),
-    length: data.getBigUint64(8, true),
-  };
-}
-
 export function writeNSRange(view: StructBytes, range: NSRangeValue): void {
   if (view.byteLength < 16) throw new RangeError("winding(darwin) NSRange buffer is too small");
   const data = structDataView(view);
@@ -161,12 +127,6 @@ export interface NSRectMsgSend {
     receiver: Deno.PointerValue,
     selector: Deno.PointerValue,
     rect: NSRectBuffer,
-  ): Uint8Array;
-  rangePointerArgs(
-    receiver: Deno.PointerValue,
-    selector: Deno.PointerValue,
-    range: StructBytes,
-    actualRange: Deno.PointerValue,
   ): Uint8Array;
 }
 
@@ -200,16 +160,7 @@ export function openNSRectMsgSend(libraries: Closeable[]): NSRectMsgSend {
         },
       } as const,
     );
-    const rangePointerArgsLib = Deno.dlopen(
-      LIBOBJC,
-      {
-        objc_msgSend_stret: {
-          parameters: ["buffer", "pointer", "pointer", NSRANGE, "pointer"],
-          result: "void",
-        },
-      } as const,
-    );
-    libraries.push(noArgsLib, rectArgLib, rangePointerArgsLib);
+    libraries.push(noArgsLib, rectArgLib);
     return {
       noArgs(receiver, selector) {
         const result = new Float64Array(4);
@@ -219,17 +170,6 @@ export function openNSRectMsgSend(libraries: Closeable[]): NSRectMsgSend {
       rectArg(receiver, selector, rect) {
         const result = new Float64Array(4);
         rectArgLib.symbols.objc_msgSend_stret(result, receiver, selector, rect);
-        return new Uint8Array(result.buffer);
-      },
-      rangePointerArgs(receiver, selector, range, actualRange) {
-        const result = new Float64Array(4);
-        rangePointerArgsLib.symbols.objc_msgSend_stret(
-          result,
-          receiver,
-          selector,
-          range,
-          actualRange,
-        );
         return new Uint8Array(result.buffer);
       },
     };
@@ -253,21 +193,10 @@ export function openNSRectMsgSend(libraries: Closeable[]): NSRectMsgSend {
       },
     } as const,
   );
-  const rangePointerArgsLib = Deno.dlopen(
-    LIBOBJC,
-    {
-      objc_msgSend: {
-        parameters: ["pointer", "pointer", NSRANGE, "pointer"],
-        result: NSRECT,
-      },
-    } as const,
-  );
-  libraries.push(noArgsLib, rectArgLib, rangePointerArgsLib);
+  libraries.push(noArgsLib, rectArgLib);
   return {
     noArgs: (receiver, selector) => noArgsLib.symbols.objc_msgSend(receiver, selector) as Uint8Array,
     rectArg: (receiver, selector, rect) => rectArgLib.symbols.objc_msgSend(receiver, selector, rect) as Uint8Array,
-    rangePointerArgs: (receiver, selector, range, actualRange) =>
-      rangePointerArgsLib.symbols.objc_msgSend(receiver, selector, range, actualRange) as Uint8Array,
   };
 }
 

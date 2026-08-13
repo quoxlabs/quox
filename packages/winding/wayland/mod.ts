@@ -19,7 +19,6 @@ import {
   WL_MARSHAL_FLAG_DESTROY,
 } from "./protocol.ts";
 import { WaylandWindow } from "./window.ts";
-import { WaylandTextInputController } from "./text_input_controller.ts";
 import { WaylandKeyboardController } from "./keyboard_controller.ts";
 
 // WaylandLibrary coordinates globals and the extracted native controllers.
@@ -39,8 +38,6 @@ class WaylandLibrary implements Library {
   readonly xdgToplevelIface: Deno.PointerObject;
   readonly wpCursorShapeManagerIface: Deno.PointerObject;
   readonly wpCursorShapeDeviceIface: Deno.PointerObject;
-  readonly zwpTextInputManagerIface: Deno.PointerObject;
-  readonly zwpTextInputIface: Deno.PointerObject;
   readonly ifaces: {
     registry: Deno.PointerObject;
     compositor: Deno.PointerObject;
@@ -64,7 +61,6 @@ class WaylandLibrary implements Library {
   #seat: Deno.PointerObject | null = null;
   #pointer: Deno.PointerObject | null = null;
   #pointerFocus: WaylandWindow | null = null;
-  readonly #textInputController: WaylandTextInputController;
   // Event queue filled by listener callbacks, drained by event()
   readonly #events = new EventQueue<UIEvent>();
   readonly #callbackErrors = new DeferredNativeError();
@@ -104,17 +100,13 @@ class WaylandLibrary implements Library {
       xdgToplevelIface,
       wpCursorShapeManagerIface,
       wpCursorShapeDeviceIface,
-      zwpTextInputManagerIface,
-      zwpTextInputIface,
-    } = buildXdgIfaces(ifaces.seat, ifaces.surface);
+    } = buildXdgIfaces();
     this.#xdgMem = mem;
     this.xdgWmBaseIface = xdgWmBaseIface;
     this.xdgSurfaceIface = xdgSurfaceIface;
     this.xdgToplevelIface = xdgToplevelIface;
     this.wpCursorShapeManagerIface = wpCursorShapeManagerIface;
     this.wpCursorShapeDeviceIface = wpCursorShapeDeviceIface;
-    this.zwpTextInputManagerIface = zwpTextInputManagerIface;
-    this.zwpTextInputIface = zwpTextInputIface;
     this.ifaces = ifaces;
     const sym = this.wl.symbols;
 
@@ -133,19 +125,6 @@ class WaylandLibrary implements Library {
       guardCallback: (callback) => this.guardCallback(callback),
       pushEvent: (event) => this.pushEvent(event),
       windowForSurface: (surface) => this.#windowForSurface(surface),
-      syncTextInput: (window) => this.#textInputController.syncWindow(window, true),
-    });
-    this.#textInputController = new WaylandTextInputController({
-      wl: this.wl,
-      display: this.display,
-      zwpTextInputIface: this.zwpTextInputIface,
-      noop: this.noop,
-      guardCallback: (callback) => this.guardCallback(callback),
-      pushEvent: (event) => this.pushEvent(event),
-      windowForSurface: (surface) => this.#windowForSurface(surface),
-      keyboardFocus: () => this.#keyboardController.focus,
-      windows: () => this.windows,
-      resetLocalCompose: () => this.#keyboardController.resetCompose(),
     });
 
     // Set up pollfd for display fd
@@ -218,9 +197,6 @@ class WaylandLibrary implements Library {
     } else if (iface === "wp_cursor_shape_manager_v1") {
       ifacePtr = this.wpCursorShapeManagerIface;
       version = Math.min(offered, 1);
-    } else if (iface === "zwp_text_input_manager_v3") {
-      ifacePtr = this.zwpTextInputManagerIface;
-      version = Math.min(offered, 1);
     } else {
       return;
     }
@@ -249,8 +225,6 @@ class WaylandLibrary implements Library {
       this.#setupXdgWmBaseListener(proxy);
     } else if (iface === "wp_cursor_shape_manager_v1") {
       this.#cursorShapeManager = proxy;
-    } else if (iface === "zwp_text_input_manager_v3") {
-      this.#textInputController.bindManager(proxy);
     }
   }
 
@@ -317,7 +291,6 @@ class WaylandLibrary implements Library {
     );
     this.#vtables.push(seatVtable);
     sym.wl_proxy_add_listener(this.#seat, Deno.UnsafePointer.of(seatVtable), null);
-    this.#textInputController.setSeat(this.#seat);
     sym.wl_display_roundtrip(this.display);
   }
 
@@ -419,12 +392,10 @@ class WaylandLibrary implements Library {
   registerWindow(surface: Deno.PointerObject, window: WaylandWindow): void {
     this.#windowsBySurface.set(Deno.UnsafePointer.value(surface), window);
     this.windows.add(window);
-    this.#textInputController.registerWindow(window);
   }
 
   unregisterWindow(surface: Deno.PointerObject, window: WaylandWindow): void {
     const errors: unknown[] = [];
-    collectCleanupError(errors, () => this.#textInputController.removeWindow(window));
     collectCleanupError(errors, () => this.#keyboardController.removeWindow(window));
     if (this.#pointerFocus === window) this.#pointerFocus = null;
     const key = Deno.UnsafePointer.value(surface);
@@ -432,14 +403,6 @@ class WaylandLibrary implements Library {
     this.windows.delete(window);
     this.#events.purgeWindow(window);
     throwCleanupErrors("winding failed to unregister Wayland window", errors);
-  }
-
-  updateWindowImeState(window: WaylandWindow): void {
-    this.#textInputController.syncWindow(window, true);
-  }
-
-  updateWindowImeCursorArea(window: WaylandWindow): void {
-    this.#textInputController.updateCursorArea(window);
   }
 
   /** Called by WaylandWindow to push UI events into the shared queue. */
@@ -508,8 +471,6 @@ class WaylandLibrary implements Library {
     }
     this.windows.clear();
     this.#windowsBySurface.clear();
-    collectCleanupError(errors, () => this.#textInputController.close());
-
     const cursorShapeDevice = this.#cursorShapeDevice;
     this.#cursorShapeDevice = null;
     if (cursorShapeDevice) {

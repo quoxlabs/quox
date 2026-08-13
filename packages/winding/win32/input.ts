@@ -152,7 +152,6 @@ export interface Win32KeyboardModifiers {
 /** Classify one Win32 keydown using its actual native message ownership. */
 export function win32KeyEditDisposition(
   key: string,
-  isComposing: boolean,
   modifiers: Win32KeyboardModifiers,
   text: string | undefined,
   systemMessage: boolean,
@@ -160,7 +159,7 @@ export function win32KeyEditDisposition(
   // AltGr may arrive through WM_SYSKEYDOWN, but winding consumes the matching
   // WM_SYSCHAR as text instead of leaving it to DefWindowProcW.
   if (systemMessage && !modifiers.altGraphKey) return "platform";
-  if (isComposing || key === "Dead" || key === "Process") return "text-input";
+  if (key === "Dead" || key === "Process") return "text-input";
   if (text !== undefined && (modifiers.altGraphKey || (!modifiers.ctrlKey && !modifiers.metaKey))) {
     return "text-input";
   }
@@ -419,7 +418,7 @@ interface PendingHighSurrogate {
   repeatCount: number;
 }
 
-/** Incrementally decodes the UTF-16 code units delivered by WM_CHAR/WM_IME_CHAR. */
+/** Incrementally decodes the UTF-16 code units delivered by WM_CHAR. */
 export class WmCharDecoder {
   #pendingHigh: PendingHighSurrogate | undefined;
 
@@ -485,49 +484,4 @@ function isLowSurrogate(codeUnit: number): boolean {
 /** Expand a decoded scalar only after surrogate assembly and control filtering. */
 export function repeatedWmCharText(decoded: DecodedWmChar): string {
   return decoded.text.repeat(decoded.repeatCount);
-}
-
-/** Prevents IMM32 result strings from being committed again by a following WM_CHAR echo. */
-export class ResultEchoSuppressor {
-  #pending = "";
-  #expiresAt = 0;
-
-  constructor(
-    readonly ttlMilliseconds = 500,
-    readonly now: () => number = () => performance.now(),
-  ) {}
-
-  get pendingText(): string {
-    this.#expire();
-    return this.#pending;
-  }
-
-  expect(text: string): void {
-    if (text.length === 0) return;
-    this.#expire();
-    this.#pending += text;
-    this.#expiresAt = this.now() + Math.max(0, this.ttlMilliseconds);
-  }
-
-  /** Return true only when the complete decoded WM_CHAR text matches the pending prefix. */
-  consume(text: string, repeatCount = 1): boolean {
-    this.#expire();
-    const incoming = text.repeat(normalizeRepeatCount(repeatCount));
-    if (incoming.length === 0 || this.#pending.length === 0 || !this.#pending.startsWith(incoming)) {
-      if (incoming.length > 0) this.clear();
-      return false;
-    }
-    this.#pending = this.#pending.slice(incoming.length);
-    if (this.#pending.length === 0) this.#expiresAt = 0;
-    return true;
-  }
-
-  clear(): void {
-    this.#pending = "";
-    this.#expiresAt = 0;
-  }
-
-  #expire(): void {
-    if (this.#pending.length > 0 && this.now() > this.#expiresAt) this.clear();
-  }
 }

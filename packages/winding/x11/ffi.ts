@@ -78,7 +78,6 @@ export const NotifyNormal = 0;
 export const libcFunctions = {
   free: { parameters: ["pointer"], result: "void" },
   malloc: { parameters: ["usize"], result: "pointer" },
-  memcpy: { parameters: ["pointer", "buffer", "usize"], result: "pointer" },
   setlocale: { parameters: ["i32", "buffer"], result: "pointer" },
 } as const satisfies Deno.ForeignLibraryInterface;
 
@@ -159,22 +158,6 @@ export const x11functions = {
   // The XIM APIs below are C varargs. Deno FFI has no variadic descriptor, so
   // bind each all-GPR call shape used by this backend to a fixed alias. This is
   // intentionally limited to the repository's existing LP64 Linux target.
-  XCreateICPreeditCallbacks: {
-    name: "XCreateIC",
-    parameters: [
-      "pointer",
-      "buffer",
-      "usize",
-      "buffer",
-      "usize",
-      "buffer",
-      "usize",
-      "buffer",
-      "pointer",
-      "pointer",
-    ],
-    result: "pointer",
-  },
   XCreateICSimple: {
     name: "XCreateIC",
     parameters: ["pointer", "buffer", "usize", "buffer", "usize", "buffer", "usize", "pointer"],
@@ -487,10 +470,6 @@ export const x11functions = {
   XRecolorCursor: { parameters: ["pointer", "usize", "buffer", "buffer"], result: "i32" },
   XReconfigureWMWindow: { parameters: ["pointer", "usize", "i32", "u32", "buffer"], result: "i32" },
   XRefreshKeyboardMapping: { parameters: ["pointer"], result: "i32" },
-  XRegisterIMInstantiateCallback: {
-    parameters: ["pointer", "pointer", "buffer", "buffer", "pointer", "pointer"],
-    result: "i32",
-  },
   XRemoveConnectionWatch: { parameters: ["pointer", "pointer", "pointer"], result: "void" },
   XRemoveFromSaveSet: { parameters: ["pointer", "usize"], result: "i32" },
   XRemoveHost: { parameters: ["pointer", "pointer"], result: "i32" },
@@ -531,11 +510,6 @@ export const x11functions = {
   XSetGraphicsExposures: { parameters: ["pointer", "usize", "i32"], result: "i32" },
   XSetICFocus: { parameters: ["pointer"], result: "void" },
   XSetIconName: { parameters: ["pointer", "usize", "buffer"], result: "i32" },
-  XSetICValuesPreeditAttributes: {
-    name: "XSetICValues",
-    parameters: ["pointer", "buffer", "pointer", "pointer"],
-    result: "pointer",
-  },
   XSetIMValuesDestroyCallback: {
     name: "XSetIMValues",
     parameters: ["pointer", "buffer", "buffer", "pointer"],
@@ -597,10 +571,6 @@ export const x11functions = {
   XUnlockDisplay: { parameters: ["pointer"], result: "void" },
   XUnmapSubwindows: { parameters: ["pointer", "usize"], result: "i32" },
   XUnmapWindow: { parameters: ["pointer", "usize"], result: "i32" },
-  XUnregisterIMInstantiateCallback: {
-    parameters: ["pointer", "pointer", "buffer", "buffer", "pointer", "pointer"],
-    result: "i32",
-  },
   XUnsetICFocus: { parameters: ["pointer"], result: "void" },
   XVendorRelease: { parameters: ["pointer"], result: "i32" },
   XVisualIDFromVisual: { parameters: ["pointer"], result: "usize" },
@@ -641,29 +611,7 @@ export const x11functions = {
     result: "void",
   },
   Xutf8DrawText: { parameters: ["pointer", "usize", "usize", "i32", "i32", "buffer", "i32"], result: "void" },
-  XVaCreateNestedListGeometry: {
-    name: "XVaCreateNestedList",
-    parameters: ["i32", "buffer", "buffer", "buffer", "buffer", "pointer"],
-    result: "pointer",
-  },
-  XVaCreateNestedListPreeditCallbacks: {
-    name: "XVaCreateNestedList",
-    parameters: [
-      "i32",
-      "buffer",
-      "buffer",
-      "buffer",
-      "buffer",
-      "buffer",
-      "buffer",
-      "buffer",
-      "buffer",
-      "pointer",
-    ],
-    result: "pointer",
-  },
   Xutf8LookupString: { parameters: ["pointer", "pointer", "buffer", "i32", "buffer", "buffer"], result: "i32" },
-  Xutf8ResetIC: { parameters: ["pointer"], result: "pointer" },
   Xutf8TextEscapement: { parameters: ["pointer", "buffer", "i32"], result: "i32" },
   Xutf8TextExtents: { parameters: ["pointer", "buffer", "i32", "buffer", "buffer"], result: "i32" },
   Xutf8TextPerCharExtents: {

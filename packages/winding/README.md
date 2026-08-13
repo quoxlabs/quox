@@ -41,24 +41,20 @@ Also See [this example](../../examples/winding.ts).
 ## Keyboard and text input
 
 Every keyboard event carries the native numeric `keycode`, a layout-independent DOM-style `code`, a layout-aware
-DOM-style `key`, location, composition state, and the complete modifier snapshot. Unknown physical or logical values are
+DOM-style `key`, location, repeat state, and the complete modifier snapshot. Unknown physical or logical values are
 reported as `"Unidentified"`. Key releases reuse the logical key resolved by their matching press.
 
 Keydown events also describe who owns their editing behavior:
 
 - `key-default` leaves navigation, deletion, Enter, Tab, and shortcuts to the application.
-- `text-input` suppresses that default because native text input or an AppKit command owns the edit.
+- `text-input` suppresses that default because committed text owns the edit.
 - `platform` suppresses it because the operating system owns the action.
 
 Committed text is never duplicated on a keyboard event. A normal character press is delivered as a `text-input` keydown
-followed by one nonempty `ime` commit. Composition updates use UTF-8 byte cursor ranges; cancellation is an empty
-preedit with a `null` cursor. A commit ends preedit atomically, so it is not preceded by a synthetic empty preedit.
-AppKit editing selectors remain observable as `apple-standard-keybinding` events.
-
-Call `window.setImeEnabled(true)` when a text editor wants native composition and
-`window.setImeCursorArea(x, y, width, height)` to position its candidate window in top-left-origin logical client
-coordinates. The setter records desired permission; `ime/enabled` and `ime/disabled` events report actual activation on
-the focused native window. Non-finite cursor geometry is ignored, while negative dimensions become zero.
+followed by one nonempty `textinput` event. This supports layout-aware text such as German QWERTZ, AltGr, and dead-key
+sequences: the dead key emits no text, while its completing key emits one composed value. Inline preedit and candidate
+UI for complex input methods are not exposed. AppKit editing selectors remain observable as `apple-standard-keybinding`
+events.
 
 ### Wayland environment permission
 

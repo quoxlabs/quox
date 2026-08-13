@@ -1,5 +1,4 @@
 import type { Window } from "../types.ts";
-import { CompositionState, ImeActivationState, type ImeCursorArea, normalizeImeCursorArea } from "../input/mod.ts";
 import { utf8CString as cStr } from "../text_encoding.ts";
 import { WlOp } from "./ffi.ts";
 import {
@@ -29,8 +28,6 @@ export interface WaylandWindowHost extends NativeCallbackHost, WaylandShmHost {
   readonly noop: AnyCallback;
   registerWindow(surface: Deno.PointerObject, window: WaylandWindow): void;
   unregisterWindow(surface: Deno.PointerObject, window: WaylandWindow): void;
-  updateWindowImeState(window: WaylandWindow): void;
-  updateWindowImeCursorArea(window: WaylandWindow): void;
   throwCallbackError(): void;
 }
 
@@ -49,9 +46,6 @@ export class WaylandWindow implements Window {
   #suspended = false;
   #registered = false;
   #closed = false;
-  readonly imeActivation = new ImeActivationState();
-  readonly composition = new CompositionState();
-  #imeCursorArea: ImeCursorArea | undefined;
 
   constructor(readonly lib: WaylandWindowHost, _width: number, _height: number) {
     this.#shmBuffer = new WaylandShmBuffer(lib);
@@ -110,14 +104,6 @@ export class WaylandWindow implements Window {
     this.#closed = true;
     this.#cleanup(errors);
     throwCleanupErrors("winding failed to create Wayland window", errors);
-  }
-
-  get imeEnabled(): boolean {
-    return this.imeActivation.desired;
-  }
-
-  get imeCursorArea(): ImeCursorArea | undefined {
-    return this.#imeCursorArea;
   }
 
   #setupListeners(): void {
@@ -192,20 +178,6 @@ export class WaylandWindow implements Window {
       args(Deno.UnsafePointer.value(Deno.UnsafePointer.of(titleBuffer))),
     );
     symbols.wl_display_flush(this.lib.display);
-  }
-
-  setImeEnabled(enabled: boolean): void {
-    if (this.#closed || this.imeActivation.desired === enabled) return;
-    this.imeActivation.setDesired(enabled);
-    this.lib.updateWindowImeState(this);
-  }
-
-  setImeCursorArea(x: number, y: number, width: number, height: number): void {
-    if (this.#closed) return;
-    const area = normalizeImeCursorArea(x, y, width, height);
-    if (area === undefined) return;
-    this.#imeCursorArea = area;
-    this.lib.updateWindowImeCursorArea(this);
   }
 
   blit(rgba: Uint8Array, width: number, height: number): void {

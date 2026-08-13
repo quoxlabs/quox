@@ -1,7 +1,7 @@
 export type UIEvent =
   | KeyDownEvent
   | KeyUpEvent
-  | ImeEvent
+  | TextInputEvent
   | AppleStandardKeybindingEvent
   | ButtonEvent
   | MoveEvent
@@ -38,7 +38,7 @@ export type KeyLocation = 0 | 1 | 2 | 3;
  *
  * `text-input` and `platform` keydowns remain observable, but consumers must
  * suppress their editor's ordinary keyboard default. A `text-input` key may be
- * followed by IME or AppKit command events; a `platform` key is owned entirely
+ * followed by committed text or an AppKit command; a `platform` key is owned entirely
  * by the operating system and has no semantic editing follow-up.
  */
 export type KeyEditDisposition = "key-default" | "text-input" | "platform";
@@ -52,12 +52,6 @@ export interface KeyEventBase extends WindowEvent<"keydown" | "keyup">, KeyModif
   key: string;
   /** Standard, left, right, or numeric-keypad location. */
   location: KeyLocation;
-  /**
-   * Whether a native composition/preedit session was active immediately before
-   * this native key transition. The initiating key may therefore be false,
-   * while subsequent composition and commit keys are true.
-   */
-  isComposing: boolean;
 }
 
 export interface KeyDownEvent extends KeyEventBase {
@@ -75,30 +69,10 @@ export interface KeyUpEvent extends KeyEventBase {
 
 export type KeyEvent = KeyDownEvent | KeyUpEvent;
 
-/** Inclusive/exclusive UTF-8 byte offsets into preedit text. */
-export type ImeCursorRange = readonly [start: number, end: number];
-
-/** Native text-input offsets and lengths are UTF-8 byte counts. */
-export type ImeEvent =
-  | (WindowEvent<"ime"> & { kind: "enabled" | "disabled" })
-  | (WindowEvent<"ime"> & {
-    kind: "preedit";
-    text: string;
-    /** `null` when the native input method hides or cannot report its cursor. */
-    cursorRange: ImeCursorRange | null;
-  })
-  | (WindowEvent<"ime"> & {
-    kind: "commit";
-    /** Non-empty committed text. A commit atomically ends the current preedit. */
-    text: string;
-  })
-  | (WindowEvent<"ime"> & {
-    kind: "deleteSurrounding";
-    /** Number of UTF-8 bytes to delete before the cursor. */
-    beforeBytes: number;
-    /** Number of UTF-8 bytes to delete after the cursor. */
-    afterBytes: number;
-  });
+/** Non-empty text committed by the active keyboard layout. */
+export interface TextInputEvent extends WindowEvent<"textinput"> {
+  text: string;
+}
 export interface AppleStandardKeybindingEvent extends WindowEvent<"apple-standard-keybinding"> {
   /** Original AppKit action selector, for example `deleteBackward:`. */
   command: string;
@@ -146,12 +120,6 @@ export interface Window {
   setTitle(title: string): void;
   /** Blit (bit-block transfer) an RGBA pixel buffer to the window. Width and height must match the window dimensions. */
   blit(rgba: Uint8Array, width: number, height: number): void;
-  /** Set whether native composition is desired for this window. */
-  setImeEnabled(enabled: boolean): void;
-  /**
-   * Set the IME candidate-window anchor in top-left-origin logical client coordinates.
-   */
-  setImeCursorArea(x: number, y: number, width: number, height: number): void;
 }
 
 export interface Library {

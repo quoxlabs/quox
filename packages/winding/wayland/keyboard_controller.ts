@@ -1,7 +1,7 @@
 /** wl_keyboard proxy, focus, repeat, and canonical semantic event routing. */
 
 import type { UIEvent } from "../types.ts";
-import { createImeCommitEvent, createImePreeditEvent, createKeyDownEvent, createKeyUpEvent } from "../input/mod.ts";
+import { createKeyDownEvent, createKeyUpEvent, createTextInputEvent } from "../input/mod.ts";
 import { domCodeFromEvdev } from "../linux/mod.ts";
 import { WlOp, type xkbSymbols } from "./ffi.ts";
 import { waylandKeyEditDisposition } from "./keyboard.ts";
@@ -30,7 +30,6 @@ export interface WaylandKeyboardHost {
   ): (...args: Arguments) => void;
   pushEvent(event: UIEvent): void;
   windowForSurface(surface: Deno.PointerValue): WaylandWindow | null;
-  syncTextInput(window: WaylandWindow): void;
 }
 
 export class WaylandKeyboardController {
@@ -69,10 +68,6 @@ export class WaylandKeyboardController {
     this.#installListeners(keyboard);
   }
 
-  resetCompose(): void {
-    this.#input.resetCompose();
-  }
-
   removeWindow(window: WaylandWindow): void {
     if (this.#focus !== window) return;
     this.#focus = null;
@@ -98,9 +93,6 @@ export class WaylandKeyboardController {
     const errors: unknown[] = [];
     collectCleanupError(errors, () => this.#input.setRepeatInfo(0, 0));
     collectCleanupError(errors, () => this.#input.resetTransientState());
-    if (focusedWindow) {
-      collectCleanupError(errors, () => this.host.syncTextInput(focusedWindow));
-    }
     collectCleanupError(errors, () => {
       const version = this.host.wl.symbols.wl_proxy_get_version(keyboard);
       if (version >= 3) {
@@ -117,13 +109,7 @@ export class WaylandKeyboardController {
       }
     });
     collectCleanupError(errors, () => this.#input.clearKeymap());
-    if (focusedWindow) {
-      const clear = focusedWindow.composition.cancel();
-      if (clear !== undefined) {
-        this.host.pushEvent(createImePreeditEvent(focusedWindow, clear.text, clear.cursorRange));
-      }
-      this.host.pushEvent({ type: "blur", window: focusedWindow });
-    }
+    if (focusedWindow) this.host.pushEvent({ type: "blur", window: focusedWindow });
     for (const callback of this.#listeners) {
       collectCleanupError(errors, () => callback.close());
     }
@@ -156,17 +142,11 @@ export class WaylandKeyboardController {
         if (this.#focus) {
           const previous = this.#focus;
           this.#focus = null;
-          this.host.syncTextInput(previous);
-          const clear = previous.composition.cancel();
-          if (clear !== undefined) {
-            this.host.pushEvent(createImePreeditEvent(previous, clear.text, clear.cursorRange));
-          }
           this.host.pushEvent({ type: "blur", window: previous });
         }
         this.#input.resetTransientState();
         this.#focus = window;
         this.host.pushEvent({ type: "focus", window });
-        this.host.syncTextInput(window);
       }),
     );
     const leave = new Deno.UnsafeCallback(
@@ -176,11 +156,6 @@ export class WaylandKeyboardController {
         if (!window || this.#focus !== window) return;
         this.#input.resetTransientState();
         this.#focus = null;
-        this.host.syncTextInput(window);
-        const clear = window.composition.cancel();
-        if (clear !== undefined) {
-          this.host.pushEvent(createImePreeditEvent(window, clear.text, clear.cursorRange));
-        }
         this.host.pushEvent({ type: "blur", window });
       }),
     );
@@ -221,9 +196,7 @@ export class WaylandKeyboardController {
   #emitKey(rawKeycode: number, phase: "press" | "release" | "repeat"): void {
     const window = this.#focus;
     if (!window) return;
-    const wasComposing = window.composition.active;
-    const nativeTextInput = window.imeActivation.active;
-    const translated = this.#input.translate(rawKeycode, phase, !nativeTextInput);
+    const translated = this.#input.translate(rawKeycode, phase, true);
     const modifiers = this.#input.modifiers;
     const code = domCodeFromEvdev(rawKeycode);
     if (phase === "release") {
@@ -232,7 +205,6 @@ export class WaylandKeyboardController {
         keycode: rawKeycode,
         code,
         key: this.#input.releaseLogical(rawKeycode, translated.key),
-        isComposing: wasComposing,
         ...modifiers,
       }));
       return;
@@ -242,7 +214,7 @@ export class WaylandKeyboardController {
     const disposition = waylandKeyEditDisposition(
       key,
       translated.text,
-      wasComposing || translated.isComposing,
+      translated.composePending,
       modifiers,
     );
     this.host.pushEvent(createKeyDownEvent({
@@ -250,28 +222,15 @@ export class WaylandKeyboardController {
       keycode: rawKeycode,
       code,
       key,
-      isComposing: wasComposing,
       repeat: phase === "repeat",
       editDisposition: disposition,
       ...modifiers,
     }));
 
-    if (nativeTextInput) return;
-    if (translated.isComposing) {
-      window.composition.start();
-      return;
-    }
+    if (translated.composePending) return;
     if (translated.text !== undefined && disposition === "text-input") {
-      window.composition.commit();
-      const commit = createImeCommitEvent(window, translated.text);
+      const commit = createTextInputEvent(window, translated.text);
       if (commit !== undefined) this.host.pushEvent(commit);
-      return;
-    }
-    if (wasComposing) {
-      const clear = window.composition.cancel();
-      if (clear !== undefined) {
-        this.host.pushEvent(createImePreeditEvent(window, clear.text, clear.cursorRange));
-      }
     }
   }
 }

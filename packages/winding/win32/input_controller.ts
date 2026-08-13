@@ -1,47 +1,10 @@
-/** Native Win32 keyboard and IMM32 controller, separate from window/render ownership. */
+/** Native Win32 keyboard and committed-text controller. */
 
 import type { KeyEvent, UIEvent, Window } from "../types.ts";
-import {
-  CompositionState,
-  createImeActivationEvent,
-  createImeCommitEvent,
-  createImePreeditEvent,
-  createKeyDownEvent,
-  createKeyUpEvent,
-  ImeActivationState,
-  type PreeditUpdate,
-} from "../input/mod.ts";
-import { type ImeCursorArea, normalizeImeCursorArea } from "../input/ime.ts";
+import { createKeyDownEvent, createKeyUpEvent, createTextInputEvent } from "../input/mod.ts";
 import { PressedLogicalKeyCache } from "../input/pressed_keys.ts";
 import { getDomCode } from "./dom_code.ts";
-import {
-  CPS_CANCEL,
-  CS_INSERTCHAR,
-  CS_NOMOVECARET,
-  GCS_COMPATTR,
-  GCS_COMPCLAUSE,
-  GCS_COMPREADATTR,
-  GCS_COMPREADCLAUSE,
-  GCS_COMPREADSTR,
-  GCS_COMPSTR,
-  GCS_CURSORPOS,
-  GCS_DELTASTART,
-  GCS_RESULTCLAUSE,
-  GCS_RESULTREADCLAUSE,
-  GCS_RESULTREADSTR,
-  GCS_RESULTSTR,
-  IACE_DEFAULT,
-  IMECHARPOSITION_SIZE,
-  type imm32functions,
-  IMR_QUERYCHARPOSITION,
-  ISC_SHOWUICOMPOSITIONWINDOW,
-  NI_COMPOSITIONSTR,
-  PM_NOREMOVE,
-  TU_NO_STATE_CHANGE,
-  UNICODE_NOCHAR,
-  type user32functions,
-  WM,
-} from "./ffi.ts";
+import { PM_NOREMOVE, TU_NO_STATE_CHANGE, UNICODE_NOCHAR, type user32functions, WM } from "./ffi.ts";
 import {
   AltGraphControlFilter,
   decodeKeyLParam,
@@ -49,7 +12,6 @@ import {
   keyboardModifiers,
   logicalKeyFromVirtualKey,
   repeatedWmCharText,
-  ResultEchoSuppressor,
   type ToUnicodeAdapter,
   translateLogicalKey,
   VK,
@@ -57,21 +19,6 @@ import {
   win32KeyIdentity,
   WmCharDecoder,
 } from "./input.ts";
-import {
-  encodeCandidateForm,
-  encodeCompositionForm,
-  encodeImeCharPosition,
-  type ImeCompositionUpdate,
-  insertCompositionCharacter,
-  readImmUtf16,
-  utf16CursorRangeToUtf8,
-  withImeContext,
-} from "./imm.ts";
-
-const GCS_ALL = GCS_COMPREADSTR | GCS_COMPREADATTR | GCS_COMPREADCLAUSE | GCS_COMPSTR |
-  GCS_COMPATTR | GCS_COMPCLAUSE | GCS_CURSORPOS | GCS_DELTASTART | GCS_RESULTREADSTR |
-  GCS_RESULTREADCLAUSE | GCS_RESULTSTR | GCS_RESULTCLAUSE;
-const IME_COMPOSITION_FLAGS = GCS_ALL | CS_INSERTCHAR | CS_NOMOVECARET;
 
 export interface Win32InputWindow extends Window {
   readonly id: bigint;
@@ -79,13 +26,9 @@ export interface Win32InputWindow extends Window {
 }
 
 interface WindowInputState {
-  readonly activation: ImeActivationState;
-  readonly composition: CompositionState;
-  cursorArea?: ImeCursorArea;
   readonly logicalKeys: PressedLogicalKeyCache<string>;
   readonly altGraphControlFilter: AltGraphControlFilter;
   readonly charDecoder: WmCharDecoder;
-  readonly resultEcho: ResultEchoSuppressor;
 }
 
 interface PreparedKeyEvent {
@@ -102,7 +45,6 @@ interface NativeKeyMessage {
 }
 
 type User32Library = Deno.DynamicLibrary<typeof user32functions>;
-type Imm32Library = Deno.DynamicLibrary<typeof imm32functions>;
 
 /** Owns all mutable native-input state for Win32 windows. */
 export class Win32InputController {
@@ -110,19 +52,17 @@ export class Win32InputController {
   readonly #altGraphLayouts = new Map<bigint, boolean>();
   readonly #peekMessage = new ArrayBuffer(48);
   readonly #user32: User32Library;
-  readonly #imm32: Imm32Library;
   readonly #enqueue: (event: UIEvent) => void;
   readonly #windowById: (id: bigint) => Win32InputWindow | undefined;
   #preparedKey: PreparedKeyEvent | undefined;
+  #pendingText: UIEvent[] = [];
 
   constructor(
     user32: User32Library,
-    imm32: Imm32Library,
     enqueue: (event: UIEvent) => void,
     windowById: (id: bigint) => Win32InputWindow | undefined,
   ) {
     this.#user32 = user32;
-    this.#imm32 = imm32;
     this.#enqueue = enqueue;
     this.#windowById = windowById;
   }
@@ -130,68 +70,20 @@ export class Win32InputController {
   attach(window: Win32InputWindow): void {
     if (this.#states.has(window)) return;
     const state: WindowInputState = {
-      activation: new ImeActivationState(),
-      composition: new CompositionState(),
       logicalKeys: new PressedLogicalKeyCache<string>(),
       altGraphControlFilter: new AltGraphControlFilter(),
       charDecoder: new WmCharDecoder(),
-      resultEcho: new ResultEchoSuppressor(),
     };
     this.#states.set(window, state);
-    try {
-      // WM_CHAR remains available without an associated IMM context; native
-      // composition is opt-in and is reconciled when the focused editor asks.
-      this.#imm32.symbols.ImmAssociateContextEx(window.hwnd, null, 0);
-      state.activation.setAvailable(true);
-    } catch (error) {
-      this.#states.delete(window);
-      throw error;
-    }
   }
 
   detach(window: Win32InputWindow): void {
     const state = this.#states.get(window);
     if (state === undefined) return;
-    const errors: unknown[] = [];
-    if (state.composition.active) {
-      try {
-        this.#withImeContext(window, (context) => {
-          this.#imm32.symbols.ImmNotifyIME(context, NI_COMPOSITIONSTR, CPS_CANCEL, 0);
-        });
-      } catch (error) {
-        errors.push(error);
-      }
-    }
-    try {
-      this.#imm32.symbols.ImmAssociateContextEx(window.hwnd, null, 0);
-    } catch (error) {
-      errors.push(error);
-    }
-    state.composition.reset();
     state.charDecoder.reset();
-    state.resultEcho.clear();
     state.logicalKeys.clear();
     state.altGraphControlFilter.reset();
-    state.activation.reset();
     this.#states.delete(window);
-    throwCollected(errors, "Failed to release Win32 input state");
-  }
-
-  setImeEnabled(window: Win32InputWindow, enabled: boolean): void {
-    const state = this.#state(window);
-    if (state.activation.desired !== enabled) {
-      if (!enabled) this.#cancelComposition(window, state);
-      state.activation.setDesired(enabled);
-    }
-    this.#reconcileIme(window, state);
-  }
-
-  setImeCursorArea(window: Win32InputWindow, x: number, y: number, width: number, height: number): void {
-    const rectangle = normalizeImeCursorArea(x, y, width, height);
-    if (rectangle === undefined) return;
-    const state = this.#state(window);
-    state.cursorArea = rectangle;
-    if (state.activation.active) this.#applyImeCursorArea(window, state);
   }
 
   /** Process input-owned WndProc messages; undefined means continue with DefWindowProcW. */
@@ -206,15 +98,10 @@ export class Win32InputController {
       case WM.SETFOCUS:
         if (window !== undefined && state !== undefined) {
           this.#enqueue({ type: "focus", window });
-          state.activation.setFocused(true);
-          this.#reconcileIme(window, state);
         }
         return undefined;
       case WM.KILLFOCUS:
         if (window !== undefined && state !== undefined) {
-          this.#cancelComposition(window, state);
-          state.activation.setFocused(false);
-          this.#reconcileIme(window, state);
           state.logicalKeys.clear();
           state.altGraphControlFilter.reset();
           this.#enqueue({ type: "blur", window });
@@ -230,6 +117,7 @@ export class Win32InputController {
           message === WM.SYSKEYDOWN,
         );
         if (prepared !== undefined && !prepared.suppress) this.#enqueue(prepared.event);
+        this.#flushPendingText();
         return undefined;
       }
       case WM.KEYUP:
@@ -245,7 +133,6 @@ export class Win32InputController {
         }
         return undefined;
       case WM.DEADCHAR:
-        if (window !== undefined && state !== undefined) this.#flushCharDecoder(window, state);
         return 0n;
       case WM.SYSCHAR:
         if (window !== undefined && state !== undefined && this.#currentModifiers().altGraphKey) {
@@ -255,7 +142,6 @@ export class Win32InputController {
         return undefined;
       case WM.SYSDEADCHAR:
         if (window !== undefined && state !== undefined && this.#currentModifiers().altGraphKey) {
-          this.#flushCharDecoder(window, state);
           return 0n;
         }
         return undefined;
@@ -263,7 +149,7 @@ export class Win32InputController {
         if (Number(wParam) === UNICODE_NOCHAR) return 1n;
         if (window !== undefined && state !== undefined) {
           this.#flushCharDecoder(window, state);
-          this.#handleUniChar(window, state, Number(wParam), lParam);
+          this.#handleUniChar(window, Number(wParam), lParam);
           return 0n;
         }
         return undefined;
@@ -273,57 +159,6 @@ export class Win32InputController {
           this.#flushCharDecoder(inputWindow, inputState);
           inputState.altGraphControlFilter.reset();
         }
-        return undefined;
-      case WM.IME_STARTCOMPOSITION:
-        if (window !== undefined && state?.activation.desired) {
-          this.#flushCharDecoder(window, state);
-          state.composition.start();
-          state.resultEcho.clear();
-          if (!state.activation.active) this.#setImeActive(window, state, true);
-          this.#applyImeCursorArea(window, state);
-          return 0n;
-        }
-        return undefined;
-      case WM.IME_COMPOSITION:
-        if (
-          window !== undefined && state?.activation.desired &&
-          this.#handleImeComposition(window, state, wParam, lParam)
-        ) return 0n;
-        return undefined;
-      case WM.IME_ENDCOMPOSITION:
-        if (window !== undefined && state?.activation.desired) {
-          this.#flushCharDecoder(window, state);
-          this.#queuePreedit(window, state.composition.cancel());
-          return 0n;
-        }
-        return undefined;
-      case WM.IME_CHAR:
-        if (window !== undefined && state !== undefined) {
-          this.#handleChar(window, state, wParam, lParam);
-          return 0n;
-        }
-        return undefined;
-      case WM.IME_SETCONTEXT:
-        if (window !== undefined && state !== undefined) {
-          const activating = BigInt(wParam) !== 0n;
-          if (activating && state.activation.desired) {
-            this.#reconcileIme(window, state);
-            this.#applyImeCursorArea(window, state);
-          } else if (!activating) {
-            this.#cancelComposition(window, state);
-            this.#setImeActive(window, state, false);
-          }
-          const forwardedLParam = state.activation.desired
-            ? BigInt.asUintN(64, BigInt(lParam)) & ~BigInt(ISC_SHOWUICOMPOSITIONWINDOW)
-            : BigInt(lParam);
-          return this.#user32.symbols.DefWindowProcW(window.hwnd, message, BigInt(wParam), forwardedLParam);
-        }
-        return undefined;
-      case WM.IME_REQUEST:
-        if (
-          window !== undefined && state !== undefined && Number(wParam) === IMR_QUERYCHARPOSITION &&
-          this.#answerImeCharPosition(window, state, lParam)
-        ) return 1n;
         return undefined;
       default:
         return undefined;
@@ -368,7 +203,6 @@ export class Win32InputController {
     const identity = win32KeyIdentity(message.virtualKey, message.lParam);
     if (type === "keydown") {
       key = state.logicalKeys.press(identity, key);
-      state.resultEcho.clear();
     } else {
       key = state.logicalKeys.release(identity, key);
     }
@@ -397,7 +231,6 @@ export class Win32InputController {
         code,
         key,
         type === "keydown" && decodeKeyLParam(message.lParam).isRepeat,
-        state.composition.active,
         modifiers,
         translatedText,
         message.message === WM.SYSKEYDOWN,
@@ -407,26 +240,19 @@ export class Win32InputController {
 
   clearPreparedKey(): void {
     this.#preparedKey = undefined;
+    this.#flushPendingText();
   }
 
   close(): void {
     this.#preparedKey = undefined;
+    this.#pendingText = [];
     this.#altGraphLayouts.clear();
     for (const state of this.#states.values()) {
-      state.composition.reset();
       state.charDecoder.reset();
-      state.resultEcho.clear();
       state.logicalKeys.clear();
       state.altGraphControlFilter.reset();
-      state.activation.reset();
     }
     this.#states.clear();
-  }
-
-  #state(window: Win32InputWindow): WindowInputState {
-    const state = this.#states.get(window);
-    if (state === undefined) throw new Error("winding(win32): window input is not attached");
-    return state;
   }
 
   #snapshotKeyboardState(): Uint8Array<ArrayBuffer> {
@@ -582,33 +408,11 @@ export class Win32InputController {
         code,
         key,
         type === "keydown" && decodeKeyLParam(lParam).isRepeat,
-        state.composition.active,
         modifiers,
         translatedText,
         systemMessage,
       ),
     };
-  }
-
-  #queuePreedit(window: Win32InputWindow, update: PreeditUpdate | undefined): void {
-    if (update !== undefined) this.#enqueue(createImePreeditEvent(window, update.text, update.cursorRange));
-  }
-
-  #applyImeUpdate(window: Win32InputWindow, state: WindowInputState, update: ImeCompositionUpdate): void {
-    if (update.result !== undefined && isCommitText(update.result)) {
-      state.composition.commit();
-      const commit = createImeCommitEvent(window, update.result);
-      if (commit !== undefined) this.#enqueue(commit);
-    }
-    if (update.preedit === undefined) return;
-    if (update.preedit === null || update.preedit.text.length === 0) {
-      this.#queuePreedit(window, state.composition.cancel());
-      return;
-    }
-    this.#queuePreedit(
-      window,
-      state.composition.update(update.preedit.text, update.preedit.cursorRange ?? null),
-    );
   }
 
   #handleChar(
@@ -619,21 +423,18 @@ export class Win32InputController {
   ): void {
     const repeatCount = decodeKeyLParam(lParam).repeatCount;
     for (const decoded of state.charDecoder.push(wParam, repeatCount)) {
-      if (state.resultEcho.consume(decoded.text, decoded.repeatCount)) continue;
-      this.#applyImeUpdate(window, state, { result: repeatedWmCharText(decoded) });
+      this.#queueText(window, repeatedWmCharText(decoded));
     }
   }
 
   #flushCharDecoder(window: Win32InputWindow, state: WindowInputState): void {
     for (const decoded of state.charDecoder.flush()) {
-      if (state.resultEcho.consume(decoded.text, decoded.repeatCount)) continue;
-      this.#applyImeUpdate(window, state, { result: repeatedWmCharText(decoded) });
+      this.#queueText(window, repeatedWmCharText(decoded));
     }
   }
 
   #handleUniChar(
     window: Win32InputWindow,
-    state: WindowInputState,
     codePoint: number,
     lParam: number | bigint,
   ): void {
@@ -644,190 +445,20 @@ export class Win32InputController {
     const text = String.fromCodePoint(codePoint);
     if (!isCommitText(text)) return;
     const repeatCount = Math.max(1, decodeKeyLParam(lParam).repeatCount);
-    if (state.resultEcho.consume(text, repeatCount)) return;
-    this.#applyImeUpdate(window, state, { result: text.repeat(repeatCount) });
+    this.#queueText(window, text.repeat(repeatCount));
   }
 
-  #withImeContext<Result>(
-    window: Win32InputWindow,
-    callback: (context: Deno.PointerObject) => Result,
-  ): Result | undefined {
-    return withImeContext(
-      () => this.#imm32.symbols.ImmGetContext(window.hwnd),
-      (context) => {
-        this.#imm32.symbols.ImmReleaseContext(window.hwnd, context);
-      },
-      callback,
-    );
+  #queueText(window: Win32InputWindow, text: string): void {
+    const event = createTextInputEvent(window, text);
+    if (event === undefined) return;
+    if (this.#preparedKey?.event.type === "keydown") this.#pendingText.push(event);
+    else this.#enqueue(event);
   }
 
-  #readCompositionString(context: Deno.PointerObject, index: number): string | undefined {
-    return readImmUtf16({
-      getCompositionString: (compositionIndex, buffer) =>
-        this.#imm32.symbols.ImmGetCompositionStringW(
-          context,
-          compositionIndex,
-          buffer === undefined ? null : Deno.UnsafePointer.of(buffer),
-          buffer?.byteLength ?? 0,
-        ),
-    }, index);
-  }
-
-  #handleImeComposition(
-    window: Win32InputWindow,
-    state: WindowInputState,
-    wParam: number | bigint,
-    lParam: number | bigint,
-  ): boolean {
-    const flags = Number(BigInt(lParam) & 0xffffffffn);
-    if ((flags & IME_COMPOSITION_FLAGS) === 0) {
-      this.#applyImeUpdate(window, state, { preedit: null });
-      return true;
-    }
-
-    let insertedPreedit: { text: string; cursorRange?: readonly [number, number] } | undefined;
-    if ((flags & CS_INSERTCHAR) !== 0 && (flags & GCS_COMPSTR) === 0) {
-      const character = String.fromCharCode(Number(BigInt(wParam) & 0xffffn));
-      if (isCommitText(character)) {
-        insertedPreedit = insertCompositionCharacter(
-          state.composition.text,
-          state.composition.cursorRange ?? undefined,
-          character,
-          (flags & CS_NOMOVECARET) !== 0,
-        );
-      }
-    }
-    if ((flags & GCS_ALL) === 0) {
-      if (insertedPreedit !== undefined) this.#applyImeUpdate(window, state, { preedit: insertedPreedit });
-      return true;
-    }
-
-    const update = this.#withImeContext(window, (context) => {
-      let result: string | undefined;
-      let preedit: { text: string; cursorRange?: readonly [number, number] } | null | undefined = insertedPreedit;
-      if ((flags & GCS_RESULTSTR) !== 0) {
-        result = this.#readCompositionString(context, GCS_RESULTSTR);
-        if (result === undefined) return null;
-      }
-      if ((flags & GCS_COMPSTR) !== 0) {
-        const text = this.#readCompositionString(context, GCS_COMPSTR);
-        if (text === undefined) return null;
-        const cursorPosition = this.#imm32.symbols.ImmGetCompositionStringW(context, GCS_CURSORPOS, null, 0);
-        const cursorRange = cursorPosition < 0 ? undefined : utf16CursorRangeToUtf8(text, cursorPosition);
-        preedit = text.length === 0 ? null : { text, ...(cursorRange === undefined ? {} : { cursorRange }) };
-      } else if ((flags & GCS_CURSORPOS) !== 0 && state.composition.text.length > 0) {
-        const cursorPosition = this.#imm32.symbols.ImmGetCompositionStringW(context, GCS_CURSORPOS, null, 0);
-        const cursorRange = cursorPosition < 0
-          ? undefined
-          : utf16CursorRangeToUtf8(state.composition.text, cursorPosition);
-        preedit = {
-          text: state.composition.text,
-          ...(cursorRange === undefined ? {} : { cursorRange }),
-        };
-      }
-      return { result, preedit };
-    });
-    if (update === undefined || update === null) return false;
-    if (update.result !== undefined && isCommitText(update.result)) state.resultEcho.expect(update.result);
-    this.#applyImeUpdate(window, state, update);
-    return true;
-  }
-
-  #setImeActive(window: Win32InputWindow, state: WindowInputState, active: boolean): void {
-    const transition = state.activation.markActive(active);
-    if (transition !== undefined) this.#enqueue(createImeActivationEvent(window, transition));
-  }
-
-  #reconcileIme(window: Win32InputWindow, state: WindowInputState): void {
-    const transition = state.activation.reconcile({
-      activate: () => {
-        const activated = this.#imm32.symbols.ImmAssociateContextEx(window.hwnd, null, IACE_DEFAULT);
-        if (activated) this.#applyImeCursorArea(window, state);
-        return activated;
-      },
-      deactivate: () => {
-        this.#imm32.symbols.ImmAssociateContextEx(window.hwnd, null, 0);
-      },
-    });
-    if (transition !== undefined) this.#enqueue(createImeActivationEvent(window, transition));
-    if (transition === undefined && state.activation.active) this.#applyImeCursorArea(window, state);
-  }
-
-  #cancelComposition(window: Win32InputWindow, state: WindowInputState): void {
-    if (state.composition.active) {
-      this.#withImeContext(window, (context) => {
-        this.#imm32.symbols.ImmNotifyIME(context, NI_COMPOSITIONSTR, CPS_CANCEL, 0);
-      });
-    }
-    this.#flushCharDecoder(window, state);
-    this.#queuePreedit(window, state.composition.cancel());
-    state.resultEcho.clear();
-  }
-
-  #applyImeCursorArea(window: Win32InputWindow, state: WindowInputState): void {
-    const rectangle = state.cursorArea;
-    if (rectangle === undefined) return;
-    this.#withImeContext(window, (context) => {
-      this.#imm32.symbols.ImmSetCandidateWindow(context, encodeCandidateForm(rectangle));
-      this.#imm32.symbols.ImmSetCompositionWindow(context, encodeCompositionForm(rectangle));
-    });
-  }
-
-  #clientPointToScreen(window: Win32InputWindow, x: number, y: number): { x: number; y: number } | undefined {
-    const buffer = new ArrayBuffer(8);
-    const view = new DataView(buffer);
-    view.setInt32(0, x, true);
-    view.setInt32(4, y, true);
-    if (!this.#user32.symbols.ClientToScreen(window.hwnd, buffer)) return undefined;
-    return { x: view.getInt32(0, true), y: view.getInt32(4, true) };
-  }
-
-  #clientRectToScreen(window: Win32InputWindow, rectangle: ImeCursorArea): ImeCursorArea | undefined {
-    const topLeft = this.#clientPointToScreen(window, rectangle.x, rectangle.y);
-    const bottomRight = this.#clientPointToScreen(
-      window,
-      rectangle.x + rectangle.width,
-      rectangle.y + rectangle.height,
-    );
-    if (topLeft === undefined || bottomRight === undefined) return undefined;
-    return {
-      x: topLeft.x,
-      y: topLeft.y,
-      width: Math.max(0, bottomRight.x - topLeft.x),
-      height: Math.max(0, bottomRight.y - topLeft.y),
-    };
-  }
-
-  #screenDocumentRectangle(window: Win32InputWindow): ImeCursorArea | undefined {
-    const buffer = new ArrayBuffer(16);
-    if (!this.#user32.symbols.GetClientRect(window.hwnd, buffer)) return undefined;
-    const view = new DataView(buffer);
-    return this.#clientRectToScreen(window, {
-      x: view.getInt32(0, true),
-      y: view.getInt32(4, true),
-      width: Math.max(0, view.getInt32(8, true) - view.getInt32(0, true)),
-      height: Math.max(0, view.getInt32(12, true) - view.getInt32(4, true)),
-    });
-  }
-
-  #answerImeCharPosition(
-    window: Win32InputWindow,
-    state: WindowInputState,
-    lParam: number | bigint,
-  ): boolean {
-    const address = BigInt(lParam);
-    if (address === 0n || state.cursorArea === undefined) return false;
-    const pointer = Deno.UnsafePointer.create(address);
-    if (pointer === null) return false;
-    const target = new Deno.UnsafePointerView(pointer).getArrayBuffer(IMECHARPOSITION_SIZE);
-    const targetView = new DataView(target);
-    if (targetView.getUint32(0, true) < IMECHARPOSITION_SIZE) return false;
-    const caret = this.#clientRectToScreen(window, state.cursorArea);
-    const document = this.#screenDocumentRectangle(window);
-    if (caret === undefined || document === undefined) return false;
-    const response = encodeImeCharPosition(targetView.getUint32(4, true), caret, document);
-    new Uint8Array(target).set(new Uint8Array(response));
-    return true;
+  #flushPendingText(): void {
+    const events = this.#pendingText;
+    this.#pendingText = [];
+    for (const event of events) this.#enqueue(event);
   }
 }
 
@@ -838,22 +469,16 @@ function createWin32KeyEvent(
   code: string,
   key: string,
   repeat: boolean,
-  isComposing: boolean,
   modifiers: ReturnType<typeof keyboardModifiers>,
   text: string | undefined,
   systemMessage: boolean,
 ): KeyEvent {
-  const init = { window, keycode, code, key, isComposing, ...modifiers };
+  const init = { window, keycode, code, key, ...modifiers };
   return type === "keydown"
     ? createKeyDownEvent({
       ...init,
       repeat,
-      editDisposition: win32KeyEditDisposition(key, isComposing, modifiers, text, systemMessage),
+      editDisposition: win32KeyEditDisposition(key, modifiers, text, systemMessage),
     })
     : createKeyUpEvent(init);
-}
-
-function throwCollected(errors: unknown[], message: string): void {
-  if (errors.length === 1) throw errors[0];
-  if (errors.length > 1) throw new AggregateError(errors, message);
 }

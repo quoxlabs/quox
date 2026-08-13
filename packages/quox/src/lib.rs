@@ -9,8 +9,8 @@ use blitz_traits::shell::{ColorScheme, ShellProvider, Viewport};
 use interaction::RecordedEvents;
 use linebender_resource_handle::Blob;
 use std::cell::RefCell;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use vello::{AaSupport, Renderer, RendererOptions};
 use wasm_bindgen::prelude::*;
 use wgpu_context::WGPUContext;
@@ -45,87 +45,7 @@ struct QuoxRendererState {
     dev_id: usize,
     renderer: Renderer,
     redraw_requested: Arc<AtomicBool>,
-    ime_requests: Arc<ImeRequestMailbox>,
     recorded_events: RecordedEvents,
-}
-
-const IME_REQUEST_CURSOR_AREA: u8 = 1 << 0;
-const IME_REQUEST_ENABLED: u8 = 1 << 1;
-const IME_REQUEST_SNAPSHOT_LEN: usize = 6;
-
-#[derive(Default)]
-struct ImeRequestState {
-    desired_enabled: Option<bool>,
-    delivered_enabled: Option<bool>,
-    desired_cursor_area: Option<[f32; 4]>,
-    delivered_cursor_area: Option<[f32; 4]>,
-}
-
-/// Thread-safe hand-off for shell requests produced synchronously inside Blitz. The host
-/// drains these requests after dispatching an event or resolving layout and applies them to
-/// the native window/IME context.
-#[derive(Default)]
-struct ImeRequestMailbox {
-    state: Mutex<ImeRequestState>,
-}
-
-impl ImeRequestMailbox {
-    fn request_enabled(&self, enabled: bool) {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .desired_enabled = Some(enabled);
-    }
-
-    fn request_cursor_area(&self, mut cursor_area: [f32; 4]) {
-        if !cursor_area.iter().all(|value| value.is_finite()) {
-            return;
-        }
-        cursor_area[2] = cursor_area[2].max(0.0);
-        cursor_area[3] = cursor_area[3].max(0.0);
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .desired_cursor_area = Some(cursor_area);
-    }
-
-    /// Atomically drain the changed parts of the desired native IME state.
-    ///
-    /// The compact WASM-friendly snapshot is `[flags, x, y, width, height, enabled]`.
-    /// Cursor geometry and enabled state have independent presence bits, allowing the host to
-    /// apply geometry before an accompanying enable without racing two mailbox drains.
-    fn take_snapshot(&self) -> Option<[f32; IME_REQUEST_SNAPSHOT_LEN]> {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let cursor_area_changed = state.desired_cursor_area != state.delivered_cursor_area;
-        let enabled_changed = state.desired_enabled != state.delivered_enabled;
-        if !cursor_area_changed && !enabled_changed {
-            return None;
-        }
-
-        let mut flags = 0;
-        let mut snapshot = [0.0; IME_REQUEST_SNAPSHOT_LEN];
-        if cursor_area_changed {
-            flags |= IME_REQUEST_CURSOR_AREA;
-            if let Some(area) = state.desired_cursor_area {
-                snapshot[1..5].copy_from_slice(&area);
-            }
-            state.delivered_cursor_area = state.desired_cursor_area;
-        }
-        if enabled_changed {
-            flags |= IME_REQUEST_ENABLED;
-            snapshot[5] = if state.desired_enabled.unwrap_or(false) {
-                1.0
-            } else {
-                0.0
-            };
-            state.delivered_enabled = state.desired_enabled;
-        }
-        snapshot[0] = f32::from(flags);
-        Some(snapshot)
-    }
 }
 
 /// Notices Blitz-internal redraw requests (hover/active/focus/scroll/text-input state
@@ -133,55 +53,12 @@ impl ImeRequestMailbox {
 /// are deferred, so `set_cursor` stays at the trait's no-op default.
 struct QuoxShellProvider {
     redraw_requested: Arc<AtomicBool>,
-    ime_requests: Arc<ImeRequestMailbox>,
 }
 
 impl ShellProvider for QuoxShellProvider {
     fn request_redraw(&self) {
         self.redraw_requested.store(true, Ordering::Relaxed);
     }
-
-    fn set_ime_enabled(&self, is_enabled: bool) {
-        self.ime_requests.request_enabled(is_enabled);
-    }
-
-    fn set_ime_cursor_area(&self, x: f32, y: f32, width: f32, height: f32) {
-        self.ime_requests.request_cursor_area([x, y, width, height]);
-    }
-}
-
-/// Compute the focused text editor's current composition/caret area in viewport pixels.
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "Blitz's shell API uses f32 window coordinates while Parley geometry uses f64"
-)]
-fn focused_ime_cursor_area(document: &mut BaseDocument) -> Option<[f32; 4]> {
-    let node_id = document.get_focussed_node_id()?;
-
-    let mut ime_area = None;
-    document.with_text_input(node_id, |mut driver| {
-        driver.refresh_layout();
-        ime_area = Some(driver.editor.ime_cursor_area());
-    });
-    let ime_area = ime_area?;
-
-    let scale = document.viewport().scale_f64();
-    let scroll = document.viewport_scroll();
-    let node = document.get_node(node_id)?;
-
-    let node_position = node.absolute_position(0.0, 0.0);
-    let content_x =
-        node_position.x + node.final_layout.border.left + node.final_layout.padding.left;
-    let content_y = node_position.y
-        + node.final_layout.border.top
-        + node.final_layout.padding.top
-        + node.text_input_v_centering_offset(scale) as f32;
-    let x = ((f64::from(content_x) - scroll.x) * scale + ime_area.x0) as f32;
-    let y = ((f64::from(content_y) - scroll.y) * scale + ime_area.y0) as f32;
-    let width = ime_area.width() as f32;
-    let height = ime_area.height() as f32;
-
-    Some([x, y, width, height])
 }
 
 impl QuoxRendererState {
@@ -199,17 +76,6 @@ impl QuoxRendererState {
             ColorScheme::Light,
         ));
         self.document.resolve(0.0);
-        self.refresh_ime_cursor_area();
-    }
-
-    /// Publish the focused Parley editor's current composition/caret area in viewport pixels.
-    /// Blitz currently publishes the entire input content box only when focus changes; querying
-    /// Parley here keeps candidate-window placement current as the caret, preedit, scroll, or
-    /// layout changes.
-    fn refresh_ime_cursor_area(&mut self) {
-        if let Some(cursor_area) = focused_ime_cursor_area(&mut self.document) {
-            self.ime_requests.request_cursor_area(cursor_area);
-        }
     }
 }
 
@@ -247,7 +113,6 @@ impl QuoxRenderer {
             .register_fonts(Blob::new(Arc::new(LIBERATION_SANS) as _), None);
 
         let redraw_requested = Arc::new(AtomicBool::new(false));
-        let ime_requests = Arc::new(ImeRequestMailbox::default());
 
         let document = HtmlDocument::from_html(
             &initial_html(head, body),
@@ -256,7 +121,6 @@ impl QuoxRenderer {
                 net_provider: Some(Arc::new(DummyNetProvider)),
                 shell_provider: Some(Arc::new(QuoxShellProvider {
                     redraw_requested: Arc::clone(&redraw_requested),
-                    ime_requests: Arc::clone(&ime_requests),
                 })),
                 html_parser_provider: Some(Arc::new(HtmlProvider)),
                 ua_stylesheets: Some(vec![DEFAULT_CSS.to_string(), FONT_CSS.to_string()]),
@@ -275,7 +139,6 @@ impl QuoxRenderer {
                 dev_id,
                 renderer,
                 redraw_requested,
-                ime_requests,
                 recorded_events: RecordedEvents::default(),
             }),
         })
@@ -286,114 +149,5 @@ impl QuoxRenderer {
         let mut state = self.state.borrow_mut();
         state.width = width.max(1);
         state.height = height.max(1);
-    }
-
-    /// Atomically drain changed native IME requests as
-    /// `[flags, x, y, width, height, enabled]`.
-    pub fn take_ime_requests(&self) -> Option<Box<[f32]>> {
-        self.state
-            .borrow()
-            .ime_requests
-            .take_snapshot()
-            .map(Box::<[f32]>::from)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        IME_REQUEST_CURSOR_AREA, IME_REQUEST_ENABLED, ImeRequestMailbox, focused_ime_cursor_area,
-    };
-    use blitz_dom::{DocumentConfig, Point};
-    use blitz_html::HtmlDocument;
-    use blitz_traits::shell::{ColorScheme, Viewport};
-
-    #[test]
-    fn ime_request_mailbox_coalesces_and_atomically_drains_changed_values() {
-        let mailbox = ImeRequestMailbox::default();
-
-        mailbox.request_enabled(true);
-        mailbox.request_enabled(false);
-        mailbox.request_cursor_area([1.0, 2.0, 3.0, 4.0]);
-        mailbox.request_cursor_area([5.0, 6.0, 7.0, 8.0]);
-
-        assert_eq!(
-            mailbox.take_snapshot(),
-            Some([
-                f32::from(IME_REQUEST_CURSOR_AREA | IME_REQUEST_ENABLED),
-                5.0,
-                6.0,
-                7.0,
-                8.0,
-                0.0,
-            ])
-        );
-        assert_eq!(mailbox.take_snapshot(), None);
-
-        // Repeating the delivered values is a no-op even after the previous snapshot drained.
-        mailbox.request_enabled(false);
-        mailbox.request_cursor_area([5.0, 6.0, 7.0, 8.0]);
-        assert_eq!(mailbox.take_snapshot(), None);
-
-        mailbox.request_enabled(true);
-        assert_eq!(
-            mailbox.take_snapshot(),
-            Some([f32::from(IME_REQUEST_ENABLED), 0.0, 0.0, 0.0, 0.0, 1.0])
-        );
-
-        mailbox.request_cursor_area([f32::NAN, 1.0, 2.0, 3.0]);
-        assert_eq!(mailbox.take_snapshot(), None);
-        mailbox.request_cursor_area([5.0, 6.0, -7.0, -8.0]);
-        assert_eq!(
-            mailbox.take_snapshot(),
-            Some([f32::from(IME_REQUEST_CURSOR_AREA), 5.0, 6.0, 0.0, 0.0, 0.0])
-        );
-    }
-
-    #[test]
-    fn focused_ime_area_subtracts_viewport_scroll_exactly_once() {
-        let mut document = HtmlDocument::from_html(
-            "<!doctype html><html><body><input style=\"display:block;margin-top:100px;padding:4px\" value=\"abc\"></body></html>",
-            DocumentConfig {
-                viewport: Some(Viewport::new(800, 600, 1.0, ColorScheme::Light)),
-                ..Default::default()
-            },
-        )
-        .into_inner();
-        document.resolve(0.0);
-
-        let input_id = document
-            .tree()
-            .iter()
-            .find_map(|(id, node)| {
-                node.element_data()
-                    .is_some_and(|element| element.name.local.as_ref() == "input")
-                    .then_some(id)
-            })
-            .expect("test document should contain an input");
-        assert!(document.set_focus_to(input_id));
-
-        let absolute_before = document
-            .get_node(input_id)
-            .expect("input should exist")
-            .absolute_position(0.0, 0.0);
-        let area_before =
-            focused_ime_cursor_area(&mut document).expect("input should have an area");
-
-        document.set_viewport_scroll(Point { x: 0.0, y: 37.0 });
-
-        let absolute_after = document
-            .get_node(input_id)
-            .expect("input should exist")
-            .absolute_position(0.0, 0.0);
-        let area_after = focused_ime_cursor_area(&mut document).expect("input should have an area");
-
-        // `absolute_position` includes element/ancestor scrolling but Blitz stores document
-        // viewport scrolling separately. Its own `get_client_bounding_rect` and painter subtract
-        // `viewport_scroll` after computing the absolute position, which this helper mirrors.
-        assert_eq!(absolute_after, absolute_before);
-        assert!((area_after[0] - area_before[0]).abs() < 0.001);
-        assert!((area_after[1] - (area_before[1] - 37.0)).abs() < 0.001);
-        assert_eq!(&area_after[2..], &area_before[2..]);
     }
 }

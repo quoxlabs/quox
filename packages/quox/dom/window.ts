@@ -3,13 +3,7 @@ import { QuoxRenderer as WasmRenderer } from "../lib/quox.js";
 import { load as windingLoad } from "@quoxlabs/winding";
 import type { Library as WindingLibrary, UIEvent as WindingUIEvent, Window as WindingWindow } from "@quoxlabs/winding";
 import { QuoxDocument } from "./document.ts";
-import {
-  applyImeRequestSnapshot,
-  mapWindingEvent,
-  notifyInputListeners,
-  type QuoxInputEvent,
-  QuoxInputRouter,
-} from "./input.ts";
+import { mapWindingEvent, notifyInputListeners, type QuoxInputEvent, QuoxInputRouter } from "./input.ts";
 import { isVNode, mount, type QuoxRenderable } from "./mount.ts";
 import type { QuoxElement, QuoxInnerHTML } from "./node.ts";
 
@@ -17,7 +11,6 @@ export type {
   QuoxAppleStandardKeybindingEvent,
   QuoxCloseEvent,
   QuoxFocusChangeEvent,
-  QuoxImeEvent,
   QuoxInputEvent,
   QuoxKeyboardEvent,
   QuoxMouseButtonEvent,
@@ -25,6 +18,7 @@ export type {
   QuoxMouseMoveEvent,
   QuoxMouseWheelEvent,
   QuoxResizeEvent,
+  QuoxTextInputEvent,
   QuoxVisibilityEvent,
 } from "./input.ts";
 
@@ -96,7 +90,6 @@ export class QuoxWindow implements Disposable {
       () => this.#requestRender(),
       () => this.#assertActiveDocument(),
       (title) => this.#win.setTitle(title),
-      () => this.#syncNativeImeRequests(),
     );
     this.#inputRouter = new QuoxInputRouter({
       pointerMove: (x, y, buttons) => this.document.dispatchPointerMove(x, y, buttons),
@@ -104,7 +97,7 @@ export class QuoxWindow implements Disposable {
       pointerUp: (x, y, button, buttons) => this.document.dispatchPointerUp(x, y, button, buttons),
       wheel: (x, y, deltaX, deltaY, buttons) => this.document.dispatchWheel(x, y, deltaX, deltaY, buttons),
       key: (event) => this.document.dispatchKey(event),
-      ime: (event) => this.document.dispatchIme(event),
+      textInput: (event) => this.document.dispatchTextInput(event),
       appleCommand: (event) => this.document.dispatchAppleStandardKeybinding(event),
       clearHover: () => this.document.clearHover(),
       resize: (event) => {
@@ -137,7 +130,6 @@ export class QuoxWindow implements Disposable {
       await mountWindowContent(quoxWindow.document.head, options.head);
       await mountWindowContent(quoxWindow.document.body, options.body);
       quoxWindow.setTitle(options.title ?? (quoxWindow.document.title || DEFAULT_WINDOW_TITLE));
-      quoxWindow.#syncNativeImeRequests();
       return quoxWindow;
     } catch (error) {
       const errors = [error];
@@ -196,13 +188,6 @@ export class QuoxWindow implements Disposable {
     notifyInputListeners(this.#listeners, event, (error) => errors.push(error));
   }
 
-  #syncNativeImeRequests(): void {
-    if (this.#disposed || this.#rendererFreed) return;
-
-    const snapshot = this.#renderer.take_ime_requests();
-    if (snapshot !== undefined) applyImeRequestSnapshot(this.#win, snapshot);
-  }
-
   #requestRender(): void {
     if (this.#stopped || this.#disposed) return;
 
@@ -245,7 +230,6 @@ export class QuoxWindow implements Disposable {
     } catch (err) {
       console.error("Quox render failed:", err);
     } finally {
-      this.#syncNativeImeRequests();
       this.#rendering = false;
       if (this.#needsRender) this.#requestRender();
     }

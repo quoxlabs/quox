@@ -13,35 +13,25 @@ interface NativeX11Window extends Window {
   };
 }
 
-Deno.test("X11 opens a window, configures XIM, and translates a basic keypress", () => {
+Deno.test("X11 opens a window and translates a commit-only XIM keypress", () => {
   const library = load();
   try {
     const window = library.openWindow(0, 0, 64, 64) as NativeX11Window;
     drainEvents(library);
 
-    window.setImeCursorArea(8, 12, 2, 18);
-    window.setImeEnabled(true);
     focusWindow(window);
     const focus = nextEvent(library, (event) => event.type === "focus");
     if (focus?.type !== "focus" || focus.window !== window) {
       throw new Error("Expected the X11 window to receive keyboard focus");
     }
-    assertImeKind(nextEvent(library, (event) => event.type === "ime"), "enabled");
-
-    window.setImeEnabled(false);
-    assertImeKind(nextEvent(library, (event) => event.type === "ime"), "disabled");
-
     sendKeyPress(window, "a");
     const event = nextEvent(library, (candidate) => candidate.type === "keydown");
     if (event?.type !== "keydown") throw new Error("Expected an X11 keydown event");
     assertKey(event, { code: "KeyA", key: "a", editDisposition: "text-input" });
     if (event.window !== window) throw new Error("X11 keydown was routed to the wrong window");
-    const commit = nextEvent(
-      library,
-      (candidate) => candidate.type === "ime" && candidate.kind === "commit",
-    );
-    if (commit?.type !== "ime" || commit.kind !== "commit" || commit.text !== "a") {
-      throw new Error("Expected an X11 IME commit for the basic keypress");
+    const commit = nextEvent(library, (candidate) => candidate.type === "textinput");
+    if (commit?.type !== "textinput" || commit.text !== "a") {
+      throw new Error("Expected X11 committed text for the basic keypress");
     }
   } finally {
     library.close();
@@ -50,9 +40,7 @@ Deno.test("X11 opens a window, configures XIM, and translates a basic keypress",
 
 function focusWindow(window: NativeX11Window): void {
   // Xvfb runs without a window manager, so mapping a window does not give it
-  // keyboard focus. IME activation is intentionally conditional on native
-  // focus; establish it explicitly and let the resulting FocusIn event drive
-  // the public `focus → enabled` lifecycle.
+  // keyboard focus. Establish it explicitly before sending the key.
   const REVERT_TO_PARENT = 2;
   const CURRENT_TIME = 0n;
   window.lib.X11.symbols.XSetInputFocus(
@@ -106,12 +94,6 @@ function sendKeyPress(window: NativeX11Window, name: string): void {
   );
   if (accepted === 0) throw new Error("XSendEvent rejected the synthetic keypress");
   X11.symbols.XSync(display, 0);
-}
-
-function assertImeKind(event: UIEvent | undefined, expected: "enabled" | "disabled"): void {
-  if (event?.type === "ime" && event.kind === expected) return;
-  const actual = event?.type === "ime" ? event.kind : event?.type ?? "no event";
-  throw new Error(`Expected IME ${expected}, got ${actual}`);
 }
 
 function assertKey(

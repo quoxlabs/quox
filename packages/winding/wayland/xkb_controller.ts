@@ -74,7 +74,7 @@ export class WaylandXkbController {
         xkbKeycode: rawKeycode + 8,
         keysym: 0,
         key: "Unidentified",
-        isComposing: false,
+        composePending: false,
       };
     }
     return translateKey(rawKeycode, phase, translator, useCompose ? this.#composeAdapter() : undefined);

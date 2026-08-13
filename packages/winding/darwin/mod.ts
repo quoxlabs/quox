@@ -19,7 +19,6 @@ import { getDomCode } from "./dom_code.ts";
 import { DarwinInputState } from "./input_state.ts";
 import {
   addMethod as runtimeAddMethod,
-  addProtocol as runtimeAddProtocol,
   allocateClassPair as runtimeAllocateClassPair,
   APPKIT,
   cfSymbols,
@@ -28,7 +27,6 @@ import {
   CORE_GRAPHICS,
   cStr,
   getClass as runtimeGetClass,
-  getProtocol as runtimeGetProtocol,
   LIBOBJC,
   NSPOINT,
   NSRECT,
@@ -41,13 +39,8 @@ import {
   sel as runtimeSel,
   selectorName as runtimeSelectorName,
 } from "./ffi.ts";
-import {
-  type DarwinNativeClasses,
-  type DarwinNativeResponder,
-  ensureNativeClasses,
-  type NativeRange,
-} from "./native_classes.ts";
-import { cocoaRectFromClient, logicalKeyForEvent, uninterpretedCommitText } from "./text_input.ts";
+import { type DarwinNativeClasses, type DarwinNativeResponder, ensureNativeClasses } from "./native_classes.ts";
+import { isPotentiallyPrintableCode, logicalKeyForEvent, uninterpretedCommitText } from "./text_input.ts";
 
 // NSWindowStyleMask: Titled | Closable | Resizable | Miniaturizable
 const NS_WINDOW_STYLE_MASK = 1 | 2 | 8 | 4;
@@ -169,9 +162,6 @@ function openDarwinFfi() {
       sel: (name: string) => runtimeSel(runtime, name),
       allocateClassPair: (superclass: Deno.PointerObject, name: string) =>
         runtimeAllocateClassPair(runtime, superclass, name),
-      getProtocol: (name: string) => runtimeGetProtocol(runtime, name),
-      addProtocol: (cls: Deno.PointerObject, protocol: Deno.PointerObject) =>
-        runtimeAddProtocol(runtime, cls, protocol),
       selectorName: (selector: Deno.PointerValue) => runtimeSelectorName(runtime, selector),
       registerClassPair: runtime.symbols.objc_registerClassPair,
       addMethod: (
@@ -237,11 +227,7 @@ function getModifiers(event: Deno.PointerValue, ffi: DarwinFfi): KeyModifiers {
 
 function readInputString(value: Deno.PointerValue, ffi: DarwinFfi): string {
   if (value === null) return "";
-  const { cf, getClass, sel, send } = ffi;
-  const string = send.bool_id(value, sel("isKindOfClass:"), getClass("NSAttributedString"))
-    ? send.id(value, sel("string"))
-    : value;
-  return string === null ? "" : readCFString(cf, string);
+  return readCFString(ffi.cf, value);
 }
 
 class DarwinWindow implements Window, DarwinNativeResponder {
@@ -253,10 +239,8 @@ class DarwinWindow implements Window, DarwinNativeResponder {
   readonly inputState: DarwinInputState;
   #width: number;
   #height: number;
-  #discardingMarkedText = false;
   #keyDispatchActive = false;
   #producedText: string | undefined;
-  #producedPreedit = false;
   readonly #pressedKeys = new PressedLogicalKeyCache<number>();
   #closed = false;
   // Kept alive for one extra frame: CGImage/CGDataProvider wrap this memory
@@ -433,40 +417,8 @@ class DarwinWindow implements Window, DarwinNativeResponder {
     this.handleInsertText(text);
   }
 
-  handleNativeSetMarkedText(
-    text: Deno.PointerValue,
-    selectionLocation: bigint,
-    selectionLength: bigint,
-  ): void {
-    this.handleSetMarkedText(text, selectionLocation, selectionLength);
-  }
-
-  handleNativeUnmarkText(): void {
-    this.handleUnmarkText();
-  }
-
   handleNativeCommand(command: Deno.PointerValue): void {
     this.handleCommand(command);
-  }
-
-  get nativeHasMarkedText(): boolean {
-    return this.inputState.hasMarkedText;
-  }
-
-  get nativeMarkedRange(): NativeRange {
-    return this.inputState.markedRange;
-  }
-
-  get nativeSelectedRange(): NativeRange {
-    return this.inputState.selectedRange;
-  }
-
-  nativeValidAttributes(): Deno.PointerValue {
-    return this.emptyArray();
-  }
-
-  nativeFirstRectForCharacterRange(): Uint8Array {
-    return this.firstRectForCharacterRange();
   }
 
   handleResize(): void {
@@ -482,15 +434,10 @@ class DarwinWindow implements Window, DarwinNativeResponder {
   handleFocusGained(): void {
     if (this.#closed) return;
     this.lib.pushEvent({ type: "focus", window: this });
-    this.inputState.setNativeFocused(true);
-    this.#flushInputState();
   }
 
   handleFocusLost(): void {
     if (this.#closed) return;
-    this.inputState.setNativeFocused(false);
-    this.#flushInputState();
-    this.#discardNativeMarkedText();
     this.resetModifierState();
     this.#pressedKeys.clear();
     this.lib.pushEvent({ type: "blur", window: this });
@@ -508,16 +455,18 @@ class DarwinWindow implements Window, DarwinNativeResponder {
     this.inputState.beginKey(key);
     this.#keyDispatchActive = true;
     this.#producedText = undefined;
-    this.#producedPreedit = false;
     try {
-      if (this.inputState.active) {
+      const directText = uninterpretedCommitText(
+        native.characters,
+        native.base.ctrlKey,
+        native.base.metaKey,
+      );
+      if (directText !== undefined || isPotentiallyPrintableCode(native.base.code)) {
+        this.#producedText = this.inputState.insertText(directText ?? "");
+      } else {
         const { getClass, sel, send } = this.lib.ffi;
         const events = send.id_id(getClass("NSArray"), sel("arrayWithObject:"), event);
         send.void_id(this.contentView, sel("interpretKeyEvents:"), events);
-      } else {
-        this.#producedText = this.inputState.insertText(
-          uninterpretedCommitText(native.characters, native.base.ctrlKey, native.base.metaKey) ?? "",
-        );
       }
     } finally {
       const batch = this.inputState.finishKey();
@@ -528,13 +477,11 @@ class DarwinWindow implements Window, DarwinNativeResponder {
           characters: native.characters,
           charactersIgnoringModifiers: native.charactersIgnoringModifiers,
           producedText: this.#producedText,
-          producedPreedit: this.#producedPreedit || completedKey.isComposing,
         });
         completedKey.key = this.#pressedKeys.press(completedKey.keycode, resolvedKey);
       }
       this.#keyDispatchActive = false;
       this.#producedText = undefined;
-      this.#producedPreedit = false;
       this.lib.pushEvents(batch);
     }
   }
@@ -593,90 +540,17 @@ class DarwinWindow implements Window, DarwinNativeResponder {
   }
 
   handleInsertText(value: Deno.PointerValue): void {
-    if (this.#closed || this.#discardingMarkedText || !this.inputState.active) return;
+    if (this.#closed) return;
     const text = readInputString(value, this.lib.ffi);
     const committed = this.inputState.insertText(text);
     if (this.#keyDispatchActive) this.#producedText = committed;
     this.#flushInputState();
   }
 
-  handleSetMarkedText(
-    value: Deno.PointerValue,
-    selectionLocation: bigint,
-    selectionLength: bigint,
-  ): void {
-    if (this.#closed || this.#discardingMarkedText || !this.inputState.active) return;
-    if (this.#keyDispatchActive) this.#producedPreedit = true;
-    this.inputState.setMarkedText(
-      readInputString(value, this.lib.ffi),
-      selectionLocation,
-      selectionLength,
-    );
-    this.#flushInputState();
-  }
-
-  handleUnmarkText(): void {
-    if (this.#closed || this.#discardingMarkedText || !this.inputState.active) return;
-    const committed = this.inputState.unmarkText();
-    if (this.#keyDispatchActive) this.#producedText = committed;
-    this.#flushInputState();
-  }
-
   handleCommand(command: Deno.PointerValue): void {
-    if (this.#closed || command === null || !this.inputState.active) return;
+    if (this.#closed || command === null) return;
     this.inputState.performCommand(this.lib.ffi.selectorName(command));
     this.#flushInputState();
-  }
-
-  emptyArray(): Deno.PointerValue {
-    const { getClass, sel, send } = this.lib.ffi;
-    return send.id(getClass("NSArray"), sel("array"));
-  }
-
-  firstRectForCharacterRange(): Uint8Array {
-    const { nsrect, sel } = this.lib.ffi;
-    const bounds = nsrect.noArgs(this.contentView, sel("bounds"));
-    const viewHeight = readStructF64(bounds, 24);
-    const local = cocoaRectFromClient(this.inputState.cursorArea, viewHeight);
-    return nsrect.rectArg(
-      this.nsWindow,
-      sel("convertRectToScreen:"),
-      new Float64Array([local.x, local.y, local.width, local.height]),
-    );
-  }
-
-  setImeEnabled(enabled: boolean): void {
-    if (this.#closed || enabled === this.inputState.imeEnabled) return;
-    this.inputState.setImeEnabled(enabled);
-    this.#flushInputState();
-    if (!enabled) this.#discardNativeMarkedText();
-  }
-
-  setImeCursorArea(x: number, y: number, width: number, height: number): void {
-    if (this.#closed) return;
-    this.inputState.setCursorArea(x, y, width, height);
-    const { sel, send } = this.lib.ffi;
-    const inputContext = send.id(this.contentView, sel("inputContext"));
-    if (inputContext !== null) send.void(inputContext, sel("invalidateCharacterCoordinates"));
-  }
-
-  cancelComposition(): void {
-    if (this.#closed) return;
-    this.inputState.cancelComposition();
-    this.#flushInputState();
-    this.#discardNativeMarkedText();
-  }
-
-  #discardNativeMarkedText(): void {
-    const { sel, send } = this.lib.ffi;
-    const inputContext = send.id(this.contentView, sel("inputContext"));
-    if (inputContext === null) return;
-    this.#discardingMarkedText = true;
-    try {
-      send.void(inputContext, sel("discardMarkedText"));
-    } finally {
-      this.#discardingMarkedText = false;
-    }
   }
 
   #flushInputState(): void {
@@ -702,7 +576,6 @@ class DarwinWindow implements Window, DarwinNativeResponder {
       code,
       key: logicalKeyForEvent({ code, characters, charactersIgnoringModifiers }),
       location: keyLocationForCode(code),
-      isComposing: this.inputState.composing,
       ...getModifiers(event, this.lib.ffi),
       window: this,
     };
@@ -766,7 +639,6 @@ class DarwinWindow implements Window, DarwinNativeResponder {
     cleanup(() => this.lib.nativeClasses.unregisterDelegate(this.#delegate));
     cleanup(() => this.#pressedKeys.clear());
     cleanup(() => this.inputState.close());
-    cleanup(() => this.#discardNativeMarkedText());
     const { sel, send } = this.lib.ffi;
     cleanup(() => send.void_id(this.nsWindow, sel("setDelegate:"), null));
     cleanup(() => send.bool_id(this.nsWindow, sel("makeFirstResponder:"), null));

@@ -3,7 +3,6 @@ import { DeferredNativeError, guardNativeCallback } from "../input/callback.ts";
 import { EventQueue } from "../input/event_queue.ts";
 import {
   gdi32functions,
-  imm32functions,
   kernel32functions,
   PM_REMOVE,
   SIZE_MINIMIZED,
@@ -111,16 +110,6 @@ class Win32Window implements Window {
     if (!ok) throw new Error(this.lib.getLastError());
   }
 
-  setImeEnabled(enabled: boolean): void {
-    if (this.#closed) return;
-    this.lib.input.setImeEnabled(this, enabled);
-  }
-
-  setImeCursorArea(x: number, y: number, width: number, height: number): void {
-    if (this.#closed) return;
-    this.lib.input.setImeCursorArea(this, x, y, width, height);
-  }
-
   /**
    * Copy an RGBA pixel buffer to the window's client area via GDI. Converts
    * to a top-down 32bpp BGRA DIB (matching the BGRX reordering used by the
@@ -200,7 +189,6 @@ class Win32Library implements Library {
   readonly kernel32: Deno.DynamicLibrary<typeof kernel32functions>;
   readonly user32: Deno.DynamicLibrary<typeof user32functions>;
   readonly gdi32: Deno.DynamicLibrary<typeof gdi32functions>;
-  readonly imm32: Deno.DynamicLibrary<typeof imm32functions>;
   #wndClass = new ArrayBuffer(80);
   #classNameBuffer = (() => {
     return wideStringBuffer("Winding");
@@ -223,10 +211,8 @@ class Win32Library implements Library {
     this.kernel32 = Deno.dlopen("kernel32", kernel32functions);
     this.user32 = Deno.dlopen("user32", user32functions);
     this.gdi32 = Deno.dlopen("gdi32", gdi32functions);
-    this.imm32 = Deno.dlopen("imm32", imm32functions);
     this.input = new Win32InputController(
       this.user32,
-      this.imm32,
       (event) => this.#events.push(event),
       (id) => this.windows.get(id),
     );
@@ -492,7 +478,6 @@ class Win32Library implements Library {
     });
     captureError(errors, () => this.#callbackErrors.throwIfPending());
     captureError(errors, () => this.#wndProc.close());
-    captureError(errors, () => this.imm32.close());
     captureError(errors, () => this.gdi32.close());
     captureError(errors, () => this.user32.close());
     captureError(errors, () => this.kernel32.close());

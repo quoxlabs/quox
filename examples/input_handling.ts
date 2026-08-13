@@ -45,6 +45,9 @@ if (import.meta.main) {
           }`,
         );
         break;
+      case "textinput":
+        console.log(`Committed text: ${event.text}`);
+        break;
       case "resize":
         console.log(`Window resized to ${event.width}x${event.height}`);
         break;

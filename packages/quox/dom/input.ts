@@ -1,16 +1,15 @@
 import type {
   AppleStandardKeybindingEvent as WindingAppleStandardKeybindingEvent,
-  ImeEvent as WindingImeEvent,
   KeyEvent as WindingKeyEvent,
+  TextInputEvent as WindingTextInputEvent,
   UIEvent as WindingUIEvent,
-  Window as WindingWindow,
 } from "@quoxlabs/winding";
 import { KeyEventFlag, KeyModifierMask } from "../lib/quox.js";
 
 type WithoutWindow<Event> = Event extends { window: unknown } ? Omit<Event, "window"> : never;
 
 export type QuoxKeyboardEvent = WithoutWindow<WindingKeyEvent>;
-export type QuoxImeEvent = WithoutWindow<WindingImeEvent>;
+export type QuoxTextInputEvent = WithoutWindow<WindingTextInputEvent>;
 export type QuoxAppleStandardKeybindingEvent = WithoutWindow<WindingAppleStandardKeybindingEvent>;
 
 export type QuoxMouseMoveEvent = { type: "mousemove"; x: number; y: number };
@@ -27,7 +26,7 @@ export type QuoxInputEvent =
   | QuoxMouseButtonEvent
   | QuoxMouseWheelEvent
   | QuoxKeyboardEvent
-  | QuoxImeEvent
+  | QuoxTextInputEvent
   | QuoxAppleStandardKeybindingEvent
   | QuoxResizeEvent
   | QuoxCloseEvent
@@ -41,7 +40,7 @@ export interface QuoxInputRoutePort {
   pointerUp(x: number, y: number, button: number, buttons: number): void;
   wheel(x: number, y: number, deltaX: number, deltaY: number, buttons: number): void;
   key(event: QuoxKeyboardEvent): void;
-  ime(event: QuoxImeEvent): void;
+  textInput(event: QuoxTextInputEvent): void;
   appleCommand(event: QuoxAppleStandardKeybindingEvent): void;
   clearHover(): void;
   resize(event: QuoxResizeEvent): void;
@@ -87,8 +86,8 @@ export class QuoxInputRouter {
       case "keyup":
         this.port.key(event);
         return undefined;
-      case "ime":
-        this.port.ime(event);
+      case "textinput":
+        this.port.textInput(event);
         return undefined;
       case "apple-standard-keybinding":
         this.port.appleCommand(event);
@@ -139,7 +138,6 @@ export function mapWindingEvent(event: WindingUIEvent): QuoxInputEvent {
         key: event.key,
         location: event.location,
         repeat: event.repeat,
-        isComposing: event.isComposing,
         editDisposition: event.editDisposition,
         shiftKey: event.shiftKey,
         ctrlKey: event.ctrlKey,
@@ -158,7 +156,6 @@ export function mapWindingEvent(event: WindingUIEvent): QuoxInputEvent {
         key: event.key,
         location: event.location,
         repeat: false,
-        isComposing: event.isComposing,
         shiftKey: event.shiftKey,
         ctrlKey: event.ctrlKey,
         altKey: event.altKey,
@@ -167,30 +164,8 @@ export function mapWindingEvent(event: WindingUIEvent): QuoxInputEvent {
         capsLock: event.capsLock,
         altGraphKey: event.altGraphKey,
       };
-    case "ime": {
-      switch (event.kind) {
-        case "enabled":
-        case "disabled":
-          return { type: "ime", kind: event.kind };
-        case "preedit":
-          return {
-            type: "ime",
-            kind: "preedit",
-            text: event.text,
-            cursorRange: event.cursorRange,
-          };
-        case "commit":
-          return { type: "ime", kind: "commit", text: event.text };
-        case "deleteSurrounding":
-          return {
-            type: "ime",
-            kind: "deleteSurrounding",
-            beforeBytes: event.beforeBytes,
-            afterBytes: event.afterBytes,
-          };
-      }
-      return assertNever(event);
-    }
+    case "textinput":
+      return { type: "textinput", text: event.text };
     case "apple-standard-keybinding":
       return { type: "apple-standard-keybinding", command: event.command };
     case "resize":
@@ -230,7 +205,7 @@ export function encodeKeyEvent(event: QuoxKeyboardEvent): EncodedKeyEvent {
   if (event.altGraphKey) modifierBits |= KeyModifierMask.AltGraph;
   if (event.accelKey) modifierBits |= KeyModifierMask.Accelerator;
 
-  let eventFlags = event.isComposing ? KeyEventFlag.Composing : 0;
+  let eventFlags = 0;
   if (event.type === "keydown") {
     eventFlags |= KeyEventFlag.Pressed;
     if (event.repeat) eventFlags |= KeyEventFlag.Repeat;
@@ -260,27 +235,5 @@ export function notifyInputListeners(
     } catch (error) {
       reportError(error);
     }
-  }
-}
-
-export const IME_REQUEST_FLAG = {
-  cursorArea: 1 << 0,
-  enabled: 1 << 1,
-} as const;
-
-/** Apply one atomic Rust IME-request snapshot, always placing geometry before enabling. */
-export function applyImeRequestSnapshot(window: WindingWindow, snapshot: Float32Array): void {
-  if (snapshot.length !== 6) {
-    throw new RangeError(`invalid IME request snapshot length: ${snapshot.length}`);
-  }
-  const flags = Math.trunc(snapshot[0]);
-  if (!Number.isFinite(snapshot[0]) || flags !== snapshot[0] || (flags & ~3) !== 0) {
-    throw new RangeError(`invalid IME request flags: ${snapshot[0]}`);
-  }
-  if (flags & IME_REQUEST_FLAG.cursorArea) {
-    window.setImeCursorArea(snapshot[1], snapshot[2], snapshot[3], snapshot[4]);
-  }
-  if (flags & IME_REQUEST_FLAG.enabled) {
-    window.setImeEnabled(snapshot[5] !== 0);
   }
 }

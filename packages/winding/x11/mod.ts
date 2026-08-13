@@ -1,17 +1,14 @@
-import type { KeyDownEvent, KeyModifiers, KeyUpEvent, Library, LoadLibrary, UIEvent, Window } from "../types.ts";
+import type { KeyDownEvent, KeyModifiers, Library, LoadLibrary, UIEvent, Window } from "../types.ts";
 import {
-  createImeActivationEvent,
-  createImeCommitEvent,
-  createImeDeleteSurroundingEvent,
-  createImePreeditEvent,
   createKeyDownEvent,
   createKeyUpEvent,
+  createTextInputEvent,
   EventQueue,
   keyLocationForCode,
   normalizeCommittedText,
   PressedLogicalKeyCache,
 } from "../input/mod.ts";
-import { domCodeFromX11 } from "../linux/mod.ts";
+import { domCodeFromX11, logicalKeyFromKeysym } from "../linux/mod.ts";
 import { utf8Bytes, utf8CString as cString } from "../text_encoding.ts";
 import { libcFunctions, NotifyNormal, x11functions, XEventMask, XEventType } from "./ffi.ts";
 import { isAutoRepeatPair, x11KeyEditDisposition } from "./input.ts";
@@ -66,7 +63,6 @@ class X11Window implements Window {
   readonly id: bigint;
   readonly input: XimContext;
   readonly pressedKeys = new PressedLogicalKeyCache<number>();
-  readonly filteredKeys = new Set<number>();
   readonly #gc: bigint;
   #image: NativeXImage;
   #width: number;
@@ -144,14 +140,6 @@ class X11Window implements Window {
       lib.X11.symbols.XDestroyWindow(lib.display, window);
       throw error;
     }
-  }
-
-  setImeEnabled(enabled: boolean): void {
-    this.input.setEnabled(enabled);
-  }
-
-  setImeCursorArea(x: number, y: number, width: number, height: number): void {
-    this.input.setCursorArea(x, y, width, height);
   }
 
   setTitle(title: string): void {
@@ -248,7 +236,6 @@ class X11Window implements Window {
     };
     cleanup(() => this.input.close());
     this.pressedKeys.clear();
-    this.filteredKeys.clear();
     cleanup(() => this.#image.close());
     cleanup(() => {
       this.lib.X11.symbols.XFreeGC(this.lib.display, this.#gc);
@@ -324,31 +311,6 @@ class X11Library implements Library {
         this.X11,
         display,
         this.libc,
-        (windowId, event) => {
-          const window = this.windows.get(windowId);
-          if (window === undefined) return;
-          switch (event.kind) {
-            case "enabled":
-            case "disabled":
-              this.#events.push(createImeActivationEvent(window, event.kind));
-              return;
-            case "preedit":
-              this.#events.push(createImePreeditEvent(window, event.text, event.cursorRange));
-              return;
-            case "commit": {
-              const commit = createImeCommitEvent(window, event.text);
-              if (commit !== undefined) this.#events.push(commit);
-              return;
-            }
-            case "deleteSurrounding": {
-              const deletion = createImeDeleteSurroundingEvent(window, event.beforeBytes, event.afterBytes);
-              if (deletion !== undefined) this.#events.push(deletion);
-              return;
-            }
-            default:
-              assertNever(event);
-          }
-        },
         (windowId, extraMask) => {
           this.X11.symbols.XSelectInput(this.display, windowId, ALL_X_EV_MASKS | extraMask);
         },
@@ -403,83 +365,53 @@ class X11Library implements Library {
       }
 
       if ((type === XEventType.KeyPress || type === XEventType.KeyRelease) && window !== undefined) {
-        let lookupStaged = type === XEventType.KeyPress;
-        if (lookupStaged) window.input.beginLookup();
-        try {
-          const filtered = this.input.filterEvent(eventPointer, window.input);
-          this.input.throwIfCallbackFailed();
-          if (filtered) {
-            const keycode = view.getUint32(84, true);
-            if (type === XEventType.KeyPress) window.filteredKeys.add(keycode);
-            else {
-              window.filteredKeys.delete(keycode);
-              window.pressedKeys.release(keycode);
-            }
-            if (lookupStaged) {
-              window.input.finishLookup();
-              lookupStaged = false;
-            }
-            const imeEvent = this.#events.shift();
-            if (imeEvent !== undefined) return imeEvent;
-            continue;
-          }
+        const filtered = this.input.filterEvent(eventPointer, window.input);
+        this.input.throwIfCallbackFailed();
 
-          const state = view.getUint32(80, true);
-          const keycode = view.getUint32(84, true);
-          const code = domCodeFromX11(keycode);
-          const modifiers = getModifiers(state, this.#altGraphMask);
-          if (type === XEventType.KeyRelease) {
-            if (window.filteredKeys.delete(keycode)) {
-              window.pressedKeys.release(keycode);
-              continue;
-            }
-            if (this.#isAutoRepeatRelease(view)) continue;
-            const key = window.pressedKeys.release(keycode);
-            const event: KeyUpEvent = createKeyUpEvent({
-              keycode,
-              code,
-              key,
-              location: keyLocationForCode(code),
-              isComposing: window.input.composing,
-              ...modifiers,
-              window,
-            });
-            return event;
-          }
-
-          const wasComposing = window.input.composing;
-          const lookup = this.input.lookup(window.input, eventPointer);
-          this.input.throwIfCallbackFailed();
-          const repeat = window.pressedKeys.has(keycode);
-          const key = window.pressedKeys.press(keycode, lookup.key);
-          const text = normalizeCommittedText(lookup.text ?? "");
-          const event: KeyDownEvent = createKeyDownEvent({
+        const state = view.getUint32(80, true);
+        const keycode = view.getUint32(84, true);
+        const code = domCodeFromX11(keycode);
+        const modifiers = getModifiers(state, this.#altGraphMask);
+        if (type === XEventType.KeyRelease) {
+          if (this.#isAutoRepeatRelease(view)) continue;
+          const key = window.pressedKeys.release(keycode);
+          return createKeyUpEvent({
             keycode,
             code,
             key,
             location: keyLocationForCode(code),
-            repeat,
-            isComposing: wasComposing,
-            editDisposition: x11KeyEditDisposition(
-              key,
-              text !== undefined,
-              wasComposing,
-              window.input.composing,
-              window.input.hasStagedEvents,
-            ),
             ...modifiers,
             window,
           });
-
-          // Xutf8LookupString may invoke XIM callbacks synchronously. The native
-          // transition's keydown must remain observably ahead of those semantic
-          // events, and committed text remains exclusively in the commit event.
-          this.#events.prepend(event);
-          if (text !== undefined) window.input.commit(text);
-          return this.#events.shift();
-        } finally {
-          if (lookupStaged) window.input.finishLookup();
         }
+
+        const lookup = filtered
+          ? {
+            key: logicalKeyFromKeysym(BigInt(this.X11.symbols.XLookupKeysym(eventPointer, 0))),
+            text: undefined,
+          }
+          : this.input.lookup(window.input, eventPointer);
+        this.input.throwIfCallbackFailed();
+        const repeat = window.pressedKeys.has(keycode);
+        const key = window.pressedKeys.press(keycode, lookup.key);
+        const text = normalizeCommittedText(lookup.text ?? "");
+        const event: KeyDownEvent = createKeyDownEvent({
+          keycode,
+          code,
+          key,
+          location: keyLocationForCode(code),
+          repeat,
+          editDisposition: x11KeyEditDisposition(key, text !== undefined),
+          ...modifiers,
+          window,
+        });
+
+        this.#events.prepend(event);
+        if (text !== undefined) {
+          const textInput = createTextInputEvent(window, text);
+          if (textInput !== undefined) this.#events.push(textInput);
+        }
+        return this.#events.shift();
       }
 
       if (type === XEventType.FocusIn && window !== undefined && view.getInt32(40, true) === NotifyNormal) {
@@ -489,12 +421,6 @@ class X11Library implements Library {
       if (type === XEventType.FocusOut && window !== undefined && view.getInt32(40, true) === NotifyNormal) {
         window.input.setNativeFocused(false);
         window.pressedKeys.clear();
-        window.filteredKeys.clear();
-        const imeEvent = this.#events.shift();
-        if (imeEvent !== undefined) {
-          this.#events.push({ type: "blur", window });
-          return imeEvent;
-        }
         return { type: "blur", window };
       }
 
@@ -621,7 +547,3 @@ function importEvent(
 }
 
 export const load: LoadLibrary = () => new X11Library();
-
-function assertNever(_value: never): never {
-  throw new TypeError("Unsupported XIM event");
-}

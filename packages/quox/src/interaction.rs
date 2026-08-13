@@ -57,8 +57,7 @@ pub enum KeyModifierMask {
 pub enum KeyEventFlag {
     Pressed = 1,
     Repeat = 2,
-    Composing = 4,
-    PreventDefault = 8,
+    PreventDefault = 4,
 }
 
 const KEY_MOD_SHIFT: u32 = KeyModifierMask::Shift as u32;
@@ -76,10 +75,8 @@ const KEY_MOD_KNOWN: u32 = KEY_MOD_SHIFT
 
 const KEY_EVENT_PRESSED: u32 = KeyEventFlag::Pressed as u32;
 const KEY_EVENT_REPEAT: u32 = KeyEventFlag::Repeat as u32;
-const KEY_EVENT_COMPOSING: u32 = KeyEventFlag::Composing as u32;
 const KEY_EVENT_PREVENT_DEFAULT: u32 = KeyEventFlag::PreventDefault as u32;
-const KEY_EVENT_KNOWN: u32 =
-    KEY_EVENT_PRESSED | KEY_EVENT_REPEAT | KEY_EVENT_COMPOSING | KEY_EVENT_PREVENT_DEFAULT;
+const KEY_EVENT_KNOWN: u32 = KEY_EVENT_PRESSED | KEY_EVENT_REPEAT | KEY_EVENT_PREVENT_DEFAULT;
 
 /// Build the modifier set used by Blitz's editor defaults. Quox itself exposes the exact
 /// physical flags to JS; this projection deliberately maps the runtime platform accelerator to
@@ -150,19 +147,6 @@ fn key_location(location: u32) -> Location {
     }
 }
 
-fn preedit_cursor(
-    text: &str,
-    cursor_start: Option<usize>,
-    cursor_end: Option<usize>,
-) -> Option<(usize, usize)> {
-    cursor_start.zip(cursor_end).filter(|(start, end)| {
-        start <= end
-            && *end <= text.len()
-            && text.is_char_boundary(*start)
-            && text.is_char_boundary(*end)
-    })
-}
-
 /// Map a `winding` button index (`left:0, middle:1, right:2`, matching the ordinals
 /// `MouseEventButton` itself already uses for `Main`/`Auxiliary`/`Secondary`) to the
 /// corresponding `MouseEventButton`.
@@ -229,7 +213,7 @@ fn key_event(
         modifiers: build_editor_modifiers(modifier_bits),
         location: key_location(location),
         is_auto_repeating: event_flags & KEY_EVENT_REPEAT != 0,
-        is_composing: event_flags & KEY_EVENT_COMPOSING != 0,
+        is_composing: false,
         state: if event_flags & KEY_EVENT_PRESSED != 0 {
             KeyState::Pressed
         } else {
@@ -301,9 +285,8 @@ impl EventHandler for RecordingEventHandler<'_> {
 }
 
 impl QuoxRendererState {
-    /// Run one host dispatch inside a single `EventDriver`/recording scope. Keeping the scope
-    /// reusable lets a native commit clear preedit and insert text atomically without resetting
-    /// the generated DOM-event mailbox between the two Blitz events.
+    /// Run one host dispatch inside a single `EventDriver`/recording scope while preserving
+    /// the generated DOM-event mailbox for the entire dispatch.
     fn with_event_driver(
         &mut self,
         cancel_keydown_default: bool,
@@ -326,8 +309,6 @@ impl QuoxRendererState {
             );
             drive(&mut driver);
         }
-
-        self.refresh_ime_cursor_area();
 
         self.redraw_requested.swap(false, Ordering::Relaxed)
     }
@@ -356,11 +337,6 @@ impl QuoxRendererState {
         );
         self.with_event_driver(false, |driver| driver.handle_dom_event(event))
     }
-}
-
-fn drive_ime_commit<Handler: EventHandler>(driver: &mut EventDriver<'_, Handler>, text: &str) {
-    driver.handle_ui_event(UiEvent::Ime(BlitzImeEvent::Preedit(String::new(), None)));
-    driver.handle_ui_event(UiEvent::Ime(BlitzImeEvent::Commit(text.to_owned())));
 }
 
 #[wasm_bindgen]
@@ -446,8 +422,7 @@ impl QuoxRenderer {
 
     /// Feed a canonical native key event into Blitz. `modifier_bits` carries the editor-facing
     /// modifier projection plus its runtime accelerator; `event_flags` carries pressed/repeat/
-    /// composing/default-cancellation state. Every insertion arrives through a following
-    /// `dispatch_ime_commit`.
+    /// default-cancellation state. Every insertion arrives through a following text-input event.
     pub fn dispatch_key_event(
         &self,
         code: &str,
@@ -467,45 +442,14 @@ impl QuoxRenderer {
         }
     }
 
-    /// Notify Blitz that the native input method has become active.
-    pub fn dispatch_ime_enabled(&self) -> bool {
-        self.state
-            .borrow_mut()
-            .dispatch(UiEvent::Ime(BlitzImeEvent::Enabled))
-    }
-
-    /// Notify Blitz that the native input method has become inactive and clear any pending
-    /// preedit text.
-    pub fn dispatch_ime_disabled(&self) -> bool {
-        self.state
-            .borrow_mut()
-            .dispatch(UiEvent::Ime(BlitzImeEvent::Disabled))
-    }
-
-    /// Update the native IME's preedit text. Cursor offsets are optional UTF-8 byte offsets;
-    /// both must be present to expose a cursor/selection inside the preedit.
-    pub fn dispatch_ime_preedit(
-        &self,
-        text: &str,
-        cursor_start: Option<usize>,
-        cursor_end: Option<usize>,
-    ) -> bool {
-        let cursor = preedit_cursor(text, cursor_start, cursor_end);
-        self.state
-            .borrow_mut()
-            .dispatch(UiEvent::Ime(BlitzImeEvent::Preedit(
-                text.to_owned(),
-                cursor,
-            )))
-    }
-
-    /// Commit native IME text to the focused Blitz text editor.
-    pub fn dispatch_ime_commit(&self, text: &str) -> bool {
+    /// Insert non-control text committed by the active keyboard layout.
+    pub fn dispatch_text_input(&self, text: &str) -> bool {
         if !is_insertable_text(text) {
             return false;
         }
-        let mut state = self.state.borrow_mut();
-        state.with_event_driver(false, |driver| drive_ime_commit(driver, text))
+        self.state
+            .borrow_mut()
+            .dispatch(UiEvent::Ime(BlitzImeEvent::Commit(text.to_owned())))
     }
 
     /// Forward an `AppKit` `doCommandBySelector:` edit through Blitz's existing selector map.
@@ -513,18 +457,6 @@ impl QuoxRenderer {
         self.state
             .borrow_mut()
             .dispatch_apple_standard_keybinding(command)
-    }
-
-    /// Forward byte-counted surrounding-text deletion. Pinned Blitz currently accepts but does
-    /// not apply this event; keeping the ABI wired avoids another host-boundary change once its
-    /// editor implementation lands.
-    pub fn dispatch_ime_delete_surrounding(&self, before_bytes: u32, after_bytes: u32) -> bool {
-        self.state
-            .borrow_mut()
-            .dispatch(UiEvent::Ime(BlitzImeEvent::DeleteSurrounding {
-                before_bytes: before_bytes as usize,
-                after_bytes: after_bytes as usize,
-            }))
     }
 
     /// Clear Blitz's hover state (and reset the cursor), e.g. when the pointer leaves the
@@ -575,10 +507,9 @@ impl QuoxRenderer {
 #[cfg(test)]
 mod tests {
     use super::{
-        KEY_EVENT_COMPOSING, KEY_EVENT_PRESSED, KEY_EVENT_REPEAT, KEY_MOD_ACCEL, KEY_MOD_ALT,
-        KEY_MOD_ALT_GRAPH, KEY_MOD_META, KEY_MOD_SHIFT, RecordedEvents, RecordingEventHandler,
-        build_editor_modifiers, drive_ime_commit, is_insertable_text, key_event, preedit_cursor,
-        validate_key_abi, viewport_point_to_page,
+        KEY_EVENT_PRESSED, KEY_EVENT_REPEAT, KEY_MOD_ACCEL, KEY_MOD_ALT, KEY_MOD_ALT_GRAPH,
+        KEY_MOD_META, KEY_MOD_SHIFT, RecordedEvents, RecordingEventHandler, build_editor_modifiers,
+        is_insertable_text, key_event, validate_key_abi, viewport_point_to_page,
     };
     use blitz_dom::{BaseDocument, DocumentConfig, EventDriver};
     use blitz_html::HtmlDocument;
@@ -650,18 +581,6 @@ mod tests {
         text.expect("test node should remain a text input")
     }
 
-    fn input_compose_range(document: &mut BaseDocument, input_id: usize) -> Option<(usize, usize)> {
-        let mut range = None;
-        document.with_text_input(input_id, |driver| {
-            range = driver
-                .editor
-                .raw_compose()
-                .as_ref()
-                .map(|range| (range.start, range.end));
-        });
-        range
-    }
-
     #[test]
     fn rejects_non_finite_coordinates() {
         assert_eq!(
@@ -719,14 +638,14 @@ mod tests {
             "@",
             KEY_MOD_SHIFT | KEY_MOD_ALT,
             3,
-            KEY_EVENT_PRESSED | KEY_EVENT_REPEAT | KEY_EVENT_COMPOSING,
+            KEY_EVENT_PRESSED | KEY_EVENT_REPEAT,
         );
 
         assert_eq!(event.key, Key::Character("@".into()));
         assert_eq!(event.text, None);
         assert_eq!(event.location, Location::Numpad);
         assert!(event.is_auto_repeating);
-        assert!(event.is_composing);
+        assert!(!event.is_composing);
         assert!(event.state.is_pressed());
 
         assert_eq!(
@@ -793,16 +712,7 @@ mod tests {
     }
 
     #[test]
-    fn preedit_cursor_accepts_only_valid_utf8_byte_ranges() {
-        assert_eq!(preedit_cursor("éx", Some(2), Some(3)), Some((2, 3)));
-        assert_eq!(preedit_cursor("éx", Some(1), Some(3)), None);
-        assert_eq!(preedit_cursor("éx", Some(3), Some(2)), None);
-        assert_eq!(preedit_cursor("éx", Some(0), Some(4)), None);
-        assert_eq!(preedit_cursor("éx", Some(0), None), None);
-    }
-
-    #[test]
-    fn cancelled_text_input_keydown_then_ime_commit_inserts_exactly_once() {
+    fn cancelled_text_input_keydown_then_text_input_inserts_exactly_once() {
         let (mut document, input_id) = focused_input_document();
         let mut recorded = RecordedEvents::default();
         let key = key_event("KeyS", "ß", 0, 0, KEY_EVENT_PRESSED);
@@ -811,21 +721,13 @@ mod tests {
         assert_eq!(input_raw_text(&mut document, input_id), "");
         assert_eq!(recorded.input, None);
 
+        recorded = RecordedEvents::default();
         dispatch_to_document(
             &mut document,
             &mut recorded,
-            UiEvent::Ime(BlitzImeEvent::Preedit("に".to_owned(), Some((0, 3)))),
+            UiEvent::Ime(BlitzImeEvent::Commit("ß".to_owned())),
             false,
         );
-        recorded = RecordedEvents::default();
-        let mut driver = EventDriver::new(
-            &mut document,
-            RecordingEventHandler {
-                recorded: &mut recorded,
-                cancel_keydown_default: false,
-            },
-        );
-        drive_ime_commit(&mut driver, "ß");
         assert_eq!(input_raw_text(&mut document, input_id), "ß");
         assert_eq!(recorded.input, Some(input_id));
         assert_eq!(recorded.input_count, 1);
@@ -872,38 +774,5 @@ mod tests {
 
         assert_eq!(input_raw_text(&mut document, input_id), "");
         assert_eq!(recorded.input, Some(input_id));
-    }
-
-    #[test]
-    fn utf8_preedit_updates_and_clears_without_emitting_input() {
-        let (mut document, input_id) = focused_input_document();
-        let mut recorded = RecordedEvents::default();
-        let preedit = "に";
-
-        dispatch_to_document(
-            &mut document,
-            &mut recorded,
-            UiEvent::Ime(BlitzImeEvent::Preedit(
-                preedit.to_owned(),
-                Some((0, preedit.len())),
-            )),
-            false,
-        );
-        assert_eq!(input_raw_text(&mut document, input_id), preedit);
-        assert_eq!(
-            input_compose_range(&mut document, input_id),
-            Some((0, preedit.len()))
-        );
-        assert_eq!(recorded.input, None);
-
-        dispatch_to_document(
-            &mut document,
-            &mut recorded,
-            UiEvent::Ime(BlitzImeEvent::Preedit(String::new(), None)),
-            false,
-        );
-        assert_eq!(input_raw_text(&mut document, input_id), "");
-        assert_eq!(input_compose_range(&mut document, input_id), None);
-        assert_eq!(recorded.input, None);
     }
 }

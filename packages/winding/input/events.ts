@@ -1,14 +1,12 @@
 import type {
-  ImeCursorRange,
-  ImeEvent,
   KeyDownEvent,
   KeyEditDisposition,
   KeyLocation,
   KeyModifiers,
   KeyUpEvent,
+  TextInputEvent,
   Window,
 } from "../types.ts";
-import { validateImeCursorRange } from "./ime.ts";
 import { keyLocationForCode, normalizeCommittedText, normalizeLogicalKey } from "./keyboard.ts";
 
 export interface KeyEventInit extends KeyModifiers {
@@ -17,7 +15,6 @@ export interface KeyEventInit extends KeyModifiers {
   code?: string;
   key?: string;
   location?: KeyLocation;
-  isComposing: boolean;
 }
 
 export interface KeyDownEventInit extends KeyEventInit {
@@ -35,7 +32,6 @@ export function createKeyDownEvent(init: KeyDownEventInit): KeyDownEvent {
     code,
     key: normalizeLogicalKey(init.key),
     location: init.location ?? keyLocationForCode(code),
-    isComposing: init.isComposing,
     repeat: init.repeat,
     editDisposition: init.editDisposition,
     ...modifiers(init),
@@ -52,55 +48,15 @@ export function createKeyUpEvent(init: KeyEventInit): KeyUpEvent {
     code,
     key: normalizeLogicalKey(init.key),
     location: init.location ?? keyLocationForCode(code),
-    isComposing: init.isComposing,
     repeat: false,
     ...modifiers(init),
   };
 }
 
-export function createImeActivationEvent(
-  window: Window,
-  kind: "enabled" | "disabled",
-): ImeEvent {
-  return { type: "ime", kind, window };
-}
-
-export function createImePreeditEvent(
-  window: Window,
-  text: string,
-  cursorRange: ImeCursorRange | null,
-): ImeEvent {
-  return {
-    type: "ime",
-    kind: "preedit",
-    window,
-    text,
-    cursorRange: text.length === 0 || cursorRange === null
-      ? null
-      : validateImeCursorRange(text, cursorRange[0], cursorRange[1]),
-  };
-}
-
-/** Empty commits carry no semantic edit and are omitted. */
-export function createImeCommitEvent(window: Window, text: string): ImeEvent | undefined {
+/** Empty or control-only commits carry no semantic edit and are omitted. */
+export function createTextInputEvent(window: Window, text: string): TextInputEvent | undefined {
   const committed = normalizeCommittedText(text);
-  return committed === undefined ? undefined : { type: "ime", kind: "commit", window, text: committed };
-}
-
-/** Invalid or empty surrounding deletions are omitted. */
-export function createImeDeleteSurroundingEvent(
-  window: Window,
-  beforeBytes: number,
-  afterBytes: number,
-): ImeEvent | undefined {
-  if (
-    !Number.isSafeInteger(beforeBytes) || beforeBytes < 0 ||
-    !Number.isSafeInteger(afterBytes) || afterBytes < 0 ||
-    (beforeBytes === 0 && afterBytes === 0)
-  ) {
-    return undefined;
-  }
-  return { type: "ime", kind: "deleteSurrounding", window, beforeBytes, afterBytes };
+  return committed === undefined ? undefined : { type: "textinput", window, text: committed };
 }
 
 function modifiers(value: KeyModifiers): KeyModifiers {

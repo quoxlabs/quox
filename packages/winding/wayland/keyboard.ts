@@ -55,7 +55,7 @@ export interface TranslatedKey {
   readonly keysym: number;
   readonly key: string;
   readonly text?: string;
-  readonly isComposing: boolean;
+  readonly composePending: boolean;
 }
 
 export function waylandKeyEditDisposition(
@@ -81,7 +81,7 @@ export function translateKey(
   const xkbKeycode = toXkbKeycode(rawKeycode);
   const keysym = translator.keysymForKeycode(xkbKeycode);
   const key = logicalKeyFromKeysym(keysym, translator.utf8ForKeysym(keysym));
-  const base: TranslatedKey = { rawKeycode, xkbKeycode, keysym, key, isComposing: false };
+  const base: TranslatedKey = { rawKeycode, xkbKeycode, keysym, key, composePending: false };
 
   if (phase === "release") return base;
   if (!compose) return translatedKeyWithText(base, translator.utf8ForKeycode(xkbKeycode));
@@ -89,13 +89,13 @@ export function translateKey(
   const feedResult = compose.feed(keysym);
   const status = compose.status();
   if (feedResult !== ComposeFeedResult.ACCEPTED) {
-    return { ...base, isComposing: status === ComposeStatus.COMPOSING };
+    return { ...base, composePending: status === ComposeStatus.COMPOSING };
   }
   switch (status) {
     case ComposeStatus.NOTHING:
       return translatedKeyWithText(base, translator.utf8ForKeycode(xkbKeycode));
     case ComposeStatus.COMPOSING:
-      return { ...base, isComposing: true };
+      return { ...base, composePending: true };
     case ComposeStatus.COMPOSED: {
       const text = compose.utf8();
       compose.reset();

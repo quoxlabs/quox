@@ -12,8 +12,6 @@ function testWindow(): Window {
     close() {},
     setTitle() {},
     blit() {},
-    setImeEnabled() {},
-    setImeCursorArea() {},
   };
 }
 
