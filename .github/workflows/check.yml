@@ -138,6 +138,6 @@ jobs:
           timeout --kill-after=5s 30s
           wlheadless-run -c weston --renderer=pixman --
           env LANG=C.UTF-8 LC_ALL=C.UTF-8
-          deno test --allow-ffi --allow-env=LC_ALL,LC_CTYPE,LANG
+          deno test --unstable-webgpu --allow-ffi --allow-env=LC_ALL,LC_CTYPE,LANG
           wayland/headless_smoke.ts
         working-directory: packages/winding
