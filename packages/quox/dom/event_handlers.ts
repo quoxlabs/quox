@@ -1,5 +1,5 @@
 import type { QuoxDocument } from "./document.ts";
-import type { QuoxElement, QuoxEvent, QuoxEventHandler, QuoxEventType } from "./node.ts";
+import { QuoxElement, type QuoxEvent, type QuoxEventHandler, type QuoxEventType } from "./node.ts";
 
 type EventHandlerEntry = {
   readonly element: QuoxElement;
@@ -37,10 +37,52 @@ export function setEventHandler(element: QuoxElement, type: QuoxEventType, handl
   }
 }
 
-export function invokeEventHandler(document: QuoxDocument, nodeId: number, type: QuoxEventType): void {
-  const entry = eventHandlers.get(document)?.get(nodeId)?.get(type);
-  if (entry === undefined) return;
+export function invokeEventHandlers(document: QuoxDocument, path: Iterable<number>, type: QuoxEventType): void {
+  const frozenPath = Object.freeze([...path]);
+  const targetId = frozenPath[0];
+  if (targetId === undefined) return;
 
-  const event: QuoxEvent = { type, target: entry.element, currentTarget: entry.element };
-  entry.handler.call(entry.element, event);
+  const documentHandlers = eventHandlers.get(document);
+  const target = documentHandlers?.get(targetId)?.values().next().value?.element ??
+    new QuoxElement(document, targetId);
+  const event = new BubblingQuoxEvent(type, target, !["focus", "blur", "scroll"].includes(type));
+
+  for (const nodeId of frozenPath) {
+    const entry = documentHandlers?.get(nodeId)?.get(type);
+    if (entry !== undefined) {
+      event.setCurrentTarget(entry.element);
+      entry.handler.call(entry.element, event);
+      event.setCurrentTarget(null);
+    }
+    if (event.propagationStopped) break;
+  }
+
+  event.setCurrentTarget(null);
+}
+
+class BubblingQuoxEvent implements QuoxEvent {
+  #currentTarget: QuoxElement | null = null;
+  #propagationStopped = false;
+
+  constructor(
+    readonly type: QuoxEventType,
+    readonly target: QuoxElement,
+    readonly bubbles: boolean,
+  ) {}
+
+  get currentTarget(): QuoxElement | null {
+    return this.#currentTarget;
+  }
+
+  get propagationStopped(): boolean {
+    return this.#propagationStopped;
+  }
+
+  stopPropagation(): void {
+    this.#propagationStopped = true;
+  }
+
+  setCurrentTarget(element: QuoxElement | null): void {
+    this.#currentTarget = element;
+  }
 }

@@ -9,7 +9,9 @@ export type QuoxEventType = "click" | "dblclick" | "contextmenu" | "input" | "fo
 export interface QuoxEvent {
   readonly type: QuoxEventType;
   readonly target: QuoxElement;
-  readonly currentTarget: QuoxElement;
+  readonly currentTarget: QuoxElement | null;
+  readonly bubbles: boolean;
+  stopPropagation(): void;
 }
 
 export type QuoxEventHandler = (this: QuoxElement, event: QuoxEvent) => unknown;

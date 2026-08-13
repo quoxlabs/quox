@@ -1,5 +1,5 @@
 import type { QuoxRenderer as WasmRenderer } from "../lib/quox.js";
-import { invokeEventHandler } from "./event_handlers.ts";
+import { invokeEventHandlers } from "./event_handlers.ts";
 import {
   encodeKeyEvent,
   type QuoxAppleStandardKeybindingEvent,
@@ -144,22 +144,21 @@ export class QuoxDocument {
 
   /**
    * After a dispatch call, check which (if any) of the JS-handler-relevant DOM events fired
-   * and invoke the matching `on*` handler registered on the exact target node. This is
-   * target-only — it does not bubble to ancestors the way native DOM event dispatch would.
+   * and invoke matching `on*` handlers target-to-root along Blitz's frozen element path.
    */
   #drainFiredEvents(): void {
-    this.#invokeHandler(this.#renderer.take_click_node(), "click");
-    this.#invokeHandler(this.#renderer.take_double_click_node(), "dblclick");
-    this.#invokeHandler(this.#renderer.take_context_menu_node(), "contextmenu");
-    this.#invokeHandler(this.#renderer.take_input_node(), "input");
-    this.#invokeHandler(this.#renderer.take_focus_node(), "focus");
-    this.#invokeHandler(this.#renderer.take_blur_node(), "blur");
-    this.#invokeHandler(this.#renderer.take_scroll_node(), "scroll");
+    this.#invokeHandlers(this.#renderer.take_click_path(), "click");
+    this.#invokeHandlers(this.#renderer.take_double_click_path(), "dblclick");
+    this.#invokeHandlers(this.#renderer.take_context_menu_path(), "contextmenu");
+    this.#invokeHandlers(this.#renderer.take_input_path(), "input");
+    this.#invokeHandlers(this.#renderer.take_focus_path(), "focus");
+    this.#invokeHandlers(this.#renderer.take_blur_path(), "blur");
+    this.#invokeHandlers(this.#renderer.take_scroll_path(), "scroll");
   }
 
-  #invokeHandler(nodeId: number | undefined, type: QuoxEventType): void {
-    if (nodeId === undefined) return;
-    invokeEventHandler(this, nodeId, type);
+  #invokeHandlers(path: Uint32Array, type: QuoxEventType): void {
+    if (path.length === 0) return;
+    invokeEventHandlers(this, path, type);
   }
 
   createElement(tagName: string): QuoxElement {
