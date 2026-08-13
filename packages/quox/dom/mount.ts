@@ -1,6 +1,5 @@
 import type { QuoxDocument } from "./document.ts";
-import { setElementFunctionProp } from "./handlers.ts";
-import type { QuoxElement, QuoxNode } from "./node.ts";
+import type { QuoxElement, QuoxEventHandler, QuoxNode } from "./node.ts";
 
 const QUOX_VNODE = Symbol.for("quox.vnode");
 
@@ -116,7 +115,11 @@ function applyProps(element: QuoxElement, props: QuoxProps): void {
     if (value === null || value === undefined || value === false) continue;
 
     if (typeof value === "function") {
-      setElementFunctionProp(element, rawName, value as (...args: unknown[]) => unknown);
+      const property = eventPropertyName(rawName);
+      if (property === undefined) {
+        throw new TypeError(`Cannot set function value as "${rawName}" property.`);
+      }
+      element[property] = value as QuoxEventHandler;
       continue;
     }
 
@@ -140,6 +143,39 @@ function applyProps(element: QuoxElement, props: QuoxProps): void {
     }
 
     element.setAttribute(name, String(value));
+  }
+}
+
+function eventPropertyName(name: string):
+  | keyof Pick<
+    QuoxElement,
+    "onclick" | "ondblclick" | "oncontextmenu" | "oninput" | "onfocus" | "onblur" | "onscroll"
+  >
+  | undefined {
+  switch (name) {
+    case "onClick":
+    case "onclick":
+      return "onclick";
+    case "onDoubleClick":
+    case "ondblclick":
+      return "ondblclick";
+    case "onContextMenu":
+    case "oncontextmenu":
+      return "oncontextmenu";
+    case "onInput":
+    case "oninput":
+      return "oninput";
+    case "onFocus":
+    case "onfocus":
+      return "onfocus";
+    case "onBlur":
+    case "onblur":
+      return "onblur";
+    case "onScroll":
+    case "onscroll":
+      return "onscroll";
+    default:
+      return undefined;
   }
 }
 

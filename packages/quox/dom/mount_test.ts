@@ -1,8 +1,7 @@
 import { createVNode, Fragment, type QuoxRenderable, type QuoxVNodeType } from "@quoxlabs/jsx";
-import { assert, assertEquals, assertRejects } from "@std/assert";
+import { assert, assertEquals, assertRejects, assertStrictEquals } from "@std/assert";
 import type { QuoxRenderer as WasmRenderer } from "../lib/quox.js";
 import { QuoxDocument } from "./document.ts";
-import { getElementFunctionProps } from "./handlers.ts";
 import { mount } from "./mount.ts";
 import { QuoxElement, QuoxNode } from "./node.ts";
 
@@ -213,7 +212,7 @@ Deno.test("mount walks fragments, function components, and nested arrays", async
   ]);
 });
 
-Deno.test("mount lowers props and stores function-valued DOM props", async () => {
+Deno.test("mount lowers props and assigns browser-style event handlers", async () => {
   const { renderer, root } = createTestDocument();
   const onClick = () => "clicked";
   const [node] = await mount(
@@ -250,7 +249,41 @@ Deno.test("mount lowers props and stores function-valued DOM props", async () =>
     { type: "append_child", parentId: 1, childId: 2 },
     { type: "append_child", parentId: 0, childId: 1 },
   ]);
-  assert(getElementFunctionProps(node as QuoxElement)?.get("onClick") === onClick, "onClick was not stored");
+  assert((node as QuoxElement).onclick === onClick, "onclick was not assigned");
+});
+
+Deno.test("mount maps every supported JSX event prop to its browser-style property", async () => {
+  const { root } = createTestDocument();
+  const handlers = {
+    onClick: () => "click",
+    onDoubleClick: () => "dblclick",
+    onContextMenu: () => "contextmenu",
+    onInput: () => "input",
+    onFocus: () => "focus",
+    onBlur: () => "blur",
+    onScroll: () => "scroll",
+  };
+
+  const [node] = await mount(root, createVNode("div", handlers));
+  const element = node as QuoxElement;
+
+  assertStrictEquals(element.onclick, handlers.onClick);
+  assertStrictEquals(element.ondblclick, handlers.onDoubleClick);
+  assertStrictEquals(element.oncontextmenu, handlers.onContextMenu);
+  assertStrictEquals(element.oninput, handlers.onInput);
+  assertStrictEquals(element.onfocus, handlers.onFocus);
+  assertStrictEquals(element.onblur, handlers.onBlur);
+  assertStrictEquals(element.onscroll, handlers.onScroll);
+});
+
+Deno.test("mount rejects unsupported function-valued DOM props", async () => {
+  const { root } = createTestDocument();
+
+  await assertRejects(
+    () => mount(root, createVNode("div", { unsupported: () => undefined })),
+    TypeError,
+    'Cannot set function value as "unsupported" property.',
+  );
 });
 
 Deno.test("mount kebab-cases vendor-prefixed style properties", async () => {

@@ -243,7 +243,7 @@ pub(super) struct RecordedEvents {
 
 /// Bridges Blitz's `EventHandler` hook (normally a no-op via `NoopEventHandler`) to a
 /// `RecordedEvents` buffer, so the wasm boundary can tell the TS side which node/event kind
-/// fired and let it invoke the matching JSX `onXxx` prop from `handlers.ts`'s registry.
+/// fired and let it invoke the matching browser-style `on*` property on `QuoxElement`.
 struct RecordingEventHandler<'a> {
     recorded: &'a mut RecordedEvents,
     cancel_keydown_default: bool,

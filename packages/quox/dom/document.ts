@@ -1,5 +1,5 @@
 import type { QuoxRenderer as WasmRenderer } from "../lib/quox.js";
-import { getElementFunctionProps } from "./handlers.ts";
+import { invokeEventHandler } from "./event_handlers.ts";
 import {
   encodeKeyEvent,
   type QuoxAppleStandardKeybindingEvent,
@@ -7,24 +7,9 @@ import {
   type QuoxTextInputEvent,
 } from "./input.ts";
 import { type AssertActive, attachDocumentInternals, type RequestRender } from "./internals.ts";
-import { QuoxElement, QuoxNode, QuoxText } from "./node.ts";
+import { QuoxElement, type QuoxEventType, QuoxNode, QuoxText } from "./node.ts";
 
 type SetNativeTitle = (title: string) => void;
-
-/**
- * Maps the DOM event kinds quox can invoke a JS handler for to their JSX prop name.
- * `dblclick`'s prop deliberately doesn't match the raw event name — it mirrors React's
- * actual `onDoubleClick` convention instead.
- */
-const EVENT_KIND_TO_PROP = {
-  click: "onClick",
-  dblclick: "onDoubleClick",
-  contextmenu: "onContextMenu",
-  input: "onInput",
-  focus: "onFocus",
-  blur: "onBlur",
-  scroll: "onScroll",
-} as const;
 
 export class QuoxDocument {
   readonly #renderer: WasmRenderer;
@@ -159,7 +144,7 @@ export class QuoxDocument {
 
   /**
    * After a dispatch call, check which (if any) of the JS-handler-relevant DOM events fired
-   * and invoke the matching JSX `onXxx` prop registered on the exact target node. This is
+   * and invoke the matching `on*` handler registered on the exact target node. This is
    * target-only — it does not bubble to ancestors the way native DOM event dispatch would.
    */
   #drainFiredEvents(): void {
@@ -172,10 +157,9 @@ export class QuoxDocument {
     this.#invokeHandler(this.#renderer.take_scroll_node(), "scroll");
   }
 
-  #invokeHandler(nodeId: number | undefined, kind: keyof typeof EVENT_KIND_TO_PROP): void {
+  #invokeHandler(nodeId: number | undefined, type: QuoxEventType): void {
     if (nodeId === undefined) return;
-    const handlers = getElementFunctionProps(new QuoxNode(this, nodeId));
-    handlers?.get(EVENT_KIND_TO_PROP[kind])?.();
+    invokeEventHandler(this, nodeId, type);
   }
 
   createElement(tagName: string): QuoxElement {
