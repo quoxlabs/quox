@@ -28,6 +28,14 @@ export const gdi32functions = {
 } as const satisfies Deno.ForeignLibraryInterface;
 
 export const user32functions = {
+  // DPI_AWARENESS_CONTEXT is a pointer-sized pseudo-handle, passed here as an
+  // isize (see DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 in mod.ts).
+  SetProcessDpiAwarenessContext: { parameters: ["isize"], result: "bool" },
+  GetClientRect: { parameters: ["pointer", "buffer"], result: "bool" },
+  SetWindowPos: {
+    parameters: ["pointer", "pointer", "i32", "i32", "i32", "i32", "u32"],
+    result: "bool",
+  },
   GetDC: { parameters: ["pointer"], result: "pointer" },
   GetKeyState: { parameters: ["i32"], result: "i16" },
   GetKeyboardState: { parameters: ["buffer"], result: "bool" },
@@ -128,3 +136,43 @@ export const WHEEL_DELTA = 120;
 
 /** `wParam` value for `WM_SIZE` meaning the window was just minimized. See WinUser.h. */
 export const SIZE_MINIMIZED = 1;
+
+/** Top-level window styles: WS_VISIBLE | WS_OVERLAPPEDWINDOW. */
+export const WINDOW_STYLE = 0x10CF0000;
+
+/** Window class styles: CS_VREDRAW | CS_HREDRAW | CS_OWNDC. */
+export const CLASS_STYLE = 0x1 | 0x2 | 0x20;
+
+/** CW_USEDEFAULT: let the OS choose (used for the window's x/y position). */
+export const CW_USEDEFAULT = 0x80000000;
+
+/** SetWindowPos flags: keep the position and z-order chosen at creation. */
+export const SWP_NOMOVE = 0x2;
+export const SWP_NOZORDER = 0x4;
+export const SWP_NOACTIVATE = 0x10;
+
+/**
+ * DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 == (HANDLE)-4. Declaring the
+ * process per-monitor DPI aware makes window sizes and the blitted bitmap map
+ * to physical device pixels 1:1 with the render buffer, instead of being
+ * virtualized at 96 DPI and stretched by DWM on scaled displays.
+ */
+export const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4n;
+
+/** IDC_ARROW standard cursor id for LoadCursorW. */
+export const IDC_ARROW = 32512n;
+
+/** FORMAT_MESSAGE_FROM_SYSTEM flag for FormatMessageW. */
+export const FORMAT_MESSAGE_FROM_SYSTEM = 0x1000;
+
+// GDI bitmap constants for SetDIBitsToDevice. BITMAPINFOHEADER is 40 bytes; for
+// 32bpp BI_RGB no color table follows, so a 40-byte buffer alone is a valid
+// BITMAPINFO.
+export const BITMAPINFOHEADER_SIZE = 40;
+export const BI_RGB = 0;
+export const DIB_RGB_COLORS = 0;
+
+// TRACKMOUSEEVENT: cbSize(4) + dwFlags(4) + hwndTrack(8, 8-byte aligned) +
+// dwHoverTime(4) + 4 bytes trailing padding to the struct's 8-byte alignment = 24 bytes.
+export const TRACKMOUSEEVENT_SIZE = 24;
+export const TME_LEAVE = 0x00000002;
