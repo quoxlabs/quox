@@ -70,7 +70,7 @@ class Win32Window implements Window {
   minimized = false;
   #closed = false;
 
-  constructor(readonly lib: Win32Library, classNameBuf: ArrayBuffer, w = 800, h = 600) {
+  constructor(readonly lib: Win32Library, classNameBuf: ArrayBuffer, w: number, h: number) {
     const window = lib.user32.symbols.CreateWindowExW(
       0,
       classNameBuf,
