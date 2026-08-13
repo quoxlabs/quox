@@ -2,44 +2,38 @@ import { openWindow, setElementFunctionProp } from "../packages/quox/mod.ts";
 
 const head = `
 <style>
-  * {
-    box-sizing: border-box;
-  }
-
   body {
     margin: 0;
     min-height: 100vh;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background: #f3efe6;
-    color: #17202a;
-    font-family: Liberation Sans, Arial, sans-serif;
+    display: grid;
+    place-items: center;
+    background: linen;
+    color: midnightblue;
+    text-align: center;
+    font-family: sans-serif;
   }
 
   main {
+    box-sizing: border-box;
     width: 420px;
     padding: 42px;
-    text-align: center;
-    background: #fffdf8;
-    border: 2px solid #17202a;
+    background: ivory;
+    border: 2px solid;
     border-radius: 18px;
   }
 
   h1 {
     margin: 0 0 20px;
     font-size: 22px;
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
   }
 
   output {
     display: block;
-    margin: 0 0 28px;
+    margin-bottom: 28px;
+    color: tomato;
     font-size: 112px;
-    font-weight: 700;
+    font-weight: bold;
     line-height: 1;
-    color: #d44f2a;
   }
 
   nav {
@@ -51,18 +45,18 @@ const head = `
   button {
     width: 112px;
     height: 64px;
-    border: 2px solid #17202a;
+    border: 2px solid;
     border-radius: 12px;
-    background: #fffdf8;
-    color: #17202a;
+    background: ivory;
+    color: inherit;
     font-size: 36px;
-    font-weight: 700;
+    font-weight: bold;
     cursor: pointer;
   }
 
   button:hover {
-    background: #17202a;
-    color: #fffdf8;
+    background: midnightblue;
+    color: ivory;
   }
 </style>`;
 
