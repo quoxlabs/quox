@@ -31,7 +31,7 @@ import { load as DarwinLoad } from "./darwin/mod.ts";
 
 export const load: LoadLibrary = () => {
   if (Deno.permissions.requestSync({ name: "ffi" }).state !== "granted") {
-    throw new Error("winding cannot run without FFI access");
+    throw new Error("quox cannot run without FFI access");
   }
   if (Deno.build.os === "windows") return Win32Load();
   if (Deno.build.os === "darwin") return DarwinLoad();
