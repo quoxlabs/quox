@@ -20,6 +20,11 @@ blitz-paint = "=0.3.0-alpha.6"
 blitz-traits = "=0.3.0-alpha.6"
 console_error_panic_hook = "0.1"
 futures-intrusive = "0.5"
+# Pin image codecs explicitly. `image`'s default features drag in heavy extra
+# codecs (TIFF, OpenEXR, and AVIF encoding via `rav1e`) that roughly doubled the
+# added Wasm size for formats we don't need, so we opt out of defaults and list
+# only what `set_image_data` supports.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 keyboard-types = "0.7"
 smol_str = "0.3.6"
 vello = "0.9"

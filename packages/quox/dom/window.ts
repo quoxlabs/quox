@@ -5,7 +5,8 @@ import type { Library as WindingLibrary, UIEvent as WindingUIEvent, Window as Wi
 import { QuoxDocument } from "./document.ts";
 import { mapWindingEvent, notifyInputListeners, type QuoxInputEvent, QuoxInputRouter } from "./input.ts";
 import { isVNode, mount, type QuoxRenderable } from "./mount.ts";
-import type { QuoxElement, QuoxInnerHTML } from "./node.ts";
+import { QuoxElement } from "./node.ts";
+import type { QuoxInnerHTML } from "./node.ts";
 
 export type {
   QuoxAppleStandardKeybindingEvent,
@@ -73,6 +74,21 @@ export class QuoxWindow implements Disposable {
   readonly #inputRouter: QuoxInputRouter;
   readonly document: QuoxDocument;
 
+  /**
+   * Browser-style `<img>` constructor bound to this window's document, mirroring
+   * the DOM `Image(width?, height?)` constructor. `new win.Image(440)` creates an
+   * `<img>` with `width="440"` in this window; load pixels with `setImageData`.
+   *
+   * Like in the browser, this is exactly equivalent to
+   * `win.document.createElement("img")` (with the optional `width`/`height`
+   * arguments reflected to the corresponding attributes) — it returns the same
+   * kind of element, just via the familiar `new Image()` idiom.
+   *
+   * quox has no global `Image` (and no ambient `document`) to bind to, so the
+   * constructor lives on the window that owns the document instead.
+   */
+  readonly Image: new (width?: number, height?: number) => QuoxElement;
+
   private constructor(
     lib: WindingLibrary,
     win: WindingWindow,
@@ -91,6 +107,17 @@ export class QuoxWindow implements Disposable {
       () => this.#assertActiveDocument(),
       (title) => this.#win.setTitle(title),
     );
+
+    // Bind an <img> constructor to this window's document. Capturing `document`
+    // (not `this`) lets `super(...)` reference it before `this` is initialised.
+    const document = this.document;
+    this.Image = class Image extends QuoxElement {
+      constructor(width?: number, height?: number) {
+        super(document, document.createElement("img").nodeId);
+        if (width !== undefined) this.setAttribute("width", String(width));
+        if (height !== undefined) this.setAttribute("height", String(height));
+      }
+    };
     this.#inputRouter = new QuoxInputRouter({
       pointerMove: (x, y, buttons) => this.document.dispatchPointerMove(x, y, buttons),
       pointerDown: (x, y, button, buttons) => this.document.dispatchPointerDown(x, y, button, buttons),
