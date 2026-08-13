@@ -46,12 +46,7 @@ export class QuoxDocument {
     this.#requestRender();
   }
 
-  /**
-   * Push the live `<title>` text to the native window if it changed since the last push. Called
-   * once per render pass so title-affecting DOM edits (e.g. appending a `<title>` element, or
-   * editing one via `textContent`/`innerHTML`) reach the OS without every DOM mutation in the
-   * document paying for a `<head>` lookup.
-   */
+  /** Synchronize the window title with the document's current `<title>` text. */
   syncNativeTitle(): void {
     this.#assertActive();
     const title = this.#renderer.title();
@@ -87,27 +82,27 @@ export class QuoxDocument {
     return nodeId === undefined ? null : new QuoxNode(this, nodeId);
   }
 
-  /** Feed a pointer-move event into the engine. Drives hover/`:hover` and cursor resolution. */
+  /** Dispatch a pointer-move event, updating hover styles and the cursor. */
   dispatchPointerMove(x: number, y: number, buttons: number): void {
     this.#dispatchInputEvent(() => this.#renderer.dispatch_pointer_move(x, y, buttons));
   }
 
-  /** Feed a pointer-down event into the engine. Drives `:active`, click timing, and focus. */
+  /** Dispatch a pointer-down event, updating `:active`, focus, and click interactions. */
   dispatchPointerDown(x: number, y: number, button: number, buttons: number): void {
     this.#dispatchInputEvent(() => this.#renderer.dispatch_pointer_down(x, y, button, buttons));
   }
 
-  /** Feed a pointer-up event into the engine. Synthesizes `click`/`dblclick`/`contextmenu`. */
+  /** Dispatch a pointer-up event, potentially firing `click`, `dblclick`, or `contextmenu`. */
   dispatchPointerUp(x: number, y: number, button: number, buttons: number): void {
     this.#dispatchInputEvent(() => this.#renderer.dispatch_pointer_up(x, y, button, buttons));
   }
 
-  /** Feed a wheel event into the engine, scrolling whatever's hovered (not just the viewport). */
+  /** Dispatch a wheel event, scrolling the content under the pointer. */
   dispatchWheel(x: number, y: number, deltaX: number, deltaY: number, buttons: number): void {
     this.#dispatchInputEvent(() => this.#renderer.dispatch_wheel(x, y, deltaX, deltaY, buttons));
   }
 
-  /** Feed a canonical native key event into the engine. Character insertion remains a later Commit. */
+  /** Dispatch a keyboard event. Use `dispatchTextInput` separately for text committed by the keyboard layout. */
   dispatchKey(event: QuoxKeyboardEvent): void {
     const encoded = encodeKeyEvent(event);
     this.#dispatchInputEvent(() =>
@@ -121,7 +116,7 @@ export class QuoxDocument {
     );
   }
 
-  /** Apply an AppKit editing selector through the engine's platform-command adapter. */
+  /** Dispatch a standard macOS editing command identified by its AppKit selector. */
   dispatchAppleStandardKeybinding(event: QuoxAppleStandardKeybindingEvent): void {
     this.#dispatchInputEvent(() => this.#renderer.dispatch_apple_standard_keybinding(event.command));
   }
@@ -131,7 +126,7 @@ export class QuoxDocument {
     this.#dispatchInputEvent(() => this.#renderer.dispatch_text_input(event.text));
   }
 
-  /** Clear the engine's hover state, e.g. when the pointer leaves the window entirely. */
+  /** Clear hover styles and reset the cursor, such as when the pointer leaves the window. */
   clearHover(): void {
     this.#dispatchInputEvent(() => this.#renderer.clear_hover(), false);
   }

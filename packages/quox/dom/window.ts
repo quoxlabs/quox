@@ -113,7 +113,7 @@ export class QuoxWindow implements Disposable {
     });
   }
 
-  /** Open a window and create a WASM renderer with a live document. */
+  /** Create a window with a live document without starting event processing. */
   static async create(options: WindowOptions = {}): Promise<QuoxWindow> {
     const width = options.width ?? 800;
     const height = options.height ?? 600;
@@ -146,7 +146,7 @@ export class QuoxWindow implements Disposable {
     }
   }
 
-  /** Start native event polling and queue an initial render. */
+  /** Begin processing window events and render the initial document. */
   start(): void {
     if (this.#intervalId !== null) return;
     this.#intervalId = setInterval(() => {
@@ -235,7 +235,7 @@ export class QuoxWindow implements Disposable {
     }
   }
 
-  /** Register a callback that is invoked for every input event during a tick. */
+  /** Register a callback that is invoked for each window event. */
   addEventListener(callback: (event: QuoxInputEvent) => void): void {
     this.#listeners.push(callback);
   }
@@ -251,7 +251,7 @@ export class QuoxWindow implements Disposable {
     this.document.title = title;
   }
 
-  /** Stop the render loop and free WASM resources. */
+  /** Stop processing events and rendering, making the document inactive. */
   stop(): void {
     if (this.#stopped) return;
     this.#stopped = true;
@@ -294,7 +294,7 @@ function cleanupError(errors: unknown[], message: string): unknown {
 }
 
 /**
- * Open a blank native window with a live DOM facade backed by Blitz's WASM document mutator.
+ * Open a native window with a live DOM-like document.
  *
  * Accepts either a `WindowOptions` bag, or content (an HTML string or JSX) as shorthand for
  * `{ body: content }`.
