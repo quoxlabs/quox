@@ -30,6 +30,65 @@ fn invalid_element(node_id: usize) -> JsValue {
     JsValue::from_str(&format!("DOM node id is not an element: {node_id}"))
 }
 
+const FULLSCREEN_TARGET_ATTRIBUTE: &str = "data-quox-internal-fullscreen-target";
+const FULLSCREEN_ANCESTOR_ATTRIBUTE: &str = "data-quox-internal-fullscreen-ancestor";
+
+fn connected_element_path(
+    document: &blitz_dom::BaseDocument,
+    node_id: usize,
+) -> Option<Vec<usize>> {
+    let node = document.get_node(node_id)?;
+    node.element_data()?;
+    if !node.flags.is_in_document() {
+        return None;
+    }
+
+    let mut path = Vec::new();
+    let mut current = Some(node_id);
+    while let Some(id) = current {
+        let node = document.get_node(id)?;
+        if node.element_data().is_some() {
+            path.push(id);
+        }
+        current = node.parent;
+    }
+    Some(path)
+}
+
+fn clear_fullscreen_markers(document: &mut blitz_dom::BaseDocument, old_path: &mut Vec<usize>) {
+    let valid_path: Vec<_> = std::mem::take(old_path)
+        .into_iter()
+        .filter(|id| {
+            document
+                .get_node(*id)
+                .is_some_and(|node| node.element_data().is_some())
+        })
+        .collect();
+    let mut mutator = document.mutate();
+    for id in valid_path {
+        mutator.clear_attribute(id, attr_name(FULLSCREEN_TARGET_ATTRIBUTE));
+        mutator.clear_attribute(id, attr_name(FULLSCREEN_ANCESTOR_ATTRIBUTE));
+    }
+}
+
+fn apply_fullscreen_markers(
+    document: &mut blitz_dom::BaseDocument,
+    old_path: &mut Vec<usize>,
+    node_id: usize,
+) -> Result<(), JsValue> {
+    let path = connected_element_path(document, node_id)
+        .ok_or_else(|| JsValue::from_str("Fullscreen element is not connected"))?;
+    clear_fullscreen_markers(document, old_path);
+    let mut mutator = document.mutate();
+    mutator.set_attribute(node_id, attr_name(FULLSCREEN_TARGET_ATTRIBUTE), "");
+    for ancestor in path.iter().skip(1) {
+        mutator.set_attribute(*ancestor, attr_name(FULLSCREEN_ANCESTOR_ATTRIBUTE), "");
+    }
+    drop(mutator);
+    *old_path = path;
+    Ok(())
+}
+
 impl QuoxRendererState {
     fn mutate_document<T>(
         &mut self,
@@ -56,6 +115,20 @@ impl QuoxRendererState {
             .element_data()
             .map(|_| ())
             .ok_or_else(|| invalid_element(node_id))
+    }
+
+    fn connected_element_path(&self, node_id: usize) -> Option<Vec<usize>> {
+        connected_element_path(&self.document, node_id)
+    }
+
+    fn clear_fullscreen_markers(&mut self) {
+        clear_fullscreen_markers(&mut self.document, &mut self.fullscreen_path);
+    }
+
+    fn apply_fullscreen_markers(&mut self, node_id: usize) -> Result<(), JsValue> {
+        apply_fullscreen_markers(&mut self.document, &mut self.fullscreen_path, node_id)?;
+        self.fullscreen_node = Some(node_id);
+        Ok(())
     }
 
     fn child_element_by_tag(&self, parent_id: usize, tag_name: &str) -> Result<usize, JsValue> {
@@ -107,6 +180,51 @@ impl QuoxRendererState {
 
 #[wasm_bindgen]
 impl QuoxRenderer {
+    /// Whether an element exists and is attached to this renderer's active document.
+    pub fn is_connected_element(&self, node_id: usize) -> bool {
+        self.state
+            .borrow()
+            .connected_element_path(node_id)
+            .is_some()
+    }
+
+    /// Return an attached element's target-to-root element path.
+    pub fn element_path(&self, node_id: usize) -> Result<Vec<u32>, JsValue> {
+        self.state
+            .borrow()
+            .connected_element_path(node_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|id| u32::try_from(id).map_err(|_| JsValue::from_str("DOM node id exceeds u32")))
+            .collect()
+    }
+
+    /// Apply Quox's private fullscreen presentation markers.
+    pub fn set_fullscreen_element(&self, node_id: usize) -> Result<(), JsValue> {
+        self.state.borrow_mut().apply_fullscreen_markers(node_id)
+    }
+
+    /// Clear all private fullscreen presentation markers.
+    pub fn clear_fullscreen_element(&self) {
+        let mut state = self.state.borrow_mut();
+        state.clear_fullscreen_markers();
+        state.fullscreen_node = None;
+    }
+
+    /// Rebuild marker ancestry after a DOM mutation. Returns false if the target detached.
+    pub fn refresh_fullscreen_element(&self) -> bool {
+        let mut state = self.state.borrow_mut();
+        let Some(node_id) = state.fullscreen_node else {
+            return true;
+        };
+        if state.connected_element_path(node_id).is_none() {
+            state.clear_fullscreen_markers();
+            state.fullscreen_node = None;
+            return false;
+        }
+        state.apply_fullscreen_markers(node_id).is_ok()
+    }
+
     /// Remove a node from the retained document.
     pub fn remove_node(&self, node_id: usize) -> Result<(), JsValue> {
         let mut state = self.state.borrow_mut();
@@ -337,5 +455,123 @@ impl QuoxRenderer {
     pub fn head(&self) -> Result<usize, JsValue> {
         let state = self.state.borrow();
         state.child_element_by_tag(state.document.root_element().id, "head")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::FULLSCREEN_CSS;
+    use blitz_dom::DocumentConfig;
+    use blitz_html::{HtmlDocument, HtmlProvider};
+    use std::sync::Arc;
+
+    fn document() -> blitz_dom::BaseDocument {
+        HtmlDocument::from_html(
+            "<!doctype html><html><body><div><span>target</span></div><section></section></body></html>",
+            DocumentConfig {
+                html_parser_provider: Some(Arc::new(HtmlProvider)),
+                ua_stylesheets: Some(vec![FULLSCREEN_CSS.to_string()]),
+                ..Default::default()
+            },
+        )
+        .into_inner()
+    }
+
+    fn element_by_tag(document: &blitz_dom::BaseDocument, tag: &str) -> usize {
+        document
+            .tree()
+            .iter()
+            .find_map(|(id, node)| {
+                node.element_data()
+                    .is_some_and(|element| element.name.local.as_ref() == tag)
+                    .then_some(id)
+            })
+            .unwrap()
+    }
+
+    fn has_attribute(document: &blitz_dom::BaseDocument, id: usize, name: &str) -> bool {
+        document
+            .get_node(id)
+            .and_then(|node| node.element_data())
+            .is_some_and(|element| element.attr(LocalName::from(name)).is_some())
+    }
+
+    #[test]
+    fn fullscreen_markers_follow_the_target_ancestor_path_and_clear() {
+        let mut document = document();
+        let html = element_by_tag(&document, "html");
+        let body = element_by_tag(&document, "body");
+        let div = element_by_tag(&document, "div");
+        let span = element_by_tag(&document, "span");
+        let section = element_by_tag(&document, "section");
+        let mut path = Vec::new();
+
+        apply_fullscreen_markers(&mut document, &mut path, span).unwrap();
+        assert!(has_attribute(&document, span, FULLSCREEN_TARGET_ATTRIBUTE));
+        for ancestor in [div, body, html] {
+            assert!(has_attribute(
+                &document,
+                ancestor,
+                FULLSCREEN_ANCESTOR_ATTRIBUTE
+            ));
+        }
+        assert!(!has_attribute(
+            &document,
+            section,
+            FULLSCREEN_ANCESTOR_ATTRIBUTE
+        ));
+
+        clear_fullscreen_markers(&mut document, &mut path);
+        for id in [span, div, body, html] {
+            assert!(!has_attribute(&document, id, FULLSCREEN_TARGET_ATTRIBUTE));
+            assert!(!has_attribute(&document, id, FULLSCREEN_ANCESTOR_ATTRIBUTE));
+        }
+    }
+
+    #[test]
+    fn root_fullscreen_uses_normal_document_layout_rule() {
+        assert!(FULLSCREEN_CSS.contains(":not(html)[data-quox-internal-fullscreen-target]"));
+        assert!(FULLSCREEN_CSS.contains("position: fixed !important"));
+        assert!(FULLSCREEN_CSS.contains("width: 100vw !important"));
+        assert!(FULLSCREEN_CSS.contains("background: black !important"));
+
+        let mut document = document();
+        let html = element_by_tag(&document, "html");
+        let mut path = Vec::new();
+        apply_fullscreen_markers(&mut document, &mut path, html).unwrap();
+        assert_eq!(path, vec![html]);
+        assert!(has_attribute(&document, html, FULLSCREEN_TARGET_ATTRIBUTE));
+        assert!(!has_attribute(
+            &document,
+            html,
+            FULLSCREEN_ANCESTOR_ATTRIBUTE
+        ));
+    }
+
+    #[test]
+    fn marker_path_reconciles_after_reparenting() {
+        let mut document = document();
+        let html = element_by_tag(&document, "html");
+        let body = element_by_tag(&document, "body");
+        let div = element_by_tag(&document, "div");
+        let span = element_by_tag(&document, "span");
+        let section = element_by_tag(&document, "section");
+        let mut path = Vec::new();
+        apply_fullscreen_markers(&mut document, &mut path, span).unwrap();
+
+        document.mutate().append_children(section, &[span]);
+        apply_fullscreen_markers(&mut document, &mut path, span).unwrap();
+        assert_eq!(path, vec![span, section, body, html]);
+        assert!(!has_attribute(
+            &document,
+            div,
+            FULLSCREEN_ANCESTOR_ATTRIBUTE
+        ));
+        assert!(has_attribute(
+            &document,
+            section,
+            FULLSCREEN_ANCESTOR_ATTRIBUTE
+        ));
     }
 }

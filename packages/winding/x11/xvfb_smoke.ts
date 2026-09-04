@@ -19,6 +19,16 @@ Deno.test("X11 opens a window and translates a commit-only XIM keypress", () => 
     const window = library.openWindow(0, 0, 64, 64) as NativeX11Window;
     drainEvents(library);
 
+    // Xvfb has no EWMH window manager, so support detection must fail closed.
+    if (window.fullscreenEnabled) throw new Error("Expected fullscreen to be unavailable without a window manager");
+    let fullscreenRejected = false;
+    try {
+      window.setFullscreen(true);
+    } catch {
+      fullscreenRejected = true;
+    }
+    if (!fullscreenRejected) throw new Error("Expected an unsupported X11 fullscreen request to fail");
+
     focusWindow(window);
     const focus = nextEvent(library, (event) => event.type === "focus");
     if (focus?.type !== "focus" || focus.window !== window) {

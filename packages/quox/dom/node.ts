@@ -1,10 +1,16 @@
 import type { QuoxDocument } from "./document.ts";
-import { getEventHandler, setEventHandler } from "./event_handlers.ts";
-import { documentInternals } from "./internals.ts";
+import {
+  addElementEventListener,
+  getEventHandler,
+  removeElementEventListener,
+  setEventHandler,
+} from "./event_handlers.ts";
+import { documentInternals, requestElementFullscreen } from "./internals.ts";
 
 export type QuoxInnerHTML = string;
 
 export type QuoxEventType = "click" | "dblclick" | "contextmenu" | "input" | "focus" | "blur" | "scroll";
+export type QuoxFullscreenEventType = "fullscreenchange" | "fullscreenerror";
 
 export interface QuoxEvent {
   readonly type: QuoxEventType;
@@ -15,6 +21,16 @@ export interface QuoxEvent {
 }
 
 export type QuoxEventHandler = (this: QuoxElement, event: QuoxEvent) => unknown;
+
+export interface QuoxFullscreenEvent {
+  readonly type: QuoxFullscreenEventType;
+  readonly target: QuoxElement | QuoxDocument;
+  readonly currentTarget: QuoxElement | QuoxDocument | null;
+  readonly bubbles: true;
+  stopPropagation(): void;
+}
+
+export type QuoxFullscreenEventHandler = (this: QuoxElement, event: QuoxFullscreenEvent) => unknown;
 
 export class QuoxNode {
   constructor(
@@ -27,9 +43,9 @@ export class QuoxNode {
   }
 
   set textContent(value: string | null) {
-    const { renderer, requestRender } = documentInternals(this.ownerDocument);
+    const { renderer } = documentInternals(this.ownerDocument);
     renderer.set_text_content(this.nodeId, value ?? "");
-    requestRender();
+    documentInternals(this.ownerDocument).didMutate();
   }
 
   appendChild<T extends QuoxNode>(child: T): T {
@@ -37,20 +53,38 @@ export class QuoxNode {
       throw new TypeError("node belongs to a different document");
     }
 
-    const { renderer, requestRender } = documentInternals(this.ownerDocument);
+    const { renderer } = documentInternals(this.ownerDocument);
     renderer.append_child(this.nodeId, child.nodeId);
-    requestRender();
+    documentInternals(this.ownerDocument).didMutate();
     return child;
   }
 
   remove(): void {
-    const { renderer, requestRender } = documentInternals(this.ownerDocument);
+    const { renderer } = documentInternals(this.ownerDocument);
     renderer.remove_node(this.nodeId);
-    requestRender();
+    documentInternals(this.ownerDocument).didMutate();
   }
 }
 
 export class QuoxElement extends QuoxNode {
+  addEventListener(type: QuoxEventType, listener: QuoxEventHandler): void;
+  addEventListener(type: QuoxFullscreenEventType, listener: QuoxFullscreenEventHandler): void;
+  addEventListener(
+    type: QuoxEventType | QuoxFullscreenEventType,
+    listener: QuoxEventHandler | QuoxFullscreenEventHandler,
+  ): void {
+    addElementEventListener(this, type, listener);
+  }
+
+  removeEventListener(type: QuoxEventType, listener: QuoxEventHandler): void;
+  removeEventListener(type: QuoxFullscreenEventType, listener: QuoxFullscreenEventHandler): void;
+  removeEventListener(
+    type: QuoxEventType | QuoxFullscreenEventType,
+    listener: QuoxEventHandler | QuoxFullscreenEventHandler,
+  ): void {
+    removeElementEventListener(this, type, listener);
+  }
+
   get onclick(): QuoxEventHandler | null {
     return getEventHandler(this, "click");
   }
@@ -107,17 +141,37 @@ export class QuoxElement extends QuoxNode {
     setEventHandler(this, "scroll", handler);
   }
 
+  get onfullscreenchange(): QuoxFullscreenEventHandler | null {
+    return getEventHandler(this, "fullscreenchange") as QuoxFullscreenEventHandler | null;
+  }
+
+  set onfullscreenchange(handler: QuoxFullscreenEventHandler | null) {
+    setEventHandler(this, "fullscreenchange", handler);
+  }
+
+  get onfullscreenerror(): QuoxFullscreenEventHandler | null {
+    return getEventHandler(this, "fullscreenerror") as QuoxFullscreenEventHandler | null;
+  }
+
+  set onfullscreenerror(handler: QuoxFullscreenEventHandler | null) {
+    setEventHandler(this, "fullscreenerror", handler);
+  }
+
+  requestFullscreen(): Promise<void> {
+    return requestElementFullscreen(this);
+  }
+
   set innerHTML(value: QuoxInnerHTML) {
-    const { renderer, requestRender } = documentInternals(this.ownerDocument);
+    const { renderer } = documentInternals(this.ownerDocument);
     const html = value;
     renderer.set_inner_html(this.nodeId, html);
-    requestRender();
+    documentInternals(this.ownerDocument).didMutate();
   }
 
   setAttribute(name: string, value: string): void {
-    const { renderer, requestRender } = documentInternals(this.ownerDocument);
+    const { renderer } = documentInternals(this.ownerDocument);
     renderer.set_attribute(this.nodeId, name, value);
-    requestRender();
+    documentInternals(this.ownerDocument).didMutate();
   }
 
   /**
@@ -130,15 +184,15 @@ export class QuoxElement extends QuoxNode {
    * as a still image: an animated GIF renders as its first frame, not animated.
    */
   setImageData(bytes: Uint8Array): void {
-    const { renderer, requestRender } = documentInternals(this.ownerDocument);
+    const { renderer } = documentInternals(this.ownerDocument);
     renderer.set_image_data(this.nodeId, bytes);
-    requestRender();
+    documentInternals(this.ownerDocument).didMutate();
   }
 
   removeAttribute(name: string): void {
-    const { renderer, requestRender } = documentInternals(this.ownerDocument);
+    const { renderer } = documentInternals(this.ownerDocument);
     renderer.remove_attribute(this.nodeId, name);
-    requestRender();
+    documentInternals(this.ownerDocument).didMutate();
   }
 }
 

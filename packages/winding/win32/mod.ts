@@ -10,19 +10,27 @@ import {
   DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
   FORMAT_MESSAGE_FROM_SYSTEM,
   gdi32functions,
+  GWL_STYLE,
   IDC_ARROW,
   kernel32functions,
+  MONITOR_DEFAULTTONEAREST,
+  MONITORINFO_SIZE,
   PM_REMOVE,
   SIZE_MINIMIZED,
+  SWP_FRAMECHANGED,
   SWP_NOACTIVATE,
   SWP_NOMOVE,
+  SWP_NOOWNERZORDER,
+  SWP_NOSIZE,
   SWP_NOZORDER,
   TME_LEAVE,
   TRACKMOUSEEVENT_SIZE,
   user32functions,
   WHEEL_DELTA,
   WINDOW_STYLE,
+  WINDOWPLACEMENT_SIZE,
   WM,
+  WS_OVERLAPPEDWINDOW,
 } from "./ffi.ts";
 import { Win32InputController } from "./input_controller.ts";
 
@@ -69,6 +77,7 @@ class Win32Window implements Window {
   /** Tracks minimized state so `WM_SIZE` transitions map to a single `visibilitychange` event instead of firing on every resize message. */
   minimized = false;
   #closed = false;
+  #windowedPlacement: ArrayBuffer | undefined;
 
   constructor(readonly lib: Win32Library, classNameBuf: ArrayBuffer, w: number, h: number) {
     const window = lib.user32.symbols.CreateWindowExW(
@@ -138,6 +147,84 @@ class Win32Window implements Window {
   setTitle(title: string): void {
     const ok = this.lib.user32.symbols.SetWindowTextW(this.#hwnd, wideStringBuffer(title));
     if (!ok) throw new Error(this.lib.getLastError());
+  }
+
+  get fullscreenEnabled(): boolean {
+    return !this.#closed;
+  }
+
+  setFullscreen(fullscreen: boolean): void {
+    if (this.#closed) throw new Error("winding(win32): window is closed");
+    if (fullscreen === (this.#windowedPlacement !== undefined)) {
+      this.lib.pushEvent({ type: "fullscreenchange", fullscreen, window: this });
+      return;
+    }
+
+    const style = BigInt(this.lib.user32.symbols.GetWindowLongPtrW(this.#hwnd, GWL_STYLE));
+    if (fullscreen) {
+      const placement = new ArrayBuffer(WINDOWPLACEMENT_SIZE);
+      new DataView(placement).setUint32(0, WINDOWPLACEMENT_SIZE, true);
+      if (!this.lib.user32.symbols.GetWindowPlacement(this.#hwnd, placement)) {
+        throw new Error(this.lib.getLastError());
+      }
+      const monitor = this.lib.user32.symbols.MonitorFromWindow(this.#hwnd, MONITOR_DEFAULTTONEAREST);
+      if (monitor === null) throw new Error(this.lib.getLastError());
+      const info = new ArrayBuffer(MONITORINFO_SIZE);
+      const infoView = new DataView(info);
+      infoView.setUint32(0, MONITORINFO_SIZE, true);
+      if (!this.lib.user32.symbols.GetMonitorInfoW(monitor, info)) {
+        throw new Error(this.lib.getLastError());
+      }
+      const left = infoView.getInt32(4, true);
+      const top = infoView.getInt32(8, true);
+      const right = infoView.getInt32(12, true);
+      const bottom = infoView.getInt32(16, true);
+      this.lib.user32.symbols.SetWindowLongPtrW(
+        this.#hwnd,
+        GWL_STYLE,
+        style & ~BigInt(WS_OVERLAPPEDWINDOW),
+      );
+      if (
+        !this.lib.user32.symbols.SetWindowPos(
+          this.#hwnd,
+          null,
+          left,
+          top,
+          right - left,
+          bottom - top,
+          SWP_NOOWNERZORDER | SWP_FRAMECHANGED,
+        )
+      ) {
+        this.lib.user32.symbols.SetWindowLongPtrW(this.#hwnd, GWL_STYLE, style);
+        throw new Error(this.lib.getLastError());
+      }
+      this.#windowedPlacement = placement;
+    } else {
+      const placement = this.#windowedPlacement!;
+      this.lib.user32.symbols.SetWindowLongPtrW(
+        this.#hwnd,
+        GWL_STYLE,
+        style | BigInt(WS_OVERLAPPEDWINDOW),
+      );
+      if (!this.lib.user32.symbols.SetWindowPlacement(this.#hwnd, placement)) {
+        throw new Error(this.lib.getLastError());
+      }
+      if (
+        !this.lib.user32.symbols.SetWindowPos(
+          this.#hwnd,
+          null,
+          0,
+          0,
+          0,
+          0,
+          SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED,
+        )
+      ) {
+        throw new Error(this.lib.getLastError());
+      }
+      this.#windowedPlacement = undefined;
+    }
+    this.lib.pushEvent({ type: "fullscreenchange", fullscreen, window: this });
   }
 
   /**
@@ -428,6 +515,10 @@ class Win32Library implements Library {
 
   purgeWindowEvents(window: Win32Window): void {
     this.#events.purgeWindow(window);
+  }
+
+  pushEvent(event: UIEvent): void {
+    this.#events.push(event);
   }
 
   readonly windows = new Map<bigint, Win32Window>();

@@ -5,6 +5,7 @@ import {
   type AnyCallback,
   args,
   collectCleanupError,
+  FULLSCREEN_TOPLEVEL_STATE,
   hasXdgToplevelState,
   makeVtable,
   type NativeCallbackHost,
@@ -44,10 +45,16 @@ export class WaylandWindow implements Window {
   #pendingSerial = 0;
   #configured = false;
   #suspended = false;
+  #fullscreen = false;
+  #requestedFullscreen: boolean | undefined;
+  #windowedWidth: number;
+  #windowedHeight: number;
   #registered = false;
   #closed = false;
 
   constructor(readonly lib: WaylandWindowHost, _width: number, _height: number) {
+    this.#windowedWidth = _width;
+    this.#windowedHeight = _height;
     this.#shmBuffer = new WaylandShmBuffer(lib);
     const symbols = lib.wl.symbols;
     const errors: unknown[] = [];
@@ -124,14 +131,39 @@ export class WaylandWindow implements Window {
     this.#toplevelConfigure = new Deno.UnsafeCallback(
       { parameters: ["pointer", "pointer", "i32", "i32", "pointer"], result: "void" },
       this.lib.guardCallback((_data, _toplevel, width, height, states) => {
-        if (width > 0 && height > 0) {
-          this.lib.pushEvent({ type: "resize", width, height, window: this });
+        const fullscreen = hasXdgToplevelState(states, FULLSCREEN_TOPLEVEL_STATE);
+        if (!fullscreen && width > 0 && height > 0) {
+          this.#windowedWidth = width;
+          this.#windowedHeight = height;
+        }
+        const configuredWidth = width > 0 ? width : fullscreen ? 0 : this.#windowedWidth;
+        const configuredHeight = height > 0 ? height : fullscreen ? 0 : this.#windowedHeight;
+        if (configuredWidth > 0 && configuredHeight > 0) {
+          this.lib.pushEvent({
+            type: "resize",
+            width: configuredWidth,
+            height: configuredHeight,
+            window: this,
+          });
         }
         const suspended = hasXdgToplevelState(states, SUSPENDED_TOPLEVEL_STATE);
         if (suspended !== this.#suspended) {
           this.#suspended = suspended;
           this.lib.pushEvent({ type: "visibilitychange", visible: !suspended, window: this });
         }
+        const requested = this.#requestedFullscreen;
+        this.#requestedFullscreen = undefined;
+        if (requested !== undefined && fullscreen !== requested) {
+          this.lib.pushEvent({
+            type: "fullscreenerror",
+            requestedFullscreen: requested,
+            message: "Wayland compositor denied the fullscreen request",
+            window: this,
+          });
+        } else if (fullscreen !== this.#fullscreen || requested !== undefined) {
+          this.lib.pushEvent({ type: "fullscreenchange", fullscreen, window: this });
+        }
+        this.#fullscreen = fullscreen;
       }),
     );
     this.#toplevelClose = new Deno.UnsafeCallback(
@@ -178,6 +210,46 @@ export class WaylandWindow implements Window {
       args(Deno.UnsafePointer.value(Deno.UnsafePointer.of(titleBuffer))),
     );
     symbols.wl_display_flush(this.lib.display);
+  }
+
+  get fullscreenEnabled(): boolean {
+    return !this.#closed;
+  }
+
+  setFullscreen(fullscreen: boolean): void {
+    if (!this.#xdgToplevel || !this.#surface || this.#closed) {
+      throw new Error("winding(wayland): window is closed");
+    }
+    if (this.#requestedFullscreen === undefined && this.#fullscreen === fullscreen) {
+      this.lib.pushEvent({ type: "fullscreenchange", fullscreen, window: this });
+      return;
+    }
+
+    const symbols = this.lib.wl.symbols;
+    const toplevelVersion = symbols.wl_proxy_get_version(this.#xdgToplevel);
+    this.#requestedFullscreen = fullscreen;
+    try {
+      symbols.wl_proxy_marshal_array_flags(
+        this.#xdgToplevel,
+        fullscreen ? WlOp.XDG_TOPLEVEL_SET_FULLSCREEN : WlOp.XDG_TOPLEVEL_UNSET_FULLSCREEN,
+        null,
+        toplevelVersion,
+        0,
+        fullscreen ? args(0n) : args(),
+      );
+      symbols.wl_proxy_marshal_array_flags(
+        this.#surface,
+        WlOp.SURFACE_COMMIT,
+        null,
+        symbols.wl_proxy_get_version(this.#surface),
+        0,
+        args(),
+      );
+      symbols.wl_display_flush(this.lib.display);
+    } catch (error) {
+      this.#requestedFullscreen = undefined;
+      throw error;
+    }
   }
 
   blit(rgba: Uint8Array, width: number, height: number): void {

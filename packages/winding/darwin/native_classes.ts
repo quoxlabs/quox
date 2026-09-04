@@ -20,7 +20,11 @@ export interface DarwinNativeResponder {
       | "focus"
       | "blur"
       | "hidden"
-      | "visible",
+      | "visible"
+      | "fullscreen-entered"
+      | "fullscreen-exited"
+      | "fullscreen-enter-failed"
+      | "fullscreen-exit-failed",
   ): void;
   handleNativeKeyEvent(
     kind: "keydown" | "keyup" | "flagschanged",
@@ -132,6 +136,38 @@ export class DarwinNativeClasses {
         () => undefined,
       ),
     );
+    const didEnterFullscreen = new Deno.UnsafeCallback(
+      { parameters: ["pointer", "pointer", "pointer"], result: "void" },
+      guardNativeCallback(
+        this.#errors,
+        (self: Deno.PointerValue) => this.#delegate(self)?.handleNativeWindowEvent("fullscreen-entered"),
+        () => undefined,
+      ),
+    );
+    const didExitFullscreen = new Deno.UnsafeCallback(
+      { parameters: ["pointer", "pointer", "pointer"], result: "void" },
+      guardNativeCallback(
+        this.#errors,
+        (self: Deno.PointerValue) => this.#delegate(self)?.handleNativeWindowEvent("fullscreen-exited"),
+        () => undefined,
+      ),
+    );
+    const didFailToEnterFullscreen = new Deno.UnsafeCallback(
+      { parameters: ["pointer", "pointer", "pointer"], result: "void" },
+      guardNativeCallback(
+        this.#errors,
+        (self: Deno.PointerValue) => this.#delegate(self)?.handleNativeWindowEvent("fullscreen-enter-failed"),
+        () => undefined,
+      ),
+    );
+    const didFailToExitFullscreen = new Deno.UnsafeCallback(
+      { parameters: ["pointer", "pointer", "pointer"], result: "void" },
+      guardNativeCallback(
+        this.#errors,
+        (self: Deno.PointerValue) => this.#delegate(self)?.handleNativeWindowEvent("fullscreen-exit-failed"),
+        () => undefined,
+      ),
+    );
     this.#callbacks.push(
       shouldClose,
       didResize,
@@ -141,6 +177,10 @@ export class DarwinNativeClasses {
       didResignKey,
       didMiniaturize,
       didDeminiaturize,
+      didEnterFullscreen,
+      didExitFullscreen,
+      didFailToEnterFullscreen,
+      didFailToExitFullscreen,
     );
 
     const delegate = allocateClassPair(getClass("NSObject"), "WindingWindowDelegate");
@@ -152,6 +192,10 @@ export class DarwinNativeClasses {
     addMethod(delegate, sel("windowDidResignKey:"), didResignKey.pointer, "v@:@");
     addMethod(delegate, sel("windowDidMiniaturize:"), didMiniaturize.pointer, "v@:@");
     addMethod(delegate, sel("windowDidDeminiaturize:"), didDeminiaturize.pointer, "v@:@");
+    addMethod(delegate, sel("windowDidEnterFullScreen:"), didEnterFullscreen.pointer, "v@:@");
+    addMethod(delegate, sel("windowDidExitFullScreen:"), didExitFullscreen.pointer, "v@:@");
+    addMethod(delegate, sel("windowDidFailToEnterFullScreen:"), didFailToEnterFullscreen.pointer, "v@:@");
+    addMethod(delegate, sel("windowDidFailToExitFullScreen:"), didFailToExitFullscreen.pointer, "v@:@");
     registerClassPair(delegate);
     this.delegate = delegate;
 

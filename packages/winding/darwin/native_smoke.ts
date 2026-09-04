@@ -12,7 +12,7 @@ Deno.test({
   permissions: { ffi: true },
   sanitizeOps: false,
   sanitizeResources: false,
-  fn() {
+  async fn() {
     const runtime = Deno.dlopen(LIBOBJC, runtimeSymbols);
     const sendId = Deno.dlopen(LIBOBJC, {
       objc_msgSend: { parameters: ["pointer", "pointer"], result: "pointer" },
@@ -61,6 +61,18 @@ Deno.test({
         if (command?.type !== "apple-standard-keybinding" || command.command !== "deleteBackward:") {
           throw new Error("expected Darwin AppKit editing command");
         }
+
+        if (!window.fullscreenEnabled) throw new Error("Expected AppKit fullscreen support");
+        window.setFullscreen(true);
+        const entered = await waitForEvent(library, (event) => event.type === "fullscreenchange");
+        if (entered?.type !== "fullscreenchange" || !entered.fullscreen) {
+          throw new Error("Expected AppKit fullscreen entry confirmation");
+        }
+        window.setFullscreen(false);
+        const exited = await waitForEvent(library, (event) => event.type === "fullscreenchange");
+        if (exited?.type !== "fullscreenchange" || exited.fullscreen) {
+          throw new Error("Expected AppKit fullscreen exit confirmation");
+        }
       } finally {
         sendVoid.symbols.objc_msgSend(text, sel(runtime, "release"));
         window.close();
@@ -88,4 +100,14 @@ function nextEvent(library: Library, predicate: (event: UIEvent) => boolean): UI
     if (predicate(event)) return event;
   }
   throw new Error("Darwin smoke test exceeded its event limit");
+}
+
+async function waitForEvent(library: Library, predicate: (event: UIEvent) => boolean): Promise<UIEvent | undefined> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const event = nextEvent(library, predicate);
+    if (event !== undefined) return event;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return undefined;
 }

@@ -20,6 +20,12 @@ export type QuoxCloseEvent = { type: "close" };
 export type QuoxMouseEnterLeaveEvent = { type: "mouseenter" | "mouseleave" };
 export type QuoxFocusChangeEvent = { type: "focus" | "blur" };
 export type QuoxVisibilityEvent = { type: "visibilitychange"; visible: boolean };
+export type QuoxFullscreenChangeEvent = { type: "fullscreenchange"; fullscreen: boolean };
+export type QuoxFullscreenErrorEvent = {
+  type: "fullscreenerror";
+  requestedFullscreen: boolean;
+  message: string;
+};
 
 export type QuoxInputEvent =
   | QuoxMouseMoveEvent
@@ -32,7 +38,9 @@ export type QuoxInputEvent =
   | QuoxCloseEvent
   | QuoxMouseEnterLeaveEvent
   | QuoxFocusChangeEvent
-  | QuoxVisibilityEvent;
+  | QuoxVisibilityEvent
+  | QuoxFullscreenChangeEvent
+  | QuoxFullscreenErrorEvent;
 
 export interface QuoxInputRoutePort {
   pointerMove(x: number, y: number, buttons: number): void;
@@ -45,6 +53,8 @@ export interface QuoxInputRoutePort {
   clearHover(): void;
   resize(event: QuoxResizeEvent): void;
   visibility(event: QuoxVisibilityEvent): void;
+  fullscreenChange(event: QuoxFullscreenChangeEvent): void;
+  fullscreenError(event: QuoxFullscreenErrorEvent): void;
 }
 
 const BUTTON_INDEX_TO_BIT = [1, 4, 2] as const;
@@ -102,6 +112,12 @@ export class QuoxInputRouter {
         return undefined;
       case "visibilitychange":
         this.port.visibility(event);
+        return undefined;
+      case "fullscreenchange":
+        this.port.fullscreenChange(event);
+        return undefined;
+      case "fullscreenerror":
+        this.port.fullscreenError(event);
         return undefined;
       case "close":
         return "close";
@@ -184,6 +200,14 @@ export function mapWindingEvent(event: WindingUIEvent): QuoxInputEvent {
       return { type: "blur" };
     case "visibilitychange":
       return { type: "visibilitychange", visible: event.visible };
+    case "fullscreenchange":
+      return { type: "fullscreenchange", fullscreen: event.fullscreen };
+    case "fullscreenerror":
+      return {
+        type: "fullscreenerror",
+        requestedFullscreen: event.requestedFullscreen,
+        message: event.message,
+      };
     default:
       return assertNever(event);
   }
@@ -195,6 +219,17 @@ export interface EncodedKeyEvent {
   modifierBits: number;
   location: number;
   eventFlags: number;
+}
+
+/** Whether a keydown is the unmodified browser-style fullscreen escape gesture. */
+export function isFullscreenExitKey(event: QuoxKeyboardEvent): boolean {
+  return event.type === "keydown" &&
+    !event.repeat &&
+    (event.key === "Escape" || event.key === "F11") &&
+    !event.shiftKey &&
+    !event.ctrlKey &&
+    !event.altKey &&
+    !event.metaKey;
 }
 
 /** Encode exact host flags into the compact Quox→WASM key ABI. */

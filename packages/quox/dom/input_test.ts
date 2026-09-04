@@ -1,6 +1,6 @@
 import { assertEquals } from "@std/assert";
 import type { Window as WindingWindow } from "@quoxlabs/winding";
-import { encodeKeyEvent, mapWindingEvent, QuoxInputRouter } from "./input.ts";
+import { encodeKeyEvent, isFullscreenExitKey, mapWindingEvent, QuoxInputRouter } from "./input.ts";
 
 const window = {} as WindingWindow;
 const base = {
@@ -65,6 +65,8 @@ Deno.test("router preserves keydown, textinput, then keyup order", () => {
     clearHover() {},
     resize() {},
     visibility() {},
+    fullscreenChange() {},
+    fullscreenError() {},
   });
   router.route(mapWindingEvent({ ...base, type: "keydown", repeat: false, editDisposition: "text-input" }));
   router.route(mapWindingEvent({ type: "textinput", text: "y", window }));
@@ -85,10 +87,44 @@ Deno.test("router translates browser-style wheel deltas to Blitz's scroll direct
     clearHover() {},
     resize() {},
     visibility() {},
+    fullscreenChange() {},
+    fullscreenError() {},
   });
 
   router.route({ type: "mousemove", x: 12, y: 34 });
   router.route({ type: "wheel", deltaX: 2, deltaY: -3 });
 
   assertEquals(calls, [[12, 34, -80, 120, 0]]);
+});
+
+Deno.test("native fullscreen notifications map to typed Quox window events", () => {
+  assertEquals(mapWindingEvent({ type: "fullscreenchange", fullscreen: true, window }), {
+    type: "fullscreenchange",
+    fullscreen: true,
+  });
+  assertEquals(
+    mapWindingEvent({
+      type: "fullscreenerror",
+      requestedFullscreen: false,
+      message: "denied",
+      window,
+    }),
+    { type: "fullscreenerror", requestedFullscreen: false, message: "denied" },
+  );
+});
+
+Deno.test("only unmodified Escape and F11 keydowns request fullscreen exit", () => {
+  const keydown = mapWindingEvent({
+    ...base,
+    type: "keydown",
+    key: "Escape",
+    repeat: false,
+    editDisposition: "platform",
+  });
+  if (keydown.type !== "keydown") throw new TypeError("expected keydown");
+  assertEquals(isFullscreenExitKey(keydown), true);
+  assertEquals(isFullscreenExitKey({ ...keydown, key: "F11" }), true);
+  assertEquals(isFullscreenExitKey({ ...keydown, repeat: true }), false);
+  assertEquals(isFullscreenExitKey({ ...keydown, shiftKey: true }), false);
+  assertEquals(isFullscreenExitKey({ ...keydown, type: "keyup", repeat: false }), false);
 });

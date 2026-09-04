@@ -243,6 +243,8 @@ class DarwinWindow implements Window, DarwinNativeResponder {
   #producedText: string | undefined;
   readonly #pressedKeys = new PressedLogicalKeyCache<number>();
   #closed = false;
+  #fullscreen = false;
+  #requestedFullscreen: boolean | undefined;
   // Kept alive for one extra frame: CGImage/CGDataProvider wrap this memory
   // without copying it, and CALayer's `contents` assignment is composited
   // asynchronously, so the previous frame's buffer must outlive the call that
@@ -366,7 +368,11 @@ class DarwinWindow implements Window, DarwinNativeResponder {
       | "focus"
       | "blur"
       | "hidden"
-      | "visible",
+      | "visible"
+      | "fullscreen-entered"
+      | "fullscreen-exited"
+      | "fullscreen-enter-failed"
+      | "fullscreen-exit-failed",
   ): void {
     switch (kind) {
       case "close":
@@ -393,6 +399,26 @@ class DarwinWindow implements Window, DarwinNativeResponder {
           window: this,
         });
         return;
+      case "fullscreen-entered":
+      case "fullscreen-exited": {
+        const fullscreen = kind === "fullscreen-entered";
+        this.#fullscreen = fullscreen;
+        this.#requestedFullscreen = undefined;
+        this.lib.pushEvent({ type: "fullscreenchange", fullscreen, window: this });
+        return;
+      }
+      case "fullscreen-enter-failed":
+      case "fullscreen-exit-failed": {
+        const requestedFullscreen = kind === "fullscreen-enter-failed";
+        this.#requestedFullscreen = undefined;
+        this.lib.pushEvent({
+          type: "fullscreenerror",
+          requestedFullscreen,
+          message: `AppKit failed to ${requestedFullscreen ? "enter" : "exit"} fullscreen`,
+          window: this,
+        });
+        return;
+      }
     }
   }
 
@@ -587,6 +613,29 @@ class DarwinWindow implements Window, DarwinNativeResponder {
     const titleString = makeNSString(this.lib.ffi, title);
     send.void_id(this.nsWindow, sel("setTitle:"), titleString);
     send.void(titleString, sel("release"));
+  }
+
+  get fullscreenEnabled(): boolean {
+    return !this.#closed;
+  }
+
+  setFullscreen(fullscreen: boolean): void {
+    if (this.#closed) throw new Error("winding(darwin): window is closed");
+    if (this.#requestedFullscreen !== undefined) {
+      throw new Error("winding(darwin): fullscreen transition already in progress");
+    }
+    if (this.#fullscreen === fullscreen) {
+      this.lib.pushEvent({ type: "fullscreenchange", fullscreen, window: this });
+      return;
+    }
+    this.#requestedFullscreen = fullscreen;
+    try {
+      const { sel, send } = this.lib.ffi;
+      send.void_id(this.nsWindow, sel("toggleFullScreen:"), null);
+    } catch (error) {
+      this.#requestedFullscreen = undefined;
+      throw error;
+    }
   }
 
   blit(rgba: Uint8Array, width: number, height: number): void {

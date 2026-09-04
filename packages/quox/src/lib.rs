@@ -17,6 +17,29 @@ use wgpu_context::WGPUContext;
 
 const LIBERATION_SANS: &[u8] = include_bytes!("../assets/LiberationSans-Regular.ttf");
 const FONT_CSS: &str = "html,body,*{font-family:'Liberation Sans',sans-serif;}";
+const FULLSCREEN_CSS: &str = r"
+[data-quox-internal-fullscreen-ancestor] > :not([data-quox-internal-fullscreen-target]):not([data-quox-internal-fullscreen-ancestor]) {
+  display: none !important;
+}
+:not(html)[data-quox-internal-fullscreen-target] {
+  position: fixed !important;
+  top: 0 !important;
+  right: 0 !important;
+  bottom: 0 !important;
+  left: 0 !important;
+  width: 100vw !important;
+  height: 100vh !important;
+  box-sizing: border-box !important;
+  min-width: 0 !important;
+  min-height: 0 !important;
+  max-width: none !important;
+  max-height: none !important;
+  margin: 0 !important;
+  transform: none !important;
+  z-index: 2147483647 !important;
+  background: black !important;
+}
+";
 
 fn initial_html(head: &str, body: &str) -> String {
     format!("<!DOCTYPE html><html><head>{head}</head><body>{body}</body></html>")
@@ -46,6 +69,8 @@ struct QuoxRendererState {
     renderer: Renderer,
     redraw_requested: Arc<AtomicBool>,
     recorded_events: RecordedEvents,
+    fullscreen_node: Option<usize>,
+    fullscreen_path: Vec<usize>,
 }
 
 /// Notices Blitz-internal redraw requests (hover/active/focus/scroll/text-input state
@@ -123,7 +148,11 @@ impl QuoxRenderer {
                     redraw_requested: Arc::clone(&redraw_requested),
                 })),
                 html_parser_provider: Some(Arc::new(HtmlProvider)),
-                ua_stylesheets: Some(vec![DEFAULT_CSS.to_string(), FONT_CSS.to_string()]),
+                ua_stylesheets: Some(vec![
+                    DEFAULT_CSS.to_string(),
+                    FONT_CSS.to_string(),
+                    FULLSCREEN_CSS.to_string(),
+                ]),
                 font_ctx: Some(font_ctx),
                 ..Default::default()
             },
@@ -140,6 +169,8 @@ impl QuoxRenderer {
                 renderer,
                 redraw_requested,
                 recorded_events: RecordedEvents::default(),
+                fullscreen_node: None,
+                fullscreen_path: Vec::new(),
             }),
         })
     }

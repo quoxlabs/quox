@@ -1,4 +1,4 @@
-import type { Library, TextInputEvent, Window } from "../types.ts";
+import type { FullscreenChangeEvent, Library, TextInputEvent, Window } from "../types.ts";
 import { UNICODE_NOCHAR, WM } from "./ffi.ts";
 import { load } from "./mod.ts";
 
@@ -66,12 +66,31 @@ function runLifecycle(user32: Deno.DynamicLibrary<typeof testUser32Functions>): 
       if (commit?.text !== "A") {
         throw new Error("Expected Win32 committed text containing A");
       }
+
+      if (!window.fullscreenEnabled) throw new Error("Expected Win32 fullscreen support");
+      window.setFullscreen(true);
+      if (nextFullscreenChange(library, window)?.fullscreen !== true) {
+        throw new Error("Expected Win32 fullscreen entry confirmation");
+      }
+      window.setFullscreen(false);
+      if (nextFullscreenChange(library, window)?.fullscreen !== false) {
+        throw new Error("Expected Win32 fullscreen exit confirmation");
+      }
     } finally {
       window.close();
     }
   } finally {
     library.close();
   }
+}
+
+function nextFullscreenChange(library: Library, window: Window): FullscreenChangeEvent | undefined {
+  for (let count = 0; count < 128; count++) {
+    const event = library.event();
+    if (event === undefined) return undefined;
+    if (event.type === "fullscreenchange" && event.window === window) return event;
+  }
+  throw new Error("Win32 fullscreen smoke test exceeded its event limit");
 }
 
 function drainEvents(library: Library): void {
