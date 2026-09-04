@@ -3,6 +3,7 @@ import { QuoxRenderer as WasmRenderer } from "../lib/quox.js";
 import { load as windingLoad } from "@quoxlabs/winding";
 import type { Library as WindingLibrary, UIEvent as WindingUIEvent, Window as WindingWindow } from "@quoxlabs/winding";
 import { QuoxDocument } from "./document.ts";
+import { DEFAULT_FONTS, type FontSource } from "./fonts.ts";
 import { mapWindingEvent, notifyInputListeners, type QuoxInputEvent, QuoxInputRouter } from "./input.ts";
 import { isVNode, mount, type QuoxRenderable } from "./mount.ts";
 import { QuoxElement } from "./node.ts";
@@ -36,6 +37,12 @@ export interface WindowOptions {
   head?: QuoxWindowContent;
   /** Initial content for `document.body`: an HTML string, or JSX from any recognized runtime. */
   body?: QuoxWindowContent;
+  /**
+   * Fonts to load before the window's first render. Defaults to a small built-in set
+   * (currently just `"liberation-sans"`) so text renders out of the box; pass your own list
+   * to replace it, or `[]` to load no fonts up front and rely entirely on `document.loadFonts`.
+   */
+  fonts?: FontSource[];
 }
 
 const DEFAULT_WINDOW_TITLE = "quox";
@@ -154,6 +161,7 @@ export class QuoxWindow implements Disposable {
       win = lib.openWindow(0, 0, width, height);
       renderer = await WasmRenderer.create(width, height, head, body);
       const quoxWindow = new QuoxWindow(lib, win, width, height, renderer);
+      await quoxWindow.document.loadFonts(options.fonts ?? [...DEFAULT_FONTS]);
       await mountWindowContent(quoxWindow.document.head, options.head);
       await mountWindowContent(quoxWindow.document.body, options.body);
       quoxWindow.setTitle(options.title ?? (quoxWindow.document.title || DEFAULT_WINDOW_TITLE));

@@ -97,6 +97,11 @@
   },
   "workspace": {
     "members": {
+      "packages/font": {
+        "dependencies": [
+          "jsr:@std/assert@^1.0.19"
+        ]
+      },
       "packages/jsx": {
         "dependencies": [
           "jsr:@std/assert@^1.0.19"

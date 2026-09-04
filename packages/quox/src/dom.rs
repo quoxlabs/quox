@@ -1,6 +1,8 @@
 use super::{QuoxRenderer, QuoxRendererState};
+use blitz_dom::net::{FontFaceOverrides, Resource, ResourceLoadResponse};
 use blitz_dom::node::{ImageData, RasterImageData, SpecialElementData};
-use blitz_dom::{DocumentMutator, LocalName, NodeData, QualName, ns};
+use blitz_dom::{DocumentMutator, LocalName, NodeData, QualName, decode_font_bytes, ns};
+use blitz_traits::net::Bytes;
 use image::ImageReader;
 use std::io::Cursor;
 use std::sync::Arc;
@@ -159,6 +161,34 @@ impl QuoxRenderer {
             mutator.set_attribute(node_id, attr_name(name), value);
             Ok(())
         })
+    }
+
+    /// Register a font for use via CSS `font-family`.
+    ///
+    /// `bytes` are the raw contents of a font file — TTF, OTF, WOFF, or WOFF2 (WOFF/WOFF2
+    /// are decoded automatically). `family_name`, when given, is the name CSS
+    /// `font-family` should use to select this font, overriding whatever name is
+    /// embedded in the font's own `name` table.
+    ///
+    /// Fonts are document-global: once registered, any element (not just ones that
+    /// existed at load time) can select this font via `font-family`.
+    pub fn load_font(&self, bytes: &[u8], family_name: Option<String>) -> Result<(), JsValue> {
+        let mut state = self.state.borrow_mut();
+        let decoded = decode_font_bytes(bytes).into_owned();
+        state.document.load_resource(ResourceLoadResponse {
+            request_id: 0,
+            node_id: None,
+            resolved_url: None,
+            result: Ok(Resource::Font(
+                Bytes::from(decoded),
+                FontFaceOverrides {
+                    family_name,
+                    weight: None,
+                    style: None,
+                },
+            )),
+        });
+        Ok(())
     }
 
     /// Decode an encoded image from `bytes` and display it in an `<img>` element.
