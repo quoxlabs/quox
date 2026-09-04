@@ -513,7 +513,7 @@ class DarwinWindow implements Window, DarwinNativeResponder {
   handleFlagsChanged(event: Deno.PointerValue): void {
     if (this.#closed || event === null) return;
     this.lib.markNativeEventHandled(event);
-    const native = this.#nativeKeyData(event);
+    const native = this.#nativeKeyData(event, { readCharacters: false });
     const code = native.base.code;
     const flags = this.lib.ffi.send.u64(event, this.lib.ffi.sel("modifierFlags"));
     const flag = modifierFlagForCode(code);
@@ -557,7 +557,10 @@ class DarwinWindow implements Window, DarwinNativeResponder {
     this.lib.pushEvents(this.inputState.drainEvents());
   }
 
-  #nativeKeyData(event: Deno.PointerValue): {
+  #nativeKeyData(
+    event: Deno.PointerValue,
+    { readCharacters = true }: { readCharacters?: boolean } = {},
+  ): {
     base: Omit<KeyEventBase, "type">;
     characters: string;
     charactersIgnoringModifiers: string;
@@ -565,12 +568,18 @@ class DarwinWindow implements Window, DarwinNativeResponder {
     const { sel, send } = this.lib.ffi;
     const keycode = send.u16(event, sel("keyCode"));
     const code = getDomCode(keycode);
-    const charactersPointer = send.id(event, sel("characters"));
-    const charactersIgnoringModifiersPointer = send.id(event, sel("charactersIgnoringModifiers"));
-    const characters = charactersPointer === null ? "" : readCFString(this.lib.ffi.cf, charactersPointer);
-    const charactersIgnoringModifiers = charactersIgnoringModifiersPointer === null
-      ? ""
-      : readCFString(this.lib.ffi.cf, charactersIgnoringModifiersPointer);
+    // NSEvent#characters/#charactersIgnoringModifiers are only valid for keyDown/keyUp;
+    // sending them to a FlagsChanged event throws NSInternalInconsistencyException.
+    let characters = "";
+    let charactersIgnoringModifiers = "";
+    if (readCharacters) {
+      const charactersPointer = send.id(event, sel("characters"));
+      const charactersIgnoringModifiersPointer = send.id(event, sel("charactersIgnoringModifiers"));
+      characters = charactersPointer === null ? "" : readCFString(this.lib.ffi.cf, charactersPointer);
+      charactersIgnoringModifiers = charactersIgnoringModifiersPointer === null
+        ? ""
+        : readCFString(this.lib.ffi.cf, charactersIgnoringModifiersPointer);
+    }
     const base: Omit<KeyEventBase, "type"> = {
       keycode,
       code,
