@@ -1,0 +1,25 @@
+{
+  "name": "@quoxlabs/font",
+  "version": "0.0.1",
+  "exports": {
+    "./liberation-sans": "./liberation-sans.ts",
+    "./liberation-serif": "./liberation-serif.ts",
+    "./liberation-mono": "./liberation-mono.ts"
+  },
+  "license": "OFL-1.1",
+  "tasks": {
+    "generate": "deno run --allow-read=. --allow-write=. generate.ts"
+  },
+  "publish": {
+    "include": [
+      "./liberation-sans.ts",
+      "./liberation-serif.ts",
+      "./liberation-mono.ts",
+      "./types.ts",
+      "./OFL.txt"
+    ]
+  },
+  "imports": {
+    "@std/assert": "jsr:@std/assert@^1.0.19"
+  }
+}

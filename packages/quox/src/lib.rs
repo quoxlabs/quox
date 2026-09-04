@@ -7,7 +7,6 @@ use blitz_html::{HtmlDocument, HtmlProvider};
 use blitz_traits::net::DummyNetProvider;
 use blitz_traits::shell::{ColorScheme, ShellProvider, Viewport};
 use interaction::RecordedEvents;
-use linebender_resource_handle::Blob;
 use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,7 +14,11 @@ use vello::{AaSupport, Renderer, RendererOptions};
 use wasm_bindgen::prelude::*;
 use wgpu_context::WGPUContext;
 
-const LIBERATION_SANS: &[u8] = include_bytes!("../assets/LiberationSans-Regular.ttf");
+// No font is embedded in this binary — `QuoxRenderer::load_font` (see `dom.rs`) registers
+// fonts at runtime, loaded from the TS side. This fallback only names *which* family CSS
+// should default to; it does nothing until something actually registers a font under that
+// name (the TS layer always does, via its own default font set, before the first render —
+// see `packages/quox/dom/window.ts`).
 const FONT_CSS: &str = "html,body,*{font-family:'Liberation Sans',sans-serif;}";
 
 fn initial_html(head: &str, body: &str) -> String {
@@ -107,10 +110,7 @@ impl QuoxRenderer {
         )
         .map_err(|e| JsValue::from_str(&format!("Vello renderer: {e:?}")))?;
 
-        let mut font_ctx = FontContext::default();
-        font_ctx
-            .collection
-            .register_fonts(Blob::new(Arc::new(LIBERATION_SANS) as _), None);
+        let font_ctx = FontContext::default();
 
         let redraw_requested = Arc::new(AtomicBool::new(false));
 

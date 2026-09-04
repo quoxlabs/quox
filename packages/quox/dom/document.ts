@@ -1,5 +1,6 @@
 import type { QuoxRenderer as WasmRenderer } from "../lib/quox.js";
 import { invokeEventHandlers } from "./event_handlers.ts";
+import { type FontSource, resolveFontSource } from "./fonts.ts";
 import {
   encodeKeyEvent,
   type QuoxAppleStandardKeybindingEvent,
@@ -164,5 +165,20 @@ export class QuoxDocument {
   createTextNode(text: string): QuoxText {
     this.#assertActive();
     return new QuoxText(this, this.#renderer.create_text_node(text));
+  }
+
+  /**
+   * Register fonts for use via CSS `font-family`, e.g.
+   * `loadFonts(["liberation-serif", await Deno.readFile("./MyFont.ttf")])`. See
+   * {@link FontSource} for the accepted forms. Fonts are document-global: any element can
+   * select a loaded font via `font-family`, not just ones created after this resolves.
+   */
+  async loadFonts(sources: FontSource[]): Promise<void> {
+    this.#assertActive();
+    for (const source of sources) {
+      const { family, bytes } = await resolveFontSource(source);
+      this.#renderer.load_font(bytes, family);
+    }
+    this.#requestRender();
   }
 }
