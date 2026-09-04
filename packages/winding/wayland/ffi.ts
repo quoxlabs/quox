@@ -229,6 +229,8 @@ export const WlOp = {
   XDG_TOPLEVEL_DESTROY: 0,
   XDG_TOPLEVEL_SET_TITLE: 2,
   XDG_TOPLEVEL_SET_APP_ID: 3,
+  XDG_TOPLEVEL_SET_FULLSCREEN: 11,
+  XDG_TOPLEVEL_UNSET_FULLSCREEN: 12,
   // wp_cursor_shape_manager_v1 requests
   WP_CURSOR_SHAPE_MANAGER_DESTROY: 0,
   WP_CURSOR_SHAPE_MANAGER_GET_POINTER: 1,
@@ -260,6 +262,7 @@ export const WlCursorShape = {
 // for instead. Compositors that don't support it simply never set the bit, which degrades
 // safely to "always visible" (today's behavior).
 export const XdgToplevelState = {
+  FULLSCREEN: 2,
   SUSPENDED: 9,
 } as const;
 

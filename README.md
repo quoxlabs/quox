@@ -47,3 +47,21 @@ It has a lot of nice benefits:
 - pure Deno tooling lets you iterate at ludicrous speeds
 - automatic deduplication of quox in the Deno cache (tiny on disk)
 - full system access via Deno
+
+## Fullscreen
+
+Fullscreen follows the browser [Fullscreen API](https://developer.mozilla.org/en-US/docs/Web/API/Fullscreen_API) on a
+Quox window's document. The promise settles after the native window system confirms the transition:
+
+```ts
+const element = window.document.documentElement;
+
+await element.requestFullscreen();
+console.log(window.document.fullscreenElement === element); // true
+
+await window.document.exitFullscreen();
+```
+
+Use `fullscreenchange` and `fullscreenerror` listeners on the element or document to observe transitions. Escape and F11
+leave fullscreen. Advanced browser features such as fullscreen options, permissions policy, element stacks,
+`:fullscreen`, and `::backdrop` are not implemented yet.

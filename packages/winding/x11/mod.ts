@@ -11,6 +11,7 @@ import {
 import { domCodeFromX11, logicalKeyFromKeysym } from "../linux/mod.ts";
 import { utf8Bytes, utf8CString as cString } from "../text_encoding.ts";
 import { libcFunctions, NotifyNormal, x11functions, XEventMask, XEventType } from "./ffi.ts";
+import { encodeFullscreenClientMessage, parseAtomProperty } from "./fullscreen.ts";
 import { isAutoRepeatPair, x11KeyEditDisposition } from "./input.ts";
 import { NativeXImage } from "./native_image.ts";
 import { XimContext, XimManager } from "./xim.ts";
@@ -68,6 +69,8 @@ class X11Window implements Window {
   #width: number;
   #height: number;
   #closed = false;
+  #fullscreen = false;
+  #requestedFullscreen: boolean | undefined;
 
   constructor(readonly lib: X11Library, x = 0, y = 0, w = 800, h = 600) {
     const view = new Deno.UnsafePointerView(lib.screen);
@@ -157,6 +160,60 @@ class X11Window implements Window {
     );
     this.lib.X11.symbols.XStoreName(this.lib.display, this.id, latin1CString(title));
     this.lib.X11.symbols.XFlush(this.lib.display);
+  }
+
+  get fullscreenEnabled(): boolean {
+    return !this.#closed && this.lib.fullscreenSupported;
+  }
+
+  setFullscreen(fullscreen: boolean): void {
+    if (this.#closed) throw new Error("winding(x11): window is closed");
+    if (!this.lib.fullscreenSupported) {
+      throw new Error("winding(x11): the window manager does not support fullscreen");
+    }
+    if (this.#fullscreen === fullscreen) {
+      this.lib.pushEvent({ type: "fullscreenchange", fullscreen, window: this });
+      return;
+    }
+    this.#requestedFullscreen = fullscreen;
+
+    const event = encodeFullscreenClientMessage(
+      this.lib.display,
+      this.id,
+      this.lib.netWmState,
+      this.lib.netWmStateFullscreen,
+      fullscreen,
+    );
+    const root = this.lib.X11.symbols.XDefaultRootWindow(this.lib.display);
+    const sent = this.lib.X11.symbols.XSendEvent(
+      this.lib.display,
+      root,
+      0,
+      BigInt(XEventMask.SubstructureRedirectMask | XEventMask.SubstructureNotifyMask),
+      Deno.UnsafePointer.of(event),
+    );
+    if (sent === 0) {
+      this.#requestedFullscreen = undefined;
+      throw new Error("winding(x11): failed to send fullscreen request");
+    }
+    this.lib.X11.symbols.XFlush(this.lib.display);
+  }
+
+  handleFullscreenProperty(): UIEvent | undefined {
+    const fullscreen = this.lib.readWindowState(this.id).includes(this.lib.netWmStateFullscreen);
+    const requested = this.#requestedFullscreen;
+    this.#requestedFullscreen = undefined;
+    if (requested !== undefined && fullscreen !== requested) {
+      return {
+        type: "fullscreenerror",
+        requestedFullscreen: requested,
+        message: "X11 window manager denied the fullscreen request",
+        window: this,
+      };
+    }
+    if (fullscreen === this.#fullscreen) return undefined;
+    this.#fullscreen = fullscreen;
+    return { type: "fullscreenchange", fullscreen, window: this };
   }
 
   /**
@@ -272,6 +329,9 @@ class X11Library implements Library {
   readonly wmDeleteWindow: bigint;
   readonly netWmName: bigint;
   readonly utf8String: bigint;
+  readonly netWmState: bigint;
+  readonly netWmStateFullscreen: bigint;
+  readonly fullscreenSupported: boolean;
   readonly input: XimManager;
   readonly #events = new EventQueue<UIEvent>();
   #altGraphMask = 0;
@@ -305,6 +365,17 @@ class X11Library implements Library {
     );
     this.netWmName = BigInt(this.X11.symbols.XInternAtom(display, cString("_NET_WM_NAME"), 0));
     this.utf8String = BigInt(this.X11.symbols.XInternAtom(display, cString("UTF8_STRING"), 0));
+    this.netWmState = BigInt(this.X11.symbols.XInternAtom(display, cString("_NET_WM_STATE"), 0));
+    this.netWmStateFullscreen = BigInt(
+      this.X11.symbols.XInternAtom(display, cString("_NET_WM_STATE_FULLSCREEN"), 0),
+    );
+    const netSupported = BigInt(
+      this.X11.symbols.XInternAtom(display, cString("_NET_SUPPORTED"), 0),
+    );
+    const root = BigInt(this.X11.symbols.XDefaultRootWindow(display));
+    this.fullscreenSupported = this.readAtomProperty(root, netSupported).includes(
+      this.netWmStateFullscreen,
+    );
     this.#refreshAltGraphMask();
     try {
       this.input = new XimManager(
@@ -432,10 +503,60 @@ class X11Library implements Library {
         continue;
       }
 
+      if (
+        type === XEventType.PropertyNotify &&
+        window !== undefined &&
+        view.getBigUint64(40, true) === this.netWmState
+      ) {
+        const fullscreenEvent = window.handleFullscreenProperty();
+        if (fullscreenEvent !== undefined) return fullscreenEvent;
+        continue;
+      }
+
       const event = importEvent(view, window, this.wmProtocols, this.wmDeleteWindow);
       if (event !== undefined) return event;
     }
     return undefined;
+  }
+
+  pushEvent(event: UIEvent): void {
+    this.#events.push(event);
+  }
+
+  readWindowState(window: bigint): bigint[] {
+    return this.readAtomProperty(window, this.netWmState);
+  }
+
+  private readAtomProperty(window: bigint, property: bigint): bigint[] {
+    const actualType = new BigUint64Array(1);
+    const actualFormat = new Int32Array(1);
+    const itemCount = new BigUint64Array(1);
+    const bytesAfter = new BigUint64Array(1);
+    const propertyPointer = new BigUint64Array(1);
+    const status = this.X11.symbols.XGetWindowProperty(
+      this.display,
+      window,
+      property,
+      0n,
+      4096n,
+      0,
+      4n, // XA_ATOM
+      Deno.UnsafePointer.of(actualType.buffer),
+      Deno.UnsafePointer.of(actualFormat.buffer),
+      Deno.UnsafePointer.of(itemCount.buffer),
+      Deno.UnsafePointer.of(bytesAfter.buffer),
+      Deno.UnsafePointer.of(propertyPointer.buffer),
+    );
+    if (status !== 0 || actualType[0] !== 4n || actualFormat[0] !== 32 || propertyPointer[0] === 0n) return [];
+    const pointer = Deno.UnsafePointer.create(propertyPointer[0]);
+    if (pointer === null) return [];
+    try {
+      const count = Number(itemCount[0]);
+      const copy = new Deno.UnsafePointerView(pointer).getArrayBuffer(count * 8);
+      return parseAtomProperty(copy, count);
+    } finally {
+      this.X11.symbols.XFree(pointer);
+    }
   }
   [Symbol.dispose](): void {
     this.close();

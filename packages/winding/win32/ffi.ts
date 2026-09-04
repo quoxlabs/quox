@@ -32,6 +32,12 @@ export const user32functions = {
   // isize (see DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 in mod.ts).
   SetProcessDpiAwarenessContext: { parameters: ["isize"], result: "bool" },
   GetClientRect: { parameters: ["pointer", "buffer"], result: "bool" },
+  GetWindowLongPtrW: { parameters: ["pointer", "i32"], result: "isize" },
+  SetWindowLongPtrW: { parameters: ["pointer", "i32", "isize"], result: "isize" },
+  GetWindowPlacement: { parameters: ["pointer", "buffer"], result: "bool" },
+  SetWindowPlacement: { parameters: ["pointer", "buffer"], result: "bool" },
+  MonitorFromWindow: { parameters: ["pointer", "u32"], result: "pointer" },
+  GetMonitorInfoW: { parameters: ["pointer", "buffer"], result: "bool" },
   SetWindowPos: {
     parameters: ["pointer", "pointer", "i32", "i32", "i32", "i32", "u32"],
     result: "bool",
@@ -139,6 +145,11 @@ export const SIZE_MINIMIZED = 1;
 
 /** Top-level window styles: WS_VISIBLE | WS_OVERLAPPEDWINDOW. */
 export const WINDOW_STYLE = 0x10CF0000;
+export const WS_OVERLAPPEDWINDOW = 0x00CF0000;
+export const GWL_STYLE = -16;
+export const MONITOR_DEFAULTTONEAREST = 2;
+export const WINDOWPLACEMENT_SIZE = 44;
+export const MONITORINFO_SIZE = 40;
 
 /** Window class styles: CS_VREDRAW | CS_HREDRAW | CS_OWNDC. */
 export const CLASS_STYLE = 0x1 | 0x2 | 0x20;
@@ -148,8 +159,11 @@ export const CW_USEDEFAULT = 0x80000000;
 
 /** SetWindowPos flags: keep the position and z-order chosen at creation. */
 export const SWP_NOMOVE = 0x2;
+export const SWP_NOSIZE = 0x1;
 export const SWP_NOZORDER = 0x4;
 export const SWP_NOACTIVATE = 0x10;
+export const SWP_FRAMECHANGED = 0x20;
+export const SWP_NOOWNERZORDER = 0x200;
 
 /**
  * DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 == (HANDLE)-4. Declaring the

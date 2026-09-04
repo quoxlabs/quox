@@ -262,6 +262,8 @@ Deno.test("mount maps every supported JSX event prop to its browser-style proper
     onFocus: () => "focus",
     onBlur: () => "blur",
     onScroll: () => "scroll",
+    onFullscreenChange: () => "fullscreenchange",
+    onFullscreenError: () => "fullscreenerror",
   };
 
   const [node] = await mount(root, createVNode("div", handlers));
@@ -274,6 +276,8 @@ Deno.test("mount maps every supported JSX event prop to its browser-style proper
   assertStrictEquals(element.onfocus, handlers.onFocus);
   assertStrictEquals(element.onblur, handlers.onBlur);
   assertStrictEquals(element.onscroll, handlers.onScroll);
+  assertStrictEquals(element.onfullscreenchange, handlers.onFullscreenChange);
+  assertStrictEquals(element.onfullscreenerror, handlers.onFullscreenError);
 });
 
 Deno.test("mount rejects unsupported function-valued DOM props", async () => {

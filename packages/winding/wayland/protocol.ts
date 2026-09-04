@@ -102,3 +102,4 @@ export interface NativeCallbackHost {
 }
 
 export const SUSPENDED_TOPLEVEL_STATE = XdgToplevelState.SUSPENDED;
+export const FULLSCREEN_TOPLEVEL_STATE = XdgToplevelState.FULLSCREEN;

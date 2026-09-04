@@ -11,6 +11,8 @@ function testWindow(): Window {
     [Symbol.dispose]() {},
     close() {},
     setTitle() {},
+    fullscreenEnabled: true,
+    setFullscreen() {},
     blit() {},
   };
 }

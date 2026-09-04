@@ -3,7 +3,14 @@ import { QuoxRenderer as WasmRenderer } from "../lib/quox.js";
 import { load as windingLoad } from "@quoxlabs/winding";
 import type { Library as WindingLibrary, UIEvent as WindingUIEvent, Window as WindingWindow } from "@quoxlabs/winding";
 import { QuoxDocument } from "./document.ts";
-import { mapWindingEvent, notifyInputListeners, type QuoxInputEvent, QuoxInputRouter } from "./input.ts";
+import { disposeDocumentFullscreen, documentInternals } from "./internals.ts";
+import {
+  isFullscreenExitKey,
+  mapWindingEvent,
+  notifyInputListeners,
+  type QuoxInputEvent,
+  QuoxInputRouter,
+} from "./input.ts";
 import { isVNode, mount, type QuoxRenderable } from "./mount.ts";
 import { QuoxElement } from "./node.ts";
 import type { QuoxInnerHTML } from "./node.ts";
@@ -12,6 +19,8 @@ export type {
   QuoxAppleStandardKeybindingEvent,
   QuoxCloseEvent,
   QuoxFocusChangeEvent,
+  QuoxFullscreenChangeEvent,
+  QuoxFullscreenErrorEvent,
   QuoxInputEvent,
   QuoxKeyboardEvent,
   QuoxMouseButtonEvent,
@@ -106,6 +115,8 @@ export class QuoxWindow implements Disposable {
       () => this.#requestRender(),
       () => this.#assertActiveDocument(),
       (title) => this.#win.setTitle(title),
+      (fullscreen) => this.#win.setFullscreen(fullscreen),
+      () => this.#win.fullscreenEnabled,
     );
 
     // Bind an <img> constructor to this window's document. Capturing `document`
@@ -123,7 +134,12 @@ export class QuoxWindow implements Disposable {
       pointerDown: (x, y, button, buttons) => this.document.dispatchPointerDown(x, y, button, buttons),
       pointerUp: (x, y, button, buttons) => this.document.dispatchPointerUp(x, y, button, buttons),
       wheel: (x, y, deltaX, deltaY, buttons) => this.document.dispatchWheel(x, y, deltaX, deltaY, buttons),
-      key: (event) => this.document.dispatchKey(event),
+      key: (event) => {
+        this.document.dispatchKey(event);
+        if (isFullscreenExitKey(event) && this.document.fullscreenElement !== null) {
+          void this.document.exitFullscreen().catch(() => undefined);
+        }
+      },
       textInput: (event) => this.document.dispatchTextInput(event),
       appleCommand: (event) => this.document.dispatchAppleStandardKeybinding(event),
       clearHover: () => this.document.clearHover(),
@@ -137,6 +153,9 @@ export class QuoxWindow implements Disposable {
         this.#visible = event.visible;
         if (event.visible) this.#requestRender();
       },
+      fullscreenChange: (event) => documentInternals(this.document).handleNativeFullscreenChange(event.fullscreen),
+      fullscreenError: (event) =>
+        documentInternals(this.document).handleNativeFullscreenError(event.requestedFullscreen, event.message),
     });
   }
 
@@ -281,6 +300,7 @@ export class QuoxWindow implements Disposable {
   /** Stop processing events and rendering, making the document inactive. */
   stop(): void {
     if (this.#stopped) return;
+    disposeDocumentFullscreen(this.document);
     this.#stopped = true;
 
     if (this.#intervalId !== null) {

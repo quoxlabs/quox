@@ -1,5 +1,5 @@
 import type { QuoxDocument } from "./document.ts";
-import type { QuoxElement, QuoxEventHandler, QuoxNode } from "./node.ts";
+import type { QuoxElement, QuoxEventHandler, QuoxFullscreenEventHandler, QuoxNode } from "./node.ts";
 
 const QUOX_VNODE = Symbol.for("quox.vnode");
 
@@ -122,7 +122,11 @@ function applyProps(element: QuoxElement, props: QuoxProps): void {
             '(such as "onClick" or "onInput"). Use a supported event prop, or call the function and pass its return value instead.',
         );
       }
-      element[property] = value as QuoxEventHandler;
+      if (property === "onfullscreenchange" || property === "onfullscreenerror") {
+        element[property] = value as QuoxFullscreenEventHandler;
+      } else {
+        element[property] = value as QuoxEventHandler;
+      }
       continue;
     }
 
@@ -152,7 +156,15 @@ function applyProps(element: QuoxElement, props: QuoxProps): void {
 function eventPropertyName(name: string):
   | keyof Pick<
     QuoxElement,
-    "onclick" | "ondblclick" | "oncontextmenu" | "oninput" | "onfocus" | "onblur" | "onscroll"
+    | "onclick"
+    | "ondblclick"
+    | "oncontextmenu"
+    | "oninput"
+    | "onfocus"
+    | "onblur"
+    | "onscroll"
+    | "onfullscreenchange"
+    | "onfullscreenerror"
   >
   | undefined {
   switch (name) {
@@ -177,6 +189,12 @@ function eventPropertyName(name: string):
     case "onScroll":
     case "onscroll":
       return "onscroll";
+    case "onFullscreenChange":
+    case "onfullscreenchange":
+      return "onfullscreenchange";
+    case "onFullscreenError":
+    case "onfullscreenerror":
+      return "onfullscreenerror";
     default:
       return undefined;
   }

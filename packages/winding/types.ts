@@ -10,7 +10,9 @@ export type UIEvent =
   | CloseEvent
   | EnterLeaveEvent
   | FocusChangeEvent
-  | VisibilityEvent;
+  | VisibilityEvent
+  | FullscreenChangeEvent
+  | FullscreenErrorEvent;
 export type UIEventType = UIEvent["type"];
 
 export interface WindowEvent<T extends string = string> {
@@ -113,11 +115,26 @@ export interface VisibilityEvent extends WindowEvent<"visibilitychange"> {
   visible: boolean;
 }
 
+/** Fired after the operating system confirms a fullscreen transition. */
+export interface FullscreenChangeEvent extends WindowEvent<"fullscreenchange"> {
+  fullscreen: boolean;
+}
+
+/** Fired when the operating system rejects a fullscreen transition. */
+export interface FullscreenErrorEvent extends WindowEvent<"fullscreenerror"> {
+  requestedFullscreen: boolean;
+  message: string;
+}
+
 export interface Window {
   [Symbol.dispose](): void;
   close(): void;
   /** Set the native window title. */
   setTitle(title: string): void;
+  /** Whether this backend can request native fullscreen presentation. */
+  readonly fullscreenEnabled: boolean;
+  /** Request entry to or exit from native fullscreen presentation. */
+  setFullscreen(fullscreen: boolean): void;
   /** Blit (bit-block transfer) an RGBA pixel buffer to the window. Width and height must match the window dimensions. */
   blit(rgba: Uint8Array, width: number, height: number): void;
 }
