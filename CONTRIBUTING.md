@@ -37,11 +37,6 @@ rustup default stable-x86_64-pc-windows-gnu
 rustup set default-host x86_64-pc-windows-gnu
 ```
 
-The last line is required, not optional. `packages/quox/rust-toolchain.toml` pins a bare `channel = "stable"`, and
-rustup resolves that against the _default host_ rather than the default toolchain. Without it, `cargo` still selects
-MSVC inside `packages/quox` and fails with ``linker `link.exe` not found`` even though `rustup default` reports GNU.
-Verify with `rustup show`: the `Default host:` line must read `x86_64-pc-windows-gnu`.
-
 `stylo`'s build script also needs a real Python 3 interpreter (the `python`/`python3` stubs under `WindowsApps` just
 open the Microsoft Store):
 
@@ -53,6 +48,8 @@ Open a new terminal afterwards so the updated `PATH` takes effect. If `python` o
 _Settings > Apps > Advanced app settings > App execution aliases_ and disable the Python stub aliases.
 
 #### Corporate-managed machines
+
+> This section is only relevant if you are in a tightly controlled networking environment, such as a corporate one.
 
 Endpoint protection may block cargo from executing the helper binaries it compiles for `build.rs` scripts and procedural
 macros. Under Microsoft Defender this surfaces as a build failure like:
