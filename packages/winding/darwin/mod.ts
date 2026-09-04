@@ -22,9 +22,7 @@ import {
   allocateClassPair as runtimeAllocateClassPair,
   APPKIT,
   cfSymbols,
-  cgSymbols,
   CORE_FOUNDATION,
-  CORE_GRAPHICS,
   cStr,
   getClass as runtimeGetClass,
   LIBOBJC,
@@ -34,7 +32,6 @@ import {
   openNSRectMsgSend,
   readCFString,
   readStructF64,
-  RGBA_BITMAP_INFO,
   runtimeSymbols,
   sel as runtimeSel,
   selectorName as runtimeSelectorName,
@@ -145,9 +142,6 @@ function openDarwinFfi() {
     const send = openMsgSendSymbols(opened);
     const nsrect = openNSRectMsgSend(opened);
 
-    const cg = Deno.dlopen(CORE_GRAPHICS, cgSymbols);
-    opened.push(cg);
-
     const cf = Deno.dlopen(CORE_FOUNDATION, cfSymbols);
     opened.push(cf);
 
@@ -156,7 +150,6 @@ function openDarwinFfi() {
       runtime,
       send,
       nsrect,
-      cg,
       cf,
       getClass: (name: string) => runtimeGetClass(runtime, name),
       sel: (name: string) => runtimeSel(runtime, name),
@@ -234,7 +227,6 @@ class DarwinWindow implements Window, DarwinNativeResponder {
   readonly id: bigint;
   readonly nsWindow: Deno.PointerValue;
   readonly contentView: Deno.PointerValue;
-  readonly #layer: Deno.PointerValue;
   readonly #delegate: Deno.PointerValue;
   readonly inputState: DarwinInputState;
   #width: number;
@@ -243,12 +235,6 @@ class DarwinWindow implements Window, DarwinNativeResponder {
   #producedText: string | undefined;
   readonly #pressedKeys = new PressedLogicalKeyCache<number>();
   #closed = false;
-  // Kept alive for one extra frame: CGImage/CGDataProvider wrap this memory
-  // without copying it, and CALayer's `contents` assignment is composited
-  // asynchronously, so the previous frame's buffer must outlive the call that
-  // replaces it.
-  #imageBuf: Uint8Array | undefined;
-  #prevImageBuf: Uint8Array | undefined;
 
   constructor(readonly lib: DarwinLibrary, x = 0, y = 0, w = 800, h = 600) {
     const { getClass, sel, send } = lib.ffi;
@@ -293,9 +279,6 @@ class DarwinWindow implements Window, DarwinNativeResponder {
       viewRegistered = true;
       send.void_id(win, sel("setContentView:"), contentView);
       send.void_bool(contentView, sel("setWantsLayer:"), true);
-      const layer = send.id(contentView, sel("layer"));
-      if (layer === null) throw new Error("winding(darwin): failed to create content layer");
-      this.#layer = layer;
 
       // Tracking area to receive mouseEntered:/mouseExited: on our delegate (registered as its
       // owner below), which AppKit invokes directly rather than delivering as queued NSEvents.
@@ -589,35 +572,14 @@ class DarwinWindow implements Window, DarwinNativeResponder {
     send.void(titleString, sel("release"));
   }
 
-  blit(rgba: Uint8Array, width: number, height: number): void {
-    const { cf, cg, sel, send } = this.lib.ffi;
-    this.#prevImageBuf = this.#imageBuf;
-    // Own a stable copy: the caller's buffer isn't guaranteed to outlive this call.
-    const buf = new Uint8Array(rgba);
-    this.#imageBuf = buf;
-
-    const provider = cg.symbols.CGDataProviderCreateWithData(null, buf, BigInt(buf.byteLength), null);
-    if (provider === null) throw new Error("winding(darwin): CGDataProviderCreateWithData failed");
-    const image = cg.symbols.CGImageCreate(
-      BigInt(width),
-      BigInt(height),
-      8n,
-      32n,
-      BigInt(width * 4),
-      this.lib.colorSpace,
-      RGBA_BITMAP_INFO,
-      provider,
-      null,
-      false,
-      0,
-    );
-    cf.symbols.CFRelease(provider);
-    if (image === null) throw new Error("winding(darwin): CGImageCreate failed");
-    send.void_id(this.#layer, sel("setContents:"), image);
-    cf.symbols.CFRelease(image);
-
-    this.#width = width;
-    this.#height = height;
+  windowSurface(): Deno.UnsafeWindowSurface {
+    return new Deno.UnsafeWindowSurface({
+      system: "cocoa",
+      windowHandle: null,
+      displayHandle: this.contentView,
+      width: this.#width,
+      height: this.#height,
+    });
   }
 
   [Symbol.dispose](): void {
@@ -658,7 +620,6 @@ const BUTTONS = [, "left", "middle", "right"] as const;
 class DarwinLibrary implements Library {
   readonly ffi: DarwinFfi;
   readonly nsApp: Deno.PointerValue;
-  readonly colorSpace: Deno.PointerObject;
   readonly nativeClasses: DarwinNativeClasses;
   readonly windows = new Map<bigint, DarwinWindow>();
   readonly #distantPast: Deno.PointerValue;
@@ -669,16 +630,13 @@ class DarwinLibrary implements Library {
 
   constructor() {
     this.ffi = openDarwinFfi();
-    const { cg, getClass, sel, send } = this.ffi;
+    const { getClass, sel, send } = this.ffi;
     this.nativeClasses = ensureNativeClasses(this.ffi);
     this.nsApp = send.id(getClass("NSApplication"), sel("sharedApplication"));
     send.void_i64(this.nsApp, sel("setActivationPolicy:"), NS_APPLICATION_ACTIVATION_POLICY_REGULAR);
     send.void(this.nsApp, sel("finishLaunching"));
     this.#distantPast = send.id(getClass("NSDate"), sel("distantPast"));
     this.#runLoopMode = makeNSString(this.ffi, "kCFRunLoopDefaultMode");
-    const colorSpace = cg.symbols.CGColorSpaceCreateDeviceRGB();
-    if (colorSpace === null) throw new Error("winding(darwin): CGColorSpaceCreateDeviceRGB failed");
-    this.colorSpace = colorSpace;
   }
 
   registerWindow(window: DarwinWindow): void {
@@ -786,11 +744,6 @@ class DarwinLibrary implements Library {
     }
     try {
       this.ffi.send.void(this.#runLoopMode, this.ffi.sel("release"));
-    } catch (error) {
-      cleanupErrors.push(error);
-    }
-    try {
-      this.ffi.cf.symbols.CFRelease(this.colorSpace);
     } catch (error) {
       cleanupErrors.push(error);
     }

@@ -24,6 +24,7 @@ export type {
 } from "./input.ts";
 
 export type QuoxWindowContent = QuoxInnerHTML | QuoxRenderable;
+type SurfaceRenderTarget = Pick<Deno.UnsafeWindowSurface, "width" | "height" | "getContext">;
 
 export interface WindowOptions {
   /** Width of the window in pixels (default 800). */
@@ -69,6 +70,9 @@ export class QuoxWindow implements Disposable {
   #stopped = false;
   #disposed = false;
   #rendererFreed = false;
+  #surface: Deno.UnsafeWindowSurface | null = null;
+  #surfaceRenderTarget: SurfaceRenderTarget | null = null;
+  #surfaceContext: GPUCanvasContext | null = null;
   #visible = true;
   readonly #listeners: Array<(event: QuoxInputEvent) => void> = [];
   readonly #inputRouter: QuoxInputRouter;
@@ -131,6 +135,7 @@ export class QuoxWindow implements Disposable {
         this.#width = event.width;
         this.#height = event.height;
         this.#renderer.resize(event.width, event.height);
+        this.#resetSurfaceTarget(event.width, event.height);
         this.#requestRender();
       },
       visibility: (event) => {
@@ -247,18 +252,55 @@ export class QuoxWindow implements Disposable {
     try {
       this.document.syncNativeTitle();
 
-      // Render the retained Blitz document via WebGPU in WASM.
-      const rgba = await this.#renderer.render();
-
+      const { surface, target } = this.#surfaceTarget();
+      this.#resizeSurfaceTarget(target, renderWidth, renderHeight);
+      await this.#renderer.render_to_canvas(target);
       if (!this.#stopped && !this.#disposed) {
-        // Blit RGBA buffer to the window (conversion to native pixel format is handled by winding).
-        this.#win.blit(rgba, renderWidth, renderHeight);
+        surface.present();
       }
     } catch (err) {
       console.error("Quox render failed:", err);
     } finally {
       this.#rendering = false;
       if (this.#needsRender) this.#requestRender();
+    }
+  }
+
+  #surfaceTarget(): { surface: Deno.UnsafeWindowSurface; target: SurfaceRenderTarget } {
+    if (this.#surface === null || this.#surfaceRenderTarget === null) {
+      const surface = this.#win.windowSurface();
+      const target: SurfaceRenderTarget = {
+        width: surface.width,
+        height: surface.height,
+        getContext: (contextId, options) => {
+          const context = surface.getContext(contextId, options) as GPUCanvasContext | null;
+          this.#surfaceContext = context;
+          return context;
+        },
+      };
+      this.#surface = surface;
+      this.#surfaceRenderTarget = target;
+      return { surface, target };
+    }
+    return { surface: this.#surface, target: this.#surfaceRenderTarget };
+  }
+
+  #resizeSurfaceTarget(target: SurfaceRenderTarget, width: number, height: number): void {
+    target.width = width;
+    target.height = height;
+  }
+
+  #resetSurfaceTarget(width: number, height: number): void {
+    this.#renderer.reset_surface();
+    this.#surfaceContext?.unconfigure();
+    this.#surfaceContext = null;
+
+    if (this.#surface !== null) {
+      this.#surface.width = width;
+      this.#surface.height = height;
+    }
+    if (this.#surfaceRenderTarget !== null) {
+      this.#resizeSurfaceTarget(this.#surfaceRenderTarget, width, height);
     }
   }
 
@@ -288,6 +330,7 @@ export class QuoxWindow implements Disposable {
       this.#intervalId = null;
     }
 
+    this.#resetSurfaceTarget(this.#width, this.#height);
     this.#releaseRenderer();
   }
 

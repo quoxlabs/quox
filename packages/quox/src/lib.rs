@@ -1,5 +1,6 @@
 mod dom;
 mod interaction;
+#[cfg(target_arch = "wasm32")]
 mod render;
 
 use blitz_dom::{BaseDocument, DEFAULT_CSS, DocumentConfig, FontContext};
@@ -11,9 +12,11 @@ use linebender_resource_handle::Blob;
 use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_arch = "wasm32")]
 use vello::{AaSupport, Renderer, RendererOptions};
 use wasm_bindgen::prelude::*;
-use wgpu_context::WGPUContext;
+#[cfg(target_arch = "wasm32")]
+use wgpu_context::{SurfaceRenderer, WGPUContext};
 
 const LIBERATION_SANS: &[u8] = include_bytes!("../assets/LiberationSans-Regular.ttf");
 const FONT_CSS: &str = "html,body,*{font-family:'Liberation Sans',sans-serif;}";
@@ -27,11 +30,7 @@ pub fn start() {
     console_error_panic_hook::set_once();
 }
 
-/// Renders HTML documents to RGBA pixel buffers using WebGPU (Blitz + Vello).
-///
-/// Designed to run inside the Deno runtime, which provides native WebGPU
-/// support. The caller is responsible for displaying the returned pixel data,
-/// e.g. via X11 FFI using `XPutImage`.
+/// Renders HTML documents directly to native WebGPU surfaces using Blitz + Vello.
 #[wasm_bindgen]
 pub struct QuoxRenderer {
     state: RefCell<QuoxRendererState>,
@@ -41,9 +40,12 @@ struct QuoxRendererState {
     document: BaseDocument,
     width: u32,
     height: u32,
+    #[cfg(target_arch = "wasm32")]
     context: WGPUContext,
-    dev_id: usize,
+    #[cfg(target_arch = "wasm32")]
     renderer: Renderer,
+    #[cfg(target_arch = "wasm32")]
+    canvas_surface: Option<SurfaceRenderer<'static>>,
     redraw_requested: Arc<AtomicBool>,
     recorded_events: RecordedEvents,
 }
@@ -62,7 +64,7 @@ impl ShellProvider for QuoxShellProvider {
 }
 
 impl QuoxRendererState {
-    /// Resolve layout for the current viewport state. Shared by `render()` and
+    /// Resolve layout for the current viewport state. Shared by rendering and
     /// `node_from_point()` so hit-testing never sees stale geometry — mirrors how browsers
     /// force a layout flush before geometry queries like `elementFromPoint`. Blitz's own
     /// `set_viewport` already re-clamps scroll on every call, so scroll position is owned
@@ -84,18 +86,28 @@ impl QuoxRenderer {
     /// Initialise a renderer with a live document and viewport dimensions.
     ///
     /// Acquires a WebGPU device; must be `await`ed.
+    #[cfg_attr(
+        not(target_arch = "wasm32"),
+        allow(
+            clippy::unused_async,
+            reason = "the public constructor is asynchronous for Wasm GPU initialization; native builds only exercise shared tests"
+        )
+    )]
     pub async fn create(
         width: u32,
         height: u32,
         head: &str,
         body: &str,
     ) -> Result<QuoxRenderer, JsValue> {
+        #[cfg(target_arch = "wasm32")]
         let mut context = WGPUContext::new();
+        #[cfg(target_arch = "wasm32")]
         let dev_id = context
             .find_or_create_device(None)
             .await
             .map_err(|e| JsValue::from_str(&format!("WebGPU device: {e:?}")))?;
 
+        #[cfg(target_arch = "wasm32")]
         let renderer = Renderer::new(
             &context.device_pool[dev_id].device,
             RendererOptions {
@@ -135,9 +147,12 @@ impl QuoxRenderer {
                 document,
                 width: width.max(1),
                 height: height.max(1),
+                #[cfg(target_arch = "wasm32")]
                 context,
-                dev_id,
+                #[cfg(target_arch = "wasm32")]
                 renderer,
+                #[cfg(target_arch = "wasm32")]
+                canvas_surface: None,
                 redraw_requested,
                 recorded_events: RecordedEvents::default(),
             }),

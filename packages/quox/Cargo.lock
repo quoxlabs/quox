@@ -1787,7 +1787,6 @@ dependencies = [
  "blitz-paint",
  "blitz-traits",
  "console_error_panic_hook",
- "futures-intrusive",
  "image",
  "keyboard-types",
  "linebender_resource_handle",
@@ -1795,6 +1794,7 @@ dependencies = [
  "vello",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "web-sys",
  "wgpu_context",
 ]
 

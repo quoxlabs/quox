@@ -12,7 +12,6 @@ import { domCodeFromX11, logicalKeyFromKeysym } from "../linux/mod.ts";
 import { utf8Bytes, utf8CString as cString } from "../text_encoding.ts";
 import { libcFunctions, NotifyNormal, x11functions, XEventMask, XEventType } from "./ffi.ts";
 import { isAutoRepeatPair, x11KeyEditDisposition } from "./input.ts";
-import { NativeXImage } from "./native_image.ts";
 import { XimContext, XimManager } from "./xim.ts";
 
 // XStoreName sets the legacy WM_NAME property, which is read as Latin-1 by clients that don't
@@ -63,8 +62,6 @@ class X11Window implements Window {
   readonly id: bigint;
   readonly input: XimContext;
   readonly pressedKeys = new PressedLogicalKeyCache<number>();
-  readonly #gc: bigint;
-  #image: NativeXImage;
   #width: number;
   #height: number;
   #closed = false;
@@ -109,34 +106,11 @@ class X11Window implements Window {
     this.#width = w;
     this.#height = h;
 
-    const gc = BigInt(lib.X11.symbols.XCreateGC(lib.display, window, 0n, null));
-    if (gc === 0n) {
-      lib.X11.symbols.XDestroyWindow(lib.display, window);
-      throw new Error("winding(x11): failed to create graphics context");
-    }
-    this.#gc = gc;
+    lib.windows.set(this.id, this);
     try {
-      const visual = lib.X11.symbols.XDefaultVisual(lib.display, 0);
-      if (visual === null) throw new Error("winding(x11): failed to get default visual");
-      this.#image = new NativeXImage(
-        lib.X11.symbols,
-        lib.libc.symbols,
-        lib.display,
-        visual,
-        w,
-        h,
-      );
-
-      lib.windows.set(this.id, this);
-      try {
-        this.input = lib.input.createContext(this.id);
-      } catch (error) {
-        lib.windows.delete(this.id);
-        this.#image.close();
-        throw error;
-      }
+      this.input = lib.input.createContext(this.id);
     } catch (error) {
-      lib.X11.symbols.XFreeGC(lib.display, gc);
+      lib.windows.delete(this.id);
       lib.X11.symbols.XDestroyWindow(lib.display, window);
       throw error;
     }
@@ -159,64 +133,19 @@ class X11Window implements Window {
     this.lib.X11.symbols.XFlush(this.lib.display);
   }
 
-  /**
-   * Copy an RGBA pixel buffer to the X11 window. The buffer must be
-   * `width * height * 4` bytes. Internally converts to X11 TrueColor BGRX
-   * (little-endian) before blitting.
-   *
-   * If the dimensions differ from the last blit, the XImage is recreated to
-   * match the new size.
-   */
-  blit(rgba: Uint8Array, width: number, height: number): void {
-    if (rgba.byteLength !== width * height * 4) {
-      throw new RangeError("winding(x11): RGBA buffer size does not match its dimensions");
-    }
-    if (width !== this.#width || height !== this.#height) {
-      const visual = this.lib.X11.symbols.XDefaultVisual(this.lib.display, 0);
-      if (visual === null) throw new Error("winding(x11): failed to get default visual");
-      const image = new NativeXImage(
-        this.lib.X11.symbols,
-        this.lib.libc.symbols,
-        this.lib.display,
-        visual,
-        width,
-        height,
-      );
-      this.#image.close();
-      this.#image = image;
-      this.#width = width;
-      this.#height = height;
-    }
-    const buf = this.#image.pixels;
-    for (let i = 0; i < rgba.length; i += 4) {
-      buf[i] = rgba[i + 2]; // B ← R
-      buf[i + 1] = rgba[i + 1]; // G
-      buf[i + 2] = rgba[i]; // R ← B
-      buf[i + 3] = 0; // padding
-    }
-    this.reblit();
+  setSize(width: number, height: number): void {
+    this.#width = width;
+    this.#height = height;
   }
 
-  /**
-   * Re-issue the last blitted frame to the drawable without touching `#imageBuf`. Used to
-   * respond to an `Expose` event (the window manager/compositor asking us to repaint a
-   * region, e.g. after being uncovered) — the pixels haven't changed, only the drawable
-   * needs the same bytes reapplied.
-   */
-  reblit(): void {
-    this.lib.X11.symbols.XPutImage(
-      this.lib.display,
-      this.id,
-      this.#gc,
-      this.#image.pointer,
-      0,
-      0,
-      0,
-      0,
-      this.#width,
-      this.#height,
-    );
-    this.lib.X11.symbols.XFlush(this.lib.display);
+  windowSurface(): Deno.UnsafeWindowSurface {
+    return new Deno.UnsafeWindowSurface({
+      system: "x11",
+      windowHandle: Deno.UnsafePointer.create(this.id),
+      displayHandle: this.lib.display,
+      width: this.#width,
+      height: this.#height,
+    });
   }
 
   [Symbol.dispose](): void {
@@ -236,10 +165,6 @@ class X11Window implements Window {
     };
     cleanup(() => this.input.close());
     this.pressedKeys.clear();
-    cleanup(() => this.#image.close());
-    cleanup(() => {
-      this.lib.X11.symbols.XFreeGC(this.lib.display, this.#gc);
-    });
     cleanup(() => {
       this.lib.X11.symbols.XDestroyWindow(this.lib.display, this.id);
     });
@@ -424,11 +349,8 @@ class X11Library implements Library {
         return { type: "blur", window };
       }
 
-      // Expose is a pure repaint request (e.g. the window was uncovered) — the pixels
-      // haven't changed, so self-heal by re-blitting the last frame directly rather than
-      // surfacing a UIEvent for it.
+      // WebGPU owns presentation; an expose does not require a CPU-side re-blit.
       if (type === XEventType.Expose) {
-        window?.reblit();
         continue;
       }
 
@@ -519,6 +441,7 @@ function importEvent(
       // XConfigureEvent: width at offset 56, height at offset 60.
       const width = view.getInt32(56, true);
       const height = view.getInt32(60, true);
+      window.setSize(width, height);
       return { type: "resize", width, height, window };
     }
     case XEventType.ClientMessage: {

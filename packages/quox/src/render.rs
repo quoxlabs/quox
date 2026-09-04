@@ -1,121 +1,116 @@
 use super::QuoxRenderer;
 use anyrender_vello::VelloScenePainter;
 use blitz_paint::paint_scene;
-use vello::wgpu::{
-    self, BufferDescriptor, BufferUsages, Extent3d, TexelCopyBufferInfo, TexelCopyBufferLayout,
-    TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureViewDescriptor,
-};
-use vello::{AaConfig, RenderParams, Scene};
-use wasm_bindgen::prelude::*;
+use vello::wgpu::{CompositeAlphaMode, PresentMode, SurfaceTarget, TextureFormat, TextureUsages};
+use vello::{AaConfig, AaSupport, RenderParams, Renderer, RendererOptions, Scene};
+use wasm_bindgen::{JsCast, prelude::*};
+use wgpu_context::{SurfaceRendererConfiguration, TextureConfiguration};
 
 #[wasm_bindgen]
 impl QuoxRenderer {
-    /// Render the current HTML and return a flat `width × height × 4`
-    /// RGBA byte buffer (`TextureFormat::Rgba8Unorm`).
-    pub async fn render(&self) -> Result<Vec<u8>, JsValue> {
-        let (_texture, gpu_buffer, row_bytes, padded_row_bytes, w, h) = {
+    /// Drop the cached WebGPU surface so the next render creates a fresh one.
+    pub fn reset_surface(&self) {
+        self.state.borrow_mut().canvas_surface = None;
+    }
+
+    /// Render the current document directly into a canvas-like WebGPU surface.
+    pub async fn render_to_canvas(&self, surface_target: JsValue) -> Result<(), JsValue> {
+        let needs_surface = self.state.borrow().canvas_surface.is_none();
+        if needs_surface {
+            // Deno.UnsafeWindowSurface is not an actual OffscreenCanvas, but
+            // wgpu's web backend only needs the structural `getContext`,
+            // `width`, and `height` members that both objects provide.
+            let surface_target = surface_target.unchecked_into::<web_sys::OffscreenCanvas>();
+            let (width, height, mut context) = {
+                let mut state = self.state.borrow_mut();
+                (
+                    state.width,
+                    state.height,
+                    std::mem::take(&mut state.context),
+                )
+            };
+
+            let surface_result = context
+                .create_surface_renderer(
+                    SurfaceTarget::OffscreenCanvas(surface_target),
+                    SurfaceRendererConfiguration {
+                        usage: TextureUsages::RENDER_ATTACHMENT,
+                        formats: vec![TextureFormat::Rgba8Unorm, TextureFormat::Bgra8Unorm],
+                        width,
+                        height,
+                        present_mode: PresentMode::AutoVsync,
+                        desired_maximum_frame_latency: 2,
+                        alpha_mode: CompositeAlphaMode::Auto,
+                        view_formats: vec![],
+                    },
+                    Some(TextureConfiguration {
+                        usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
+                    }),
+                )
+                .await;
+
             let mut state = self.state.borrow_mut();
-            state.sync_layout();
-            let w = state.width;
-            let h = state.height;
+            state.context = context;
+            let surface = surface_result
+                .map_err(|e| JsValue::from_str(&format!("WebGPU canvas surface: {e:?}")))?;
+            state.renderer = Renderer::new(
+                surface.device(),
+                RendererOptions {
+                    use_cpu: false,
+                    num_init_threads: None,
+                    antialiasing_support: AaSupport::area_only(),
+                    pipeline_cache: None,
+                },
+            )
+            .map_err(|e| JsValue::from_str(&format!("Vello renderer: {e:?}")))?;
+            state.canvas_surface = Some(surface);
+        }
 
-            let device_handle = state.context.device_pool[state.dev_id].clone();
+        let mut state = self.state.borrow_mut();
+        state.sync_layout();
+        let w = state.width;
+        let h = state.height;
+        let mut scene = Scene::new();
+        let mut painter = VelloScenePainter::new(&mut scene);
+        paint_scene(&mut painter, &mut state.document, 1.0, w, h, 0, 0);
 
-            let texture = device_handle.device.create_texture(&TextureDescriptor {
-                label: Some("quox-target"),
-                size: Extent3d {
+        let state = &mut *state;
+        let surface = state
+            .canvas_surface
+            .as_mut()
+            .ok_or_else(|| JsValue::from_str("WebGPU canvas surface was not initialized"))?;
+        if surface.config.width != w || surface.config.height != h {
+            surface.resize(w, h);
+        }
+
+        surface
+            .ensure_current_surface_texture()
+            .map_err(|e| JsValue::from_str(&format!("WebGPU surface texture: {e:?}")))?;
+        let texture_view = surface
+            .target_texture_view()
+            .map_err(|e| JsValue::from_str(&format!("WebGPU surface texture view: {e:?}")))?;
+
+        state
+            .renderer
+            .render_to_texture(
+                surface.device(),
+                surface.queue(),
+                &scene,
+                &texture_view,
+                &RenderParams {
+                    base_color: vello::peniko::Color::WHITE,
                     width: w,
                     height: h,
-                    depth_or_array_layers: 1,
+                    antialiasing_method: AaConfig::Area,
                 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: TextureDimension::D2,
-                format: TextureFormat::Rgba8Unorm,
-                usage: TextureUsages::RENDER_ATTACHMENT
-                    | TextureUsages::COPY_SRC
-                    | TextureUsages::STORAGE_BINDING,
-                view_formats: &[],
-            });
-            let texture_view = texture.create_view(&TextureViewDescriptor::default());
+            )
+            .map_err(|e| JsValue::from_str(&format!("Vello render: {e:?}")))?;
 
-            let mut scene = Scene::new();
-            let mut painter = VelloScenePainter::new(&mut scene);
-            paint_scene(&mut painter, &mut state.document, 1.0, w, h, 0, 0);
+        drop(texture_view);
+        surface
+            .maybe_blit_and_present()
+            .map_err(|e| JsValue::from_str(&format!("WebGPU present: {e:?}")))?;
 
-            state
-                .renderer
-                .render_to_texture(
-                    &device_handle.device,
-                    &device_handle.queue,
-                    &scene,
-                    &texture_view,
-                    &RenderParams {
-                        base_color: vello::peniko::Color::WHITE,
-                        width: w,
-                        height: h,
-                        antialiasing_method: AaConfig::Area,
-                    },
-                )
-                .map_err(|e| JsValue::from_str(&format!("Vello render: {e:?}")))?;
-
-            let row_bytes = w * 4;
-            let padded_row_bytes = row_bytes.next_multiple_of(256);
-            let out_size = u64::from(padded_row_bytes) * u64::from(h);
-            let gpu_buffer = device_handle.device.create_buffer(&BufferDescriptor {
-                label: Some("quox-readback"),
-                size: out_size,
-                usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-
-            let mut encoder =
-                device_handle
-                    .device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("quox-copy"),
-                    });
-            encoder.copy_texture_to_buffer(
-                texture.as_image_copy(),
-                TexelCopyBufferInfo {
-                    buffer: &gpu_buffer,
-                    layout: TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(padded_row_bytes),
-                        rows_per_image: None,
-                    },
-                },
-                texture.size(),
-            );
-            device_handle.queue.submit([encoder.finish()]);
-
-            (texture, gpu_buffer, row_bytes, padded_row_bytes, w, h)
-        };
-
-        let mut rgba = vec![0u8; (w as usize) * (h as usize) * 4];
-        let buf_slice = gpu_buffer.slice(..);
-        let (tx, rx) = futures_intrusive::channel::shared::oneshot_channel();
-        buf_slice.map_async(wgpu::MapMode::Read, move |res| {
-            let _ = tx.send(res);
-        });
-        let map_res = rx
-            .receive()
-            .await
-            .ok_or_else(|| JsValue::from_str("map_async channel closed"))?;
-        map_res.map_err(|e| JsValue::from_str(&format!("map_async: {e:?}")))?;
-
-        {
-            let mapped = buf_slice.get_mapped_range();
-            let row_bytes_us = row_bytes as usize;
-            let padded_us = padded_row_bytes as usize;
-            for row in 0..(h as usize) {
-                let src = row * padded_us;
-                let dst = row * row_bytes_us;
-                rgba[dst..dst + row_bytes_us].copy_from_slice(&mapped[src..src + row_bytes_us]);
-            }
-        }
-        gpu_buffer.unmap();
-
-        Ok(rgba)
+        Ok(())
     }
 }

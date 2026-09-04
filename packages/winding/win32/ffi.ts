@@ -7,26 +7,6 @@ export const kernel32functions = {
   },
 } as const satisfies Deno.ForeignLibraryInterface;
 
-export const gdi32functions = {
-  SetDIBitsToDevice: {
-    parameters: [
-      "pointer",
-      "i32",
-      "i32",
-      "u32",
-      "u32",
-      "i32",
-      "i32",
-      "u32",
-      "u32",
-      "buffer",
-      "buffer",
-      "u32",
-    ],
-    result: "i32",
-  },
-} as const satisfies Deno.ForeignLibraryInterface;
-
 export const user32functions = {
   // DPI_AWARENESS_CONTEXT is a pointer-sized pseudo-handle, passed here as an
   // isize (see DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 in mod.ts).
@@ -153,9 +133,9 @@ export const SWP_NOACTIVATE = 0x10;
 
 /**
  * DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 == (HANDLE)-4. Declaring the
- * process per-monitor DPI aware makes window sizes and the blitted bitmap map
- * to physical device pixels 1:1 with the render buffer, instead of being
- * virtualized at 96 DPI and stretched by DWM on scaled displays.
+ * process per-monitor DPI aware makes window and WebGPU surface dimensions map
+ * to physical device pixels instead of being virtualized at 96 DPI and
+ * stretched by DWM on scaled displays.
  */
 export const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4n;
 
@@ -164,13 +144,6 @@ export const IDC_ARROW = 32512n;
 
 /** FORMAT_MESSAGE_FROM_SYSTEM flag for FormatMessageW. */
 export const FORMAT_MESSAGE_FROM_SYSTEM = 0x1000;
-
-// GDI bitmap constants for SetDIBitsToDevice. BITMAPINFOHEADER is 40 bytes; for
-// 32bpp BI_RGB no color table follows, so a 40-byte buffer alone is a valid
-// BITMAPINFO.
-export const BITMAPINFOHEADER_SIZE = 40;
-export const BI_RGB = 0;
-export const DIB_RGB_COLORS = 0;
 
 // TRACKMOUSEEVENT: cbSize(4) + dwFlags(4) + hwndTrack(8, 8-byte aligned) +
 // dwHoverTime(4) + 4 bytes trailing padding to the struct's 8-byte alignment = 24 bytes.

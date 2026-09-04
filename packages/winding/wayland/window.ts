@@ -12,9 +12,8 @@ import {
   throwCleanupErrors,
   WL_MARSHAL_FLAG_DESTROY,
 } from "./protocol.ts";
-import { WaylandShmBuffer, type WaylandShmHost } from "./shm_buffer.ts";
 
-export interface WaylandWindowHost extends NativeCallbackHost, WaylandShmHost {
+export interface WaylandWindowHost extends NativeCallbackHost {
   readonly display: Deno.PointerObject;
   readonly compositor: Deno.PointerObject | null;
   readonly xdgWmBase: Deno.PointerObject | null;
@@ -22,8 +21,6 @@ export interface WaylandWindowHost extends NativeCallbackHost, WaylandShmHost {
   readonly xdgToplevelIface: Deno.PointerObject;
   readonly ifaces: {
     readonly surface: Deno.PointerObject;
-    readonly shmPool: Deno.PointerObject;
-    readonly buffer: Deno.PointerObject;
   };
   readonly noop: AnyCallback;
   registerWindow(surface: Deno.PointerObject, window: WaylandWindow): void;
@@ -40,15 +37,17 @@ export class WaylandWindow implements Window {
   #xdgSurfaceConfigure: AnyCallback | null = null;
   #toplevelConfigure: AnyCallback | null = null;
   #toplevelClose: AnyCallback | null = null;
-  readonly #shmBuffer: WaylandShmBuffer;
+  #width: number;
+  #height: number;
+  #windowSurface: Deno.UnsafeWindowSurface | null = null;
   #pendingSerial = 0;
-  #configured = false;
   #suspended = false;
   #registered = false;
   #closed = false;
 
-  constructor(readonly lib: WaylandWindowHost, _width: number, _height: number) {
-    this.#shmBuffer = new WaylandShmBuffer(lib);
+  constructor(readonly lib: WaylandWindowHost, width: number, height: number) {
+    this.#width = width;
+    this.#height = height;
     const symbols = lib.wl.symbols;
     const errors: unknown[] = [];
     try {
@@ -112,6 +111,7 @@ export class WaylandWindow implements Window {
       { parameters: ["pointer", "pointer", "u32"], result: "void" },
       this.lib.guardCallback((_data, _surface, serial) => {
         this.#pendingSerial = serial;
+        this.#ackPendingConfigure();
       }),
     );
     this.#surfaceVtable = makeVtable([this.#xdgSurfaceConfigure], 1, this.lib.noop);
@@ -125,6 +125,8 @@ export class WaylandWindow implements Window {
       { parameters: ["pointer", "pointer", "i32", "i32", "pointer"], result: "void" },
       this.lib.guardCallback((_data, _toplevel, width, height, states) => {
         if (width > 0 && height > 0) {
+          this.#width = width;
+          this.#height = height;
           this.lib.pushEvent({ type: "resize", width, height, window: this });
         }
         const suspended = hasXdgToplevelState(states, SUSPENDED_TOPLEVEL_STATE);
@@ -162,7 +164,6 @@ export class WaylandWindow implements Window {
       args(BigInt(this.#pendingSerial)),
     );
     this.#pendingSerial = 0;
-    this.#configured = true;
   }
 
   setTitle(title: string): void {
@@ -180,38 +181,17 @@ export class WaylandWindow implements Window {
     symbols.wl_display_flush(this.lib.display);
   }
 
-  blit(rgba: Uint8Array, width: number, height: number): void {
-    if (this.#closed || !this.#surface) return;
+  windowSurface(): Deno.UnsafeWindowSurface {
+    if (this.#closed || !this.#surface) throw new Error("winding Wayland window is closed");
     this.#ackPendingConfigure();
-    if (!this.#configured) return;
-    const buffer = this.#shmBuffer.write(rgba, width, height);
-    const symbols = this.lib.wl.symbols;
-    const version = symbols.wl_proxy_get_version(this.#surface);
-    symbols.wl_proxy_marshal_array_flags(
-      this.#surface,
-      WlOp.SURFACE_ATTACH,
-      null,
-      version,
-      0,
-      args(Deno.UnsafePointer.value(buffer), 0n, 0n),
-    );
-    symbols.wl_proxy_marshal_array_flags(
-      this.#surface,
-      WlOp.SURFACE_DAMAGE_BUFFER,
-      null,
-      version,
-      0,
-      args(0n, 0n, BigInt(width), BigInt(height)),
-    );
-    symbols.wl_proxy_marshal_array_flags(
-      this.#surface,
-      WlOp.SURFACE_COMMIT,
-      null,
-      version,
-      0,
-      args(),
-    );
-    symbols.wl_display_flush(this.lib.display);
+    this.#windowSurface ??= new Deno.UnsafeWindowSurface({
+      system: "wayland",
+      windowHandle: this.#surface,
+      displayHandle: this.lib.display,
+      width: this.#width,
+      height: this.#height,
+    });
+    return this.#windowSurface;
   }
 
   [Symbol.dispose](): void {
@@ -232,7 +212,6 @@ export class WaylandWindow implements Window {
       this.#registered = false;
       collectCleanupError(errors, () => this.lib.unregisterWindow(surface, this));
     }
-    collectCleanupError(errors, () => this.#shmBuffer.close());
     const symbols = this.lib.wl.symbols;
     const toplevel = this.#xdgToplevel;
     this.#xdgToplevel = null;

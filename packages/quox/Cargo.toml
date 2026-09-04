@@ -19,7 +19,6 @@ blitz-html = "=0.3.0-alpha.6"
 blitz-paint = "=0.3.0-alpha.6"
 blitz-traits = "=0.3.0-alpha.6"
 console_error_panic_hook = "0.1"
-futures-intrusive = "0.5"
 # Pin image codecs explicitly. `image`'s default features drag in heavy extra
 # codecs (TIFF, OpenEXR, and AVIF encoding via `rav1e`) that roughly doubled the
 # added Wasm size for formats we don't need, so we opt out of defaults and list
@@ -30,4 +29,5 @@ smol_str = "0.3.6"
 vello = "0.9"
 wasm-bindgen = "=0.2.108"
 wasm-bindgen-futures = "=0.4.58"
+web-sys = { version = "0.3.85", features = ["OffscreenCanvas"] }
 wgpu_context = "0.7"

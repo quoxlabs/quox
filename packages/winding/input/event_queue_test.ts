@@ -11,7 +11,7 @@ function testWindow(): Window {
     [Symbol.dispose]() {},
     close() {},
     setTitle() {},
-    blit() {},
+    windowSurface: () => ({}) as Deno.UnsafeWindowSurface,
   };
 }
 

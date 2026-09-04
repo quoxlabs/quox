@@ -2,14 +2,10 @@ import type { Library, LoadLibrary, UIEvent, Window } from "../types.ts";
 import { DeferredNativeError, guardNativeCallback } from "../input/callback.ts";
 import { EventQueue } from "../input/event_queue.ts";
 import {
-  BI_RGB,
-  BITMAPINFOHEADER_SIZE,
   CLASS_STYLE,
   CW_USEDEFAULT,
-  DIB_RGB_COLORS,
   DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
   FORMAT_MESSAGE_FROM_SYSTEM,
-  gdi32functions,
   IDC_ARROW,
   kernel32functions,
   PM_REMOVE,
@@ -64,8 +60,8 @@ function trackMouseLeave(lib: Win32Library, hWnd: Deno.PointerValue): void {
 class Win32Window implements Window {
   readonly id: bigint;
   readonly #hwnd: Deno.PointerObject;
-  #bgra = new Uint8Array(0) as Uint8Array<ArrayBuffer>;
-  #bmi = new ArrayBuffer(BITMAPINFOHEADER_SIZE);
+  #width: number;
+  #height: number;
   /** Tracks minimized state so `WM_SIZE` transitions map to a single `visibilitychange` event instead of firing on every resize message. */
   minimized = false;
   #closed = false;
@@ -89,6 +85,8 @@ class Win32Window implements Window {
     this.#hwnd = window;
     this.#resizeClientTo(w, h);
     this.id = BigInt(Deno.UnsafePointer.value(window));
+    this.#width = w;
+    this.#height = h;
     lib.windows.set(this.id, this);
     try {
       lib.input.attach(this);
@@ -112,8 +110,8 @@ class Win32Window implements Window {
   /**
    * Grow the window so its *client* area is exactly w×h. CreateWindowExW's
    * width/height size the whole window (title bar and borders included), but
-   * the render buffer and `blit` target the client area, so without this the
-   * drawable would be smaller than requested and the blit would be clipped.
+   * the WebGPU surface targets the client area, so without this the drawable
+   * would be smaller than requested.
    */
   #resizeClientTo(w: number, h: number): void {
     const rect = new ArrayBuffer(16); // RECT { left, top, right, bottom } as i32
@@ -140,57 +138,19 @@ class Win32Window implements Window {
     if (!ok) throw new Error(this.lib.getLastError());
   }
 
-  /**
-   * Copy an RGBA pixel buffer to the window's client area via GDI. Converts
-   * to a top-down 32bpp BGRA DIB (matching the BGRX reordering used by the
-   * X11 backend) and blits it with `SetDIBitsToDevice`.
-   */
-  blit(rgba: Uint8Array, width: number, height: number): void {
-    const byteLength = width * height * 4;
-    if (this.#bgra.byteLength !== byteLength) {
-      this.#bgra = new Uint8Array(byteLength) as Uint8Array<ArrayBuffer>;
-    }
-    const bgra = this.#bgra;
-    for (let i = 0; i < rgba.length; i += 4) {
-      bgra[i] = rgba[i + 2]; // B ← R
-      bgra[i + 1] = rgba[i + 1]; // G
-      bgra[i + 2] = rgba[i]; // R ← B
-      bgra[i + 3] = rgba[i + 3]; // A
-    }
+  setSize(width: number, height: number): void {
+    this.#width = width;
+    this.#height = height;
+  }
 
-    const dv = new DataView(this.#bmi);
-    dv.setUint32(0, BITMAPINFOHEADER_SIZE, true); // biSize
-    dv.setInt32(4, width, true); // biWidth
-    dv.setInt32(8, -height, true); // biHeight (negative = top-down)
-    dv.setUint16(12, 1, true); // biPlanes
-    dv.setUint16(14, 32, true); // biBitCount
-    dv.setUint32(16, BI_RGB, true); // biCompression
-    dv.setUint32(20, byteLength, true); // biSizeImage
-    dv.setInt32(24, 0, true); // biXPelsPerMeter
-    dv.setInt32(28, 0, true); // biYPelsPerMeter
-    dv.setUint32(32, 0, true); // biClrUsed
-    dv.setUint32(36, 0, true); // biClrImportant
-
-    const hdc = this.lib.user32.symbols.GetDC(this.#hwnd);
-    if (hdc == null) throw new Error(this.lib.getLastError());
-    try {
-      this.lib.gdi32.symbols.SetDIBitsToDevice(
-        hdc,
-        0,
-        0,
-        width,
-        height,
-        0,
-        0,
-        0,
-        height,
-        bgra,
-        this.#bmi,
-        DIB_RGB_COLORS,
-      );
-    } finally {
-      this.lib.user32.symbols.ReleaseDC(this.#hwnd, hdc);
-    }
+  windowSurface(): Deno.UnsafeWindowSurface {
+    return new Deno.UnsafeWindowSurface({
+      system: "win32",
+      windowHandle: this.#hwnd,
+      displayHandle: this.lib.instance,
+      width: this.#width,
+      height: this.#height,
+    });
   }
   [Symbol.dispose]() {
     this.close();
@@ -218,7 +178,6 @@ class Win32Window implements Window {
 class Win32Library implements Library {
   readonly kernel32: Deno.DynamicLibrary<typeof kernel32functions>;
   readonly user32: Deno.DynamicLibrary<typeof user32functions>;
-  readonly gdi32: Deno.DynamicLibrary<typeof gdi32functions>;
   #wndClass = new ArrayBuffer(80);
   #classNameBuffer = (() => {
     return wideStringBuffer("Winding");
@@ -240,7 +199,6 @@ class Win32Library implements Library {
   constructor() {
     this.kernel32 = Deno.dlopen("kernel32", kernel32functions);
     this.user32 = Deno.dlopen("user32", user32functions);
-    this.gdi32 = Deno.dlopen("gdi32", gdi32functions);
 
     // Opt the whole process into per-monitor DPI awareness before creating any
     // window. Best-effort: this fails harmlessly if awareness was already set
@@ -280,6 +238,7 @@ class Win32Library implements Library {
             const w = Number(BigInt(lParam) & 0xFFFFn);
             const h = Number((BigInt(lParam) >> 16n) & 0xFFFFn);
             const minimized = Number(wParam) === SIZE_MINIMIZED;
+            if (w > 0 && h > 0) win.setSize(w, h);
             if (win !== undefined && minimized !== win.minimized) {
               win.minimized = minimized;
               this.#events.push({ type: "visibilitychange", visible: !minimized, window: win });
@@ -514,7 +473,6 @@ class Win32Library implements Library {
     });
     captureError(errors, () => this.#callbackErrors.throwIfPending());
     captureError(errors, () => this.#wndProc.close());
-    captureError(errors, () => this.gdi32.close());
     captureError(errors, () => this.user32.close());
     captureError(errors, () => this.kernel32.close());
     throwCollected(errors, "Failed to close Win32 library");

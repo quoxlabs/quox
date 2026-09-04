@@ -118,8 +118,8 @@ export interface Window {
   close(): void;
   /** Set the native window title. */
   setTitle(title: string): void;
-  /** Blit (bit-block transfer) an RGBA pixel buffer to the window. Width and height must match the window dimensions. */
-  blit(rgba: Uint8Array, width: number, height: number): void;
+  /** Create a presentable WebGPU surface for this native window. */
+  windowSurface(): Deno.UnsafeWindowSurface;
 }
 
 export interface Library {

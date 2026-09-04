@@ -422,8 +422,8 @@ class WaylandLibrary implements Library {
 
   openWindow(_x = 0, _y = 0, w = 800, h = 600): WaylandWindow {
     if (this.#closed) throw new Error("winding Wayland library is closed");
-    if (!this.compositor || !this.shm || !this.xdgWmBase) {
-      throw new Error("winding wayland globals not ready (compositor/shm/xdg_wm_base missing)");
+    if (!this.compositor || !this.xdgWmBase) {
+      throw new Error("winding wayland globals not ready (compositor/xdg_wm_base missing)");
     }
     return new WaylandWindow(this, w, h);
   }

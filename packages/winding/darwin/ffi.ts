@@ -1,4 +1,4 @@
-// Minimal Objective-C runtime + AppKit/CoreGraphics FFI bindings.
+// Minimal Objective-C runtime + AppKit FFI bindings.
 //
 // macOS has no stable C ABI for windowing (unlike X11/Win32): everything goes
 // through the Objective-C message-dispatch runtime (`objc_msgSend`). Deno's FFI
@@ -11,7 +11,6 @@ export { cStr };
 
 export const LIBOBJC = "/usr/lib/libobjc.dylib";
 export const APPKIT = "/System/Library/Frameworks/AppKit.framework/AppKit";
-export const CORE_GRAPHICS = "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics";
 export const CORE_FOUNDATION = "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation";
 
 export const runtimeSymbols = {
@@ -200,31 +199,7 @@ export function openNSRectMsgSend(libraries: Closeable[]): NSRectMsgSend {
   };
 }
 
-// CoreGraphics / CoreFoundation plain C functions (not Objective-C messages).
-export const cgSymbols = {
-  CGColorSpaceCreateDeviceRGB: { parameters: [], result: "pointer" },
-  CGDataProviderCreateWithData: {
-    parameters: ["pointer", "buffer", "usize", "pointer"],
-    result: "pointer",
-  },
-  CGImageCreate: {
-    parameters: [
-      "usize",
-      "usize",
-      "usize",
-      "usize",
-      "usize",
-      "pointer",
-      "u32",
-      "pointer",
-      "pointer",
-      "bool",
-      "i32",
-    ],
-    result: "pointer",
-  },
-} as const satisfies Deno.ForeignLibraryInterface;
-
+// CoreFoundation plain C functions used to decode NSString/CFString input.
 export const cfSymbols = {
   CFRelease: { parameters: ["pointer"], result: "void" },
   CFStringGetLength: { parameters: ["pointer"], result: "i64" },
@@ -272,10 +247,6 @@ export function readCFString(cf: CoreFoundation, string: Deno.PointerValue): str
   }
   return new TextDecoder().decode(bytes.subarray(0, Number(used[0])));
 }
-
-// kCGImageAlphaLast | kCGBitmapByteOrderDefault: straight (non-premultiplied)
-// alpha, RGBA byte order — matches the RGBA buffer winding's callers hand us.
-export const RGBA_BITMAP_INFO = 3;
 
 export function readStructF64(view: Uint8Array, offset: number): number {
   return structDataView(view).getFloat64(offset, true);

@@ -196,19 +196,9 @@ export const WlOp = {
   REGISTRY_BIND: 0,
   // wl_compositor requests
   COMPOSITOR_CREATE_SURFACE: 0,
-  // wl_shm requests
-  SHM_CREATE_POOL: 0,
-  // wl_shm_pool requests
-  SHM_POOL_CREATE_BUFFER: 0,
-  SHM_POOL_DESTROY: 1,
-  // wl_buffer requests
-  BUFFER_DESTROY: 0,
   // wl_surface requests
   SURFACE_DESTROY: 0,
-  SURFACE_ATTACH: 1,
-  SURFACE_DAMAGE: 2,
   SURFACE_COMMIT: 6,
-  SURFACE_DAMAGE_BUFFER: 9,
   // wl_seat requests
   SEAT_GET_POINTER: 0,
   SEAT_GET_KEYBOARD: 1,
@@ -235,11 +225,6 @@ export const WlOp = {
   // wp_cursor_shape_device_v1 requests
   WP_CURSOR_SHAPE_DEVICE_DESTROY: 0,
   WP_CURSOR_SHAPE_DEVICE_SET_SHAPE: 1,
-} as const;
-
-export const WlShmFormat = {
-  ARGB8888: 0,
-  XRGB8888: 1,
 } as const;
 
 // wl_seat::capabilities bitmask
