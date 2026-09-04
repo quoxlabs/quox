@@ -15,6 +15,7 @@ class FakeRenderer {
   readonly operations: Operation[] = [];
   #nextNodeId = 1;
   readonly #text = new Map<number, string>();
+  readonly #attributes = new Map<string, string>();
   #title = "";
 
   create_element(tagName: string): number {
@@ -35,7 +36,12 @@ class FakeRenderer {
   }
 
   set_attribute(nodeId: number, name: string, value: string): void {
+    this.#attributes.set(`${nodeId}/${name}`, value);
     this.operations.push({ type: "set_attribute", nodeId, name, value });
+  }
+
+  get_attribute(nodeId: number, name: string): string | undefined {
+    return this.#attributes.get(`${nodeId}/${name}`);
   }
 
   text_content(nodeId: number): string {
@@ -76,8 +82,7 @@ class FakeRenderer {
   }
 
   remove_attribute(nodeId: number, name: string): void {
-    void nodeId;
-    void name;
+    this.#attributes.delete(`${nodeId}/${name}`);
   }
 
   #hitNodeId: number | undefined = undefined;
@@ -431,6 +436,42 @@ Deno.test("mount resolves Preact-shaped fragments and function components withou
     { type: "append_child", parentId: 0, childId: 1 },
     { type: "append_child", parentId: 0, childId: 3 },
   ]);
+});
+
+Deno.test("getAttribute reads back what setAttribute wrote", () => {
+  const { document } = createTestDocument();
+  const element = document.createElement("div");
+
+  assertEquals(element.getAttribute("class"), null);
+
+  element.setAttribute("class", "card");
+
+  assertEquals(element.getAttribute("class"), "card");
+
+  element.removeAttribute("class");
+
+  assertEquals(element.getAttribute("class"), null);
+});
+
+Deno.test("img.src and img.alt reflect their attributes", () => {
+  const { document, renderer } = createTestDocument();
+  const img = document.createElement("img");
+
+  // Absent attributes read as the empty string, as in the DOM — not as null.
+  assertEquals(img.src, "");
+  assertEquals(img.alt, "");
+
+  img.src = "https://cdn.test/avatar.png";
+  img.alt = "an avatar";
+
+  // Assigning `src` must go through the attribute: that is what makes the renderer
+  // request the resource.
+  assertEquals(renderer.operations.filter((operation) => operation.type === "set_attribute"), [
+    { type: "set_attribute", nodeId: img.nodeId, name: "src", value: "https://cdn.test/avatar.png" },
+    { type: "set_attribute", nodeId: img.nodeId, name: "alt", value: "an avatar" },
+  ]);
+  assertEquals(img.src, "https://cdn.test/avatar.png");
+  assertEquals(img.alt, "an avatar");
 });
 
 Deno.test("document.nodeFromPoint returns null when nothing is hit", () => {

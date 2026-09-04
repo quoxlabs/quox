@@ -120,6 +120,41 @@ export class QuoxElement extends QuoxNode {
     requestRender();
   }
 
+  getAttribute(name: string): string | null {
+    const { renderer } = documentInternals(this.ownerDocument);
+    return renderer.get_attribute(this.nodeId, name) ?? null;
+  }
+
+  /**
+   * URL of the image an `<img>` element displays, mirroring `HTMLImageElement.src`.
+   *
+   * Assigning it reflects the `src` attribute, which is what makes quox load the image:
+   * the URL is resolved against the window's `baseUrl` and fetched by Deno (see
+   * `QuoxResourceLoader`), then decoded from the fetched bytes — the same byte buffer
+   * `setImageData` takes. Loading is asynchronous, so the image appears on a later frame;
+   * the window re-renders itself once it arrives.
+   *
+   * Unlike in a browser, the getter returns the attribute verbatim rather than the
+   * absolutized URL, and no `load`/`error` event fires — a failed fetch is reported to the
+   * console instead.
+   */
+  get src(): string {
+    return this.getAttribute("src") ?? "";
+  }
+
+  set src(value: string) {
+    this.setAttribute("src", value);
+  }
+
+  /** Alternative text for an `<img>` element, mirroring `HTMLImageElement.alt`. */
+  get alt(): string {
+    return this.getAttribute("alt") ?? "";
+  }
+
+  set alt(value: string) {
+    this.setAttribute("alt", value);
+  }
+
   /**
    * Display an image in this `<img>` element from a byte buffer of encoded image
    * data — e.g. the `Uint8Array` returned by `Deno.readFile`. You pass the raw
