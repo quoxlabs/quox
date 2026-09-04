@@ -562,16 +562,14 @@ class DarwinWindow implements Window, DarwinNativeResponder {
     { readCharacters = true }: { readCharacters?: boolean } = {},
   ): {
     base: Omit<KeyEventBase, "type">;
-    characters: string;
-    charactersIgnoringModifiers: string;
+    characters: string | null;
+    charactersIgnoringModifiers: string | null;
   } {
     const { sel, send } = this.lib.ffi;
     const keycode = send.u16(event, sel("keyCode"));
     const code = getDomCode(keycode);
-    // NSEvent#characters/#charactersIgnoringModifiers are only valid for keyDown/keyUp;
-    // sending them to a FlagsChanged event throws NSInternalInconsistencyException.
-    let characters = "";
-    let charactersIgnoringModifiers = "";
+    let characters: string | null = null;
+    let charactersIgnoringModifiers: string | null = null;
     if (readCharacters) {
       const charactersPointer = send.id(event, sel("characters"));
       const charactersIgnoringModifiersPointer = send.id(event, sel("charactersIgnoringModifiers"));

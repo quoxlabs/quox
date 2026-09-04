@@ -44,10 +44,10 @@ const NAMED_KEYS_BY_CODE: Readonly<Record<string, string>> = {
 
 export interface NativeLogicalKeyInput {
   code: string;
-  /** `NSEvent.characters`, decoded as a complete NSString. */
-  characters: string;
-  /** `NSEvent.charactersIgnoringModifiers`, decoded as a complete NSString. */
-  charactersIgnoringModifiers: string;
+  /** `NSEvent.characters`, decoded as a complete NSString. `null` when not queried (e.g. FlagsChanged). */
+  characters: string | null;
+  /** `NSEvent.charactersIgnoringModifiers`, decoded as a complete NSString. `null` when not queried. */
+  charactersIgnoringModifiers: string | null;
   /** Text delivered synchronously through insertText:, when available. */
   producedText?: string;
 }
@@ -65,13 +65,13 @@ export function logicalKeyForEvent(input: NativeLogicalKeyInput): string {
   const produced = printableText(input.producedText ?? "");
   if (produced !== undefined) return produced;
 
-  const modified = printableText(input.characters);
+  const modified = printableText(input.characters ?? "");
   if (modified !== undefined) return modified;
 
   // A dead key commonly has no `characters`, while
   // `charactersIgnoringModifiers` still names the underlying physical key.
-  const unmodified = printableText(input.charactersIgnoringModifiers);
-  if (input.characters.length === 0 && unmodified !== undefined && isPotentiallyPrintableCode(input.code)) {
+  const unmodified = printableText(input.charactersIgnoringModifiers ?? "");
+  if (!input.characters && unmodified !== undefined && isPotentiallyPrintableCode(input.code)) {
     return "Dead";
   }
   if (unmodified !== undefined) return unmodified;
@@ -95,11 +95,11 @@ export function printableText(value: string): string | undefined {
 
 /** Ordinary AppKit text fallback used while native composition is not active. */
 export function uninterpretedCommitText(
-  characters: string,
+  characters: string | null,
   ctrlKey: boolean,
   metaKey: boolean,
 ): string | undefined {
-  return ctrlKey || metaKey ? undefined : printableText(characters);
+  return ctrlKey || metaKey ? undefined : printableText(characters ?? "");
 }
 
 export function isPotentiallyPrintableCode(code: string): boolean {
