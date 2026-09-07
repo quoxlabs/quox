@@ -1,13 +1,15 @@
 mod dom;
 mod interaction;
+mod net;
 mod render;
 
 use blitz_dom::{BaseDocument, DEFAULT_CSS, DocumentConfig, FontContext};
 use blitz_html::{HtmlDocument, HtmlProvider};
-use blitz_traits::net::DummyNetProvider;
+use blitz_traits::net::{NetProvider, Url};
 use blitz_traits::shell::{ColorScheme, ShellProvider, Viewport};
 use interaction::RecordedEvents;
 use linebender_resource_handle::Blob;
+use net::QuoxNetProvider;
 use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -46,6 +48,12 @@ struct QuoxRendererState {
     renderer: Renderer,
     redraw_requested: Arc<AtomicBool>,
     recorded_events: RecordedEvents,
+    /// The document's own provider, retained so the host can drain and answer the resource
+    /// requests it queues (see [`net`]).
+    net_provider: Arc<QuoxNetProvider>,
+    /// The document's base URL, kept alongside Blitz's own copy so relative resource
+    /// references can be validated before Blitz resolves them (see [`dom`]).
+    base_url: Url,
 }
 
 /// Notices Blitz-internal redraw requests (hover/active/focus/scroll/text-input state
@@ -83,13 +91,22 @@ impl QuoxRendererState {
 impl QuoxRenderer {
     /// Initialise a renderer with a live document and viewport dimensions.
     ///
+    /// `base_url` is the document's own URL: every relative resource reference (`<img src>`,
+    /// `<link href>`, CSS `url()`) resolves against it, exactly as a page's URL does in a
+    /// browser. It must be an absolute URL — relative references cannot be resolved otherwise,
+    /// and Blitz treats that as unreachable rather than recoverable.
+    ///
     /// Acquires a WebGPU device; must be `await`ed.
     pub async fn create(
         width: u32,
         height: u32,
         head: &str,
         body: &str,
+        base_url: &str,
     ) -> Result<QuoxRenderer, JsValue> {
+        let base_url = Url::parse(base_url)
+            .map_err(|e| JsValue::from_str(&format!("Document base URL {base_url:?}: {e}")))?;
+
         let mut context = WGPUContext::new();
         let dev_id = context
             .find_or_create_device(None)
@@ -113,12 +130,13 @@ impl QuoxRenderer {
             .register_fonts(Blob::new(Arc::new(LIBERATION_SANS) as _), None);
 
         let redraw_requested = Arc::new(AtomicBool::new(false));
+        let net_provider = Arc::new(QuoxNetProvider::default());
 
         let document = HtmlDocument::from_html(
             &initial_html(head, body),
             DocumentConfig {
-                base_url: Some("https://example.com".to_string()),
-                net_provider: Some(Arc::new(DummyNetProvider)),
+                base_url: Some(base_url.to_string()),
+                net_provider: Some(Arc::clone(&net_provider) as Arc<dyn NetProvider>),
                 shell_provider: Some(Arc::new(QuoxShellProvider {
                     redraw_requested: Arc::clone(&redraw_requested),
                 })),
@@ -140,6 +158,8 @@ impl QuoxRenderer {
                 renderer,
                 redraw_requested,
                 recorded_events: RecordedEvents::default(),
+                net_provider,
+                base_url,
             }),
         })
     }

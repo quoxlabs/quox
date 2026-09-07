@@ -7,6 +7,7 @@ import { mapWindingEvent, notifyInputListeners, type QuoxInputEvent, QuoxInputRo
 import { isVNode, mount, type QuoxRenderable } from "./mount.ts";
 import { QuoxElement } from "./node.ts";
 import type { QuoxInnerHTML } from "./node.ts";
+import { QuoxResourceLoader } from "./resources.ts";
 
 export type {
   QuoxAppleStandardKeybindingEvent,
@@ -36,6 +37,16 @@ export interface WindowOptions {
   head?: QuoxWindowContent;
   /** Initial content for `document.body`: an HTML string, or JSX from any recognized runtime. */
   body?: QuoxWindowContent;
+  /**
+   * The document's own URL. Relative resource references — `<img src="./logo.png">`,
+   * `<link href>`, CSS `url()` — resolve against it, exactly as a page's URL does in a
+   * browser. Must be an absolute URL.
+   *
+   * Defaults to `Deno.mainModule`, so resources resolve next to the app's entry point:
+   * alongside the script on disk, or on the origin the app was run from when it was
+   * launched straight from a URL.
+   */
+  baseUrl?: string;
 }
 
 const DEFAULT_WINDOW_TITLE = "quox";
@@ -72,6 +83,7 @@ export class QuoxWindow implements Disposable {
   #visible = true;
   readonly #listeners: Array<(event: QuoxInputEvent) => void> = [];
   readonly #inputRouter: QuoxInputRouter;
+  readonly #resources: QuoxResourceLoader;
   readonly document: QuoxDocument;
 
   /**
@@ -101,6 +113,7 @@ export class QuoxWindow implements Disposable {
     this.#width = width;
     this.#height = height;
     this.#renderer = renderer;
+    this.#resources = new QuoxResourceLoader(renderer, () => this.#requestRender());
     this.document = new QuoxDocument(
       renderer,
       () => this.#requestRender(),
@@ -146,13 +159,14 @@ export class QuoxWindow implements Disposable {
     const height = options.height ?? 600;
     const head = contentToString(options.head);
     const body = contentToString(options.body);
+    const baseUrl = options.baseUrl ?? Deno.mainModule;
 
     const lib = windingLoad();
     let win: WindingWindow | undefined;
     let renderer: WasmRenderer | undefined;
     try {
       win = lib.openWindow(0, 0, width, height);
-      renderer = await WasmRenderer.create(width, height, head, body);
+      renderer = await WasmRenderer.create(width, height, head, body, baseUrl);
       const quoxWindow = new QuoxWindow(lib, win, width, height, renderer);
       await mountWindowContent(quoxWindow.document.head, options.head);
       await mountWindowContent(quoxWindow.document.body, options.body);
@@ -173,16 +187,24 @@ export class QuoxWindow implements Disposable {
     }
   }
 
-  /** Begin processing window events and render the initial document. */
+  /** Begin processing window events, fetch the document's resources, and render it. */
   start(): void {
     if (this.#intervalId !== null) return;
     this.#intervalId = setInterval(() => {
       this.#pollEvents();
     }, 16);
+    // Start on whatever the initial document already references, rather than waiting for
+    // the first tick.
+    this.#resources.pump();
     this.#requestRender();
   }
 
   #pollEvents(): void {
+    // Fetch resources the document has asked for since the last tick — DOM mutations and
+    // CSS both reach for them, so this rides the event loop rather than the render path,
+    // which is skipped while the window is hidden.
+    this.#resources.pump();
+
     // Drain all pending events and forward input events to listeners.
     const listenerErrors: unknown[] = [];
     try {
@@ -288,6 +310,8 @@ export class QuoxWindow implements Disposable {
       this.#intervalId = null;
     }
 
+    // Before the renderer goes away, so an in-flight fetch can't try to deliver into it.
+    this.#resources.close();
     this.#releaseRenderer();
   }
 

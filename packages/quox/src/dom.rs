@@ -58,6 +58,49 @@ impl QuoxRendererState {
             .ok_or_else(|| invalid_element(node_id))
     }
 
+    /// The tag name of `node_id`'s element, lowercase for HTML elements.
+    fn element_tag_name(&self, node_id: usize) -> Result<&str, JsValue> {
+        Ok(self
+            .document
+            .get_node(node_id)
+            .ok_or_else(|| invalid_node(node_id))?
+            .element_data()
+            .ok_or_else(|| invalid_element(node_id))?
+            .name
+            .local
+            .as_ref())
+    }
+
+    /// Reject a resource reference that can't be resolved against the document's base URL.
+    ///
+    /// Blitz resolves `<img src>` and `<link href>` the moment they're set — that's what
+    /// kicks off the fetch — and treats a URL it can't resolve as unreachable, panicking,
+    /// which in WebAssembly takes the whole renderer with it. Validating against the same
+    /// base URL first turns a bad URL into an ordinary error the caller can catch.
+    fn ensure_resolvable_resource_url(
+        &self,
+        node_id: usize,
+        name: &str,
+        value: &str,
+    ) -> Result<(), JsValue> {
+        // Blitz ignores an empty reference rather than resolving it.
+        if value.is_empty() {
+            return Ok(());
+        }
+
+        match (self.element_tag_name(node_id)?, name) {
+            ("img", "src") | ("link", "href") => {}
+            _ => return Ok(()),
+        }
+
+        self.base_url.join(value).map(|_| ()).map_err(|e| {
+            JsValue::from_str(&format!(
+                "Cannot resolve {name}={value:?} against the document base URL {}: {e}",
+                self.base_url
+            ))
+        })
+    }
+
     fn child_element_by_tag(&self, parent_id: usize, tag_name: &str) -> Result<usize, JsValue> {
         let parent = self
             .document
@@ -152,13 +195,31 @@ impl QuoxRenderer {
     }
 
     /// Set an element attribute.
+    ///
+    /// Setting an attribute that references a resource (`<img src>`, `<link href>`) is what
+    /// starts a fetch for it: Blitz resolves the value against the document's base URL and
+    /// asks quox's net provider for the bytes (see `net`). The value is validated first, so
+    /// an unresolvable URL is an error here rather than a panic inside Blitz.
     pub fn set_attribute(&self, node_id: usize, name: &str, value: &str) -> Result<(), JsValue> {
         let mut state = self.state.borrow_mut();
         state.ensure_element(node_id)?;
+        state.ensure_resolvable_resource_url(node_id, name, value)?;
         state.mutate_document(|mutator| {
             mutator.set_attribute(node_id, attr_name(name), value);
             Ok(())
         })
+    }
+
+    /// Return an element attribute's value, or `None` if the attribute isn't set.
+    pub fn get_attribute(&self, node_id: usize, name: &str) -> Result<Option<String>, JsValue> {
+        let state = self.state.borrow();
+        state.ensure_element(node_id)?;
+        Ok(state
+            .document
+            .get_node(node_id)
+            .and_then(blitz_dom::Node::element_data)
+            .and_then(|element| element.attr(LocalName::from(name)))
+            .map(str::to_owned))
     }
 
     /// Decode an encoded image from `bytes` and display it in an `<img>` element.
@@ -173,6 +234,10 @@ impl QuoxRenderer {
     /// The image's intrinsic size becomes the element's natural size; `width`/`height`
     /// attributes or CSS on the element override it as usual. Errors if `node_id`
     /// isn't an `<img>` element or the bytes can't be decoded.
+    ///
+    /// This is the direct route for bytes the caller already holds. Setting the element's
+    /// `src` attribute instead has Blitz request the URL through quox's net provider (see
+    /// `net`), which ends up decoding the very same kind of byte buffer.
     //
     // Format support is pinned in `Cargo.toml` (`image` with `default-features =
     // false`); see the comment there for why we don't just take `image`'s defaults.
@@ -191,17 +256,7 @@ impl QuoxRenderer {
         // paint if the element were given an explicit CSS size, but it gets no
         // intrinsic size from the image — so by default the box collapses and nothing
         // shows. We reject non-<img> up front rather than ship that half-working case.
-        let is_img = state
-            .document
-            .get_node(node_id)
-            .ok_or_else(|| invalid_node(node_id))?
-            .element_data()
-            .ok_or_else(|| invalid_element(node_id))?
-            .name
-            .local
-            .as_ref()
-            == "img";
-        if !is_img {
+        if state.element_tag_name(node_id)? != "img" {
             return Err(JsValue::from_str(&format!(
                 "DOM node id is not an <img> element: {node_id}"
             )));
